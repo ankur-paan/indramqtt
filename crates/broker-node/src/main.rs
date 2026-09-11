@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use broker_auth::{AclAction, AclRule, Authenticator, Authorizer, MemoryAuth};
 use broker_cluster::{ClusterMessage, RoutingPlane};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
-use broker_router::{Router, Subscription};
+use broker_router::{split_shared_filter, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager};
 use broker_storage::{MemoryStore, RetainedStore};
@@ -64,8 +65,8 @@ fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<Bro
 /// MQTT 3.1.1 CONNACK "identifier rejected" code.
 fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> BrokerFrame {
     let (session_id, present, return_code) = match decode_bind_meta(&frame.metadata) {
-        Ok((client_id, clean_start)) => {
-            let (session, present) = sessions.get_or_create(&client_id, clean_start);
+        Ok(req) => {
+            let (session, present) = sessions.get_or_create(&req.client_id, req.clean_start);
             // Connection != Session: pin this edge connection to the session
             // so Unbind can later verify ownership before detaching.
             *session.conn_id.write() = Some(frame.header.conn_id);
@@ -74,6 +75,16 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
         Err(_) => (0u64, false, 2u8),
     };
 
+    session_binding_reply(frame, session_id, present, return_code)
+}
+
+/// Build one `SessionBinding` reply frame.
+fn session_binding_reply(
+    frame: &BrokerFrame,
+    session_id: u64,
+    present: bool,
+    return_code: u8,
+) -> BrokerFrame {
     let mut meta = Vec::with_capacity(10);
     meta.extend_from_slice(&session_id.to_be_bytes());
     meta.push(u8::from(present));
@@ -89,22 +100,88 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
     .expect("SessionBinding reply within size bounds")
 }
 
-/// Decode `BindConnection` metadata into `(client_id, clean_start)`.
+/// Authenticated bind for the live path: credentialed requests verify
+/// against the auth store first (failure short-circuits to return code
+/// `0x86`, bad username/password, with no session created), then the
+/// standard session resolution applies.
+async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+        if req.username.is_some() {
+            let password = req.password.as_deref();
+            if shared
+                .auth
+                .authenticate(&req.client_id, req.username.as_deref(), password)
+                .await
+                .is_err()
+            {
+                return Some(session_binding_reply(frame, 0, false, 0x86));
+            }
+        }
+    }
+    reply_for_frame(frame, &shared.sessions)
+}
+
+/// Decode `BindConnection` metadata.
 ///
-/// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`.
-/// The keepalive is framing-validated here; supervision lives on the edge.
-fn decode_bind_meta(meta: &[u8]) -> Result<(String, bool), &'static str> {
+/// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
+/// optionally followed by a credentials section `UserLen:16be | Username
+/// | PassLen:16be | Password` (absent entirely when the client connects
+/// anonymously). The keepalive is framing-validated here; supervision
+/// lives on the edge.
+struct BindRequest {
+    client_id: String,
+    clean_start: bool,
+    username: Option<String>,
+    password: Option<Vec<u8>>,
+}
+
+fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     if meta.len() < 5 {
         return Err("bind meta too short");
     }
     let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() != 2 + id_len + 1 + 2 {
-        return Err("bind meta length mismatch");
+    if meta.len() < 2 + id_len + 1 + 2 {
+        return Err("bind meta too short");
     }
     let id_bytes = &meta[2..2 + id_len];
     let flags = meta[2 + id_len];
+    // Keepalive occupies the next two bytes (validated for presence).
+    let _keepalive = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
     let client_id = std::str::from_utf8(id_bytes).map_err(|_| "client id not UTF-8")?;
-    Ok((client_id.to_string(), flags & 0x01 != 0))
+    let rest = &meta[5 + id_len..];
+    let (username, password) = decode_bind_credentials(rest)?;
+    Ok(BindRequest {
+        client_id: client_id.to_string(),
+        clean_start: flags & 0x01 != 0,
+        username,
+        password,
+    })
+}
+
+/// Decode the optional trailing credentials section: empty means
+/// anonymous; otherwise exactly `UserLen | Username | PassLen | Password`.
+fn decode_bind_credentials(
+    rest: &[u8],
+) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
+    if rest.is_empty() {
+        return Ok((None, None));
+    }
+    if rest.len() < 2 {
+        return Err("bind credentials truncated");
+    }
+    let user_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    if rest.len() < 2 + user_len + 2 {
+        return Err("bind credentials truncated");
+    }
+    let username =
+        std::str::from_utf8(&rest[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
+    let base = 2 + user_len;
+    let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
+    if rest.len() != base + 2 + pass_len {
+        return Err("bind meta length mismatch");
+    }
+    let password = rest[base + 2..].to_vec();
+    Ok((Some(username.to_string()), Some(password)))
 }
 
 /// Ephemeral routing table: edge `conn_id` -> mailbox of the task owning
@@ -177,6 +254,7 @@ struct Shared {
     /// remote node (single forward per node; remotes fan out locally).
     cluster: Option<Arc<dyn RoutingPlane>>,
     metrics: Arc<Metrics>,
+    auth: Arc<MemoryAuth>,
 }
 
 impl Shared {
@@ -203,6 +281,7 @@ impl Shared {
             retained: Arc::new(MemoryStore::new()),
             cluster: None,
             metrics,
+            auth: Arc::new(MemoryAuth::new()),
         }
     }
 }
@@ -323,13 +402,13 @@ where
 {
     match frame.header.opcode {
         OpCode::BindConnection => {
-            if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
+            if let Some(reply) = apply_bind(&frame, shared).await {
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
                 shared.metrics.inc_connections();
                 // Remember who we serve so a dead socket detaches cleanly.
-                if let Ok((client_id, _)) = decode_bind_meta(&frame.metadata) {
-                    *bound = Some((client_id, frame.header.conn_id));
+                if let Ok(req) = decode_bind_meta(&frame.metadata) {
+                    *bound = Some((req.client_id, frame.header.conn_id));
                 }
                 let replayed = replay_offline(&frame, shared).await;
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
@@ -384,8 +463,11 @@ where
 ///
 /// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
 /// (FilterLen:16be | Filter | QoS:8) * N`. Each granted code echoes the
-/// requested QoS; invalid filters are answered with `0x80` and fetch no
-/// retained state. Retained deliveries carry `retain = true` at
+/// requested QoS; invalid filters and ACL denials are answered with
+/// `0x80` (not authorized) and `0x87` respectively and register nothing.
+/// `$share/<group>/` prefixes are split before routing, ACL checks,
+/// retained fetch, and cluster announce so every downstream stage sees
+/// the plain inner filter. Retained deliveries carry `retain = true` at
 /// `min(subscription QoS, stored QoS)`.
 async fn apply_subscribe(
     frame: &BrokerFrame,
@@ -399,24 +481,39 @@ async fn apply_subscribe(
     let mut codes = Vec::with_capacity(subs.len());
     let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
     for (filter_str, qos_raw) in subs {
-        let granted_code = match TopicFilter::new(filter_str).and_then(|filter| {
-            QoS::try_from(qos_raw).map(|qos| (filter, qos))
-        }) {
-            Ok((filter, qos)) => {
-                shared.router.subscribe(
-                    &filter,
-                    Subscription {
-                        client_id: client_id.clone().into(),
-                        conn_id: frame.header.conn_id,
-                        qos,
-                    },
-                );
-                granted.push((filter, qos_raw));
-                qos_raw
+        let parsed = TopicFilter::new(filter_str).ok().and_then(|filter| {
+            QoS::try_from(qos_raw)
+                .ok()
+                .and_then(|qos| split_shared_filter(&filter).map(|(group, inner)| (inner, qos, group)))
+        });
+        let (filter, qos, group) = match parsed {
+            Some(parts) => parts,
+            None => {
+                codes.push(0x80);
+                continue;
             }
-            Err(_) => 0x80,
         };
-        codes.push(granted_code);
+        if shared
+            .auth
+            .authorize_subscribe(&client_id, &filter)
+            .await
+            .is_err()
+        {
+            // MQTT 5 style "Not Authorized"; registers nothing.
+            codes.push(0x87);
+            continue;
+        }
+        shared.router.subscribe(
+            &filter,
+            Subscription {
+                client_id: client_id.clone().into(),
+                conn_id: frame.header.conn_id,
+                qos,
+                group,
+            },
+        );
+        granted.push((filter, qos_raw));
+        codes.push(qos_raw);
     }
 
     let mut meta = Vec::with_capacity(2 + codes.len());
@@ -493,11 +590,11 @@ async fn apply_subscribe(
 /// connection. Runs after the `SessionBinding` reply so the edge always
 /// observes binding before backlog. Returns the replayed frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
-    let (client_id, _) = match decode_bind_meta(&frame.metadata) {
-        Ok(parts) => parts,
+    let req = match decode_bind_meta(&frame.metadata) {
+        Ok(req) => req,
         Err(_) => return 0,
     };
-    let session = match shared.sessions.get(&client_id) {
+    let session = match shared.sessions.get(&req.client_id) {
         Some(session) => session,
         None => return 0,
     };
@@ -556,6 +653,24 @@ async fn apply_publish(
     };
     shared.metrics.inc_messages_received();
 
+    // ACL: the publisher is whoever owns this edge connection. Denied
+    // publishes die here (QoS 1 still gets its PubAck, stamped 0x87).
+    if let Some(publisher) = shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        if shared
+            .auth
+            .authorize_publish(&publisher, &topic)
+            .await
+            .is_err()
+        {
+            let ack = if qos == QoS::AtLeastOnce {
+                pub_ack_reply(frame, packet_id, 0x87)
+            } else {
+                None
+            };
+            return (ack, Vec::new());
+        }
+    }
+
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message.
     if retain {
@@ -582,17 +697,7 @@ async fn apply_publish(
     shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
     let ack = if qos == QoS::AtLeastOnce {
-        let mut meta = Vec::with_capacity(3);
-        meta.extend_from_slice(&packet_id.to_be_bytes());
-        meta.push(0u8);
-        BrokerFrame::new(
-            OpCode::PubAckOut,
-            frame.header.conn_id,
-            frame.header.sequence_no,
-            Bytes::from(meta),
-            Bytes::new(),
-        )
-        .ok()
+        pub_ack_reply(frame, packet_id, 0)
     } else {
         None
     };
@@ -704,6 +809,21 @@ fn build_downlink_frames(
         }
     }
     deliveries
+}
+
+/// Build one `PubAckOut` reply mirroring the request identity.
+fn pub_ack_reply(frame: &BrokerFrame, packet_id: u16, return_code: u8) -> Option<BrokerFrame> {
+    let mut meta = Vec::with_capacity(3);
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(return_code);
+    BrokerFrame::new(
+        OpCode::PubAckOut,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(meta),
+        Bytes::new(),
+    )
+    .ok()
 }
 
 /// Encode one `PublishOut` frame for `conn_id` (sequence stamped later
@@ -877,6 +997,7 @@ async fn serve_api(
         shared.sessions.clone(),
         shared.router.clone(),
         shared.metrics.clone(),
+        shared.auth.clone(),
     );
     broker_api::serve(listener, state).await
 }
@@ -935,6 +1056,23 @@ mod tests {
     fn bind_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
         BrokerFrame::new(OpCode::BindConnection, conn_id, seq, meta, Bytes::new())
             .expect("valid bind frame")
+    }
+
+    /// Encode `BindConnection` metadata with credentials (test mirror of
+    /// the BEAM `indra_brokerlink:encode_bind_meta/4` contract).
+    fn encode_bind_meta_creds(
+        client_id: &str,
+        clean_start: bool,
+        keepalive: u16,
+        username: &str,
+        password: &[u8],
+    ) -> Bytes {
+        let mut meta = encode_bind_meta(client_id, clean_start, keepalive).to_vec();
+        meta.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        meta.extend_from_slice(username.as_bytes());
+        meta.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        meta.extend_from_slice(password);
+        Bytes::from(meta)
     }
 
     /// Encode `SubscribeMeta` (test mirror of the BEAM contract).
@@ -1905,7 +2043,201 @@ mod tests {
         );
 
         edge_task.abort();
-        api_task.abort();
+    }
+
+    #[tokio::test]
+    async fn bind_auth_rejects_bad_password_with_0x86() {
+        let shared = test_shared();
+        shared.auth.add_user("alice", b"s3cret");
+
+        let frame = bind_frame(
+            81,
+            1,
+            encode_bind_meta_creds("dev-x", true, 60, "alice", b"wrong"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "bad password must yield return code 0x86");
+        assert!(!present);
+        // Failed binds create no session.
+        assert!(shared.sessions.get("dev-x").is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_auth_accepts_valid_and_anonymous() {
+        let shared = test_shared();
+        shared.auth.add_user("alice", b"s3cret");
+
+        let frame = bind_frame(
+            82,
+            1,
+            encode_bind_meta_creds("dev-y", true, 60, "alice", b"s3cret"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+
+        // Anonymous binds stay open even with users configured.
+        let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_denied_yields_0x87_without_routing() {
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new("boxed", AclAction::All, "#", false));
+
+        let frame = subscribe_frame(91, 1, encode_subscribe_meta(1, "boxed", &[("t", 0)]));
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("suback replies");
+        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        assert!(retained.is_empty());
+        // Denied subscriptions register nothing.
+        assert!(shared.router.matches(&Topic::new("t").unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_denied_yields_puback_0x87_and_drops() {
+        let shared = test_shared();
+        // A live listener proves the drop: it would receive otherwise.
+        let (listener, _) = shared.sessions.get_or_create("listener", true);
+        *listener.conn_id.write() = Some(93);
+        let sub = subscribe_frame(93, 1, encode_subscribe_meta(1, "listener", &[("t", 0)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (muted, _) = shared.sessions.get_or_create("muted", true);
+        *muted.conn_id.write() = Some(92);
+        shared
+            .auth
+            .add_rule(AclRule::new("muted", AclAction::Publish, "#", false));
+
+        let (meta, payload) = encode_publish_meta("t", 5, 1, false, b"shh");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(92, 1, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
+        assert!(deliveries.is_empty(), "denied publish must not fan out");
+    }
+
+    #[tokio::test]
+    async fn bind_auth_failure_over_tcp_returns_0x86() {
+        let mut shared = Shared::new();
+        shared.auth.add_user("alice", b"s3cret");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, shared).await.expect("handle");
+        });
+
+        // Wrong password over a real transport: 0x86, no session.
+        let io = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let client = FramedTransport::new(io);
+        client
+            .send(bind_frame(
+                84,
+                1,
+                encode_bind_meta_creds("dev-bad", true, 60, "alice", b"nope"),
+            ))
+            .await
+            .expect("bind");
+        let reply = client.recv().await.expect("recv binding");
+        assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86);
+        assert!(!present);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_subscriptions_balance_across_workers() {
+        let shared = Shared::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        // Two workers share one group; one plain subscriber listens too.
+        let worker_a = bind_client(addr, 711, "worker-a", true).await;
+        worker_a
+            .send(subscribe_frame(
+                711,
+                2,
+                encode_subscribe_meta(1, "worker-a", &[("$share/pool/work/jobs", 0)]),
+            ))
+            .await
+            .expect("subscribe a");
+        assert_eq!(worker_a.recv().await.expect("suback a").header.opcode, OpCode::SubAckOut);
+
+        let worker_b = bind_client(addr, 712, "worker-b", true).await;
+        worker_b
+            .send(subscribe_frame(
+                712,
+                2,
+                encode_subscribe_meta(1, "worker-b", &[("$share/pool/work/jobs", 0)]),
+            ))
+            .await
+            .expect("subscribe b");
+        assert_eq!(worker_b.recv().await.expect("suback b").header.opcode, OpCode::SubAckOut);
+
+        let plain = bind_client(addr, 713, "plain-c", true).await;
+        plain
+            .send(subscribe_frame(
+                713,
+                2,
+                encode_subscribe_meta(1, "plain-c", &[("work/jobs", 0)]),
+            ))
+            .await
+            .expect("subscribe c");
+        assert_eq!(plain.recv().await.expect("suback c").header.opcode, OpCode::SubAckOut);
+
+        // Publisher emits two jobs.
+        let publ = bind_client(addr, 714, "producer", true).await;
+        for (seq, job) in [(3u64, "job-1"), (4u64, "job-2")] {
+            let (meta, payload) = encode_publish_meta("work/jobs", 0, 0, false, job.as_bytes());
+            publ.send(publish_frame(714, seq, meta, payload))
+                .await
+                .expect("publish job");
+        }
+
+        // Deterministic round-robin (members sort by client id): job-1
+        // goes to worker-a, job-2 to worker-b, exactly one each.
+        let first_a = worker_a.recv().await.expect("worker-a delivery");
+        assert_eq!(first_a.header.conn_id, 711);
+        assert_eq!(first_a.payload, Bytes::from_static(b"job-1"));
+        let first_b = worker_b.recv().await.expect("worker-b delivery");
+        assert_eq!(first_b.header.conn_id, 712);
+        assert_eq!(first_b.payload, Bytes::from_static(b"job-2"));
+        for (worker, name) in [(&worker_a, "a"), (&worker_b, "b")] {
+            let extra =
+                tokio::time::timeout(std::time::Duration::from_millis(300), worker.recv()).await;
+            assert!(extra.is_err(), "worker {name} must receive exactly one job");
+        }
+
+        // The plain subscriber still gets the full fan-out: both jobs.
+        for expected in [b"job-1".as_slice(), b"job-2".as_slice()] {
+            let got = plain.recv().await.expect("plain delivery");
+            assert_eq!(got.header.conn_id, 713);
+            assert_eq!(got.payload, Bytes::from(expected));
+        }
+
+        server.abort();
     }
 
     #[tokio::test]

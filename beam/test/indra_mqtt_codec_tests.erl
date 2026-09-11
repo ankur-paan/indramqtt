@@ -214,8 +214,7 @@ decode_connect_minimal_clean_test() ->
     ?assertEqual(false, maps:get(username_flag, Conn)),
     ?assertEqual(false, maps:get(will_flag, Conn)).
 
-decode_connect_persistent_with_auth_and_will_test() ->
-    %% Flags C0 (username+password) | 04 (will) | 0C (will QoS 1): 0xCC.
+decode_connect_persistent_with_auth_and_will_test() ->    %% Flags C0 (username+password) | 04 (will) | 0C (will QoS 1): 0xCC.
     Var = <<0, 4, "MQTT", 4, 16#CC, 0, 10>>,
     Payload = [<<0, 3, "cid">>,
                <<0, 2, "wt">>, <<0, 2, "wm">>,
@@ -231,6 +230,24 @@ decode_connect_persistent_with_auth_and_will_test() ->
     ?assertEqual(true, maps:get(will_flag, Conn)),
     ?assertEqual(1, maps:get(will_qos, Conn)),
     ?assertEqual(false, maps:get(will_retain, Conn)).
+
+decode_connect_captures_username_password_test() ->
+    %% Flags C0 (username+password) | 02 (clean): 0xC2.
+    Var = <<0, 4, "MQTT", 4, 16#C2, 0, 60>>,
+    Body = <<Var/binary, 0, 3, "cid", 0, 5, "alice", 0, 6, "s3cret">>,
+    Bin = <<16#10, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(true, maps:get(username_flag, Conn)),
+    ?assertEqual(true, maps:get(password_flag, Conn)),
+    ?assertEqual(<<"alice">>, maps:get(username, Conn)),
+    ?assertEqual(<<"s3cret">>, maps:get(password, Conn)).
+
+decode_connect_anonymous_has_no_credentials_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(undefined, maps:get(username, Conn)),
+    ?assertEqual(undefined, maps:get(password, Conn)).
 
 decode_connect_unsupported_protocol_test() ->
     %% Level 5 (MQTT 5.0) is outside the 3.1.1 edge scope.

@@ -100,6 +100,15 @@ impl SessionManager {
         self.sessions.read().get(client_id).cloned()
     }
 
+    /// Reverse lookup: owner of a live edge connection, if bound.
+    pub fn client_id_for_conn(&self, conn_id: u64) -> Option<String> {
+        self.sessions
+            .read()
+            .iter()
+            .find(|(_, session)| *session.conn_id.read() == Some(conn_id))
+            .map(|(client_id, _)| client_id.clone())
+    }
+
     /// Sorted ids of currently connected clients (for the management API).
     pub fn active_client_ids(&self) -> Vec<String> {
         let sessions = self.sessions.read();

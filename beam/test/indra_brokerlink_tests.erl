@@ -213,6 +213,35 @@ bind_meta_max_keepalive_test() ->
     ?assertEqual(<<>>, maps:get(client_id, Dec)),
     ?assertEqual(65535, maps:get(keepalive, Dec)).
 
+bind_meta_credentials_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>}),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(true, maps:get(clean_start, Dec)),
+    ?assertEqual(60, maps:get(keepalive, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"s3cret">>, maps:get(password, Dec)).
+
+bind_meta_anonymous_decode_test() ->
+    %% Legacy/anonymous encoding carries no credentials section.
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, false, 30),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(undefined, maps:get(username, Dec)),
+    ?assertEqual(undefined, maps:get(password, Dec)),
+    %% Explicit undefined pair encodes identically to /3.
+    ?assertEqual(Meta, indra_brokerlink:encode_bind_meta(<<"dev-1">>, false, 30,
+                                                        {undefined, undefined})).
+
+bind_meta_bad_credentials_rejected_test() ->
+    %% Truncated credentials section.
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(<<0, 1, "a", 1, 0, 60, 0, 3, "ab">>)),
+    %% Username without password is rejected at encode time.
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {<<"alice">>, undefined})).
+
 bind_meta_malformed_rejected_test() ->
     ?assertEqual({error, malformed_bind_meta},
                  indra_brokerlink:decode_bind_meta(<<>>)),

@@ -39,6 +39,7 @@ fn build_router(subscriptions: usize) -> Router {
                 client_id: format!("client-{i}").into(),
                 conn_id: i as u64,
                 qos: QoS::AtMostOnce,
+                group: None,
             },
         );
     }
@@ -53,6 +54,7 @@ fn build_router(subscriptions: usize) -> Router {
                 client_id: format!("route-{filter}").into(),
                 conn_id: 1_000_000,
                 qos,
+                group: None,
             },
         );
     }

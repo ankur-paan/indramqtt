@@ -2,9 +2,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use broker_auth::{AclAction, AclRule, MemoryAuth};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::Router as SubscriptionRouter;
@@ -22,6 +23,7 @@ pub struct ApiState {
     pub sessions: Arc<SessionManager>,
     pub router: Arc<SubscriptionRouter>,
     pub metrics: Arc<Metrics>,
+    pub auth: Arc<MemoryAuth>,
 }
 
 impl ApiState {
@@ -30,12 +32,14 @@ impl ApiState {
         sessions: Arc<SessionManager>,
         router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
+        auth: Arc<MemoryAuth>,
     ) -> Self {
         Self {
             engine,
             sessions,
             router,
             metrics,
+            auth,
         }
     }
 
@@ -46,6 +50,7 @@ impl ApiState {
             sessions: Arc::new(SessionManager::new()),
             router: Arc::new(SubscriptionRouter::new()),
             metrics: Arc::new(Metrics::new()),
+            auth: Arc::new(MemoryAuth::new()),
         }
     }
 }
@@ -56,6 +61,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/nodes", get(get_nodes))
         .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/metrics", get(get_metrics))
+        .route("/api/v1/auth/users", post(create_user))
+        .route("/api/v1/auth/acls", post(create_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route(
             "/api/v1/rules/:id",
@@ -188,6 +195,71 @@ async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> R
     }
 }
 
+/// Creation payload for a user credential (password is write-only).
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+}
+
+async fn create_user(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateUserRequest>,
+) -> Response {
+    if req.username.trim().is_empty() {
+        return bad_request("username must not be empty");
+    }
+    if req.password.is_empty() {
+        return bad_request("password must not be empty");
+    }
+    state.auth.add_user(req.username.clone(), req.password.as_bytes());
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "username": req.username })),
+    )
+        .into_response()
+}
+
+/// Creation payload for one ordered ACL entry.
+#[derive(Debug, Deserialize)]
+struct CreateAclRequest {
+    client_pattern: String,
+    action: String,
+    topic_pattern: String,
+    allow: bool,
+}
+
+async fn create_acl(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateAclRequest>,
+) -> Response {
+    if req.client_pattern.trim().is_empty() {
+        return bad_request("client_pattern must not be empty");
+    }
+    let action = match AclAction::parse(&req.action) {
+        Some(action) => action,
+        None => return bad_request("action must be publish, subscribe, or all"),
+    };
+    if TopicFilter::new(req.topic_pattern.clone()).is_err() {
+        return bad_request("topic_pattern must be a valid MQTT filter");
+    }
+    state.auth.add_rule(AclRule::new(
+        req.client_pattern.clone(),
+        action,
+        req.topic_pattern.clone(),
+        req.allow,
+    ));
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "client_pattern": req.client_pattern,
+            "topic_pattern": req.topic_pattern,
+            "allow": req.allow,
+        })),
+    )
+        .into_response()
+}
+
 fn node_id() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -235,6 +307,7 @@ mod tests {
         engine: Arc<RuleEngine>,
         sessions: Arc<SessionManager>,
         metrics: Arc<Metrics>,
+        auth: Arc<MemoryAuth>,
     }
 
     impl TestServer {
@@ -246,12 +319,14 @@ mod tests {
             let sessions = Arc::new(SessionManager::new());
             let sub_router = Arc::new(SubscriptionRouter::new());
             let metrics = Arc::new(Metrics::new());
+            let auth = Arc::new(MemoryAuth::new());
             let state = TestState {
                 engine: engine.clone(),
                 sessions: sessions.clone(),
                 metrics: metrics.clone(),
+                auth: auth.clone(),
             };
-            let app = router(ApiState::new(engine, sessions, sub_router, metrics));
+            let app = router(ApiState::new(engine, sessions, sub_router, metrics, auth));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind test server");
@@ -485,7 +560,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nodes_reports_status_version_connections() {        let (server, state) = TestServer::start().await;
+    async fn test_nodes_reports_status_version_connections() {
+        let (server, state) = TestServer::start().await;
         state.metrics.set_active_connections(3);
 
         let (status, body) = server.get("/api/v1/nodes").await;
@@ -556,5 +632,62 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_auth_users_and_acls() {
+        let (server, state) = TestServer::start().await;
+
+        // Create a user.
+        let (status, created) = server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "alice", "password": "s3cret"}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["username"], json!("alice"));
+        // Passwords are write-only: never echoed.
+        assert!(created.get("password").is_none());
+        assert_eq!(state.auth.user_count(), 1);
+
+        // Empty username or password is rejected.
+        let (status, _) = server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "", "password": "x"}),
+            )
+            .await;
+        assert_eq!(status, 400);
+        let (status, _) = server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "bob", "password": ""}),
+            )
+            .await;
+        assert_eq!(status, 400);
+
+        // Create an ACL rule.
+        let (status, created) = server
+            .post(
+                "/api/v1/auth/acls",
+                json!({"client_pattern": "alice",
+                       "action": "publish",
+                       "topic_pattern": "sensors/#",
+                       "allow": true}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["allow"], json!(true));
+
+        // Invalid action, topic pattern, and client pattern rejected.
+        for body in [
+            json!({"client_pattern": "*", "action": "delete", "topic_pattern": "#", "allow": true}),
+            json!({"client_pattern": "*", "action": "publish", "topic_pattern": "a/#/b", "allow": true}),
+            json!({"client_pattern": "", "action": "all", "topic_pattern": "#", "allow": false}),
+        ] {
+            let (status, _) = server.post("/api/v1/auth/acls", body).await;
+            assert_eq!(status, 400);
+        }
     }
 }

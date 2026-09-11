@@ -226,6 +226,7 @@ name = "broker-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "broker-auth",
  "broker-observability",
  "broker-protocol",
  "broker-router",
@@ -243,7 +244,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "broker-protocol",
+ "parking_lot",
+ "sha2",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

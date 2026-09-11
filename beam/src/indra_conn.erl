@@ -209,8 +209,10 @@ handle_connect_bytes(Buf, Data) ->
 
 handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq := Seq} = Data) ->
     case indra_mqtt_codec:decode_connect(Payload) of
-        {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive}} ->
-            Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive),
+        {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive,
+               username := User, password := Pass}} ->
+            Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive,
+                                                     {User, Pass}),
             case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
                 ok ->
                     Pending = #{client_id => ClientId, keepalive => Keepalive},

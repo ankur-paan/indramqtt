@@ -41,6 +41,7 @@
 
 %% BrokerLink metadata contracts (Sprint 2: connection handshake).
 -export([encode_bind_meta/3,
+         encode_bind_meta/4,
          decode_bind_meta/1,
          encode_session_binding_meta/3,
          decode_session_binding_meta/1]).
@@ -272,12 +273,16 @@ is_known_opcode(_) -> false.
 %%
 %% BindConnection meta (Opcode 16#0010, BEAM -> Rust):
 %% <pre>
-%%   +------------------+----------------+-------+------------+
-%%   | ClientIdLen:16be | ClientId bytes | Flags | Keepalive  |
-%%   |                  |  (UTF-8)       |  :8   |  :16be     |
-%%   +------------------+----------------+-------+------------+
+%%   +------------------+----------------+-------+------------+-----------+
+%%   | ClientIdLen:16be | ClientId bytes | Flags | Keepalive  | Creds...  |
+%%   |                  |  (UTF-8)       |  :8   |  :16be     | (optional)|
+%%   +------------------+----------------+-------+------------+-----------+
 %% </pre>
 %% Flags bit 0 = clean_start. All other bits are reserved and must be 0.
+%% The optional trailing credentials section (present only for
+%% authenticated connects) is:
+%% {@code UserLen:16be | Username | PassLen:16be | Password}.
+%% Anonymous connects omit it entirely (existing encodings are unchanged).
 %%
 %% SessionBinding meta (Opcode 16#0011, Rust -> BEAM):
 %% <pre>
@@ -291,7 +296,9 @@ is_known_opcode(_) -> false.
 
 -type bind_meta() :: #{client_id := binary(),
                        clean_start := boolean(),
-                       keepalive := 0..65535}.
+                       keepalive := 0..65535,
+                       username := binary() | undefined,
+                       password := binary() | undefined}.
 -type session_binding_meta() :: #{session_id := non_neg_integer(),
                                   session_present := boolean(),
                                   return_code := 0..255}.
@@ -306,6 +313,24 @@ encode_bind_meta(ClientId, CleanStart, Keepalive)
     true = (IdLen =< 65535) orelse erlang:error(badarg),
     <<IdLen:16/big, ClientId/binary, Flags:8, Keepalive:16/big>>.
 
+%% @doc Encode BindConnection metadata with credentials. Pass
+%% `{undefined, undefined}` (or use {@link encode_bind_meta/3}) for
+%% anonymous connects; any other combination appends the credentials
+%% section. A username without a password is rejected.
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined}) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, {undefined, undefined}) ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive);
+encode_bind_meta(ClientId, CleanStart, Keepalive, {User, Pass})
+  when is_binary(User), is_binary(Pass) ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive),
+    true = (byte_size(User) =< 65535) orelse erlang:error(badarg),
+    true = (byte_size(Pass) =< 65535) orelse erlang:error(badarg),
+    <<Base/binary, (byte_size(User)):16/big, User/binary,
+      (byte_size(Pass)):16/big, Pass/binary>>;
+encode_bind_meta(_, _, _, _) ->
+    erlang:error(badarg).
+
 %% @doc Decode BindConnection metadata.
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
@@ -313,11 +338,39 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
         <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big>> ->
             {ok, #{client_id => ClientId,
                    clean_start => (Flags band 16#01) =:= 16#01,
-                   keepalive => Keepalive}};
+                   keepalive => Keepalive,
+                   username => undefined,
+                   password => undefined}};
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Creds/binary>> ->
+            case decode_bind_creds(Creds) of
+                {ok, User, Pass} ->
+                    {ok, #{client_id => ClientId,
+                           clean_start => (Flags band 16#01) =:= 16#01,
+                           keepalive => Keepalive,
+                           username => User,
+                           password => Pass}};
+                {error, _} = Err ->
+                    Err
+            end;
         _ ->
             {error, malformed_bind_meta}
     end;
 decode_bind_meta(_) ->
+    {error, malformed_bind_meta}.
+
+decode_bind_creds(<<ULen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<User:ULen/binary, PLen:16/big, PassRest/binary>> ->
+            case PassRest of
+                <<Pass:PLen/binary>> when PLen > 0 ->
+                    {ok, User, Pass};
+                _ ->
+                    {error, malformed_bind_meta}
+            end;
+        _ ->
+            {error, malformed_bind_meta}
+    end;
+decode_bind_creds(_) ->
     {error, malformed_bind_meta}.
 
 %% @doc Encode SessionBinding metadata for the given session outcome.

@@ -12,6 +12,7 @@ broker-protocol = { workspace = true }
 broker-session = { workspace = true }
 broker-router = { workspace = true }
 broker-observability = { workspace = true }
+broker-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

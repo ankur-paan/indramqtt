@@ -16,8 +16,7 @@
 connect_clean_start_handshake_test() ->
     {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5001}]),
     _ = Port,
-    try
-        ok = gen_tcp:send(Client, connect_packet(<<"dev-1">>, true, 60)),
+    try        ok = gen_tcp:send(Client, connect_packet(<<"dev-1">>, true, 60)),
         %% Edge must emit exactly one BindConnection frame.
         [Sent] = wait_frames(Mock, 1),
         ?assertEqual(16#0010, maps:get(opcode, Sent)),
@@ -40,8 +39,28 @@ connect_clean_start_handshake_test() ->
         teardown(LSock, Mock, Client, Conn)
     end.
 
-connect_resumed_session_sets_present_flag_test() ->
-    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5002}]),
+connect_forwards_credentials_in_bind_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5009}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_creds(<<"dev-auth">>, <<"alice">>, <<"s3cret">>)),
+        [Sent] = wait_frames(Mock, 1),
+        ?assertEqual(16#0010, maps:get(opcode, Sent)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-auth">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"alice">>, maps:get(username, Bind)),
+        ?assertEqual(<<"s3cret">>, maps:get(password, Bind)),
+        %% Auth rejection (RC 0x86) still yields CONNACK-then-close.
+        Binding = indra_brokerlink:encode_session_binding_meta(0, false, 16#86),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#86>>,
+                     recv_exact(Client, 4)),
+        ?assertEqual({error, closed}, gen_tcp:recv(Client, 0, ?RECV_TIMEOUT))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_resumed_session_sets_present_flag_test() ->    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5002}]),
     _ = Port,
     try
         ok = gen_tcp:send(Client, connect_packet(<<"dev-2">>, false, 30)),
@@ -418,10 +437,18 @@ recv_exact(Sock, N) ->
 connect_packet(ClientId, CleanStart, Keepalive) ->
     Flags = case CleanStart of true -> 16#02; false -> 16#00 end,
     connect_packet_raw(ClientId, Flags, Keepalive).
-
 connect_packet_raw(ClientId, Flags, Keepalive) ->
     Var = <<0, 4, "MQTT", 4, Flags:8, Keepalive:16/big>>,
     Payload = <<(byte_size(ClientId)):16/big, ClientId/binary>>,
+    Body = <<Var/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+%% @private CONNECT with username + password credentials.
+connect_packet_creds(ClientId, User, Pass) ->
+    Var = <<0, 4, "MQTT", 4, 16#C2, 0, 60>>,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary,
+                (byte_size(User)):16/big, User/binary,
+                (byte_size(Pass)):16/big, Pass/binary>>,
     Body = <<Var/binary, Payload/binary>>,
     <<16#10, (byte_size(Body)), Body/binary>>.
 

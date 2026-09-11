@@ -37,6 +37,8 @@
                          client_id := binary(),
                          username_flag := boolean(),
                          password_flag := boolean(),
+                         username := binary() | undefined,
+                         password := binary() | undefined,
                          will_flag := boolean(),
                          will_qos := 0..2,
                          will_retain := boolean()}.
@@ -369,8 +371,8 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
         true ->
             case skip_connect_string(Payload) of
                 {ok, ClientId, Rest} ->
-                    case skip_connect_options(Rest, WillFlag, Username, Password) of
-                        ok ->
+                    case take_connect_options(Rest, WillFlag, Username, Password) of
+                        {ok, User, Pass} ->
                             {ok, #{protocol_name => <<"MQTT">>,
                                    protocol_level => 4,
                                    clean_start => CleanStart,
@@ -378,6 +380,8 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
                                    client_id => ClientId,
                                    username_flag => Username,
                                    password_flag => Password,
+                                   username => User,
+                                   password => Pass,
                                    will_flag => WillFlag,
                                    will_qos => WillQos,
                                    will_retain => WillRetain}};
@@ -398,24 +402,24 @@ skip_connect_string(<<Len:16/big, Rest/binary>>) ->
 skip_connect_string(_) ->
     {error, truncated_connect}.
 
-%% @private Skip optional CONNECT fields (will topic/message, username,
-%% password) to prove the packet is well-formed; content is session
-%% business and stays opaque to the edge.
-skip_connect_options(Rest, false, false, false) ->
+%% @private Take optional CONNECT fields, capturing username/password
+%% values (will topic/message stay opaque to the edge). Username and
+%% password come back as `undefined` when their flags are clear.
+take_connect_options(Rest, false, false, false) ->
     case Rest of
-        <<>> -> ok;
+        <<>> -> {ok, undefined, undefined};
         _ -> {error, trailing_connect_bytes}
     end;
-skip_connect_options(Rest, WillFlag, Username, Password) ->
-    case skip_optional_string(Rest, WillFlag) of
-        {ok, Rest1} ->
-            case skip_optional_string(Rest1, WillFlag) of
-                {ok, Rest2} ->
-                    case skip_optional_string(Rest2, Username) of
-                        {ok, Rest3} ->
-                            case skip_optional_string(Rest3, Password) of
-                                {ok, <<>>} -> ok;
-                                {ok, _} -> {error, trailing_connect_bytes};
+take_connect_options(Rest, WillFlag, Username, Password) ->
+    case take_optional_string(Rest, WillFlag) of
+        {ok, _, Rest1} ->
+            case take_optional_string(Rest1, WillFlag) of
+                {ok, _, Rest2} ->
+                    case take_optional_string(Rest2, Username) of
+                        {ok, User, Rest3} ->
+                            case take_optional_string(Rest3, Password) of
+                                {ok, Pass, <<>>} -> {ok, User, Pass};
+                                {ok, _, _} -> {error, trailing_connect_bytes};
                                 Err -> Err
                             end;
                         Err -> Err
@@ -425,10 +429,10 @@ skip_connect_options(Rest, WillFlag, Username, Password) ->
         Err -> Err
     end.
 
-skip_optional_string(Bin, false) -> {ok, Bin};
-skip_optional_string(Bin, true) ->
+take_optional_string(Bin, false) -> {ok, undefined, Bin};
+take_optional_string(Bin, true) ->
     case skip_connect_string(Bin) of
-        {ok, _, Tail} -> {ok, Tail};
+        {ok, Value, Tail} -> {ok, Value, Tail};
         Err -> Err
     end.
 

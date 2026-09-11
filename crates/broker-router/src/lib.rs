@@ -4,7 +4,9 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// One client's subscription. `client_id` is reference-counted so fan-out
-/// matching clones pointers instead of heap strings.
+/// matching clones pointers instead of heap strings. `group` carries a
+/// shared-subscription group (`$share/<group>/...`): members of one group
+/// split matching messages round-robin instead of each receiving a copy.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub client_id: Arc<str>,
@@ -13,6 +15,52 @@ pub struct Subscription {
     /// one `conn_id` per `(filter node, client_id)` exists.
     pub conn_id: u64,
     pub qos: QoS,
+    pub group: Option<Arc<str>>,
+}
+
+impl Subscription {
+    /// Plain (non-shared) subscription.
+    pub fn new(client_id: impl Into<Arc<str>>, conn_id: u64, qos: QoS) -> Self {
+        Self {
+            client_id: client_id.into(),
+            conn_id,
+            qos,
+            group: None,
+        }
+    }
+
+    /// Shared-subscription member of `group`.
+    pub fn shared(
+        client_id: impl Into<Arc<str>>,
+        conn_id: u64,
+        qos: QoS,
+        group: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            conn_id,
+            qos,
+            group: Some(group.into()),
+        }
+    }
+}
+
+/// Split a `$share/<group>/<filter>` request into its group and inner
+/// filter. Plain filters pass through with `group = None`. Returns `None`
+/// only for malformed shared requests (empty group or invalid inner
+/// filter); the caller should reject the subscription.
+pub fn split_shared_filter(filter: &TopicFilter) -> Option<(Option<Arc<str>>, TopicFilter)> {
+    let raw = filter.as_str();
+    let rest = match raw.strip_prefix("$share/") {
+        Some(rest) => rest,
+        None => return Some((None, filter.clone())),
+    };
+    let (group, inner) = rest.split_once('/')?;
+    if group.is_empty() || inner.is_empty() {
+        return None;
+    }
+    let inner_filter = TopicFilter::new(inner).ok()?;
+    Some((Some(group.into()), inner_filter))
 }
 
 /// Match result set. `ahash` keeps debug and release builds fast;
@@ -33,6 +81,10 @@ struct TrieNode {
 
 pub struct Router {
     root: RwLock<TrieNode>,
+    /// Round-robin cursors per shared-subscription group. Mutated under
+    /// `matches`, hence behind the lock; keyed by group name alone so one
+    /// group balances across all its filters.
+    rr_cursors: RwLock<AHashMap<Arc<str>, usize>>,
 }
 
 impl Default for Router {
@@ -45,6 +97,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             root: RwLock::new(TrieNode::default()),
+            rr_cursors: RwLock::new(AHashMap::new()),
         }
     }
 
@@ -109,7 +162,36 @@ impl Router {
         let root = self.root.read();
         let mut matched = SubscriptionSet::default();
         Self::match_recursive(&root, topic.as_str(), &mut matched);
+        self.balance_shared_groups(&mut matched);
         matched
+    }
+
+    /// Reduce each shared group in `matched` to exactly one member,
+    /// round-robin by group. Members sort by client id first so the
+    /// rotation is deterministic. Plain subscriptions pass through.
+    fn balance_shared_groups(&self, matched: &mut SubscriptionSet) {
+        if !matched.iter().any(|s| s.group.is_some()) {
+            return;
+        }
+        let mut groups: AHashMap<Arc<str>, Vec<Subscription>> = AHashMap::new();
+        matched.retain(|sub| match &sub.group {
+            Some(group) => {
+                groups.entry(group.clone()).or_default().push(sub.clone());
+                false
+            }
+            None => true,
+        });
+        if groups.is_empty() {
+            return;
+        }
+        let mut cursors = self.rr_cursors.write();
+        for (group, mut members) in groups {
+            members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+            let cursor = cursors.entry(group).or_insert(0);
+            let pick = members[*cursor % members.len()].clone();
+            *cursor = cursor.wrapping_add(1);
+            matched.insert(pick);
+        }
     }
 
     /// Walk one topic remainder without allocating: `split_once` borrows
@@ -152,21 +234,9 @@ mod tests {
     fn test_router_wildcard_fanout() {
         let router = Router::new();
 
-        let sub1 = Subscription {
-            client_id: "c1".into(),
-            conn_id: 101,
-            qos: QoS::AtMostOnce,
-        };
-        let sub2 = Subscription {
-            client_id: "c2".into(),
-            conn_id: 102,
-            qos: QoS::AtLeastOnce,
-        };
-        let sub3 = Subscription {
-            client_id: "c3".into(),
-            conn_id: 103,
-            qos: QoS::ExactlyOnce,
-        };
+        let sub1 = Subscription::new("c1", 101, QoS::AtMostOnce);
+        let sub2 = Subscription::new("c2", 102, QoS::AtLeastOnce);
+        let sub3 = Subscription::new("c3", 103, QoS::ExactlyOnce);
 
         router.subscribe(&TopicFilter::new("sports/tennis/+").unwrap(), sub1.clone());
         router.subscribe(&TopicFilter::new("sports/#").unwrap(), sub2.clone());
@@ -195,19 +265,11 @@ mod tests {
 
         router.subscribe(
             &filter,
-            Subscription {
-                client_id: "c1".into(),
-                conn_id: 101,
-                qos: QoS::AtMostOnce,
-            },
+            Subscription::new("c1", 101, QoS::AtMostOnce),
         );
         router.subscribe(
             &filter,
-            Subscription {
-                client_id: "c1".into(),
-                conn_id: 202,
-                qos: QoS::AtLeastOnce,
-            },
+            Subscription::new("c1", 202, QoS::AtLeastOnce),
         );
 
         let matches = router.matches(&Topic::new("sports/tennis").unwrap());
@@ -215,5 +277,87 @@ mod tests {
         let only = matches.iter().next().unwrap();
         assert_eq!(only.conn_id, 202);
         assert_eq!(only.qos, QoS::AtLeastOnce);
+    }
+
+    #[test]
+    fn test_split_shared_filter_vectors() {
+        // Plain filters pass through untouched.
+        let (group, inner) =
+            split_shared_filter(&TopicFilter::new("tasks/#").unwrap()).expect("plain");
+        assert!(group.is_none());
+        assert_eq!(inner.as_str(), "tasks/#");
+
+        // Shared requests split into group + inner filter.
+        let (group, inner) =
+            split_shared_filter(&TopicFilter::new("$share/worker_pool/tasks/#").unwrap())
+                .expect("shared");
+        assert_eq!(group.as_deref(), Some("worker_pool"));
+        assert_eq!(inner.as_str(), "tasks/#");
+
+        // Malformed shared requests are rejected.
+        assert!(split_shared_filter(&TopicFilter::new("$share/").unwrap()).is_none());
+        assert!(split_shared_filter(&TopicFilter::new("$share//tasks").unwrap()).is_none());
+        assert!(split_shared_filter(&TopicFilter::new("$share/g/").unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_shared_group_round_robin_distributes() {
+        let router = Router::new();
+        let inner = TopicFilter::new("tasks").unwrap();
+        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"));
+        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"));
+
+        // Four sequential matches alternate deterministically (members
+        // sort by client id; cursor starts at zero).
+        let topic = Topic::new("tasks").unwrap();
+        let mut owners = Vec::new();
+        for _ in 0..4 {
+            let matched = router.matches(&topic);
+            assert_eq!(matched.len(), 1, "exactly one member per group");
+            owners.push(matched.iter().next().unwrap().client_id.to_string());
+        }
+        assert_eq!(
+            owners,
+            vec!["worker-a".to_string(), "worker-b".to_string(),
+                 "worker-a".to_string(), "worker-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_shared_and_plain_subscribers_coexist() {
+        let router = Router::new();
+        let inner = TopicFilter::new("jobs/+").unwrap();
+        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "pool"));
+        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "pool"));
+        router.subscribe(
+            &TopicFilter::new("jobs/+").unwrap(),
+            Subscription::new("plain-c", 3, QoS::AtMostOnce),
+        );
+
+        // Plain subscriber always present; exactly one group member joins.
+        for _ in 0..4 {
+            let matched = router.matches(&Topic::new("jobs/9").unwrap());
+            assert_eq!(matched.len(), 2);
+            assert!(matched.iter().any(|s| s.client_id.as_ref() == "plain-c"));
+            assert_eq!(
+                matched.iter().filter(|s| s.group.is_some()).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_unsubscribe_removes_member() {
+        let router = Router::new();
+        let inner = TopicFilter::new("tasks").unwrap();
+        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"));
+        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"));
+
+        router.unsubscribe(&inner, "worker-a");
+        for _ in 0..3 {
+            let matched = router.matches(&Topic::new("tasks").unwrap());
+            assert_eq!(matched.len(), 1);
+            assert_eq!(matched.iter().next().unwrap().client_id.as_ref(), "worker-b");
+        }
     }
 }

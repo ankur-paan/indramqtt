@@ -8,4 +8,9 @@ repository.workspace = true
 [dependencies]
 broker-protocol = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
