@@ -94,6 +94,7 @@ fn default_enabled() -> bool {
 enum ActionDto {
     Republish { topic: String, qos: u8 },
     Log,
+    ForwardConnector { connector_id: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +148,12 @@ async fn create_rule(
                 actions.push(RuleAction::Republish { topic, qos });
             }
             ActionDto::Log => actions.push(RuleAction::Log),
+            ActionDto::ForwardConnector { connector_id } => {
+                if connector_id.trim().is_empty() {
+                    return bad_request("connector_id must not be empty");
+                }
+                actions.push(RuleAction::ForwardConnector { connector_id });
+            }
         }
     }
 
@@ -478,8 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nodes_reports_status_version_connections() {
-        let (server, state) = TestServer::start().await;
+    async fn test_nodes_reports_status_version_connections() {        let (server, state) = TestServer::start().await;
         state.metrics.set_active_connections(3);
 
         let (status, body) = server.get("/api/v1/nodes").await;
@@ -521,5 +527,34 @@ mod tests {
         assert!(text.contains("indramqtt_messages_forwarded_total 2\n"));
         assert!(text.contains("indramqtt_rules_executed_total 1\n"));
         assert!(text.contains("indramqtt_connections_active 1\n"));
+    }
+
+    #[tokio::test]
+    async fn test_rules_create_with_forward_connector() {
+        let (server, _state) = TestServer::start().await;
+
+        let (status, created) = server
+            .post(
+                "/api/v1/rules",
+                json!({"name": "to-webhook",
+                       "topic_filter": "sensors/+",
+                       "sql_query": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
+                       "actions": [{"type": "forwardconnector", "connector_id": "webhook-1"}]}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["actions"][0]["type"], json!("forwardconnector"));
+        assert_eq!(created["actions"][0]["connector_id"], json!("webhook-1"));
+
+        // Empty connector id is rejected.
+        let (status, _) = server
+            .post(
+                "/api/v1/rules",
+                json!({"name": "bad",
+                       "topic_filter": "sensors/+",
+                       "actions": [{"type": "forwardconnector", "connector_id": "  "}]}),
+            )
+            .await;
+        assert_eq!(status, 400);
     }
 }

@@ -27,4 +27,5 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 clap = { workspace = true }

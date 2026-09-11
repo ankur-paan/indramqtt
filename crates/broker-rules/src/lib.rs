@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use broker_connectors::ConnectorManager;
 use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use parking_lot::RwLock;
@@ -204,6 +205,9 @@ pub enum RuleAction {
     },
     /// Emit a structured log line for the matched event.
     Log,
+    /// Forward the (possibly transformed) payload to a registered
+    /// external connector (e.g. an HTTP webhook) by id.
+    ForwardConnector { connector_id: String },
 }
 
 /// Serde helper: [`QoS`] as its MQTT wire number (0/1/2).
@@ -231,6 +235,7 @@ pub struct RuleEngine {
     rules: RwLock<HashMap<String, Rule>>,
     next_id: AtomicU64,
     input: Arc<BoundedEventInput>,
+    connectors: Arc<ConnectorManager>,
 }
 
 impl RuleEngine {
@@ -242,12 +247,18 @@ impl RuleEngine {
             rules: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             input: BoundedEventInput::new(queue_capacity, policy),
+            connectors: Arc::new(ConnectorManager::new()),
         }
     }
 
     /// Bounded ingress queue for flood protection at outer boundaries.
     pub fn input(&self) -> &Arc<BoundedEventInput> {
         &self.input
+    }
+
+    /// Live outbound connectors addressable by `ForwardConnector` actions.
+    pub fn connectors(&self) -> &Arc<ConnectorManager> {
+        &self.connectors
     }
 
     /// Build and store a rule, assigning its id (`rule-<n>`).
@@ -362,6 +373,23 @@ impl RuleEngine {
                             topic = %topic,
                             "Rule matched ingress event"
                         );
+                    }
+                    RuleAction::ForwardConnector { connector_id } => {
+                        if let Err(e) = self.connectors.send(
+                            connector_id,
+                            topic,
+                            &data,
+                            qos,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                rule_id = %rule.id,
+                                connector = %connector_id,
+                                error = %e,
+                                "Rule connector forward failed; continuing with remaining actions"
+                            );
+                        }
                     }
                 }
             }
@@ -867,5 +895,101 @@ mod tests {
             normalize_from_target("SELECT * FROM a/#"),
             "SELECT * FROM stream"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingConnector {
+        events: StdMutex<Vec<(String, Vec<u8>, u8)>>,
+    }
+
+    #[async_trait]
+    impl broker_connectors::SinkConnector for RecordingConnector {
+        async fn send(
+            &self,
+            topic: &Topic,
+            payload: &Bytes,
+            qos: QoS,
+        ) -> Result<(), broker_connectors::ConnectorError> {
+            self.events.lock().unwrap().push((
+                topic.as_str().to_string(),
+                payload.to_vec(),
+                u8::from(qos),
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_connector_receives_projected_payload() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let recorder: Arc<RecordingConnector> = Arc::new(RecordingConnector::default());
+        engine
+            .connectors()
+            .register("webhook", recorder.clone());
+
+        engine
+            .create_rule(
+                "to-webhook".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string()),
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "webhook".to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let mqtt_sink = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn BrokerSink> = mqtt_sink.clone();
+
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/temperature").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "temperature": 72.5, "secret": "hide_me" }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // Connector got the projected payload (secret stripped), the MQTT
+        // sink got nothing (no Republish action on this rule).
+        let events = recorder.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "sensors/temperature");
+        let body: serde_json::Value =
+            serde_json::from_slice(&events[0].1).expect("connector payload is JSON");
+        assert_eq!(body, serde_json::json!({ "temperature": 72.5 }));
+        assert!(mqtt_sink.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forward_connector_missing_id_is_tolerated() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        engine
+            .create_rule(
+                "to-nowhere".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![
+                    RuleAction::ForwardConnector {
+                        connector_id: "ghost".to_string(),
+                    },
+                    RuleAction::Log,
+                ],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+
+        // Unknown connector id: warned, skipped, remaining actions run.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/temperature").unwrap(),
+                &Bytes::from_static(b"21.5C"),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
     }
 }

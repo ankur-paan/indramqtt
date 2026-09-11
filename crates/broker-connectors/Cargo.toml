@@ -11,4 +11,11 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

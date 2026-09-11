@@ -406,7 +406,7 @@ async fn apply_subscribe(
                 shared.router.subscribe(
                     &filter,
                     Subscription {
-                        client_id: client_id.clone(),
+                        client_id: client_id.clone().into(),
                         conn_id: frame.header.conn_id,
                         qos,
                     },
@@ -1224,7 +1224,7 @@ mod tests {
             .matches(&Topic::new("sport/tennis").unwrap());
         assert_eq!(matches.len(), 1);
         let sub = matches.iter().next().unwrap();
-        assert_eq!(sub.client_id, "sub-1");
+        assert_eq!(sub.client_id.as_ref(), "sub-1");
         assert_eq!(sub.conn_id, 21);
         assert_eq!(sub.qos, QoS::AtLeastOnce);
     }
@@ -1906,5 +1906,114 @@ mod tests {
 
         edge_task.abort();
         api_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rule_sql_forwards_to_http_webhook() {
+        use broker_connectors::HttpWebhookSink;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Minimal HTTP capture endpoint over raw TCP (keeps broker-node
+        // free of HTTP server deps): records one POST body, answers 200.
+        let hook_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hook");
+        let hook_port = hook_listener.local_addr().expect("addr").port();
+        let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let captured_rx = captured.clone();
+        let hook_task = tokio::spawn(async move {
+            let (mut stream, _) = hook_listener.accept().await.expect("accept hook");
+            let mut buf = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).await.expect("read head");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head_end = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("request head")
+                + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let mut content_length = 0usize;
+            for line in head.lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            while buf.len() < head_end + content_length {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).await.expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            *captured_rx.lock() =
+                Some(buf[head_end..head_end + content_length].to_vec());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write hook response");
+        });
+
+        let shared = Shared::new();
+        // Rule projects telemetry and forwards to the webhook sink: no
+        // MQTT subscribers are involved at all.
+        let sink = Arc::new(HttpWebhookSink::new(
+            format!("http://127.0.0.1:{hook_port}/hook"),
+            reqwest::header::HeaderMap::new(),
+            reqwest::Client::new(),
+        ));
+        shared.engine.connectors().register("webhook-1", sink);
+        shared
+            .engine
+            .create_rule(
+                "telemetry-webhook".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string(),
+                ),
+                true,
+                vec![broker_rules::RuleAction::ForwardConnector {
+                    connector_id: "webhook-1".to_string(),
+                }],
+            )
+            .expect("rule creates");
+
+        // Edge client publishes wide telemetry as conn 901.
+        let bl_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bl_addr = bl_listener.local_addr().expect("local addr");
+        let edge_task = tokio::spawn(async move {
+            let (stream, _) = bl_listener.accept().await.expect("accept");
+            handle_connection(stream, shared).await.expect("handle");
+        });
+        let publ = bind_client(bl_addr, 901, "sensor-x", true).await;
+        let raw = br#"{ "temperature": 85.0, "secret": "hide_me" }"#;
+        let (meta, payload) = encode_publish_meta("sensors/kitchen", 0, 0, false, raw);
+        publ.send(publish_frame(901, 2, meta, payload))
+            .await
+            .expect("publish");
+
+        // The webhook receives exactly the projected JSON.
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook_task)
+            .await
+            .expect("webhook fired")
+            .expect("hook task");
+        let body = captured.lock().clone().expect("captured body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("webhook body is JSON");
+        assert_eq!(json, serde_json::json!({ "temperature": 85.0 }));
+
+        edge_task.abort();
     }
 }

@@ -3,10 +3,11 @@
 //! These run under both `cargo test` (debug) and `cargo bench`/`cargo
 //! test --release` (release): router topic matching and streaming-SQL
 //! ingress evaluation. Gates are profile-aware: absolute numbers apply
-//! to optimized builds (production), while debug gates sit ~35% below
+//! to optimized builds (production), while debug gates sit ~50% below
 //! measured debug throughput as regression tripwires. Reference machine
-//! (Windows x64): router hit-path 154k msg/sec debug / 1.44M release,
-//! SQL ingress 660k events/sec debug / 4.6M release.
+//! (Windows x64, post-Sprint-9 ahash + Arc<str> router): hit-path 197k
+//! msg/sec debug / 3.05M release, SQL ingress 709k events/sec debug /
+//! 4.77M release.
 
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
@@ -19,7 +20,7 @@ use std::time::Instant;
 /// Floor for full fan-out match throughput (production-shaped table,
 /// three hits per lookup including clone + set costs).
 #[cfg(not(debug_assertions))]
-const ROUTER_GATE_MSG_PER_SEC: f64 = 500_000.0;
+const ROUTER_GATE_MSG_PER_SEC: f64 = 2_000_000.0;
 #[cfg(debug_assertions)]
 const ROUTER_GATE_MSG_PER_SEC: f64 = 100_000.0;
 
@@ -35,7 +36,7 @@ fn build_router(subscriptions: usize) -> Router {
         router.subscribe(
             &TopicFilter::new(filter).unwrap(),
             Subscription {
-                client_id: format!("client-{i}"),
+                client_id: format!("client-{i}").into(),
                 conn_id: i as u64,
                 qos: QoS::AtMostOnce,
             },
@@ -49,7 +50,7 @@ fn build_router(subscriptions: usize) -> Router {
         router.subscribe(
             &TopicFilter::new(filter).unwrap(),
             Subscription {
-                client_id: format!("route-{filter}"),
+                client_id: format!("route-{filter}").into(),
                 conn_id: 1_000_000,
                 qos,
             },
