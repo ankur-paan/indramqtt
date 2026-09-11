@@ -12,5 +12,11 @@ init([]) ->
     SupFlags = #{strategy => one_for_all,
                  intensity => 10,
                  period => 5},
-    ChildSpecs = [],
+    MqttPort = application:get_env(indra_edge, mqtt_port, 1883),
+    ChildSpecs = [#{id => indra_listener,
+                    start => {indra_listener, start_link, [[{port, MqttPort}]]},
+                    restart => permanent,
+                    shutdown => 5000,
+                    type => worker,
+                    modules => [indra_listener]}],
     {ok, {SupFlags, ChildSpecs}}.

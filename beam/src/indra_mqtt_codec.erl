@@ -11,6 +11,8 @@
 -export([decode_packet/1,
          decode_remaining_length/1,
          encode_remaining_length/1,
+         decode_connect/1,
+         encode_connack/2,
          packet_type_atom/1,
          packet_type_code/1]).
 
@@ -21,6 +23,16 @@
                         flags := 0..15,
                         remaining_length := non_neg_integer(),
                         payload := binary()}.
+-type connect_map() :: #{protocol_name := binary(),
+                         protocol_level := 4,
+                         clean_start := boolean(),
+                         keepalive := 0..65535,
+                         client_id := binary(),
+                         username_flag := boolean(),
+                         password_flag := boolean(),
+                         will_flag := boolean(),
+                         will_qos := 0..2,
+                         will_retain := boolean()}.
 
 %%====================================================================
 %% Public API
@@ -89,6 +101,36 @@ decode_remaining_length(Bin) when is_binary(Bin) ->
 encode_remaining_length(N) when is_integer(N), N >= 0, N =< ?MAX_REMAINING ->
     encode_rl(N, <<>>).
 
+%% @doc Decode an MQTT 3.1.1 CONNECT variable header + payload.
+%%
+%% Takes the zero-copy {@code payload} slice produced by
+%% {@code decode_packet/1} for a CONNECT packet and extracts the
+%% connection parameters the edge needs for the BrokerLink handshake.
+%% All returned binaries reference the input (no copying).
+-spec decode_connect(binary()) -> {ok, connect_map()} | {error, term()}.
+decode_connect(<<NameLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<ProtoName:NameLen/binary, Level:8, Flags:8, Keepalive:16/big, Payload/binary>> ->
+            case {ProtoName, Level} of
+                {<<"MQTT">>, 4} ->
+                    decode_connect_flags(Flags, Keepalive, Payload);
+                _ ->
+                    {error, {unsupported_protocol, ProtoName, Level}}
+            end;
+        _ ->
+            {error, truncated_connect}
+    end;
+decode_connect(_) ->
+    {error, truncated_connect}.
+
+%% @doc Encode an MQTT 3.1.1 CONNACK packet.
+-spec encode_connack(boolean(), 0..255) -> binary().
+encode_connack(SessionPresent, ReturnCode)
+  when is_boolean(SessionPresent),
+       is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255 ->
+    SP = case SessionPresent of true -> 1; false -> 0 end,
+    <<16#20, 16#02, SP:8, ReturnCode:8>>.
+
 %% @doc Map a 4-bit packet type code to its atom name.
 -spec packet_type_atom(0..15) -> atom().
 packet_type_atom(1) -> connect;
@@ -151,6 +193,87 @@ validate_flags(14, F) -> {error, {invalid_flags, disconnect, F}};
 %% the Rust core performs full validation.
 validate_flags(Type, _Flags) when Type >= 1, Type =< 14 -> ok;
 validate_flags(Type, Flags) -> {error, {invalid_flags, Type, Flags}}.
+
+%% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3.
+decode_connect_flags(Flags, Keepalive, Payload) ->
+    Username = (Flags band 16#80) =/= 0,
+    Password = (Flags band 16#40) =/= 0,
+    WillRetain = (Flags band 16#20) =/= 0,
+    WillQos = (Flags band 16#18) bsr 3,
+    WillFlag = (Flags band 16#04) =/= 0,
+    CleanStart = (Flags band 16#02) =/= 0,
+    Reserved = (Flags band 16#01) =/= 0,
+    Valid = (not Reserved) andalso (WillQos =< 2)
+        andalso (WillFlag orelse ((not WillRetain) andalso WillQos =:= 0))
+        andalso ((not Password) orelse Username),
+    case Valid of
+        false ->
+            {error, {invalid_connect_flags, Flags}};
+        true ->
+            case skip_connect_string(Payload) of
+                {ok, ClientId, Rest} ->
+                    case skip_connect_options(Rest, WillFlag, Username, Password) of
+                        ok ->
+                            {ok, #{protocol_name => <<"MQTT">>,
+                                   protocol_level => 4,
+                                   clean_start => CleanStart,
+                                   keepalive => Keepalive,
+                                   client_id => ClientId,
+                                   username_flag => Username,
+                                   password_flag => Password,
+                                   will_flag => WillFlag,
+                                   will_qos => WillQos,
+                                   will_retain => WillRetain}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end
+    end.
+
+%% @private Skip one length-prefixed UTF-8 string, returning it plus the tail.
+skip_connect_string(<<Len:16/big, Rest/binary>>) ->
+    case Rest of
+        <<Str:Len/binary, Tail/binary>> -> {ok, Str, Tail};
+        _ -> {error, truncated_connect}
+    end;
+skip_connect_string(_) ->
+    {error, truncated_connect}.
+
+%% @private Skip optional CONNECT fields (will topic/message, username,
+%% password) to prove the packet is well-formed; content is session
+%% business and stays opaque to the edge.
+skip_connect_options(Rest, false, false, false) ->
+    case Rest of
+        <<>> -> ok;
+        _ -> {error, trailing_connect_bytes}
+    end;
+skip_connect_options(Rest, WillFlag, Username, Password) ->
+    case skip_optional_string(Rest, WillFlag) of
+        {ok, Rest1} ->
+            case skip_optional_string(Rest1, WillFlag) of
+                {ok, Rest2} ->
+                    case skip_optional_string(Rest2, Username) of
+                        {ok, Rest3} ->
+                            case skip_optional_string(Rest3, Password) of
+                                {ok, <<>>} -> ok;
+                                {ok, _} -> {error, trailing_connect_bytes};
+                                Err -> Err
+                            end;
+                        Err -> Err
+                    end;
+                Err -> Err
+            end;
+        Err -> Err
+    end.
+
+skip_optional_string(Bin, false) -> {ok, Bin};
+skip_optional_string(Bin, true) ->
+    case skip_connect_string(Bin) of
+        {ok, _, Tail} -> {ok, Tail};
+        Err -> Err
+    end.
 
 %% Remaining-length decoder: at most 4 bytes, bit 7 = continuation.
 decode_rl(<<>>, _Value, _Count) ->

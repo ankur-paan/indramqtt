@@ -197,3 +197,103 @@ packet_type_mapping_helpers_test() ->
     ?assertEqual(3, indra_mqtt_codec:packet_type_code(publish)),
     ?assertEqual(12, indra_mqtt_codec:packet_type_code(pingreq)),
     ?assertEqual(14, indra_mqtt_codec:packet_type_code(disconnect)).
+
+%%====================================================================
+%% CONNECT decoding (Sprint 2 handshake)
+%%====================================================================
+
+decode_connect_minimal_clean_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    ?assertEqual(connect, maps:get(type_atom, Pkt)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(<<"MQTT">>, maps:get(protocol_name, Conn)),
+    ?assertEqual(4, maps:get(protocol_level, Conn)),
+    ?assertEqual(true, maps:get(clean_start, Conn)),
+    ?assertEqual(60, maps:get(keepalive, Conn)),
+    ?assertEqual(<<"s-1">>, maps:get(client_id, Conn)),
+    ?assertEqual(false, maps:get(username_flag, Conn)),
+    ?assertEqual(false, maps:get(will_flag, Conn)).
+
+decode_connect_persistent_with_auth_and_will_test() ->
+    %% Flags C0 (username+password) | 04 (will) | 0C (will QoS 1): 0xCC.
+    Var = <<0, 4, "MQTT", 4, 16#CC, 0, 10>>,
+    Payload = [<<0, 3, "cid">>,
+               <<0, 2, "wt">>, <<0, 2, "wm">>,
+               <<0, 1, "u">>, <<0, 1, "p">>],
+    Body = iolist_to_binary([Var | Payload]),
+    Bin = <<16#10, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(false, maps:get(clean_start, Conn)),
+    ?assertEqual(<<"cid">>, maps:get(client_id, Conn)),
+    ?assertEqual(true, maps:get(username_flag, Conn)),
+    ?assertEqual(true, maps:get(password_flag, Conn)),
+    ?assertEqual(true, maps:get(will_flag, Conn)),
+    ?assertEqual(1, maps:get(will_qos, Conn)),
+    ?assertEqual(false, maps:get(will_retain, Conn)).
+
+decode_connect_unsupported_protocol_test() ->
+    %% Level 5 (MQTT 5.0) is outside the 3.1.1 edge scope.
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    Body = <<Var/binary, 0, 1, "a">>,
+    ?assertEqual({error, {unsupported_protocol, <<"MQTT">>, 5}},
+                 indra_mqtt_codec:decode_connect(Body)),
+    %% Legacy MQIsdp name rejected as well.
+    Var3 = <<0, 6, "MQIsdp", 3, 16#02, 0, 60>>,
+    Body3 = <<Var3/binary, 0, 1, "a">>,
+    ?assertEqual({error, {unsupported_protocol, <<"MQIsdp">>, 3}},
+                 indra_mqtt_codec:decode_connect(Body3)).
+
+decode_connect_reserved_flag_rejected_test() ->
+    ?assertEqual({error, {invalid_connect_flags, 16#03}},
+                 indra_mqtt_codec:decode_connect(connect_body(<<"a">>, 16#03, 60))).
+
+decode_connect_will_qos3_rejected_test() ->
+    %% Flags 04 (will) | 18 (QoS 3): forbidden.
+    ?assertEqual({error, {invalid_connect_flags, 16#1C}},
+                 indra_mqtt_codec:decode_connect(connect_body(<<"a">>, 16#1C, 60))).
+
+decode_connect_password_without_username_rejected_test() ->
+    ?assertEqual({error, {invalid_connect_flags, 16#42}},
+                 indra_mqtt_codec:decode_connect(connect_body(<<"a">>, 16#42, 60))).
+
+decode_connect_truncated_test() ->
+    ?assertEqual({error, truncated_connect},
+                 indra_mqtt_codec:decode_connect(<<0, 4, "MQ">>)),
+    ?assertEqual({error, truncated_connect},
+                 indra_mqtt_codec:decode_connect(<<>>)),
+    %% Declared client id longer than the bytes present.
+    Var = <<0, 4, "MQTT", 4, 16#02, 0, 60>>,
+    ?assertEqual({error, truncated_connect},
+                 indra_mqtt_codec:decode_connect(<<Var/binary, 0, 9, "short">>)).
+
+decode_connect_trailing_garbage_rejected_test() ->
+    Var = <<0, 4, "MQTT", 4, 16#02, 0, 60>>,
+    ?assertEqual({error, trailing_connect_bytes},
+                 indra_mqtt_codec:decode_connect(<<Var/binary, 0, 1, "a", 16#FF>>)).
+
+%%====================================================================
+%% CONNACK encoding
+%%====================================================================
+
+encode_connack_vectors_test() ->
+    ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                 indra_mqtt_codec:encode_connack(false, 0)),
+    ?assertEqual(<<16#20, 16#02, 16#01, 16#00>>,
+                 indra_mqtt_codec:encode_connack(true, 0)),
+    ?assertEqual(<<16#20, 16#02, 16#00, 16#04>>,
+                 indra_mqtt_codec:encode_connack(false, 4)),
+    ?assertEqual(<<16#20, 16#02, 16#01, 16#02>>,
+                 indra_mqtt_codec:encode_connack(true, 2)).
+
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+connect_body(ClientId, Flags, Keepalive) ->
+    Var = <<0, 4, "MQTT", 4, Flags:8, Keepalive:16/big>>,
+    <<Var/binary, (byte_size(ClientId)):16/big, ClientId/binary>>.
+
+connect_bytes(ClientId, Flags, Keepalive) ->
+    Body = connect_body(ClientId, Flags, Keepalive),
+    <<16#10, (byte_size(Body)), Body/binary>>.

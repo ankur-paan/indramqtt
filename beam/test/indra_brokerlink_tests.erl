@@ -190,6 +190,60 @@ opcode_mapping_helpers_test() ->
     ?assertEqual(publish_in, indra_brokerlink:int_to_opcode(16#0020)).
 
 %%====================================================================
+%% Sprint 2 metadata contracts
+%%====================================================================
+
+bind_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_bind_meta(<<"sensor-1">>, true, 60),
+    ?assertEqual(<<0, 8, "sensor-1", 1, 0, 60>>, Meta),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"sensor-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(true, maps:get(clean_start, Dec)),
+    ?assertEqual(60, maps:get(keepalive, Dec)).
+
+bind_meta_clean_start_false_test() ->
+    Meta = indra_brokerlink:encode_bind_meta(<<"d">>, false, 0),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(false, maps:get(clean_start, Dec)),
+    ?assertEqual(0, maps:get(keepalive, Dec)).
+
+bind_meta_max_keepalive_test() ->
+    Meta = indra_brokerlink:encode_bind_meta(<<>>, true, 65535),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<>>, maps:get(client_id, Dec)),
+    ?assertEqual(65535, maps:get(keepalive, Dec)).
+
+bind_meta_malformed_rejected_test() ->
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(<<>>)),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(<<0, 5, "ab">>)),
+    %% Declared length longer than the bytes present.
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(<<0, 9, "short">>)).
+
+session_binding_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_session_binding_meta(16#0102030405060708, true, 0),
+    ?assertEqual(<<16#01, 16#02, 16#03, 16#04, 16#05, 16#06, 16#07, 16#08, 1, 0>>,
+                 Meta),
+    {ok, Dec} = indra_brokerlink:decode_session_binding_meta(Meta),
+    ?assertEqual(16#0102030405060708, maps:get(session_id, Dec)),
+    ?assertEqual(true, maps:get(session_present, Dec)),
+    ?assertEqual(0, maps:get(return_code, Dec)).
+
+session_binding_absent_with_rc_test() ->
+    Meta = indra_brokerlink:encode_session_binding_meta(0, false, 2),
+    {ok, Dec} = indra_brokerlink:decode_session_binding_meta(Meta),
+    ?assertEqual(false, maps:get(session_present, Dec)),
+    ?assertEqual(2, maps:get(return_code, Dec)).
+
+session_binding_malformed_rejected_test() ->
+    ?assertEqual({error, malformed_session_binding_meta},
+                 indra_brokerlink:decode_session_binding_meta(<<0, 1, 2>>)),
+    ?assertEqual({error, malformed_session_binding_meta},
+                 indra_brokerlink:decode_session_binding_meta(<<0:64, 2, 0>>)).
+
+%%====================================================================
 %% gen_server IPC behaviour (loopback TCP, no external services)
 %%====================================================================
 

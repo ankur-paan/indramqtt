@@ -39,6 +39,12 @@
          opcode_to_int/1,
          int_to_opcode/1]).
 
+%% BrokerLink metadata contracts (Sprint 2: connection handshake).
+-export([encode_bind_meta/3,
+         decode_bind_meta/1,
+         encode_session_binding_meta/3,
+         decode_session_binding_meta/1]).
+
 %% gen_server lifecycle + IPC API.
 -export([start_link/0,
          start_link/1,
@@ -242,6 +248,90 @@ is_known_opcode(16#0032) -> true;
 is_known_opcode(16#0033) -> true;
 is_known_opcode(16#0040) -> true;
 is_known_opcode(_) -> false.
+
+%%====================================================================
+%% BrokerLink metadata contracts (Sprint 2: CONNECT -> CONNACK)
+%%====================================================================
+%%
+%% These binary layouts are the canonical cross-language contract between
+%% the BEAM edge (`indra_conn`) and the Rust core
+%% (`crates/broker-node/src/main.rs::reply_for_frame`). Both sides
+%% implement the identical layout; the Rust side mirrors these comments.
+%%
+%% BindConnection meta (Opcode 16#0010, BEAM -> Rust):
+%% <pre>
+%%   +------------------+----------------+-------+------------+
+%%   | ClientIdLen:16be | ClientId bytes | Flags | Keepalive  |
+%%   |                  |  (UTF-8)       |  :8   |  :16be     |
+%%   +------------------+----------------+-------+------------+
+%% </pre>
+%% Flags bit 0 = clean_start. All other bits are reserved and must be 0.
+%%
+%% SessionBinding meta (Opcode 16#0011, Rust -> BEAM):
+%% <pre>
+%%   +----------------+---------------+------------+
+%%   | SessionId:64be | Present:8     | RC:8       |
+%%   |                | (0 | 1)       | (0 = ok)   |
+%%   +----------------+---------------+------------+
+%% </pre>
+%% RC mirrors the MQTT 3.1.1 CONNACK return code (0 = accepted,
+%% 2 = identifier rejected).
+
+-type bind_meta() :: #{client_id := binary(),
+                       clean_start := boolean(),
+                       keepalive := 0..65535}.
+-type session_binding_meta() :: #{session_id := non_neg_integer(),
+                                  session_present := boolean(),
+                                  return_code := 0..255}.
+
+%% @doc Encode BindConnection metadata for the given client parameters.
+-spec encode_bind_meta(binary(), boolean(), 0..65535) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive)
+  when is_binary(ClientId), is_boolean(CleanStart),
+       is_integer(Keepalive), Keepalive >= 0, Keepalive =< 65535 ->
+    Flags = case CleanStart of true -> 1; false -> 0 end,
+    IdLen = byte_size(ClientId),
+    true = (IdLen =< 65535) orelse erlang:error(badarg),
+    <<IdLen:16/big, ClientId/binary, Flags:8, Keepalive:16/big>>.
+
+%% @doc Decode BindConnection metadata.
+-spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
+decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big>> ->
+            {ok, #{client_id => ClientId,
+                   clean_start => (Flags band 16#01) =:= 16#01,
+                   keepalive => Keepalive}};
+        _ ->
+            {error, malformed_bind_meta}
+    end;
+decode_bind_meta(_) ->
+    {error, malformed_bind_meta}.
+
+%% @doc Encode SessionBinding metadata for the given session outcome.
+-spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255) -> binary().
+encode_session_binding_meta(SessionId, SessionPresent, ReturnCode)
+  when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
+       is_boolean(SessionPresent),
+       is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255 ->
+    Present = case SessionPresent of true -> 1; false -> 0 end,
+    <<SessionId:64/big, Present:8, ReturnCode:8>>.
+
+%% @doc Decode SessionBinding metadata.
+-spec decode_session_binding_meta(binary()) ->
+    {ok, session_binding_meta()} | {error, term()}.
+decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8>>) ->
+    case Present of
+        0 -> {ok, #{session_id => SessionId,
+                    session_present => false,
+                    return_code => RC}};
+        1 -> {ok, #{session_id => SessionId,
+                    session_present => true,
+                    return_code => RC}};
+        _ -> {error, malformed_session_binding_meta}
+    end;
+decode_session_binding_meta(_) ->
+    {error, malformed_session_binding_meta}.
 
 %%====================================================================
 %% gen_server IPC client API
