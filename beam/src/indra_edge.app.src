@@ -1,0 +1,14 @@
+{application, indra_edge,
+ [{description, "IndraMQTT BEAM Network Appliance Edge"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {indra_edge_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+  {licenses, ["MIT", "Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/ankur-paan/indramqtt"}]}
+ ]}.
