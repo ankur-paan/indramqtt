@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package brokerlink;
+
+// Connection negotiation between BEAM Edge and Rust Core
+message BindConnection {
+    string client_id = 1;
+    bool clean_start = 2;
+    uint32 keepalive_seconds = 3;
+    uint32 protocol_version = 4; // 3: 3.1, 4: 3.1.1, 5: 5.0
+    optional string will_topic = 5;
+    optional bytes will_payload = 6;
+    uint32 will_qos = 7;
+    bool will_retain = 8;
+    optional string username = 9;
+    optional bytes password = 10;
+    map<string, string> user_properties = 11;
+}
+
+message SessionBinding {
+    uint64 session_id = 1;
+    bool session_present = 2;
+    optional string assigned_client_id = 3;
+    uint32 return_code = 4; // 0 = Accepted, or MQTT 5.0 reason code
+    optional string reason_string = 5;
+    uint32 receive_maximum = 6;
+    uint32 max_packet_size = 7;
+}
+
+// Ingress / Egress message metadata (Payload transmitted raw in frame)
+message PublishMeta {
+    string topic = 1;
+    uint32 packet_id = 2;
+    uint32 qos = 3;
+    bool retain = 4;
+    bool dup = 5;
+    map<string, string> user_properties = 6;
+    optional uint32 message_expiry_interval = 7;
+}
+
+message PublishAck {
+    uint32 packet_id = 1;
+    uint32 reason_code = 2;
+}
+
+message TopicSubscription {
+    string filter = 1;
+    uint32 qos = 2;
+    bool no_local = 3;
+    bool retain_as_published = 4;
+    uint32 retain_handling = 5;
+}
+
+message SubscribeMeta {
+    uint32 packet_id = 1;
+    repeated TopicSubscription subscriptions = 2;
+    map<string, string> user_properties = 3;
+}
+
+message SubAckMeta {
+    uint32 packet_id = 1;
+    repeated uint32 reason_codes = 2;
+}
+
+message UnsubscribeMeta {
+    uint32 packet_id = 1;
+    repeated string filters = 2;
+}
+
+message UnsubAckMeta {
+    uint32 packet_id = 1;
+    repeated uint32 reason_codes = 2;
+}
+
+message DisconnectMeta {
+    uint32 reason_code = 1;
+    optional uint32 session_expiry_interval = 2;
+}

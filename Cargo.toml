@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "crates/brokerlink",
+    "crates/broker-protocol",
+    "crates/broker-router",
+    "crates/broker-session",
+    "crates/broker-storage",
+    "crates/broker-auth",
+    "crates/broker-rules",
+    "crates/broker-connectors",
+    "crates/broker-cluster",
+    "crates/broker-api",
+    "crates/broker-observability",
+    "crates/broker-node",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["I-Dacs Labs <measure@i-dacs.com>", "IndraMQTT Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ankur-paan/indramqtt"
+homepage = "https://i-dacs.com"
+readme = "README.md"
+keywords = ["mqtt", "broker", "iot", "stream-processing", "distributed"]
+categories = ["network-programming", "asynchronous"]
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+bytes = "1.6"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+futures = "0.3"
+parking_lot = "0.12"
+axum = { version = "0.7", features = ["macros"] }
+clap = { version = "4.5", features = ["derive"] }
+
+# Internal workspace crates
+brokerlink = { path = "crates/brokerlink" }
+broker-protocol = { path = "crates/broker-protocol" }
+broker-router = { path = "crates/broker-router" }
+broker-session = { path = "crates/broker-session" }
+broker-storage = { path = "crates/broker-storage" }
+broker-auth = { path = "crates/broker-auth" }
+broker-rules = { path = "crates/broker-rules" }
+broker-connectors = { path = "crates/broker-connectors" }
+broker-cluster = { path = "crates/broker-cluster" }
+broker-api = { path = "crates/broker-api" }
+broker-observability = { path = "crates/broker-observability" }

@@ -1,0 +1,14 @@
+[package]
+name = "broker-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+broker-protocol = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
