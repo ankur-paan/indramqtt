@@ -1,5 +1,7 @@
+use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
+use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::SessionManager;
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -159,15 +161,56 @@ struct Shared {
     sessions: Arc<SessionManager>,
     router: Arc<Router>,
     conns: Arc<ConnTable>,
+    engine: Arc<RuleEngine>,
+    sink: Arc<dyn BrokerSink>,
 }
 
 impl Shared {
     fn new() -> Self {
+        let sessions = Arc::new(SessionManager::new());
+        let router = Arc::new(Router::new());
+        let conns = Arc::new(ConnTable::default());
+        let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
+        // NO MQTT LOOPBACK: rule republishes route straight into the local
+        // router/mailboxes through this in-memory sink.
+        let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
+            router: router.clone(),
+            sessions: sessions.clone(),
+            conns: conns.clone(),
+        });
         Self {
-            sessions: Arc::new(SessionManager::new()),
-            router: Arc::new(Router::new()),
-            conns: Arc::new(ConnTable::default()),
+            sessions,
+            router,
+            conns,
+            engine,
+            sink,
         }
+    }
+}
+
+/// [`BrokerSink`] that forwards rule output directly to local router
+/// subscribers. Pure in-memory fan-out: no sockets, no MQTT loopback.
+struct InMemoryBrokerSink {
+    router: Arc<Router>,
+    sessions: Arc<SessionManager>,
+    conns: Arc<ConnTable>,
+}
+
+#[async_trait]
+impl BrokerSink for InMemoryBrokerSink {
+    async fn publish(
+        &self,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
+        for (conn_id, frame) in
+            build_downlink_frames(&self.router, &self.sessions, &topic, qos, retain, &payload)
+        {
+            self.conns.route(conn_id, frame);
+        }
+        Ok(())
     }
 }
 
@@ -256,7 +299,7 @@ where
             }
         },
         OpCode::PublishIn => {
-            let (ack, deliveries) = apply_publish(&frame, shared);
+            let (ack, deliveries) = apply_publish(&frame, shared).await;
             if let Some(ack) = ack {
                 transport.send(ack).await?;
             }
@@ -323,11 +366,12 @@ fn apply_subscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> 
 /// Route one `PublishIn` frame: an optional `PubAckOut` for the publisher
 /// (QoS 1) plus one `PublishOut` per matching subscriber.
 ///
-/// Delivery QoS is `min(publish QoS, subscription QoS)`; QoS 1 deliveries
-/// draw their packet id from the subscriber session so each downstream
-/// flow keeps an independent id space. The raw payload bytes are
-/// forwarded untouched.
-fn apply_publish(
+/// Ingress-only rule execution runs first on the receiving node; the
+/// standard router fan-out follows. Delivery QoS is `min(publish QoS,
+/// subscription QoS)`; QoS 1 deliveries draw their packet id from the
+/// subscriber session so each downstream flow keeps an independent id
+/// space. The raw payload bytes are forwarded untouched.
+async fn apply_publish(
     frame: &BrokerFrame,
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
@@ -343,6 +387,14 @@ fn apply_publish(
         Ok(qos) => qos,
         Err(_) => return (None, Vec::new()),
     };
+
+    // Rules execute at ingress on this node, before local fan-out.
+    // Republished output re-enters through the sink only, so rules can
+    // never recurse through their own output.
+    shared
+        .engine
+        .dispatch_ingress(&topic, &frame.payload, qos, &shared.sink)
+        .await;
 
     let ack = if qos == QoS::AtLeastOnce {
         let mut meta = Vec::with_capacity(3);
@@ -360,17 +412,42 @@ fn apply_publish(
         None
     };
 
+    let deliveries = build_downlink_frames(
+        &shared.router,
+        &shared.sessions,
+        &topic,
+        qos,
+        retain,
+        &frame.payload,
+    );
+
+    (ack, deliveries)
+}
+
+/// Build one `PublishOut` frame per router match. Shared by the standard
+/// fan-out and the rule [`BrokerSink`] so both paths downgrade QoS and
+/// allocate downlink packet ids identically.
+fn build_downlink_frames(
+    router: &Router,
+    sessions: &SessionManager,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+) -> Vec<(u64, BrokerFrame)> {
+    let qos_raw = u8::from(qos);
+    let topic_str = topic.as_str();
     let mut deliveries = Vec::new();
-    for sub in shared.router.matches(&topic) {
+    for sub in router.matches(topic) {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
         let downlink_id = if effective == 0 {
             0u16
         } else {
-            match shared.sessions.get(&sub.client_id) {
+            match sessions.get(&sub.client_id) {
                 Some(session) => session.next_packet_id(),
-                // Session vanished mid-flight: reuse the publisher id
-                // rather than silently dropping the delivery.
-                None => packet_id,
+                // Session vanished mid-flight: fall back to id 1 rather
+                // than silently dropping the delivery.
+                None => 1u16,
             }
         };
         let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
@@ -385,13 +462,12 @@ fn apply_publish(
             sub.conn_id,
             0, // stamped per-destination by ConnTable::route
             Bytes::from(meta),
-            frame.payload.clone(),
+            payload.clone(),
         ) {
             deliveries.push((sub.conn_id, routed));
         }
     }
-
-    (ack, deliveries)
+    deliveries
 }
 
 /// Detach one edge connection: mark its session disconnected (ownership
@@ -854,8 +930,8 @@ mod tests {
         assert!(apply_subscribe(&frame, &shared).is_none());
     }
 
-    #[test]
-    fn publish_qos1_fans_out_with_qos_downshift() {
+    #[tokio::test]
+    async fn publish_qos1_fans_out_with_qos_downshift() {
         let shared = test_shared();
         // Subscriber A wants QoS 1 on an exact filter; B wants QoS 0 via wildcard.
         for (conn, client, filter, qos) in [
@@ -869,7 +945,7 @@ mod tests {
         }
 
         let (meta, payload) = encode_publish_meta("sport/tennis", 5, 1, false, b"hello");
-        let (ack, deliveries) = apply_publish(&publish_frame(40, 2, meta, payload), &shared);
+        let (ack, deliveries) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
         assert!(ack.is_some(), "QoS 1 needs a PubAck");
 
         assert_eq!(deliveries.len(), 2);
@@ -890,15 +966,15 @@ mod tests {
         assert_eq!(pid_b, 0, "QoS 0 downlink carries no packet id");
     }
 
-    #[test]
-    fn publish_qos1_acks_publisher_and_routes() {
+    #[tokio::test]
+    async fn publish_qos1_acks_publisher_and_routes() {
         let shared = test_shared();
         let _ = shared.sessions.get_or_create("q1-sub", true);
         let sub = subscribe_frame(51, 1, encode_subscribe_meta(3, "q1-sub", &[("t", 1)]));
         apply_subscribe(&sub, &shared).expect("subscribe replies");
 
         let (meta, payload) = encode_publish_meta("t", 42, 1, false, b"data");
-        let (ack, deliveries) = apply_publish(&publish_frame(52, 8, meta, payload), &shared);
+        let (ack, deliveries) = apply_publish(&publish_frame(52, 8, meta, payload), &shared).await;
 
         let ack = ack.expect("QoS 1 needs PubAck");
         assert_eq!(ack.header.opcode, OpCode::PubAckOut);
@@ -911,22 +987,24 @@ mod tests {
         assert_eq!(deliveries[0].1.payload, Bytes::from_static(b"data"));
     }
 
-    #[test]
-    fn publish_qos0_needs_no_ack() {
+    #[tokio::test]
+    async fn publish_qos0_needs_no_ack() {
         let shared = test_shared();
         let (meta, payload) = encode_publish_meta("t", 0, 0, false, b"x");
         let (ack, deliveries) =
-            apply_publish(&publish_frame(60, 1, meta, payload), &shared);
+            apply_publish(&publish_frame(60, 1, meta, payload), &shared).await;
         assert!(ack.is_none(), "QoS 0 needs no PubAck");
         assert!(deliveries.is_empty(), "no subscribers, no deliveries");
     }
 
-    #[test]
-    fn publish_malformed_meta_yields_nothing() {        let shared = test_shared();
+    #[tokio::test]
+    async fn publish_malformed_meta_yields_nothing() {
+        let shared = test_shared();
         let (ack, deliveries) = apply_publish(
             &publish_frame(60, 1, Bytes::from(vec![0xFF]), Bytes::new()),
             &shared,
-        );
+        )
+        .await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
     }
@@ -1026,6 +1104,80 @@ mod tests {
         let (topic, _, qos, _) = decode_publish_meta_parts(&routed.metadata);
         assert_eq!(topic, "sport/tennis");
         assert_eq!(qos, 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rule_republish_reaches_alert_subscriber() {
+        use broker_rules::RuleAction;
+
+        let shared = Shared::new();
+        // Ingress rule: anything under sensors/+ is republished to
+        // alerts/critical. No MQTT loopback involved: delivery flows
+        // engine -> in-memory sink -> subscriber mailbox.
+        shared.engine.create_rule(
+            "republish-temp".to_string(),
+            TopicFilter::new("sensors/+").unwrap(),
+            None,
+            true,
+            vec![RuleAction::Republish {
+                topic: Topic::new("alerts/critical").unwrap(),
+                qos: QoS::AtMostOnce,
+            }],
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        // Client A subscribes to alerts/critical as conn 301.
+        let sub_io = tokio::net::TcpStream::connect(addr).await.expect("connect sub");
+        let sub = FramedTransport::new(sub_io);
+        sub.send(bind_frame(301, 1, encode_bind_meta("alert-watcher", true, 60)))
+            .await
+            .expect("bind");
+        let _ = sub.recv().await.expect("recv binding");
+        sub.send(subscribe_frame(
+            301,
+            2,
+            encode_subscribe_meta(5, "alert-watcher", &[("alerts/critical", 1)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        // Client B publishes to sensors/temperature as conn 302.
+        let pub_io = tokio::net::TcpStream::connect(addr).await.expect("connect pub");
+        let publ = FramedTransport::new(pub_io);
+        publ.send(bind_frame(302, 1, encode_bind_meta("thermometer", true, 60)))
+            .await
+            .expect("bind");
+        let _ = publ.recv().await.expect("recv binding");
+        let (meta, payload) = encode_publish_meta("sensors/temperature", 0, 0, false, b"21.5C");
+        publ.send(publish_frame(302, 2, meta, payload))
+            .await
+            .expect("publish");
+
+        // Client A receives the rule-republished message with the
+        // identical payload on its own transport.
+        let routed = sub.recv().await.expect("recv republished");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert_eq!(routed.header.conn_id, 301);
+        assert_eq!(routed.payload, Bytes::from_static(b"21.5C"));
+        let (topic, _, qos, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "alerts/critical");
+        assert_eq!(qos, 0);
 
         server.abort();
     }

@@ -156,6 +156,8 @@ name = "broker-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "broker-protocol",
+ "broker-rules",
  "serde",
  "serde_json",
  "tokio",
@@ -199,6 +201,7 @@ dependencies = [
 name = "broker-node"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "broker-api",
  "broker-auth",
  "broker-cluster",
@@ -251,6 +254,7 @@ dependencies = [
  "async-trait",
  "broker-protocol",
  "bytes",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",
