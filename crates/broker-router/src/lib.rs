@@ -5,6 +5,10 @@ use parking_lot::RwLock;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub client_id: String,
+    /// Ephemeral edge connection owning this subscription copy. A
+    /// re-subscribe from a new connection replaces the entry, so at most
+    /// one `conn_id` per `(filter node, client_id)` exists.
+    pub conn_id: u64,
     pub qos: QoS,
 }
 
@@ -44,6 +48,8 @@ impl Router {
 
         for (idx, &level) in levels.iter().enumerate() {
             if level == "#" {
+                // Re-subscribing from a new connection replaces the old copy.
+                curr.multi_wildcard_subs.retain(|s| s.client_id != sub.client_id);
                 curr.multi_wildcard_subs.insert(sub);
                 return;
             } else if level == "+" {
@@ -56,6 +62,7 @@ impl Router {
             }
 
             if idx == levels.len() - 1 {
+                curr.exact_subs.retain(|s| s.client_id != sub.client_id);
                 curr.exact_subs.insert(sub);
                 return;
             }
@@ -138,14 +145,17 @@ mod tests {
 
         let sub1 = Subscription {
             client_id: "c1".to_string(),
+            conn_id: 101,
             qos: QoS::AtMostOnce,
         };
         let sub2 = Subscription {
             client_id: "c2".to_string(),
+            conn_id: 102,
             qos: QoS::AtLeastOnce,
         };
         let sub3 = Subscription {
             client_id: "c3".to_string(),
+            conn_id: 103,
             qos: QoS::ExactlyOnce,
         };
 
@@ -167,5 +177,34 @@ mod tests {
         let matches_after = router.matches(&Topic::new("sports/tennis/wimbledon").unwrap());
         assert_eq!(matches_after.len(), 1);
         assert!(matches_after.contains(&sub2));
+    }
+
+    #[test]
+    fn test_resubscribe_replaces_conn_id() {
+        let router = Router::new();
+        let filter = TopicFilter::new("sports/tennis").unwrap();
+
+        router.subscribe(
+            &filter,
+            Subscription {
+                client_id: "c1".to_string(),
+                conn_id: 101,
+                qos: QoS::AtMostOnce,
+            },
+        );
+        router.subscribe(
+            &filter,
+            Subscription {
+                client_id: "c1".to_string(),
+                conn_id: 202,
+                qos: QoS::AtLeastOnce,
+            },
+        );
+
+        let matches = router.matches(&Topic::new("sports/tennis").unwrap());
+        assert_eq!(matches.len(), 1);
+        let only = matches.iter().next().unwrap();
+        assert_eq!(only.conn_id, 202);
+        assert_eq!(only.qos, QoS::AtLeastOnce);
     }
 }

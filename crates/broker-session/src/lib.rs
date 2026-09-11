@@ -60,8 +60,11 @@ impl SessionManager {
         }
     }
 
-    pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {
-        let mut map = self.sessions.write();
+    pub fn get(&self, client_id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().get(client_id).cloned()
+    }
+
+    pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {        let mut map = self.sessions.write();
 
         if clean_start {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
@@ -110,5 +113,8 @@ mod tests {
         let (s3, present3) = manager.get_or_create("device-001", true);
         assert!(!present3); // clean_start true creates fresh session
         assert_ne!(s1.id, s3.id);
+
+        assert!(manager.get("device-001").is_some());
+        assert!(manager.get("unknown-device").is_none());
     }
 }

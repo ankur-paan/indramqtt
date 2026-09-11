@@ -212,6 +212,7 @@ dependencies = [
  "brokerlink",
  "bytes",
  "clap",
+ "parking_lot",
  "tokio",
  "tracing",
 ]

@@ -297,3 +297,141 @@ connect_body(ClientId, Flags, Keepalive) ->
 connect_bytes(ClientId, Flags, Keepalive) ->
     Body = connect_body(ClientId, Flags, Keepalive),
     <<16#10, (byte_size(Body)), Body/binary>>.
+
+%%====================================================================
+%% SUBSCRIBE / SUBACK (Sprint 3 messaging loop)
+%%====================================================================
+
+decode_subscribe_single_test() ->
+    %% Packet id 7, one filter "sport/tennis" QoS 1.
+    Body = <<0, 7, 0, 12, "sport/tennis", 1>>,
+    Bin = <<16#82, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    ?assertEqual(subscribe, maps:get(type_atom, Pkt)),
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(maps:get(payload, Pkt)),
+    ?assertEqual(7, maps:get(packet_id, Sub)),
+    ?assertEqual([{<<"sport/tennis">>, 1}], maps:get(subscriptions, Sub)).
+
+decode_subscribe_multi_test() ->
+    Body = <<0, 9, 0, 1, "a", 0, 0, 5, "sport", 2>>,
+    Bin = <<16#82, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(maps:get(payload, Pkt)),
+    ?assertEqual(9, maps:get(packet_id, Sub)),
+    ?assertEqual([{<<"a">>, 0}, {<<"sport">>, 2}], maps:get(subscriptions, Sub)).
+
+decode_subscribe_rejects_test() ->
+    %% Zero packet id.
+    ?assertEqual({error, malformed_subscribe},
+                 indra_mqtt_codec:decode_subscribe(<<0, 0, 0, 1, "a", 0>>)),
+    %% Empty filter list.
+    ?assertEqual({error, empty_subscribe},
+                 indra_mqtt_codec:decode_subscribe(<<0, 7>>)),
+    %% Requested QoS 3.
+    ?assertEqual({error, {invalid_subscribe_qos, 3}},
+                 indra_mqtt_codec:decode_subscribe(<<0, 7, 0, 1, "a", 3>>)),
+    %% Truncated filter bytes.
+    ?assertEqual({error, truncated_subscribe},
+                 indra_mqtt_codec:decode_subscribe(<<0, 7, 0, 9, "short">>)),
+    %% Empty filter string.
+    ?assertEqual({error, malformed_subscribe},
+                 indra_mqtt_codec:decode_subscribe(<<0, 7, 0, 0, 0>>)).
+
+subscribe_bad_fixed_flags_rejected_test() ->
+    %% SUBSCRIBE with flags 0000 (must be 0010).
+    ?assertEqual({error, {invalid_flags, subscribe, 0}},
+                 indra_mqtt_codec:decode_packet(<<16#80, 16#02, 16#00, 16#07>>)).
+
+encode_suback_vectors_test() ->
+    ?assertEqual(<<16#90, 16#03, 16#00, 16#07, 16#01>>,
+                 indra_mqtt_codec:encode_suback(7, [1])),
+    ?assertEqual(<<16#90, 16#04, 16#00, 16#09, 16#00, 16#02>>,
+                 indra_mqtt_codec:encode_suback(9, [0, 2])),
+    ?assertEqual(<<16#90, 16#03, 16#00, 16#09, 16#80>>,
+                 indra_mqtt_codec:encode_suback(9, [16#80])),
+    ?assertError(badarg, indra_mqtt_codec:encode_suback(9, [5])).
+
+%%====================================================================
+%% PUBLISH / PUBACK
+%%====================================================================
+
+decode_publish_qos0_test() ->
+    %% Topic "t", payload "hi".
+    Body = <<0, 1, "t", "hi">>,
+    Bin = <<16#30, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                maps:get(flags, Pkt)),
+    ?assertEqual(<<"t">>, maps:get(topic, Pub)),
+    ?assertEqual(0, maps:get(packet_id, Pub)),
+    ?assertEqual(0, maps:get(qos, Pub)),
+    ?assertEqual(false, maps:get(retain, Pub)),
+    ?assertEqual(false, maps:get(dup, Pub)),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
+
+decode_publish_qos1_flags_test() ->
+    %% Flags 1011: DUP=1, QoS=1, RETAIN=1; topic "ab", id 16, payload "Z".
+    Body = <<0, 2, "ab", 0, 16, "Z">>,
+    Bin = <<16#3B, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                maps:get(flags, Pkt)),
+    ?assertEqual(<<"ab">>, maps:get(topic, Pub)),
+    ?assertEqual(16, maps:get(packet_id, Pub)),
+    ?assertEqual(1, maps:get(qos, Pub)),
+    ?assertEqual(true, maps:get(retain, Pub)),
+    ?assertEqual(true, maps:get(dup, Pub)),
+    ?assertEqual(<<"Z">>, maps:get(payload, Pub)).
+
+decode_publish_rejects_test() ->
+    %% Empty topic.
+    ?assertEqual({error, malformed_publish_topic},
+                 indra_mqtt_codec:decode_publish(<<0, 0, "hi">>, 0)),
+    %% Wildcard topic.
+    ?assertEqual({error, invalid_publish_topic},
+                 indra_mqtt_codec:decode_publish(<<0, 3, "a/#", "x">>, 0)),
+    %% Truncated topic bytes.
+    ?assertEqual({error, truncated_publish},
+                 indra_mqtt_codec:decode_publish(<<0, 9, "short">>, 0)),
+    %% QoS 1 without packet id bytes.
+    ?assertEqual({error, malformed_publish_packet_id},
+                 indra_mqtt_codec:decode_publish(<<0, 1, "t">>, 2)),
+    %% Zero packet id on QoS 1.
+    ?assertEqual({error, malformed_publish_packet_id},
+                 indra_mqtt_codec:decode_publish(<<0, 1, "t", 0, 0>>, 2)).
+
+encode_publish_roundtrip_test() ->
+    lists:foreach(
+      fun({Topic, Pid, QoS, Retain, Dup, Payload}) ->
+          Bin = indra_mqtt_codec:encode_publish(Topic, Pid, QoS, Retain, Dup, Payload),
+          {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+          ?assertEqual(publish, maps:get(type_atom, Pkt)),
+          {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                      maps:get(flags, Pkt)),
+          ?assertEqual(Topic, maps:get(topic, Pub)),
+          ?assertEqual(QoS, maps:get(qos, Pub)),
+          ?assertEqual(Retain, maps:get(retain, Pub)),
+          ?assertEqual(Dup, maps:get(dup, Pub)),
+          ?assertEqual(Payload, maps:get(payload, Pub)),
+          ExpectedPid = case QoS of 0 -> 0; _ -> Pid end,
+          ?assertEqual(ExpectedPid, maps:get(packet_id, Pub))
+      end, [{<<"t">>, 0, 0, false, false, <<"hi">>},
+            {<<"a/b">>, 42, 1, false, false, <<"data">>},
+            {<<"a/b">>, 43, 1, true, true, <<>>},
+            {<<"sport/tennis">>, 60000, 2, false, false, <<"x">>}]).
+
+encode_publish_qos0_drops_packet_id_test() ->
+    %% /4 defaults DUP/RETAIN to 0 and omits any packet id for QoS 0.
+    ?assertEqual(<<16#30, 5, 0, 1, "t", "hi">>,
+                 indra_mqtt_codec:encode_publish(<<"t">>, 0, 0, <<"hi">>)).
+
+encode_publish_bad_args_raise_test() ->
+    ?assertError(badarg, indra_mqtt_codec:encode_publish(<<"t">>, 0, 1, <<"x">>)),
+    ?assertError(function_clause,
+                 indra_mqtt_codec:encode_publish(<<>>, 1, 0, <<"x">>)).
+
+encode_puback_vector_test() ->
+    ?assertEqual(<<16#40, 16#02, 16#00, 16#2A>>,
+                 indra_mqtt_codec:encode_puback(42)),
+    ?assertEqual(<<16#40, 16#02, 16#FF, 16#FF>>,
+                 indra_mqtt_codec:encode_puback(65535)).

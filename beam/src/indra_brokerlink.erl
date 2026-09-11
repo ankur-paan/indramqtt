@@ -45,6 +45,18 @@
          encode_session_binding_meta/3,
          decode_session_binding_meta/1]).
 
+%% BrokerLink metadata contracts (Sprint 3: messaging loop).
+-export([encode_subscribe_meta/3,
+         decode_subscribe_meta/1,
+         encode_suback_meta/2,
+         decode_suback_meta/1,
+         encode_publish_meta/5,
+         decode_publish_meta/1,
+         encode_puback_meta/2,
+         decode_puback_meta/1,
+         encode_unbind_meta/1,
+         decode_unbind_meta/1]).
+
 %% gen_server lifecycle + IPC API.
 -export([start_link/0,
          start_link/1,
@@ -334,6 +346,177 @@ decode_session_binding_meta(_) ->
     {error, malformed_session_binding_meta}.
 
 %%====================================================================
+%% BrokerLink metadata contracts (Sprint 3: messaging loop)
+%%====================================================================
+%%
+%% Layouts mirrored by `crates/broker-node/src/main.rs`:
+%%
+%% SubscribeMeta (Opcode 16#0030, BEAM -> Rust):
+%% {@code PacketId:16be | IdLen:16be | ClientId | N:16be |
+%%  (FilterLen:16be | Filter | QoS:8) * N}
+%%
+%% SubAckMeta (Opcode 16#0031, Rust -> BEAM):
+%% {@code PacketId:16be | GrantedCodes...} (one byte per subscription:
+%% granted QoS 0..2 or 16#80 failure).
+%%
+%% PublishMeta (Opcodes 16#0020 / 16#0021, either direction):
+%% {@code TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8}
+%% with Retain/Dup encoded 0 | 1. The application payload travels in the
+%% frame payload section untouched.
+%%
+%% PubAckMeta (Opcodes 16#0023, Rust -> BEAM for QoS 1):
+%% {@code PacketId:16be | RC:8}.
+%%
+%% UnbindMeta (Opcode 16#0012, BEAM -> Rust):
+%% {@code IdLen:16be | ClientId}.
+
+-type subscribe_meta() :: #{packet_id := 1..65535,
+                            client_id := binary(),
+                            subscriptions := [{binary(), 0..2}]}.
+-type suback_meta() :: #{packet_id := 1..65535,
+                         codes := [0..2 | 16#80]}.
+-type publish_meta() :: #{topic := binary(),
+                          packet_id := 0..65535,
+                          qos := 0..2,
+                          retain := boolean(),
+                          dup := boolean()}.
+-type puback_meta() :: #{packet_id := 1..65535,
+                         return_code := 0..255}.
+
+%% @doc Encode SubscribeIn metadata.
+-spec encode_subscribe_meta(1..65535, binary(), [{binary(), 0..2}]) -> binary().
+encode_subscribe_meta(PacketId, ClientId, Subs)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_binary(ClientId), is_list(Subs) ->
+    ok = validate_meta_subs(Subs),
+    SubBin = lists:foldl(
+        fun({Filter, QoS}, Acc) ->
+            <<Acc/binary, (byte_size(Filter)):16/big, Filter/binary, QoS:8>>
+        end, <<>>, Subs),
+    <<PacketId:16/big, (byte_size(ClientId)):16/big, ClientId/binary,
+      (length(Subs)):16/big, SubBin/binary>>.
+
+%% @doc Decode SubscribeIn metadata.
+-spec decode_subscribe_meta(binary()) -> {ok, subscribe_meta()} | {error, term()}.
+decode_subscribe_meta(<<PacketId:16/big, IdLen:16/big, Rest/binary>>)
+  when PacketId =/= 0 ->
+    case Rest of
+        <<ClientId:IdLen/binary, N:16/big, Tail/binary>> ->
+            case decode_meta_subs(Tail, N, []) of
+                {ok, Subs} ->
+                    {ok, #{packet_id => PacketId,
+                           client_id => ClientId,
+                           subscriptions => Subs}};
+                {error, _} = Err ->
+                    Err
+            end;
+        _ ->
+            {error, malformed_subscribe_meta}
+    end;
+decode_subscribe_meta(_) ->
+    {error, malformed_subscribe_meta}.
+
+%% @doc Encode SubAckOut metadata.
+-spec encode_suback_meta(1..65535, [0..2 | 16#80]) -> binary().
+encode_suback_meta(PacketId, Codes)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535, is_list(Codes) ->
+    <<PacketId:16/big, (list_to_binary(Codes))/binary>>.
+
+%% @doc Decode SubAckOut metadata.
+-spec decode_suback_meta(binary()) -> {ok, suback_meta()} | {error, term()}.
+decode_suback_meta(<<PacketId:16/big, Codes/binary>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId, codes => binary_to_list(Codes)}};
+decode_suback_meta(_) ->
+    {error, malformed_suback_meta}.
+
+%% @doc Encode PublishMeta (both PublishIn and PublishOut directions).
+-spec encode_publish_meta(binary(), 0..65535, 0..2, boolean(), boolean()) -> binary().
+encode_publish_meta(Topic, PacketId, QoS, Retain, Dup)
+  when is_binary(Topic), byte_size(Topic) >= 1,
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup) ->
+    R = case Retain of true -> 1; false -> 0 end,
+    D = case Dup of true -> 1; false -> 0 end,
+    <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8>>.
+
+%% @doc Decode PublishMeta.
+-spec decode_publish_meta(binary()) -> {ok, publish_meta()} | {error, term()}.
+decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) when TopicLen > 0 ->
+    case Rest of
+        <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1) ->
+            {ok, #{topic => Topic,
+                   packet_id => PacketId,
+                   qos => QoS,
+                   retain => R =:= 1,
+                   dup => D =:= 1}};
+        _ ->
+            {error, malformed_publish_meta}
+    end;
+decode_publish_meta(_) ->
+    {error, malformed_publish_meta}.
+
+%% @doc Encode PubAckOut metadata.
+-spec encode_puback_meta(1..65535, 0..255) -> binary().
+encode_puback_meta(PacketId, RC)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_integer(RC), RC >= 0, RC =< 255 ->
+    <<PacketId:16/big, RC:8>>.
+
+%% @doc Decode PubAckOut metadata.
+-spec decode_puback_meta(binary()) -> {ok, puback_meta()} | {error, term()}.
+decode_puback_meta(<<PacketId:16/big, RC:8>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId, return_code => RC}};
+decode_puback_meta(_) ->
+    {error, malformed_puback_meta}.
+
+%% @doc Encode UnbindConnection metadata (client identity).
+-spec encode_unbind_meta(binary()) -> binary().
+encode_unbind_meta(ClientId) when is_binary(ClientId) ->
+    <<(byte_size(ClientId)):16/big, ClientId/binary>>.
+
+%% @doc Decode UnbindConnection metadata.
+-spec decode_unbind_meta(binary()) -> {ok, #{client_id := binary()}} | {error, term()}.
+decode_unbind_meta(<<IdLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<ClientId:IdLen/binary>> ->
+            {ok, #{client_id => ClientId}};
+        _ ->
+            {error, malformed_unbind_meta}
+    end;
+decode_unbind_meta(_) ->
+    {error, malformed_unbind_meta}.
+
+validate_meta_subs([]) -> erlang:error(badarg);
+validate_meta_subs(Subs) -> validate_meta_subs(Subs, 0).
+
+validate_meta_subs([], N) when N > 0, N =< 65535 -> ok;
+validate_meta_subs([], _) -> erlang:error(badarg);
+validate_meta_subs([{Filter, QoS} | Rest], N)
+  when is_binary(Filter), byte_size(Filter) > 0,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2) ->
+    validate_meta_subs(Rest, N + 1);
+validate_meta_subs(_, _) -> erlang:error(badarg).
+
+decode_meta_subs(Rest, 0, Acc) ->
+    case Rest of
+        <<>> -> {ok, lists:reverse(Acc)};
+        _ -> {error, malformed_subscribe_meta}
+    end;
+decode_meta_subs(<<FilterLen:16/big, Rest/binary>>, N, Acc) when FilterLen > 0, N > 0 ->
+    case Rest of
+        <<Filter:FilterLen/binary, QoS:8, Tail/binary>>
+          when QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2 ->
+            decode_meta_subs(Tail, N - 1, [{Filter, QoS} | Acc]);
+        _ ->
+            {error, malformed_subscribe_meta}
+    end;
+decode_meta_subs(_, _, _) ->
+    {error, malformed_subscribe_meta}.
+
+%%====================================================================
 %% gen_server IPC client API
 %%====================================================================
 
@@ -461,7 +644,7 @@ transport_send(_State, _Frame) ->
 drain_buffer(State) ->
     Buf = maps:get(buffer, State),
     case decode_frame(Buf) of
-        {ok, Header, _Meta, _Payload, Rest} ->
+        {ok, Header, Meta, Payload, Rest} ->
             Frames = [Header | maps:get(frames, State)],
             State1 = case maps:get(opcode, Header) of
                 16#0002 ->
@@ -469,10 +652,35 @@ drain_buffer(State) ->
                 _ ->
                     State#{frames => Frames, buffer => Rest}
             end,
+            dispatch_frame(Header, Meta, Payload),
             drain_buffer(State1);
         {more, _Need} ->
             State;
         {error, _Reason} ->
             %% Drop corrupt bytes to avoid a wedged stream; keep running.
             State#{buffer => <<>>}
+    end.
+
+%% Opcodes routed to the owning connection process.
+-define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0031]).
+
+%% @private Route an inbound Rust frame to its connection process.
+%%
+%% Looks the frame ConnId up in {@code indra_conn_registry} and casts the
+%% frame to the owner. Total: unknown conns (or a missing registry) are
+%% silently dropped so one stray frame can never wedge the IPC client.
+dispatch_frame(Header, Meta, Payload) ->
+    Opcode = maps:get(opcode, Header),
+    case lists:member(Opcode, ?DISPATCH_OPCODES) of
+        false ->
+            ok;
+        true ->
+            ConnId = maps:get(conn_id, Header),
+            case catch indra_conn_registry:lookup(ConnId) of
+                {ok, Pid} ->
+                    catch gen_statem:cast(Pid, {broker_frame, Header, Meta, Payload}),
+                    ok;
+                _ ->
+                    ok
+            end
     end.

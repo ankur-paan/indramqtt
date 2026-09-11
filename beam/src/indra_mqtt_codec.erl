@@ -13,10 +13,17 @@
          encode_remaining_length/1,
          decode_connect/1,
          encode_connack/2,
+         decode_subscribe/1,
+         encode_suback/2,
+         decode_publish/2,
+         encode_publish/4,
+         encode_publish/6,
+         encode_puback/1,
          packet_type_atom/1,
          packet_type_code/1]).
 
 -define(MAX_REMAINING, 268435455).
+-define(MAX_TOPIC_LEN, 65535).
 
 -type packet_map() :: #{type := 1..14,
                         type_atom := atom(),
@@ -33,6 +40,14 @@
                          will_flag := boolean(),
                          will_qos := 0..2,
                          will_retain := boolean()}.
+-type subscribe_map() :: #{packet_id := 1..65535,
+                           subscriptions := [{binary(), 0..2}]}.
+-type publish_map() :: #{topic := binary(),
+                         packet_id := 0..65535,
+                         qos := 0..2,
+                         retain := boolean(),
+                         dup := boolean(),
+                         payload := binary()}.
 
 %%====================================================================
 %% Public API
@@ -131,6 +146,100 @@ encode_connack(SessionPresent, ReturnCode)
     SP = case SessionPresent of true -> 1; false -> 0 end,
     <<16#20, 16#02, SP:8, ReturnCode:8>>.
 
+%% @doc Decode an MQTT SUBSCRIBE payload (packet id + filter list).
+%%
+%% Takes the {@code payload} slice from {@code decode_packet/1}.
+%% Each subscription is a {@code {Filter, QoS}} pair; binaries reference
+%% the input (no copying).
+-spec decode_subscribe(binary()) -> {ok, subscribe_map()} | {error, term()}.
+decode_subscribe(<<PacketId:16/big, Rest/binary>>) when PacketId =/= 0 ->
+    case decode_sub_list(Rest, []) of
+        {ok, []} ->
+            {error, empty_subscribe};
+        {ok, Subs} ->
+            {ok, #{packet_id => PacketId, subscriptions => Subs}};
+        {error, _} = Err ->
+            Err
+    end;
+decode_subscribe(_) ->
+    {error, malformed_subscribe}.
+
+%% @doc Encode an MQTT SUBACK packet from a packet id and granted codes.
+%%
+%% Each code is a granted QoS (0..2) or 16#80 (failure).
+-spec encode_suback(1..65535, [0..2 | 16#80]) -> binary().
+encode_suback(PacketId, Codes)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535, is_list(Codes) ->
+    ok = validate_suback_codes(Codes),
+    <<16#90, (2 + length(Codes)), PacketId:16/big, (list_to_binary(Codes))/binary>>.
+
+%% @doc Decode an MQTT PUBLISH payload with its fixed-header flags.
+%%
+%% Flags is the low nibble of the fixed header byte (DUP | QoS(2) |
+%% RETAIN). Returns topic, packet id (0 when QoS 0), flags and the raw
+%% zero-copy application payload.
+-spec decode_publish(binary(), 0..15) -> {ok, publish_map()} | {error, term()}.
+decode_publish(Payload, Flags)
+  when is_binary(Payload), is_integer(Flags), Flags >= 0, Flags =< 15 ->
+    Qos = (Flags band 16#06) bsr 1,
+    Dup = (Flags band 16#08) =/= 0,
+    Retain = (Flags band 16#01) =/= 0,
+    case Qos of
+        Q when Q > 2 ->
+            {error, {invalid_publish_qos, Q}};
+        _ ->
+            case Payload of
+                <<TopicLen:16/big, Rest/binary>> when TopicLen > 0 ->
+                    case Rest of
+                        <<Topic:TopicLen/binary, Tail/binary>> ->
+                            case has_wildcard(Topic) of
+                                true -> {error, invalid_publish_topic};
+                                false -> decode_publish_tail(Qos, Topic, Dup, Retain, Tail)
+                            end;
+                        _ ->
+                            {error, truncated_publish}
+                    end;
+                _ ->
+                    {error, malformed_publish_topic}
+            end
+    end.
+
+has_wildcard(Topic) ->
+    case binary:match(Topic, [<<"+">>, <<"#">>]) of
+        nomatch -> false;
+        _ -> true
+    end.
+
+%% @doc Encode an outgoing MQTT PUBLISH packet (DUP = 0, RETAIN = 0).
+-spec encode_publish(binary(), 0..65535, 0..2, binary()) -> binary().
+encode_publish(Topic, PacketId, QoS, Payload) ->
+    encode_publish(Topic, PacketId, QoS, false, false, Payload).
+
+%% @doc Encode an outgoing MQTT PUBLISH packet with full flag control.
+-spec encode_publish(binary(), 0..65535, 0..2, boolean(), boolean(), binary()) -> binary().
+encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload)
+  when is_binary(Topic), byte_size(Topic) >= 1, byte_size(Topic) =< ?MAX_TOPIC_LEN,
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup), is_binary(Payload) ->
+    ok = validate_publish_id(QoS, PacketId),
+    Header = case QoS of
+        0 -> <<(byte_size(Topic)):16/big, Topic/binary>>;
+        _ -> <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big>>
+    end,
+    Body = <<Header/binary, Payload/binary>>,
+    Flags = (case Dup of true -> 16#08; false -> 0 end)
+        bor (QoS bsl 1)
+        bor (case Retain of true -> 16#01; false -> 0 end),
+    RL = encode_remaining_length(byte_size(Body)),
+    <<3:4, Flags:4, RL/binary, Body/binary>>.
+
+%% @doc Encode an MQTT PUBACK packet for a QoS 1 delivery.
+-spec encode_puback(1..65535) -> binary().
+encode_puback(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<16#40, 16#02, PacketId:16/big>>.
+
 %% @doc Map a 4-bit packet type code to its atom name.
 -spec packet_type_atom(0..15) -> atom().
 packet_type_atom(1) -> connect;
@@ -183,6 +292,10 @@ validate_flags(3, Flags) ->   %% PUBLISH: DUP|QoS(2)|RETAIN
     if Qos =< 2 -> ok; true -> {error, {invalid_flags, publish, Flags}} end;
 validate_flags(4, 0) -> ok;   %% PUBACK
 validate_flags(4, F) -> {error, {invalid_flags, puback, F}};
+validate_flags(8, 2) -> ok;   %% SUBSCRIBE reserved flags must be 0010
+validate_flags(8, F) -> {error, {invalid_flags, subscribe, F}};
+validate_flags(10, 2) -> ok;  %% UNSUBSCRIBE reserved flags must be 0010
+validate_flags(10, F) -> {error, {invalid_flags, unsubscribe, F}};
 validate_flags(12, 0) -> ok;  %% PINGREQ
 validate_flags(12, F) -> {error, {invalid_flags, pingreq, F}};
 validate_flags(13, 0) -> ok;  %% PINGRESP
@@ -193,6 +306,50 @@ validate_flags(14, F) -> {error, {invalid_flags, disconnect, F}};
 %% the Rust core performs full validation.
 validate_flags(Type, _Flags) when Type >= 1, Type =< 14 -> ok;
 validate_flags(Type, Flags) -> {error, {invalid_flags, Type, Flags}}.
+
+%% @private Decode the SUBSCRIBE filter list (accumulator reversed).
+decode_sub_list(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_sub_list(<<FilterLen:16/big, Rest/binary>>, Acc) when FilterLen > 0 ->
+    case Rest of
+        <<Filter:FilterLen/binary, QoS:8, Tail/binary>> when QoS =< 2 ->
+            decode_sub_list(Tail, [{Filter, QoS} | Acc]);
+        <<_:FilterLen/binary, QoS:8, _/binary>> ->
+            {error, {invalid_subscribe_qos, QoS}};
+        _ ->
+            {error, truncated_subscribe}
+    end;
+decode_sub_list(_, _) ->
+    {error, malformed_subscribe}.
+
+validate_suback_codes([]) -> ok;
+validate_suback_codes([16#80 | Rest]) -> validate_suback_codes(Rest);
+validate_suback_codes([C | Rest]) when C >= 0, C =< 2 -> validate_suback_codes(Rest);
+validate_suback_codes(_) -> erlang:error(badarg).
+
+decode_publish_tail(0, Topic, Dup, Retain, AppPayload) ->
+    {ok, #{topic => Topic,
+           packet_id => 0,
+           qos => 0,
+           retain => Retain,
+           dup => Dup,
+           payload => AppPayload}};
+decode_publish_tail(Qos, Topic, Dup, Retain, Tail) ->
+    case Tail of
+        <<PacketId:16/big, AppPayload/binary>> when PacketId =/= 0 ->
+            {ok, #{topic => Topic,
+                   packet_id => PacketId,
+                   qos => Qos,
+                   retain => Retain,
+                   dup => Dup,
+                   payload => AppPayload}};
+        _ ->
+            {error, malformed_publish_packet_id}
+    end.
+
+validate_publish_id(0, _) -> ok;
+validate_publish_id(_, PacketId) when PacketId >= 1 -> ok;
+validate_publish_id(_, _) -> erlang:error(badarg).
 
 %% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3.
 decode_connect_flags(Flags, Keepalive, Payload) ->

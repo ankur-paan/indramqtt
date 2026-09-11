@@ -244,6 +244,145 @@ session_binding_malformed_rejected_test() ->
                  indra_brokerlink:decode_session_binding_meta(<<0:64, 2, 0>>)).
 
 %%====================================================================
+%% Sprint 3 messaging metadata contracts
+%%====================================================================
+
+subscribe_meta_roundtrip_test() ->
+    Subs = [{<<"sport/tennis">>, 1}, {<<"news">>, 0}],
+    Meta = indra_brokerlink:encode_subscribe_meta(7, <<"dev-1">>, Subs),
+    {ok, Dec} = indra_brokerlink:decode_subscribe_meta(Meta),
+    ?assertEqual(7, maps:get(packet_id, Dec)),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(Subs, maps:get(subscriptions, Dec)).
+
+subscribe_meta_malformed_rejected_test() ->
+    ?assertEqual({error, malformed_subscribe_meta},
+                 indra_brokerlink:decode_subscribe_meta(<<>>)),
+    ?assertEqual({error, malformed_subscribe_meta},
+                 indra_brokerlink:decode_subscribe_meta(<<0, 7, 0, 5, "ab">>)),
+    %% Zero packet id.
+    ?assertEqual({error, malformed_subscribe_meta},
+                 indra_brokerlink:decode_subscribe_meta(<<0, 0, 0, 0, 0, 0>>)),
+    %% Declared count larger than the entries present.
+    ?assertEqual({error, malformed_subscribe_meta},
+                 indra_brokerlink:decode_subscribe_meta(
+                   <<0, 7, 0, 0, 0, 2, 0, 1, "a", 0>>)),
+    %% Empty subscription list rejected at encode time.
+    ?assertError(badarg, indra_brokerlink:encode_subscribe_meta(7, <<"d">>, [])),
+    %% Bad QoS rejected at encode time.
+    ?assertError(badarg,
+                 indra_brokerlink:encode_subscribe_meta(7, <<"d">>, [{<<"a">>, 3}])).
+
+suback_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_suback_meta(9, [0, 1, 2, 16#80]),
+    {ok, Dec} = indra_brokerlink:decode_suback_meta(Meta),
+    ?assertEqual(9, maps:get(packet_id, Dec)),
+    ?assertEqual([0, 1, 2, 16#80], maps:get(codes, Dec)),
+    ?assertEqual({error, malformed_suback_meta},
+                 indra_brokerlink:decode_suback_meta(<<0, 0>>)).
+
+publish_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_publish_meta(<<"sport/tennis">>, 42, 1, true, false),
+    {ok, Dec} = indra_brokerlink:decode_publish_meta(Meta),
+    ?assertEqual(<<"sport/tennis">>, maps:get(topic, Dec)),
+    ?assertEqual(42, maps:get(packet_id, Dec)),
+    ?assertEqual(1, maps:get(qos, Dec)),
+    ?assertEqual(true, maps:get(retain, Dec)),
+    ?assertEqual(false, maps:get(dup, Dec)).
+
+publish_meta_malformed_rejected_test() ->
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<>>)),
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<0, 0, 0, 0, 0, 0, 0>>)),
+    %% Truncated topic bytes.
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<0, 9, "short", 0, 0, 0, 0, 0>>)),
+    %% Illegal QoS nibble value.
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<0, 1, "t", 0, 0, 3, 0, 0>>)).
+
+puback_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_puback_meta(60000, 0),
+    {ok, Dec} = indra_brokerlink:decode_puback_meta(Meta),
+    ?assertEqual(60000, maps:get(packet_id, Dec)),
+    ?assertEqual(0, maps:get(return_code, Dec)),
+    ?assertEqual({error, malformed_puback_meta},
+                 indra_brokerlink:decode_puback_meta(<<0, 0>>)).
+
+unbind_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_unbind_meta(<<"dev-9">>),
+    ?assertEqual({ok, #{client_id => <<"dev-9">>}},
+                 indra_brokerlink:decode_unbind_meta(Meta)),
+    ?assertEqual({error, malformed_unbind_meta},
+                 indra_brokerlink:decode_unbind_meta(<<0, 4, "ab">>)).
+
+%%====================================================================
+%% Inbound dispatch through the connection registry (Sprint 3)
+%%====================================================================
+
+dispatch_publishout_to_registered_conn_test() ->
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw},
+                                     {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(LSock),
+    Server = spawn(fun() -> dispatch_server(LSock) end),
+    {ok, Registry} = indra_conn_registry:start_link(),
+    {ok, Client} = indra_brokerlink:start_link([{transport, tcp},
+                                                {host, "127.0.0.1"},
+                                                {port, Port}]),
+    try
+        %% Register the test process as the owner of conn 6101.
+        ok = indra_conn_registry:register(6101, self()),
+        %% Fake Rust core emits one PublishOut addressed to us.
+        Meta = indra_brokerlink:encode_publish_meta(<<"t">>, 0, 0, false, false),
+        Frame = indra_brokerlink:encode_frame(16#0021, 6101, 9, Meta, <<"hi">>),
+        Server ! {emit, Frame},
+        receive
+            {'$gen_cast', {broker_frame, Header, GotMeta, GotPayload}} ->
+                ?assertEqual(16#0021, maps:get(opcode, Header)),
+                ?assertEqual(6101, maps:get(conn_id, Header)),
+                ?assertEqual(Meta, GotMeta),
+                ?assertEqual(<<"hi">>, GotPayload)
+        after 5000 ->
+            error(dispatch_timeout)
+        end,
+        %% After unregister, frames for the conn are dropped silently.
+        ok = indra_conn_registry:unregister(6101),
+        Server ! {emit, Frame},
+        receive
+            {'$gen_cast', _} -> error(unexpected_dispatch)
+        after 300 ->
+            ok
+        end
+    after
+        indra_brokerlink:stop(Client),
+        indra_conn_registry:stop(Registry),
+        gen_tcp:close(LSock)
+    end.
+
+%%--------------------------------------------------------------------
+%% Helpers
+%%--------------------------------------------------------------------
+
+%% @private Minimal fake core: forwards emitted binaries to the acceptor.
+dispatch_server(LSock) ->
+    case gen_tcp:accept(LSock, 5000) of
+        {ok, Sock} ->
+            dispatch_loop(Sock);
+        {error, _} ->
+            ok
+    end.
+
+dispatch_loop(Sock) ->
+    receive
+        {emit, Bin} ->
+            gen_tcp:send(Sock, Bin),
+            dispatch_loop(Sock)
+    after 8000 ->
+        gen_tcp:close(Sock)
+    end.
+
+%%====================================================================
 %% gen_server IPC behaviour (loopback TCP, no external services)
 %%====================================================================
 
