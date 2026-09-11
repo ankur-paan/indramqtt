@@ -109,7 +109,8 @@ fn session_binding_reply(
 /// Authenticated bind for the live path: credentialed requests verify
 /// against the auth store first (failure short-circuits to return code
 /// `0x86`, bad username/password, with no session created), then the
-/// standard session resolution applies.
+/// per-user connection quota applies (overage short-circuits to `0x8B`),
+/// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         if req.username.is_some() {
@@ -122,9 +123,39 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             {
                 return Some(session_binding_reply(frame, 0, false, 0x86));
             }
+            // Takeover pre-release: a live session for this client means
+            // the previous holder was orphaned by this very bind.
+            let already_live = shared
+                .sessions
+                .get(&req.client_id)
+                .map(|session| *session.connected.read())
+                .unwrap_or(false);
+            if already_live {
+                if let Some(username) = &req.username {
+                    shared.sessions.release_connection_slot(username);
+                }
+            }
+            if let Some(username) = &req.username {
+                let max = shared
+                    .auth
+                    .get_quotas(username)
+                    .and_then(|quotas| quotas.max_connections);
+                if !shared.sessions.acquire_connection_slot(username, max) {
+                    return Some(session_binding_reply(frame, 0, false, 0x8B));
+                }
+            }
         }
     }
-    reply_for_frame(frame, &shared.sessions)
+    let reply = reply_for_frame(frame, &shared.sessions);
+    // Stamp ownership for quota release and publish attribution.
+    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+        if let (Some(session), Some(username)) =
+            (shared.sessions.get(&req.client_id), &req.username)
+        {
+            *session.username.write() = Some(username.clone());
+        }
+    }
+    reply
 }
 
 /// Decode `BindConnection` metadata.
@@ -638,6 +669,19 @@ async fn apply_publish(
         }
     }
 
+    // Rate policing (INDRA-128): token bucket per publishing client,
+    // configured per user. Over quota the message dies here — QoS 0 is
+    // dropped and counted, QoS 1 gets its PubAck stamped 0x97.
+    if !check_publish_quota(frame, shared).await {
+        shared.metrics.inc_messages_dropped();
+        let ack = if qos == QoS::AtLeastOnce {
+            pub_ack_reply(frame, packet_id, 0x97)
+        } else {
+            None
+        };
+        return (ack, Vec::new());
+    }
+
     // Delayed delivery: ack now (the publisher must not stall), defer
     // everything else past the timer.
     if let Some((delay_secs, inner)) = strip_delayed_prefix(&topic_str) {
@@ -849,6 +893,31 @@ fn build_downlink_frames(
         }
     }
     deliveries
+}
+
+/// Token-bucket gate for one publish (INDRA-128). Resolves the owning
+/// client, looks up its user's rate quota, and consumes one token.
+/// True means route; false means drop. Anonymous, unknown, and
+/// unconfigured clients are unlimited.
+async fn check_publish_quota(frame: &BrokerFrame, shared: &Shared) -> bool {
+    let Some(client_id) = shared.sessions.client_id_for_conn(frame.header.conn_id) else {
+        return true;
+    };
+    let Some(session) = shared.sessions.get(&client_id) else {
+        return true;
+    };
+    let username = session.username.read().clone();
+    let Some(username) = username else {
+        return true;
+    };
+    let Some(quotas) = shared.auth.get_quotas(&username) else {
+        return true;
+    };
+    let Some(rate) = quotas.max_publish_rate else {
+        return true;
+    };
+    let burst = quotas.max_publish_burst.unwrap_or(rate);
+    shared.sessions.check_publish_budget(&client_id, rate, burst)
 }
 
 /// Build one `PubAckOut` reply mirroring the request identity.
@@ -2169,6 +2238,118 @@ mod tests {
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_quota_overage_returns_0x8b() {
+        use broker_auth::UserQuotas;
+
+        let shared = test_shared();
+        shared.auth.add_user("capped-user", b"pw");
+        assert!(shared.auth.set_quotas(
+            "capped-user",
+            UserQuotas {
+                max_connections: Some(1),
+                max_publish_rate: None,
+                max_publish_burst: None,
+            }
+        ));
+
+        // First connection admitted.
+        let frame = bind_frame(
+            84,
+            1,
+            encode_bind_meta_creds("dev-one", true, 60, "capped-user", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+
+        // Second concurrent connection for the same user: quota exceeded.
+        let frame = bind_frame(
+            85,
+            1,
+            encode_bind_meta_creds("dev-two", true, 60, "capped-user", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "overage must yield return code 0x8B");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-two").is_none());
+
+        // Takeover by the same client reuses its slot instead of denying.
+        let frame = bind_frame(
+            86,
+            1,
+            encode_bind_meta_creds("dev-one", true, 60, "capped-user", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+
+        // The orphaned first connection detaching afterwards releases
+        // nothing (ownership check): the retaken slot stays held.
+        shared.sessions.unbind_connection("dev-one", 84);
+        let frame = bind_frame(
+            87,
+            1,
+            encode_bind_meta_creds("dev-three", true, 60, "capped-user", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "slot still held after orphan detach");
+    }
+
+    #[tokio::test]
+    async fn publish_rate_overage_returns_0x97_and_drops() {
+        use broker_auth::UserQuotas;
+
+        let shared = test_shared();
+        shared.auth.add_user("fast-user", b"pw");
+        assert!(shared.auth.set_quotas(
+            "fast-user",
+            UserQuotas {
+                max_connections: None,
+                max_publish_rate: Some(2),
+                max_publish_burst: Some(2),
+            }
+        ));
+
+        // Subscriber soaks up whatever routes (proves the drop below).
+        let (listener, _) = shared.sessions.get_or_create("sink", true);
+        *listener.conn_id.write() = Some(96);
+        let sub = subscribe_frame(96, 1, encode_subscribe_meta(1, "sink", &[("t/rate", 0)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Publisher session owned by the capped user.
+        let (publ, _) = shared.sessions.get_or_create("throttled", true);
+        *publ.conn_id.write() = Some(97);
+        *publ.username.write() = Some("fast-user".to_string());
+
+        // Burst of 2 routes; the immediate third is over quota.
+        for seq in 2..=3u64 {
+            let (meta, payload) = encode_publish_meta("t/rate", seq as u16, 1, false, b"x");
+            let (ack, deliveries) =
+                apply_publish(&publish_frame(97, seq, meta, payload), &shared).await;
+            assert!(ack.is_some());
+            assert_eq!(deliveries.len(), 1, "burst publishes must route");
+        }
+        let (meta, payload) = encode_publish_meta("t/rate", 4, 1, false, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(97, 4, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 over-rate still gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x04, 0x97u8]);
+        assert!(deliveries.is_empty(), "over-rate publish must not fan out");
+
+        // QoS 0 over-rate drops silently but counts.
+        let (meta, payload) = encode_publish_meta("t/rate", 0, 0, false, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(97, 5, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+        // Both over-rate drops counted (QoS 1 above + this QoS 0).
+        assert_eq!(shared.metrics.messages_dropped(), 2);
     }
 
     #[tokio::test]

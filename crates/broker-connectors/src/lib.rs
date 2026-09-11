@@ -2,11 +2,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use broker_protocol::{QoS, Topic};
 use reqwest::header::{HeaderMap, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+pub mod kafka;
+pub mod rabbitmq;
+
+pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
+pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -22,14 +29,48 @@ pub enum ConnectorError {
 
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 
+/// Unified outbound boundary: every streaming sink implements `Sink`.
 #[async_trait]
-pub trait SinkConnector: Send + Sync {
+pub trait Sink: Send + Sync {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()>;
+    /// Stable kind name for management display (`webhook`, `console`,
+    /// `kafka`, `rabbitmq`, ...).
+    fn kind(&self) -> &'static str;
 }
 
-#[async_trait]
-pub trait SourceConnector: Send + Sync {
-    async fn poll(&self) -> Result<Option<(Topic, Bytes)>>;
+/// Unified connector identity: a registered, addressable sink.
+pub trait Connector: Send + Sync {
+    fn connector_id(&self) -> &str;
+    fn kind(&self) -> &'static str;
+}
+
+/// Management view of one registered connector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorInfo {
+    pub id: String,
+    pub kind: String,
+}
+
+/// Manager-side handle pairing an id with its sink.
+pub struct RegisteredConnector {
+    id: String,
+    sink: Arc<dyn Sink>,
+}
+
+impl RegisteredConnector {
+    fn new(id: String, sink: Arc<dyn Sink>) -> Self {
+        Self { id, sink }
+    }
+}
+
+impl Connector for RegisteredConnector {
+    fn connector_id(&self) -> &str {
+        &self.id
+    }
+
+    fn kind(&self) -> &'static str {
+        self.sink.kind()
+    }
 }
 
 /// Default per-request timeout for webhook delivery.
@@ -76,7 +117,7 @@ impl HttpWebhookSink {
 }
 
 #[async_trait]
-impl SinkConnector for HttpWebhookSink {
+impl Sink for HttpWebhookSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
         let response = self
             .client
@@ -100,6 +141,10 @@ impl SinkConnector for HttpWebhookSink {
         }
         self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        "webhook"
     }
 }
 
@@ -127,7 +172,7 @@ impl ConsoleLoggerSink {
 }
 
 #[async_trait]
-impl SinkConnector for ConsoleLoggerSink {
+impl Sink for ConsoleLoggerSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
         let preview = match std::str::from_utf8(payload) {
             Ok(text) if text.len() <= self.max_preview_bytes => text.into(),
@@ -144,12 +189,16 @@ impl SinkConnector for ConsoleLoggerSink {
         self.logged.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    fn kind(&self) -> &'static str {
+        "console"
+    }
 }
 
 /// Registry of live outbound connectors by id.
 #[derive(Default)]
 pub struct ConnectorManager {
-    connectors: parking_lot::RwLock<HashMap<String, Arc<dyn SinkConnector>>>,
+    connectors: parking_lot::RwLock<HashMap<String, RegisteredConnector>>,
 }
 
 impl ConnectorManager {
@@ -157,22 +206,40 @@ impl ConnectorManager {
         Self::default()
     }
 
-    pub fn register(&self, id: impl Into<String>, sink: Arc<dyn SinkConnector>) {
-        self.connectors.write().insert(id.into(), sink);
+    pub fn register(&self, id: impl Into<String>, sink: Arc<dyn Sink>) {
+        let id = id.into();
+        self.connectors
+            .write()
+            .insert(id.clone(), RegisteredConnector::new(id, sink));
     }
 
     pub fn unregister(&self, id: &str) -> bool {
         self.connectors.write().remove(id).is_some()
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<dyn SinkConnector>> {
-        self.connectors.read().get(id).cloned()
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Sink>> {
+        self.connectors.read().get(id).map(|entry| entry.sink.clone())
     }
 
     pub fn ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.connectors.read().keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Ordered management view (`id` + `kind`) for the dashboard.
+    pub fn infos(&self) -> Vec<ConnectorInfo> {
+        let mut infos: Vec<ConnectorInfo> = self
+            .connectors
+            .read()
+            .values()
+            .map(|entry| ConnectorInfo {
+                id: entry.connector_id().to_string(),
+                kind: entry.kind().to_string(),
+            })
+            .collect();
+        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        infos
     }
 
     /// Deliver one event through the named connector.
@@ -203,7 +270,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl SinkConnector for RecordingSink {
+    impl Sink for RecordingSink {
         async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
             self.events.lock().unwrap().push((
                 topic.as_str().to_string(),
@@ -211,6 +278,10 @@ mod tests {
                 u8::from(qos),
             ));
             Ok(())
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
         }
     }
 
@@ -220,7 +291,7 @@ mod tests {
         assert!(manager.ids().is_empty());
         assert!(manager.get("missing").is_none());
 
-        let sink: Arc<dyn SinkConnector> = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn Sink> = Arc::new(RecordingSink::default());
         manager.register("rec", sink);
         assert_eq!(manager.ids(), vec!["rec".to_string()]);
 

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -21,6 +22,9 @@ pub struct Session {
     /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
     /// the edge at bind time; surfaced read-only for observability.
     pub keepalive_secs: RwLock<u16>,
+    /// Authenticated username that owns this session, if any. Maintained
+    /// by the edge at bind time; drives per-user quota accounting.
+    pub username: RwLock<Option<String>>,
     next_packet_id: AtomicU16,
 }
 
@@ -62,6 +66,7 @@ impl Session {
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
             keepalive_secs: RwLock::new(0),
+            username: RwLock::new(None),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -95,9 +100,53 @@ impl Session {
     }
 }
 
+/// In-memory token bucket for per-client publish rate limiting.
+/// Starts full; refills lazily on each check so idle clients never pay
+/// for a background task.
+#[derive(Debug)]
+pub struct TokenBucket {
+    rate_per_sec: u32,
+    burst: u32,
+    tokens: f64,
+    last_update: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(rate_per_sec: u32, burst: u32) -> Self {
+        Self {
+            rate_per_sec,
+            burst,
+            tokens: burst as f64,
+            last_update: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. False means the publish is over quota.
+    pub fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        self.last_update = now;
+        self.tokens = (self.tokens + elapsed * f64::from(self.rate_per_sec))
+            .min(f64::from(self.burst));
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     next_session_id: AtomicU64,
+    /// Live connection count per username (INDRA-127 quotas). Anonymous
+    /// binds bypass accounting entirely.
+    conn_counts: RwLock<HashMap<String, AtomicU32>>,
+    /// Publish token buckets per client id (INDRA-128 rate limits).
+    /// Pruned on unbind so reconnects start full and state cannot grow
+    /// without bound.
+    buckets: RwLock<HashMap<String, TokenBucket>>,
 }
 
 impl Default for SessionManager {
@@ -111,6 +160,8 @@ impl SessionManager {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            conn_counts: RwLock::new(HashMap::new()),
+            buckets: RwLock::new(HashMap::new()),
         }
     }
 
@@ -195,14 +246,70 @@ impl SessionManager {
     }
 
     pub fn unbind_connection(&self, client_id: &str, conn_id: u64) {
-        let map = self.sessions.read();
-        if let Some(session) = map.get(client_id) {
-            let mut current_conn = session.conn_id.write();
-            if *current_conn == Some(conn_id) {
-                *current_conn = None;
-                *session.connected.write() = false;
+        let username_to_release: Option<String> = {
+            let map = self.sessions.read();
+            match map.get(client_id) {
+                Some(session) => {
+                    let mut current_conn = session.conn_id.write();
+                    if *current_conn == Some(conn_id) {
+                        *current_conn = None;
+                        *session.connected.write() = false;
+                        session.username.read().clone()
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             }
+        };
+        if let Some(username) = username_to_release {
+            self.release_connection_slot(&username);
         }
+        // Reconnects start with a full bucket; abandoned entries vanish.
+        self.buckets.write().remove(client_id);
+    }
+
+    /// Admit one connection for `username` under an optional cap
+    /// (`None` = unlimited). Single-lock check-and-increment: at most
+    /// `max` concurrent holders ever observe success.
+    pub fn acquire_connection_slot(&self, username: &str, max: Option<u32>) -> bool {
+        let Some(max) = max else {
+            return true;
+        };
+        let mut counts = self.conn_counts.write();
+        let count = counts
+            .entry(username.to_string())
+            .or_insert_with(|| AtomicU32::new(0));
+        if count.load(Ordering::SeqCst) >= max {
+            return false;
+        }
+        count.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Release one previously acquired slot (saturates at zero: double
+    /// releases from racing teardowns can never underflow).
+    pub fn release_connection_slot(&self, username: &str) {
+        if let Some(count) = self.conn_counts.read().get(username) {
+            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_sub(1)
+            });
+        }
+    }
+
+    /// Token-bucket gate for one publish by `client_id`. Buckets are
+    /// created lazily with the currently configured `(rate, burst)` and
+    /// reset when the configuration changes, so quota edits apply to the
+    /// very next publish.
+    pub fn check_publish_budget(&self, client_id: &str, rate: u32, burst: u32) -> bool {
+        let mut buckets = self.buckets.write();
+        let bucket = buckets
+            .entry(client_id.to_string())
+            .or_insert_with(|| TokenBucket::new(rate, burst));
+        if bucket.rate_per_sec != rate || bucket.burst != burst {
+            *bucket = TokenBucket::new(rate, burst);
+        }
+        bucket.try_consume()
     }
 }
 
@@ -335,5 +442,89 @@ mod tests {
             drained[0].payload,
             Bytes::from(10u32.to_be_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn test_connection_slots_enforce_max() {
+        let manager = SessionManager::new();
+
+        // Unlimited by default: always admitted.
+        for _ in 0..10 {
+            assert!(manager.acquire_connection_slot("free-user", None));
+        }
+
+        // Exactly max admissions, then denial: #101 of max 100 fails.
+        for _ in 0..100 {
+            assert!(manager.acquire_connection_slot("capped", Some(100)));
+        }
+        assert!(!manager.acquire_connection_slot("capped", Some(100)));
+
+        // Releasing re-opens exactly one slot.
+        manager.release_connection_slot("capped");
+        assert!(manager.acquire_connection_slot("capped", Some(100)));
+        assert!(!manager.acquire_connection_slot("capped", Some(100)));
+
+        // Releases saturate at zero: unknown users and double releases
+        // never underflow or panic.
+        manager.release_connection_slot("ghost");
+        manager.release_connection_slot("capped");
+        manager.release_connection_slot("capped");
+
+        // Unbind detaches and releases the owner's slot together.
+        let (session, _) = manager.get_or_create("bound-client", true);
+        *session.conn_id.write() = Some(11);
+        *session.username.write() = Some("capped".to_string());
+        assert!(manager.acquire_connection_slot("capped", Some(100)));
+        manager.unbind_connection("bound-client", 11);
+        assert!(!*session.connected.read());
+        // Slot freed by the detach: a fresh bind is admitted again.
+        assert!(manager.acquire_connection_slot("capped", Some(100)));
+
+        // A racing teardown for a superseded conn_id releases nothing:
+        // admission still succeeds exactly as before.
+        manager.unbind_connection("bound-client", 999);
+        assert!(manager.acquire_connection_slot("capped", Some(100)));
+        assert!(!manager.acquire_connection_slot("capped", Some(100)));
+    }
+
+    #[test]
+    fn test_token_bucket_burst_then_throttles() {
+        let mut bucket = TokenBucket::new(10, 2);
+        assert!(bucket.try_consume());
+        assert!(bucket.try_consume());
+        // Burst spent: immediate third consume fails.
+        assert!(!bucket.try_consume());
+    }
+
+    #[tokio::test]
+    async fn test_check_publish_budget_refills_over_time() {
+        let manager = SessionManager::new();
+        // Burst of 1 at 1000 msg/s: first passes, immediate second drops.
+        assert!(manager.check_publish_budget("fast", 1000, 1));
+        assert!(!manager.check_publish_budget("fast", 1000, 1));
+        // After ~5ms the bucket refilled ~5 tokens: passes again.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(manager.check_publish_budget("fast", 1000, 1));
+
+        // Reconfiguring quotas resets the bucket immediately (no sleep):
+        // drain it first, then widen the burst and pass at once.
+        assert!(!manager.check_publish_budget("fast", 1000, 1));
+        assert!(manager.check_publish_budget("fast", 1000, 50));
+        assert!(manager.check_publish_budget("fast", 1000, 50));
+    }
+
+    #[test]
+    fn test_unbind_prunes_publish_bucket() {
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("pruned", true);
+        *session.conn_id.write() = Some(21);
+
+        // Spend the whole burst, then detach: the bucket is forgotten.
+        assert!(manager.check_publish_budget("pruned", 1000, 1));
+        assert!(!manager.check_publish_budget("pruned", 1000, 1));
+        manager.unbind_connection("pruned", 21);
+
+        // Reconnect starts full again without waiting for refill.
+        assert!(manager.check_publish_budget("pruned", 1000, 1));
     }
 }

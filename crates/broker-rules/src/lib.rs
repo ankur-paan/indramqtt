@@ -273,7 +273,7 @@ impl RuleEngine {
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
-        actions: Vec<RuleAction>,
+        mut actions: Vec<RuleAction>,
     ) -> Result<Rule, RuleEngineError> {
         // The upstream parser only accepts bare-word stream names after
         // FROM, while MQTT rules naturally reference quoted topic filters
@@ -281,7 +281,27 @@ impl RuleEngine {
         // `topic_filter` and never reads `stmt.from`, so the target is
         // normalized to a dummy identifier before parsing. The original
         // SQL string is preserved verbatim on the rule.
-        let parsed_query = match &sql_query {
+        //
+        // A trailing `INTO connector("<id>")` clause desugars to an
+        // equivalent `ForwardConnector` action (deduped): the streaming
+        // bridge to external sinks without a separate code path. The
+        // stored `sql_query` keeps the original text for display.
+        let stripped_sql = match &sql_query {
+            Some(sql) => {
+                let (stripped, into_connector) = split_into_connector(sql)?;
+                if let Some(connector_id) = into_connector {
+                    let already = actions.iter().any(|action| {
+                        matches!(action, RuleAction::ForwardConnector { connector_id: id } if id == &connector_id)
+                    });
+                    if !already {
+                        actions.push(RuleAction::ForwardConnector { connector_id });
+                    }
+                }
+                Some(stripped)
+            }
+            None => None,
+        };
+        let parsed_query = match &stripped_sql {
             Some(sql) => {
                 let normalized = normalize_from_target(sql);
                 let stmt = rekuiper_sql::Parser::new(&normalized)
@@ -517,6 +537,117 @@ pub fn try_evaluate(
             None => Ok((false, None)),
         },
     }
+}
+
+/// Split a trailing `INTO connector("<id>")` clause off a rule SQL
+/// statement, returning `(statement_without_into, connector_id)`.
+///
+/// The scan is top-level only (parentheses and quoted strings are
+/// skipped), case-insensitive, and strict: a malformed INTO fails rule
+/// creation instead of silently changing routing. A field literally
+/// named `into` is unsupported (creation fails loudly in that case).
+fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngineError> {
+    fn invalid(reason: impl Into<String>) -> RuleEngineError {
+        RuleEngineError::InvalidRule(format!("invalid INTO clause: {}", reason.into()))
+    }
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let n = chars.len();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+    let mut i = 0;
+    let mut depth = 0u32;
+    let mut in_string: Option<char> = None;
+    while i < n {
+        let (b, c) = chars[i];
+        if let Some(quote) = in_string {
+            if c == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                in_string = Some(c);
+                i += 1;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                let is_into = depth == 0
+                    && (c == 'i' || c == 'I')
+                    && sql.len() - b >= 4
+                    && sql[b..b + 4].eq_ignore_ascii_case("into")
+                    && (b == 0 || !is_word(sql[..b].chars().next_back().unwrap_or(' ')))
+                    && (b + 4 >= sql.len()
+                        || !is_word(sql[b + 4..].chars().next().unwrap_or(' ')));
+                if !is_into {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 4;
+                while j < n && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                let word_start = j;
+                while j < n && (chars[j].1.is_alphanumeric() || chars[j].1 == '_') {
+                    j += 1;
+                }
+                let word: String = chars[word_start..j].iter().map(|(_, c)| *c).collect();
+                if !word.eq_ignore_ascii_case("connector") {
+                    return Err(invalid("INTO must target connector(\"<id>\")"));
+                }
+                while j < n && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                if j >= n || chars[j].1 != '(' {
+                    return Err(invalid("expected '(' after connector"));
+                }
+                j += 1;
+                while j < n && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                if j >= n || !matches!(chars[j].1, '"' | '\'') {
+                    return Err(invalid("connector id must be quoted"));
+                }
+                let quote = chars[j].1;
+                j += 1;
+                let id_start = j;
+                while j < n && chars[j].1 != quote {
+                    j += 1;
+                }
+                if j >= n {
+                    return Err(invalid("unterminated connector id"));
+                }
+                let id: String = chars[id_start..j].iter().map(|(_, c)| *c).collect();
+                j += 1;
+                while j < n && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                if j >= n || chars[j].1 != ')' {
+                    return Err(invalid("expected ')' after connector id"));
+                }
+                j += 1;
+                if id.is_empty() {
+                    return Err(invalid("connector id must not be empty"));
+                }
+                let tail: String = chars[j..].iter().map(|(_, c)| *c).collect();
+                let tail_trimmed = tail.trim().trim_end_matches(';').trim_end();
+                if !tail_trimmed.is_empty() {
+                    return Err(invalid("unexpected trailing input after ')'"));
+                }
+                let stripped = sql[..b].trim_end().to_string();
+                return Ok((stripped, Some(id)));
+            }
+        }
+    }
+    Ok((sql.to_string(), None))
 }
 
 /// Run one ingress payload through an optional parsed query.
@@ -955,7 +1086,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl broker_connectors::SinkConnector for RecordingConnector {
+    impl broker_connectors::Sink for RecordingConnector {
         async fn send(
             &self,
             topic: &Topic,
@@ -968,6 +1099,10 @@ mod tests {
                 u8::from(qos),
             ));
             Ok(())
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
         }
     }
 
@@ -1046,8 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_evaluate_vectors() {
-        let payload = serde_json::json!({ "temperature": 72.5, "secret": "x" });
+    fn test_try_evaluate_vectors() {        let payload = serde_json::json!({ "temperature": 72.5, "secret": "x" });
 
         // SQL match with projection.
         let (matched, projected) = try_evaluate(
@@ -1104,5 +1238,167 @@ mod tests {
         assert!(try_evaluate(Some("SELECT WHERE WHERE"), None, "t", &payload).is_err());
         assert!(try_evaluate(None, Some("a/#/b"), "t", &payload).is_err());
         assert!(try_evaluate(None, None, "", &payload).is_err());
+    }
+
+    #[test]
+    fn test_split_into_connector_vectors() {
+        // No INTO: untouched, no binding.
+        let (stripped, bound) =
+            split_into_connector(r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#)
+                .expect("parses");
+        assert_eq!(stripped, r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#);
+        assert_eq!(bound, None);
+
+        // Trailing INTO binds the connector and strips cleanly.
+        let (stripped, bound) = split_into_connector(
+            r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0 INTO connector("kafka-sink-1")"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            stripped,
+            r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#
+        );
+        assert_eq!(bound, Some("kafka-sink-1".to_string()));
+
+        // Single quotes, extra whitespace, trailing semicolon tolerated.
+        let (stripped, bound) = split_into_connector(
+            "SELECT a FROM s WHERE v > 1   INTO   connector( 'r1' ) ;",
+        )
+        .expect("parses");
+        assert_eq!(stripped, "SELECT a FROM s WHERE v > 1");
+        assert_eq!(bound, Some("r1".to_string()));
+
+        // INTO inside a string literal is data, not a clause.
+        let (stripped, bound) =
+            split_into_connector(r#"SELECT * FROM s WHERE note = 'INTO the void'"#)
+                .expect("parses");
+        assert_eq!(bound, None);
+        assert!(stripped.contains("INTO the void"));
+
+        // Malformed INTO fails creation loudly.
+        for bad in [
+            r#"SELECT * FROM s INTO connector()"#,
+            r#"SELECT * FROM s INTO connector("unclosed)"#,
+            r#"SELECT * FROM s INTO connector"#,
+            r#"SELECT * FROM s INTO topic("x")"#,
+            r#"SELECT * FROM s INTO connector("x") TRAILING"#,
+        ] {
+            assert!(
+                split_into_connector(bad).is_err(),
+                "must reject: {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_into_connector_desugars_to_forward_action() {
+        use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
+
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let transport = Arc::new(MemoryKafkaTransport::new());
+        let kafka = Arc::new(
+            KafkaSink::new(
+                KafkaSinkConfig {
+                    bootstrap_servers: "unused:9092".to_string(),
+                    topic_template: "out-${topic}".to_string(),
+                    partition_key_field: Some("device_id".to_string()),
+                    partitions: 4,
+                    client_id: "test".to_string(),
+                    acks: "1".to_string(),
+                    batch_max_records: 100,
+                    batch_max_bytes: 1024 * 1024,
+                },
+                transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("kafka-sink-1", kafka.clone());
+
+        // INTO appends the ForwardConnector action; the original SQL is
+        // preserved verbatim on the stored rule.
+        let rule = engine
+            .create_rule(
+                "bridge".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT temperature, device_id FROM "sensors/+" WHERE temperature > 0 INTO connector("kafka-sink-1")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        assert_eq!(
+            rule.sql_query.as_deref(),
+            Some(r#"SELECT temperature, device_id FROM "sensors/+" WHERE temperature > 0 INTO connector("kafka-sink-1")"#)
+        );
+        assert!(rule.actions.iter().any(|action| matches!(
+            action,
+            RuleAction::ForwardConnector { connector_id } if connector_id == "kafka-sink-1"
+        )));
+
+        // End to end: ingress MQTT bytes trigger SQL projection into the
+        // mock Kafka buffer (no broker anywhere in the loop). Batching
+        // holds records until the batch limit or an explicit flush.
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "temperature": 72.5, "device_id": "d7", "secret": "hide_me" }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(kafka.buffered_records(), 1);
+        kafka.flush().await.expect("flush");
+
+        let records = transport.records_flat();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].topic, "out-sensors/kitchen");
+        assert_eq!(records[0].key, Some(Bytes::from_static(b"d7")));
+        let body: serde_json::Value =
+            serde_json::from_slice(&records[0].value).expect("projected JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({ "temperature": 72.5, "device_id": "d7" })
+        );
+        let header_map: std::collections::HashMap<&str, &Bytes> = records[0]
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        assert_eq!(
+            header_map.get("mqtt.topic"),
+            Some(&&Bytes::from_static(b"sensors/kitchen"))
+        );
+
+        // Below-threshold ingress fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "temperature": -5.0, "device_id": "d7" }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(transport.records_flat().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_into_malformed_rejected_at_creation() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let err = engine
+            .create_rule(
+                "broken-into".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(r#"SELECT * FROM "sensors/+" WHERE temperature > 0 INTO connector()"#.to_string()),
+                true,
+                vec![],
+            )
+            .expect_err("malformed INTO must fail creation");
+        assert!(matches!(err, RuleEngineError::InvalidRule(_)));
+        assert!(engine.list_rules().is_empty());
     }
 }

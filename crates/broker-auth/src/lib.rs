@@ -165,8 +165,23 @@ impl AclRule {
 /// first matching rule decides and anything unmatched is denied.
 #[derive(Debug, Default)]
 pub struct MemoryAuth {
-    users: RwLock<HashMap<String, [u8; 32]>>,
+    users: RwLock<HashMap<String, UserEntry>>,
     rules: RwLock<Vec<AclRule>>,
+}
+
+/// Per-user multi-tenant quotas. Every bound is optional (`None` =
+/// unlimited); unset quotas preserve the pre-quota open behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct UserQuotas {
+    pub max_connections: Option<u32>,
+    pub max_publish_rate: Option<u32>,
+    pub max_publish_burst: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct UserEntry {
+    password_hash: [u8; 32],
+    quotas: UserQuotas,
 }
 
 impl MemoryAuth {
@@ -179,10 +194,18 @@ impl MemoryAuth {
     }
 
     /// Store (or replace) a username with its password digest.
+    /// Existing quotas survive a password change.
     pub fn add_user(&self, username: impl Into<String>, password: &[u8]) {
-        self.users
-            .write()
-            .insert(username.into(), Self::digest(password));
+        let username = username.into();
+        let mut users = self.users.write();
+        let quotas = users.get(&username).map(|entry| entry.quotas.clone()).unwrap_or_default();
+        users.insert(
+            username,
+            UserEntry {
+                password_hash: Self::digest(password),
+                quotas,
+            },
+        );
     }
 
     pub fn remove_user(&self, username: &str) -> bool {
@@ -191,6 +214,22 @@ impl MemoryAuth {
 
     pub fn user_count(&self) -> usize {
         self.users.read().len()
+    }
+
+    /// Attach quota bounds to an existing user (false when unknown).
+    pub fn set_quotas(&self, username: &str, quotas: UserQuotas) -> bool {
+        match self.users.write().get_mut(username) {
+            Some(entry) => {
+                entry.quotas = quotas;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Quota bounds for a user (`None` when unknown).
+    pub fn get_quotas(&self, username: &str) -> Option<UserQuotas> {
+        self.users.read().get(username).map(|entry| entry.quotas.clone())
     }
 
     /// Sorted usernames (passwords are write-only, never listed).
@@ -257,7 +296,7 @@ impl Authenticator for MemoryAuth {
             }
         };
         match users.get(username) {
-            Some(expected) if *expected == MemoryAuth::digest(password) => Ok(()),
+            Some(entry) if entry.password_hash == MemoryAuth::digest(password) => Ok(()),
             _ => Err(AuthError::AuthenticationFailed(format!(
                 "{client_id} presented bad credentials"
             ))),
@@ -341,6 +380,58 @@ mod tests {
         assert!(!auth.remove_user("alice"));
         // Back to open mode once the last user is gone.
         assert!(auth.authenticate("anon", None, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_user_quotas_roundtrip() {
+        let auth = MemoryAuth::new();
+        assert!(auth.get_quotas("alice").is_none());
+        assert!(!auth.set_quotas(
+            "alice",
+            UserQuotas {
+                max_connections: Some(100),
+                max_publish_rate: None,
+                max_publish_burst: None,
+            }
+        ));
+
+        auth.add_user("alice", b"s3cret");
+        assert_eq!(
+            auth.get_quotas("alice"),
+            Some(UserQuotas::default()),
+            "fresh users start unlimited"
+        );
+        assert!(auth.set_quotas(
+            "alice",
+            UserQuotas {
+                max_connections: Some(100),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            }
+        ));
+        assert_eq!(
+            auth.get_quotas("alice"),
+            Some(UserQuotas {
+                max_connections: Some(100),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            })
+        );
+
+        // Password rotation preserves quotas.
+        auth.add_user("alice", b"n3w");
+        assert!(auth
+            .authenticate("d", Some("alice"), Some(b"n3w"))
+            .await
+            .is_ok());
+        assert_eq!(
+            auth.get_quotas("alice").expect("quotas survive").max_connections,
+            Some(100)
+        );
+
+        // Removing the user drops quotas with it.
+        assert!(auth.remove_user("alice"));
+        assert!(auth.get_quotas("alice").is_none());
     }
 
     #[tokio::test]

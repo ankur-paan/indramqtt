@@ -15,6 +15,7 @@ pub fn init_tracing() {
 pub struct Metrics {
     messages_received: AtomicU64,
     messages_forwarded: AtomicU64,
+    messages_dropped: AtomicU64,
     rules_executed: AtomicU64,
     connections_active: AtomicI64,
 }
@@ -36,6 +37,11 @@ impl Metrics {
 
     pub fn inc_messages_forwarded_by(&self, n: u64) -> u64 {
         self.messages_forwarded.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One ingress message dropped before fan-out (quota/rate policing).
+    pub fn inc_messages_dropped(&self) -> u64 {
+        self.messages_dropped.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// One rule whose filter matched at ingress (regardless of actions).
@@ -69,6 +75,10 @@ impl Metrics {
         self.messages_forwarded.load(Ordering::Relaxed)
     }
 
+    pub fn messages_dropped(&self) -> u64 {
+        self.messages_dropped.load(Ordering::Relaxed)
+    }
+
     pub fn rules_executed(&self) -> u64 {
         self.rules_executed.load(Ordering::Relaxed)
     }
@@ -86,6 +96,9 @@ impl Metrics {
              # HELP indramqtt_messages_forwarded_total Total PublishOut frames emitted toward the edge.\n\
              # TYPE indramqtt_messages_forwarded_total counter\n\
              indramqtt_messages_forwarded_total {}\n\
+             # HELP indramqtt_messages_dropped_total Total ingress messages dropped by quota/rate policing.\n\
+             # TYPE indramqtt_messages_dropped_total counter\n\
+             indramqtt_messages_dropped_total {}\n\
              # HELP indramqtt_rules_executed_total Total ingress rules whose filter matched.\n\
              # TYPE indramqtt_rules_executed_total counter\n\
              indramqtt_rules_executed_total {}\n\
@@ -94,6 +107,7 @@ impl Metrics {
              indramqtt_connections_active {}\n",
             self.messages_received(),
             self.messages_forwarded(),
+            self.messages_dropped(),
             self.rules_executed(),
             self.connections_active(),
         )
@@ -110,6 +124,8 @@ mod tests {
         assert_eq!(metrics.inc_messages_received(), 1);
         assert_eq!(metrics.inc_messages_received(), 2);
         assert_eq!(metrics.inc_messages_forwarded_by(5), 5);
+        assert_eq!(metrics.inc_messages_dropped(), 1);
+        assert_eq!(metrics.messages_dropped(), 1);
         assert_eq!(metrics.inc_rules_executed_by(3), 3);
         assert_eq!(metrics.inc_connections(), 1);
         assert_eq!(metrics.inc_connections(), 2);
@@ -120,6 +136,7 @@ mod tests {
         let text = metrics.render_prometheus_metrics();
         assert!(text.contains("indramqtt_messages_received_total 2\n"));
         assert!(text.contains("indramqtt_messages_forwarded_total 5\n"));
+        assert!(text.contains("indramqtt_messages_dropped_total 1\n"));
         assert!(text.contains("indramqtt_rules_executed_total 3\n"));
         assert!(text.contains("indramqtt_connections_active 42\n"));
         assert!(text.contains("# TYPE indramqtt_connections_active gauge\n"));

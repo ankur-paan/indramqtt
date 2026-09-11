@@ -386,11 +386,34 @@ async fn handle_packet(
                     return Err(());
                 }
             }
+            // Connection quotas apply to console clients exactly like
+            // edge binds (release happens in teardown via unbind). The
+            // liveness probe must precede get_or_create, which itself
+            // marks resumed sessions connected.
+            if let Some(username) = conn.username.as_deref() {
+                let already_live = state
+                    .sessions
+                    .get(&conn.client_id)
+                    .map(|stored| *stored.connected.read())
+                    .unwrap_or(false);
+                if already_live {
+                    state.sessions.release_connection_slot(username);
+                }
+                let max = state
+                    .auth
+                    .get_quotas(username)
+                    .and_then(|quotas| quotas.max_connections);
+                if !state.sessions.acquire_connection_slot(username, max) {
+                    send_bin(socket, encode_connack(false, 0x8B)).await;
+                    return Err(());
+                }
+            }
             let (stored, present) = state
                 .sessions
                 .get_or_create(&conn.client_id, conn.clean_start);
             *stored.conn_id.write() = Some(conn_id);
             *stored.keepalive_secs.write() = conn.keepalive_secs;
+            *stored.username.write() = conn.username.clone();
             state.metrics.inc_connections();
             state.conns.register(conn_id, tx.clone());
             *session = Some(WsSession {

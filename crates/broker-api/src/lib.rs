@@ -84,7 +84,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/clients/:id", get(get_client))
         .route("/api/v1/metrics", get(get_metrics))
-        .route("/api/v1/connectors", get(get_connectors))
+        .route("/api/v1/connectors", get(get_connectors).post(create_connector))
         .route("/api/v1/auth/users", get(list_users).post(create_user))
         .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
@@ -269,15 +269,40 @@ async fn test_rule(
 }
 
 /// Creation payload for a user credential (password is write-only).
+/// Quotas are optional per-field; omitted fields stay unlimited.
 #[derive(Debug, Deserialize)]
 struct CreateUserRequest {
     username: String,
     password: String,
+    #[serde(default)]
+    quotas: Option<QuotasDto>,
 }
 
-/// Usernames only: passwords are write-only and never listed.
-async fn list_users(State(state): State<ApiState>) -> Json<Vec<String>> {
-    Json(state.auth.usernames())
+#[derive(Debug, Deserialize)]
+struct QuotasDto {
+    #[serde(default)]
+    max_connections: Option<u32>,
+    #[serde(default)]
+    max_publish_rate: Option<u32>,
+    #[serde(default)]
+    max_publish_burst: Option<u32>,
+}
+
+/// Users with their quota bounds (passwords are write-only, never listed).
+async fn list_users(State(state): State<ApiState>) -> Json<Vec<serde_json::Value>> {
+    Json(
+        state
+            .auth
+            .usernames()
+            .iter()
+            .map(|username| {
+                serde_json::json!({
+                    "username": username,
+                    "quotas": state.auth.get_quotas(username),
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn create_user(
@@ -291,9 +316,20 @@ async fn create_user(
         return bad_request("password must not be empty");
     }
     state.auth.add_user(req.username.clone(), req.password.as_bytes());
+    if let Some(quotas) = req.quotas.map(|dto| broker_auth::UserQuotas {
+        max_connections: dto.max_connections,
+        max_publish_rate: dto.max_publish_rate,
+        max_publish_burst: dto.max_publish_burst,
+    }) {
+        // The user was just created, so this always succeeds.
+        state.auth.set_quotas(&req.username, quotas);
+    }
+    // Quotas always render as an object (all-null when unset) so GET
+    // and POST share one shape.
+    let stored = state.auth.get_quotas(&req.username);
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({ "username": req.username })),
+        Json(serde_json::json!({ "username": req.username, "quotas": stored })),
     )
         .into_response()
 }
@@ -373,9 +409,101 @@ async fn get_client(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     }
 }
 
-/// Ids of registered external connectors (rule `ForwardConnector` targets).
-async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<String>> {
-    Json(state.engine.connectors().ids())
+/// Registered connectors with kinds for the dashboard.
+async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<serde_json::Value>> {
+    Json(
+        state
+            .engine
+            .connectors()
+            .infos()
+            .iter()
+            .map(|info| serde_json::json!({ "id": info.id, "kind": info.kind }))
+            .collect(),
+    )
+}
+
+/// Creation payload for a streaming connector. `kind` selects the sink
+/// family; `config` carries that family's fields verbatim. Streaming
+/// sinks connect lazily on first delivery, so creation never blocks on
+/// external brokers.
+#[derive(Debug, Deserialize)]
+struct CreateConnectorRequest {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
+async fn create_connector(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateConnectorRequest>,
+) -> Response {
+    if req.id.trim().is_empty() {
+        return bad_request("connector id must not be empty");
+    }
+    let kind = req.kind.to_ascii_lowercase();
+    let built: Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> = (|| {
+        match kind.as_str() {
+            "kafka" => {
+                let config: broker_connectors::KafkaSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid kafka config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid kafka config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpKafkaTransport::new(
+                        config.bootstrap_servers.clone(),
+                        config.client_id.clone(),
+                        &config.acks,
+                    )
+                    .map_err(|e| format!("invalid kafka transport: {e}"))?,
+                );
+                let sink = broker_connectors::KafkaSink::new(config, transport)
+                    .map_err(|e| format!("invalid kafka sink: {e}"))?;
+                Ok(("kafka".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "rabbitmq" | "rabbit" | "amqp" => {
+                let config: broker_connectors::RabbitMqSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid rabbitmq config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid rabbitmq config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpRabbitTransport::new(&config.endpoint)
+                        .map_err(|e| format!("invalid rabbitmq transport: {e}"))?,
+                );
+                let sink = broker_connectors::RabbitMqSink::new(config, transport)
+                    .map_err(|e| format!("invalid rabbitmq sink: {e}"))?;
+                Ok(("rabbitmq".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "logger" | "console" => {
+                let sink = broker_connectors::ConsoleLoggerSink::new(req.id.clone());
+                Ok((
+                    "console".to_string(),
+                    std::sync::Arc::new(sink)
+                        as std::sync::Arc<dyn broker_connectors::Sink>,
+                ))
+            }
+            other => Err(format!(
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, or logger)"
+            )),
+        }
+    })();
+    match built {
+        Ok((kind, sink)) => {
+            state.engine.connectors().register(req.id.clone(), sink);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "id": req.id, "kind": kind })),
+            )
+                .into_response()
+        }
+        Err(error) => bad_request(error),
+    }
 }
 
 /// Prometheus text exposition of node counters and gauges.
@@ -820,13 +948,58 @@ mod tests {
 
         let (status, body) = server.get("/api/v1/auth/users").await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!(["alice"]));
+        assert_eq!(
+            body,
+            json!([{"username": "alice", "quotas": {"max_connections": null, "max_publish_rate": null, "max_publish_burst": null}}])
+        );
         let (status, body) = server.get("/api/v1/auth/acls").await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("acls").len(), 1);
         assert_eq!(body[0]["client_pattern"], json!("alice"));
         assert_eq!(body[0]["action"], json!("subscribe"));
         assert_eq!(body[0]["allow"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_auth_users_quotas_roundtrip() {
+        let (server, _state) = TestServer::start().await;
+
+        // Create with quotas: every bound echoes back.
+        let (status, created) = server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "capped",
+                       "password": "pw",
+                       "quotas": {"max_connections": 100,
+                                  "max_publish_rate": 50,
+                                  "max_publish_burst": 10}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["username"], json!("capped"));
+        assert_eq!(created["quotas"]["max_connections"], json!(100));
+        assert_eq!(created["quotas"]["max_publish_rate"], json!(50));
+        assert_eq!(created["quotas"]["max_publish_burst"], json!(10));
+
+        // Without quotas: all-null bounds object.
+        let (status, created) = server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "plain", "password": "pw"}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["quotas"]["max_connections"], serde_json::Value::Null);
+
+        // Listing shows both shapes side by side.
+        let (status, body) = server.get("/api/v1/auth/users").await;
+        assert_eq!(status, 200);
+        let users = body.as_array().expect("users list");
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0]["username"], json!("capped"));
+        assert_eq!(users[0]["quotas"]["max_connections"], json!(100));
+        assert_eq!(users[1]["username"], json!("plain"));
+        assert_eq!(users[1]["quotas"]["max_publish_rate"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -863,6 +1036,7 @@ mod tests {
             "id=\"metrics\"",
             "id=\"clients\"",
             "id=\"sql-studio\"",
+            "id=\"connectors\"",
             "id=\"auth\"",
             "id=\"console\"",
             "/ws/mqtt",
@@ -901,17 +1075,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_connectors_endpoint_lists_registered() {
-        use broker_connectors::SinkConnector;
+        use broker_connectors::Sink;
 
         struct NullSink;
         #[async_trait::async_trait]
-        impl SinkConnector for NullSink {            async fn send(
+        impl Sink for NullSink {
+            async fn send(
                 &self,
                 _topic: &Topic,
                 _payload: &bytes::Bytes,
                 _qos: QoS,
             ) -> Result<(), broker_connectors::ConnectorError> {
                 Ok(())
+            }
+
+            fn kind(&self) -> &'static str {
+                "test"
             }
         }
 
@@ -926,7 +1105,82 @@ mod tests {
             .register("webhook-1", Arc::new(NullSink));
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!(["webhook-1"]));
+        assert_eq!(body, json!([{"id": "webhook-1", "kind": "test"}]));
+    }
+
+    #[tokio::test]
+    async fn test_connectors_create_kafka_rabbitmq_logger() {
+        let (server, _state) = TestServer::start().await;
+
+        // Kafka sink: validated, lazily connected, listed with its kind.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "kafka-sink-1",
+                       "kind": "kafka",
+                       "config": {"bootstrap_servers": "127.0.0.1:9092",
+                                  "topic_template": "out-${topic}",
+                                  "partition_key_field": "device_id",
+                                  "partitions": 4,
+                                  "client_id": "indra",
+                                  "acks": "all"}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["id"], json!("kafka-sink-1"));
+        assert_eq!(created["kind"], json!("kafka"));
+
+        // RabbitMQ sink: slash translation config accepted.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "rabbit-sink-1",
+                       "kind": "rabbitmq",
+                       "config": {"endpoint": "amqp://127.0.0.1:5672/%2f",
+                                  "exchange": "telemetry",
+                                  "routing_key_template": "sensor.${topic}",
+                                  "delivery_mode": 2}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("rabbitmq"));
+
+        // Logger sink needs no config at all.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "diag", "kind": "logger", "config": {}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("console"));
+
+        let (status, body) = server.get("/api/v1/connectors").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            json!([{"id": "diag", "kind": "console"},
+                   {"id": "kafka-sink-1", "kind": "kafka"},
+                   {"id": "rabbit-sink-1", "kind": "rabbitmq"}])
+        );
+
+        // Unknown kinds and invalid configs are 400s that store nothing.
+        for payload in [
+            json!({"id": "x", "kind": "pigeon", "config": {}}),
+            json!({"id": "", "kind": "logger", "config": {}}),
+            json!({"id": "bad-k", "kind": "kafka",
+                   "config": {"bootstrap_servers": "", "topic_template": "t",
+                              "client_id": "c", "acks": "all"}}),
+            json!({"id": "bad-r", "kind": "rabbitmq",
+                   "config": {"endpoint": "amqp://h", "exchange": "",
+                              "routing_key_template": "k", "delivery_mode": 2}}),
+        ] {
+            let (status, _) = server.post("/api/v1/connectors", payload).await;
+            assert_eq!(status, 400);
+        }
+        let (status, body) = server.get("/api/v1/connectors").await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("list").len(), 3);
     }
 
     #[tokio::test]

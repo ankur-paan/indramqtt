@@ -113,15 +113,48 @@
   <tbody id="rules-body"></tbody></table>
 </section>
 
+<section id="connectors">
+  <h2>Streaming Connectors</h2>
+  <div class="row"><label>Connector</label>
+    <input id="conn-id" placeholder="id, e.g. kafka-sink-1" size="18">
+    <select id="conn-kind">
+      <option value="kafka">kafka</option>
+      <option value="rabbitmq">rabbitmq</option>
+      <option value="logger">logger</option>
+    </select>
+  </div>
+  <div class="row"><label>Kafka config</label>
+    <input id="conn-bootstrap" placeholder="bootstrap, e.g. 127.0.0.1:9092" size="26">
+    <input id="conn-template" placeholder="topic template, e.g. out-${topic}" size="26">
+    <input id="conn-keyfield" placeholder="partition key field" size="18">
+  </div>
+  <div class="row"><label>RabbitMQ config</label>
+    <input id="conn-endpoint" placeholder="endpoint, e.g. amqp://127.0.0.1:5672/%2f" size="32">
+    <input id="conn-exchange" placeholder="exchange" size="14">
+    <input id="conn-routing" placeholder="routing key, e.g. sensor.${topic}" size="26">
+  </div>
+  <div class="row">
+    <button id="conn-add">Add connector</button>
+    <button id="conn-refresh" class="ghost">Refresh list</button>
+  </div>
+  <table><thead><tr><th>id</th><th>kind</th></tr></thead>
+  <tbody id="connectors-body"></tbody></table>
+  <p class="detail">Rules forward into connectors via <code>INTO connector("id")</code>
+  or the <code>ForwardConnector</code> action. Kafka/RabbitMQ sinks connect lazily.</p>
+</section>
+
 <section id="auth">
   <h2>Auth &amp; ACL Manager</h2>
   <div class="row"><label>Users</label>
-    <input id="user-name" placeholder="username" size="16">
-    <input id="user-pass" placeholder="password" type="password" size="16">
+    <input id="user-name" placeholder="username" size="14">
+    <input id="user-pass" placeholder="password" type="password" size="14">
+    <input id="user-max-conns" placeholder="max conns" size="9">
+    <input id="user-max-rate" placeholder="max msg/s" size="9">
+    <input id="user-max-burst" placeholder="burst" size="7">
     <button id="user-add">Add user</button>
     <button id="user-refresh" class="ghost">Refresh</button>
   </div>
-  <table><thead><tr><th>username</th></tr></thead><tbody id="users-body"></tbody></table>
+  <table><thead><tr><th>username</th><th>quotas</th></tr></thead><tbody id="users-body"></tbody></table>
   <div class="row"><label>ACL rule</label>
     <input id="acl-client" placeholder="client pattern" size="14" value="*">
     <select id="acl-action"><option>publish</option><option>subscribe</option><option>all</option></select>
@@ -241,11 +274,32 @@ async function refreshRules() {
     });
 }
 
+/* ---- connectors ---- */
+async function refreshConnectors() {
+  const conns = await api("/api/v1/connectors");
+  $("connectors-body").innerHTML = conns.map((c) =>
+    "<tr><td><code>" + c.id + "</code></td><td><span class='badge'>" +
+    c.kind + "</span></td></tr>"
+  ).join("") || "<tr><td colspan=2>none</td></tr>";
+}
+
 /* ---- auth ---- */
 async function refreshUsers() {
   const users = await api("/api/v1/auth/users");
-  $("users-body").innerHTML =
-    users.map((u) => "<tr><td>" + u + "</td></tr>").join("") || "<tr><td>none</td></tr>";
+  $("users-body").innerHTML = users.map((u) => {
+    const q = u.quotas || {};
+    const parts = [];
+    if (q.max_connections !== null && q.max_connections !== undefined)
+      parts.push("Max: " + q.max_connections + " conns");
+    if (q.max_publish_rate !== null && q.max_publish_rate !== undefined)
+      parts.push(q.max_publish_rate + " msg/s");
+    if (q.max_publish_burst !== null && q.max_publish_burst !== undefined)
+      parts.push("burst " + q.max_publish_burst);
+    const badge = parts.length === 0 ? "unlimited"
+      : parts.join(", ");
+    return "<tr><td>" + u.username + "</td><td><span class='badge'>" +
+      badge + "</span></td></tr>";
+  }).join("") || "<tr><td colspan=2>none</td></tr>";
 }
 async function refreshAcls() {
   const acls = await api("/api/v1/auth/acls");
@@ -332,9 +386,16 @@ $("rule-create").onclick = async () => {
 };
 $("rule-refresh").onclick = refreshRules;
 $("user-add").onclick = async () => {
+  const num = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : parseInt(v, 10);
+  };
   await api("/api/v1/auth/users", {method: "POST",
     headers: {"content-type": "application/json"},
-    body: JSON.stringify({username: $("user-name").value, password: $("user-pass").value})});
+    body: JSON.stringify({username: $("user-name").value, password: $("user-pass").value,
+      quotas: {max_connections: num("user-max-conns"),
+               max_publish_rate: num("user-max-rate"),
+               max_publish_burst: num("user-max-burst")}})});
   refreshUsers();
 };
 $("user-refresh").onclick = refreshUsers;
@@ -347,6 +408,30 @@ $("acl-add").onclick = async () => {
   refreshAcls();
 };
 $("acl-refresh").onclick = refreshAcls;
+$("conn-add").onclick = async () => {
+  const kind = $("conn-kind").value;
+  const id = $("conn-id").value.trim();
+  let config = {};
+  if (kind === "kafka") {
+    const keyfield = $("conn-keyfield").value.trim();
+    config = {bootstrap_servers: $("conn-bootstrap").value.trim(),
+              topic_template: $("conn-template").value.trim() || "out-${topic}",
+              partition_key_field: keyfield === "" ? null : keyfield,
+              client_id: "indramqtt",
+              acks: "all"};
+  } else if (kind === "rabbitmq") {
+    config = {endpoint: $("conn-endpoint").value.trim(),
+              exchange: $("conn-exchange").value.trim(),
+              routing_key_template: $("conn-routing").value.trim() || "${topic}",
+              delivery_mode: 2};
+  }
+  const r = await fetch("/api/v1/connectors", {method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({id: id, kind: kind, config: config})});
+  if (!r.ok) alert("create failed: " + r.status + " " + await r.text());
+  refreshConnectors();
+};
+$("conn-refresh").onclick = refreshConnectors;
 $("client-search").oninput = refreshClients;
 $("ws-connect").onclick = () => { if (!ws) wsLogOpen(); };
 $("ws-disconnect").onclick = () => { if (ws) ws.close(); };
@@ -367,6 +452,7 @@ $("ws-pub-btn").onclick = () => {
 };
 
 refreshMetrics(); refreshClients(); refreshRules(); refreshUsers(); refreshAcls();
+refreshConnectors();
 setInterval(refreshMetrics, 2000);
 setInterval(refreshClients, 5000);
 </script>
