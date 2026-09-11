@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use broker_cluster::{ClusterMessage, RoutingPlane};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
@@ -165,6 +166,10 @@ struct Shared {
     engine: Arc<RuleEngine>,
     sink: Arc<dyn BrokerSink>,
     retained: Arc<dyn RetainedStore>,
+    /// Cluster routing plane. `None` runs standalone; `Some` announces
+    /// local subscriptions and forwards each publish once per matching
+    /// remote node (single forward per node; remotes fan out locally).
+    cluster: Option<Arc<dyn RoutingPlane>>,
 }
 
 impl Shared {
@@ -187,6 +192,7 @@ impl Shared {
             engine,
             sink,
             retained: Arc::new(MemoryStore::new()),
+            cluster: None,
         }
     }
 }
@@ -403,6 +409,20 @@ async fn apply_subscribe(
     )
     .ok();
 
+    // Clustered mode: publish our route summary (filter-level only, never
+    // individual subscriptions) so peers forward matching publishes here.
+    if let Some(cluster) = &shared.cluster {
+        for (filter, _) in &granted {
+            if let Err(e) = cluster.announce_filter(filter).await {
+                warn!(
+                    "Cluster announce failed for {}: {}",
+                    filter.as_str(),
+                    e
+                );
+            }
+        }
+    }
+
     // Retained state follows the SubAck on the same transport.
     let mut retained = Vec::new();
     let session = shared.sessions.get(&client_id);
@@ -559,6 +579,26 @@ async fn apply_publish(
         &frame.payload,
     );
 
+    // Clustered mode: one forward per matching remote node; each remote
+    // fans out locally. Local delivery above already happened.
+    if let Some(cluster) = &shared.cluster {
+        match cluster.resolve_route(&topic).await {
+            Ok(targets) => {
+                for target in targets {
+                    if let Err(e) = cluster
+                        .forward_message(&target, &topic, &frame.payload, qos)
+                        .await
+                    {
+                        warn!("Cluster forward to {} failed: {}", target, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Cluster route resolution failed: {}", e);
+            }
+        }
+    }
+
     (ack, deliveries)
 }
 
@@ -666,11 +706,40 @@ fn encode_publish_out(
     .ok()
 }
 
+/// Pump messages forwarded from peer nodes until the plane closes.
+/// Inbound cluster traffic fans out locally only: only ingress paths
+/// forward, so loops cannot form even though messages carry no history.
+async fn run_cluster_inbox(shared: Shared) {
+    let cluster = match &shared.cluster {
+        Some(cluster) => cluster.clone(),
+        None => return,
+    };
+    while let Some(msg) = cluster.recv_message().await {
+        deliver_cluster_message(&shared, msg).await;
+    }
+    debug!("Cluster inbox closed");
+}
+
+/// Deliver one peer-forwarded message to local subscribers: pure fan-out
+/// with no retained writes, no rule execution (both already happened at
+/// the ingress node), and no re-forward.
+async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
+    for (conn_id, frame) in build_downlink_frames(
+        &shared.router,
+        &shared.sessions,
+        &msg.topic,
+        msg.qos,
+        false,
+        &msg.payload,
+    ) {
+        shared.conns.route(conn_id, frame);
+    }
+}
+
 /// Detach one edge connection: mark its session disconnected (ownership
 /// verified against the bound conn_id) and forget its mailbox. Durable
 /// subscriptions survive; redelivery is a later sprint.
-fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
-    if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
+fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {    if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
         shared
             .sessions
             .unbind_connection(&client_id, frame.header.conn_id);
@@ -754,6 +823,11 @@ async fn serve_brokerlink(bind: &str) -> Result<(), Box<dyn std::error::Error>> 
     let listener = TcpListener::bind(bind).await?;
     info!("BrokerLink IPC listening on {}", bind);
     let shared = Shared::new();
+
+    // Clustered mode pumps peer-forwarded messages alongside edge traffic.
+    if shared.cluster.is_some() {
+        tokio::spawn(run_cluster_inbox(shared.clone()));
+    }
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -1631,5 +1705,81 @@ mod tests {
         assert_ne!(packet_id, 0, "replayed QoS 1 needs a fresh packet id");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn cluster_forwards_publish_to_subscribed_node() {
+        use broker_cluster::{ChannelRoutingPlane, NodeId};
+
+        // Two nodes meshed over in-process channels.
+        let plane1 = ChannelRoutingPlane::new(NodeId::new("node-1"));
+        let plane2 = ChannelRoutingPlane::new(NodeId::new("node-2"));
+        ChannelRoutingPlane::link(&plane1, &plane2);
+
+        let mut shared1 = Shared::new();
+        shared1.cluster = Some(plane1.clone() as Arc<dyn RoutingPlane>);
+        let mut shared2 = Shared::new();
+        shared2.cluster = Some(plane2.clone() as Arc<dyn RoutingPlane>);
+
+        // One BrokerLink listener + one inbox pump per node.
+        async fn serve_one(
+            shared: Shared,
+        ) -> (
+            std::net::SocketAddr,
+            Vec<tokio::task::JoinHandle<()>>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let accept = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, shared).await.expect("handle");
+            });
+            (addr, vec![accept])
+        }
+        let (addr1, mut tasks) = serve_one(shared1.clone()).await;
+        let (addr2, mut tasks2) = serve_one(shared2.clone()).await;
+        tasks.push(tokio::spawn(run_cluster_inbox(shared1)));
+        tasks2.push(tokio::spawn(run_cluster_inbox(shared2)));
+
+        // Client A subscribes to metrics/# on node 1 as conn 701.
+        let sub = bind_client(addr1, 701, "metrics-fan", true).await;
+        sub.send(subscribe_frame(
+            701,
+            2,
+            encode_subscribe_meta(3, "metrics-fan", &[("metrics/#", 1)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        // Client B publishes to metrics/cpu on node 2 as conn 702.
+        let publ = bind_client(addr2, 702, "cpu-sensor", true).await;
+        let (meta, payload) = encode_publish_meta("metrics/cpu", 0, 0, false, b"42");
+        publ.send(publish_frame(702, 2, meta, payload))
+            .await
+            .expect("publish");
+
+        // Client A receives the single cross-node forward.
+        let routed = sub.recv().await.expect("recv forwarded");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert_eq!(routed.header.conn_id, 701);
+        assert_eq!(routed.payload, Bytes::from_static(b"42"));
+        let (topic, _, qos, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "metrics/cpu");
+        assert_eq!(qos, 0);
+
+        // A topic nobody subscribes to is not forwarded: silence proves
+        // both no-match suppression and no duplicate delivery.
+        let (meta, payload) = encode_publish_meta("unrelated/foo", 0, 0, false, b"zzz");
+        publ.send(publish_frame(702, 3, meta, payload))
+            .await
+            .expect("publish unrelated");
+        let silence = tokio::time::timeout(std::time::Duration::from_millis(400), sub.recv()).await;
+        assert!(silence.is_err(), "unmatched topics must not cross nodes");
+
+        for task in tasks.into_iter().chain(tasks2) {
+            task.abort();
+        }
     }
 }

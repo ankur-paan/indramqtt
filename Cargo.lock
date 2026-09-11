@@ -250,8 +250,10 @@ dependencies = [
  "async-trait",
  "broker-protocol",
  "bytes",
+ "parking_lot",
  "serde",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
