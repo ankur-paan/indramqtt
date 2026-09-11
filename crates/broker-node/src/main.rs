@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
-use broker_session::SessionManager;
+use broker_session::{QueuedMessage, SessionManager};
+use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
@@ -163,6 +164,7 @@ struct Shared {
     conns: Arc<ConnTable>,
     engine: Arc<RuleEngine>,
     sink: Arc<dyn BrokerSink>,
+    retained: Arc<dyn RetainedStore>,
 }
 
 impl Shared {
@@ -184,6 +186,7 @@ impl Shared {
             conns,
             engine,
             sink,
+            retained: Arc::new(MemoryStore::new()),
         }
     }
 }
@@ -229,6 +232,9 @@ async fn handle_connection(
     // (e.g. PublishOut fan-out). The sender is registered under our
     // conn_id once the edge binds.
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+    // Identity bound by the last BindConnection on this transport. Used
+    // to detach the session when the socket dies without DISCONNECT.
+    let mut bound: Option<(String, u64)> = None;
 
     loop {
         tokio::select! {
@@ -237,12 +243,12 @@ async fn handle_connection(
                     Ok(frame) => frame,
                     Err(brokerlink::BrokerLinkError::ConnectionClosed) => {
                         debug!("BrokerLink IPC peer {} closed", peer);
-                        shared.conns.prune_sender(&tx);
+                        detach(&bound, &shared, &tx);
                         return Ok(());
                     }
                     Err(e) => {
                         warn!("BrokerLink IPC error from {}: {}", peer, e);
-                        shared.conns.prune_sender(&tx);
+                        detach(&bound, &shared, &tx);
                         return Err(Box::new(e));
                     }
                 };
@@ -252,7 +258,7 @@ async fn handle_connection(
                     frame.header.opcode, frame.header.conn_id, frame.header.sequence_no
                 );
 
-                handle_inbound_frame(frame, &shared, &tx, &transport).await?;
+                handle_inbound_frame(frame, &shared, &tx, &transport, &mut bound).await?;
             }
             outbound = rx.recv() => {
                 match outbound {
@@ -261,11 +267,25 @@ async fn handle_connection(
                     }
                     None => {
                         // All senders gone; nothing left to deliver.
+                        detach(&bound, &shared, &tx);
                         return Ok(());
                     }
                 }
             }
         }
+    }
+}
+
+/// Detach a dead transport: forget its mailbox and mark its session
+/// detached (durable sessions keep subscriptions + offline queue).
+fn detach(
+    bound: &Option<(String, u64)>,
+    shared: &Shared,
+    tx: &UnboundedSender<BrokerFrame>,
+) {
+    shared.conns.prune_sender(tx);
+    if let Some((client_id, conn_id)) = bound {
+        shared.sessions.unbind_connection(client_id, *conn_id);
     }
 }
 
@@ -276,6 +296,7 @@ async fn handle_inbound_frame<S>(
     shared: &Shared,
     tx: &UnboundedSender<BrokerFrame>,
     transport: &FramedTransport<S>,
+    bound: &mut Option<(String, u64)>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -285,13 +306,22 @@ where
             if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
+                // Remember who we serve so a dead socket detaches cleanly.
+                if let Ok((client_id, _)) = decode_bind_meta(&frame.metadata) {
+                    *bound = Some((client_id, frame.header.conn_id));
+                }
+                replay_offline(&frame, shared).await;
             }
         }
-        OpCode::SubscribeIn => match apply_subscribe(&frame, shared) {
-            Some(reply) => {
+        OpCode::SubscribeIn => match apply_subscribe(&frame, shared).await {
+            (Some(reply), retained) => {
                 transport.send(reply).await?;
+                // SUBACK first, then retained state, per MQTT ordering.
+                for held in retained {
+                    transport.send(held).await?;
+                }
             }
-            None => {
+            (None, _) => {
                 warn!(
                     "Dropping malformed SubscribeIn from conn {}",
                     frame.header.conn_id
@@ -320,18 +350,28 @@ where
 }
 
 /// Register the subscriptions of one `SubscribeIn` frame and build its
-/// `SubAckOut` reply. Malformed framing yields `None` (the edge treats a
-/// missing SubAck as a hung request scoped to that connection).
+/// `SubAckOut` reply plus any retained messages for the new subscription.
+/// Malformed framing yields `(None, empty)` (the edge treats a missing
+/// SubAck as a hung request scoped to that connection).
 ///
 /// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
 /// (FilterLen:16be | Filter | QoS:8) * N`. Each granted code echoes the
-/// requested QoS; invalid filters are answered with `0x80`.
-fn apply_subscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
-    let (packet_id, client_id, subs) = decode_subscribe_meta(&frame.metadata)?;
+/// requested QoS; invalid filters are answered with `0x80` and fetch no
+/// retained state. Retained deliveries carry `retain = true` at
+/// `min(subscription QoS, stored QoS)`.
+async fn apply_subscribe(
+    frame: &BrokerFrame,
+    shared: &Shared,
+) -> (Option<BrokerFrame>, Vec<BrokerFrame>) {
+    let (packet_id, client_id, subs) = match decode_subscribe_meta(&frame.metadata) {
+        Some(parts) => parts,
+        None => return (None, Vec::new()),
+    };
 
     let mut codes = Vec::with_capacity(subs.len());
+    let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
     for (filter_str, qos_raw) in subs {
-        let granted = match TopicFilter::new(filter_str).and_then(|filter| {
+        let granted_code = match TopicFilter::new(filter_str).and_then(|filter| {
             QoS::try_from(qos_raw).map(|qos| (filter, qos))
         }) {
             Ok((filter, qos)) => {
@@ -343,24 +383,106 @@ fn apply_subscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> 
                         qos,
                     },
                 );
+                granted.push((filter, qos_raw));
                 qos_raw
             }
             Err(_) => 0x80,
         };
-        codes.push(granted);
+        codes.push(granted_code);
     }
 
     let mut meta = Vec::with_capacity(2 + codes.len());
     meta.extend_from_slice(&packet_id.to_be_bytes());
     meta.extend_from_slice(&codes);
-    BrokerFrame::new(
+    let reply = BrokerFrame::new(
         OpCode::SubAckOut,
         frame.header.conn_id,
         frame.header.sequence_no,
         Bytes::from(meta),
         Bytes::new(),
     )
-    .ok()
+    .ok();
+
+    // Retained state follows the SubAck on the same transport.
+    let mut retained = Vec::new();
+    let session = shared.sessions.get(&client_id);
+    for (filter, sub_qos) in &granted {
+        let matched = match shared.retained.find_matching(filter).await {
+            Ok(matched) => matched,
+            Err(e) => {
+                warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
+                continue;
+            }
+        };
+        for msg in matched {
+            let effective = std::cmp::min(*sub_qos, u8::from(msg.qos));
+            let downlink_id = if effective == 0 {
+                0u16
+            } else {
+                match &session {
+                    Some(session) => session.next_packet_id(),
+                    None => 1u16,
+                }
+            };
+            let topic_str = msg.topic.as_str();
+            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+            meta.extend_from_slice(topic_str.as_bytes());
+            meta.extend_from_slice(&downlink_id.to_be_bytes());
+            meta.push(effective);
+            meta.push(1u8); // retain: replayed retained state
+            meta.push(0u8);
+            if let Ok(routed) = BrokerFrame::new(
+                OpCode::PublishOut,
+                frame.header.conn_id,
+                0,
+                Bytes::from(meta),
+                msg.payload.clone(),
+            ) {
+                retained.push(routed);
+            }
+        }
+    }
+
+    (reply, retained)
+}
+
+/// Replay a resumed durable session's offline queue onto its new
+/// connection. Runs after the `SessionBinding` reply so the edge always
+/// observes binding before backlog.
+async fn replay_offline(frame: &BrokerFrame, shared: &Shared) {
+    let (client_id, _) = match decode_bind_meta(&frame.metadata) {
+        Ok(parts) => parts,
+        Err(_) => return,
+    };
+    let session = match shared.sessions.get(&client_id) {
+        Some(session) => session,
+        None => return,
+    };
+    for queued in session.drain_offline() {
+        let downlink_id = if queued.qos == QoS::AtMostOnce {
+            0u16
+        } else {
+            session.next_packet_id()
+        };
+        let topic_str = queued.topic.as_str();
+        let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+        meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic_str.as_bytes());
+        meta.extend_from_slice(&downlink_id.to_be_bytes());
+        meta.push(u8::from(queued.qos));
+        meta.push(u8::from(queued.retain));
+        meta.push(0u8);
+        if let Ok(routed) = BrokerFrame::new(
+            OpCode::PublishOut,
+            frame.header.conn_id,
+            0, // stamped per-destination by ConnTable::route
+            Bytes::from(meta),
+            queued.payload.clone(),
+        ) {
+            shared.conns.route(frame.header.conn_id, routed);
+        }
+    }
 }
 
 /// Route one `PublishIn` frame: an optional `PubAckOut` for the publisher
@@ -387,6 +509,22 @@ async fn apply_publish(
         Ok(qos) => qos,
         Err(_) => return (None, Vec::new()),
     };
+
+    // Retained state tracks raw ingress: store (or clear on empty
+    // payload) before rules and fan-out observe the message.
+    if retain {
+        if frame.payload.is_empty() {
+            if let Err(e) = shared.retained.clear_retained(&topic).await {
+                warn!("Retained clear failed for {}: {}", topic.as_str(), e);
+            }
+        } else if let Err(e) = shared
+            .retained
+            .set_retained(topic.clone(), qos, frame.payload.clone())
+            .await
+        {
+            warn!("Retained store failed for {}: {}", topic.as_str(), e);
+        }
+    }
 
     // Rules execute at ingress on this node, before local fan-out.
     // Republished output re-enters through the sink only, so rules can
@@ -427,6 +565,11 @@ async fn apply_publish(
 /// Build one `PublishOut` frame per router match. Shared by the standard
 /// fan-out and the rule [`BrokerSink`] so both paths downgrade QoS and
 /// allocate downlink packet ids identically.
+///
+/// Delivery targets the session's live connection: a detached durable
+/// session buffers into its offline queue instead, and a detached clean
+/// session drops. Sessions unknown to the manager fall back to the
+/// router-registered conn_id.
 fn build_downlink_frames(
     router: &Router,
     sessions: &SessionManager,
@@ -440,34 +583,87 @@ fn build_downlink_frames(
     let mut deliveries = Vec::new();
     for sub in router.matches(topic) {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-        let downlink_id = if effective == 0 {
-            0u16
-        } else {
-            match sessions.get(&sub.client_id) {
-                Some(session) => session.next_packet_id(),
-                // Session vanished mid-flight: fall back to id 1 rather
-                // than silently dropping the delivery.
-                None => 1u16,
+        match sessions.get(&sub.client_id) {
+            Some(session) => {
+                let connected = *session.connected.read();
+                let live = session.conn_id.read().clone();
+                match (connected, live) {
+                    (true, Some(conn_id)) => {
+                        let downlink_id = if effective == 0 {
+                            0u16
+                        } else {
+                            session.next_packet_id()
+                        };
+                        if let Some(frame) = encode_publish_out(
+                            conn_id,
+                            topic_str,
+                            downlink_id,
+                            effective,
+                            retain,
+                            payload,
+                        ) {
+                            deliveries.push((conn_id, frame));
+                        }
+                    }
+                    _ => {
+                        // Detached (or half-bound) session: durable
+                        // sessions buffer for replay, clean ones drop.
+                        if !session.clean_start {
+                            session.push_offline(QueuedMessage {
+                                topic: topic.clone(),
+                                qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
+                                retain,
+                                payload: payload.clone(),
+                            });
+                        }
+                    }
+                }
             }
-        };
-        let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
-        meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        meta.extend_from_slice(topic_str.as_bytes());
-        meta.extend_from_slice(&downlink_id.to_be_bytes());
-        meta.push(effective);
-        meta.push(u8::from(retain));
-        meta.push(0u8); // dup: fresh downstream delivery
-        if let Ok(routed) = BrokerFrame::new(
-            OpCode::PublishOut,
-            sub.conn_id,
-            0, // stamped per-destination by ConnTable::route
-            Bytes::from(meta),
-            payload.clone(),
-        ) {
-            deliveries.push((sub.conn_id, routed));
+            None => {
+                // No session on record: legacy fallback to the
+                // router-registered conn_id.
+                let downlink_id = if effective == 0 { 0u16 } else { 1u16 };
+                if let Some(frame) = encode_publish_out(
+                    sub.conn_id,
+                    topic_str,
+                    downlink_id,
+                    effective,
+                    retain,
+                    payload,
+                ) {
+                    deliveries.push((sub.conn_id, frame));
+                }
+            }
         }
     }
     deliveries
+}
+
+/// Encode one `PublishOut` frame for `conn_id` (sequence stamped later
+/// per-destination by `ConnTable::route`).
+fn encode_publish_out(
+    conn_id: u64,
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    payload: &Bytes,
+) -> Option<BrokerFrame> {
+    let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3);
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(0u8); // dup: fresh downstream delivery
+    BrokerFrame::new(
+        OpCode::PublishOut,
+        conn_id,
+        0, // stamped per-destination by ConnTable::route
+        Bytes::from(meta),
+        payload.clone(),
+    )
+    .ok()
 }
 
 /// Detach one edge connection: mark its session disconnected (ownership
@@ -879,8 +1075,8 @@ mod tests {
         server_task.abort();
     }
 
-    #[test]
-    fn subscribe_registers_and_replies_suback() {
+    #[tokio::test]
+    async fn subscribe_registers_and_replies_suback() {
         let shared = test_shared();
         let frame = subscribe_frame(
             21,
@@ -888,7 +1084,9 @@ mod tests {
             encode_subscribe_meta(7, "sub-1", &[("sport/tennis", 1), ("news", 0)]),
         );
 
-        let reply = apply_subscribe(&frame, &shared).expect("subscribe replies");
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert!(retained.is_empty(), "no retained state stored yet");
         assert_eq!(reply.header.opcode, OpCode::SubAckOut);
         assert_eq!(reply.header.conn_id, 21);
         assert_eq!(reply.header.sequence_no, 4);
@@ -905,8 +1103,8 @@ mod tests {
         assert_eq!(sub.qos, QoS::AtLeastOnce);
     }
 
-    #[test]
-    fn subscribe_invalid_filter_gets_0x80_without_registering() {
+    #[tokio::test]
+    async fn subscribe_invalid_filter_gets_0x80_without_registering() {
         let shared = test_shared();
         let frame = subscribe_frame(
             21,
@@ -914,7 +1112,9 @@ mod tests {
             encode_subscribe_meta(9, "sub-bad", &[("sport/#/bogus", 0)]),
         );
 
-        let reply = apply_subscribe(&frame, &shared).expect("subscribe replies");
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert!(retained.is_empty());
         assert_eq!(reply.header.opcode, OpCode::SubAckOut);
         assert_eq!(&reply.metadata[0..2], &9u16.to_be_bytes());
         assert_eq!(&reply.metadata[2..], &[0x80u8]);
@@ -923,11 +1123,13 @@ mod tests {
         assert!(matches.is_empty());
     }
 
-    #[test]
-    fn subscribe_malformed_meta_yields_no_reply() {
+    #[tokio::test]
+    async fn subscribe_malformed_meta_yields_no_reply() {
         let shared = test_shared();
         let frame = subscribe_frame(21, 4, Bytes::from(vec![0x00, 0x07, 0xAA]));
-        assert!(apply_subscribe(&frame, &shared).is_none());
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        assert!(reply.is_none());
+        assert!(retained.is_empty());
     }
 
     #[tokio::test]
@@ -939,9 +1141,11 @@ mod tests {
             (32u64, "fan-b", "sport/#", 0u8),
         ] {
             let frame = subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[(filter, qos)]));
-            apply_subscribe(&frame, &shared).expect("subscribe replies");
-            // Sessions must exist for downlink packet-id allocation.
-            let _ = shared.sessions.get_or_create(client, true);
+            let (reply, _) = apply_subscribe(&frame, &shared).await;
+            reply.expect("subscribe replies");
+            // Sessions must exist and be bound for live delivery.
+            let (session, _) = shared.sessions.get_or_create(client, true);
+            *session.conn_id.write() = Some(conn);
         }
 
         let (meta, payload) = encode_publish_meta("sport/tennis", 5, 1, false, b"hello");
@@ -969,9 +1173,11 @@ mod tests {
     #[tokio::test]
     async fn publish_qos1_acks_publisher_and_routes() {
         let shared = test_shared();
-        let _ = shared.sessions.get_or_create("q1-sub", true);
+        let (session, _) = shared.sessions.get_or_create("q1-sub", true);
+        *session.conn_id.write() = Some(51);
         let sub = subscribe_frame(51, 1, encode_subscribe_meta(3, "q1-sub", &[("t", 1)]));
-        apply_subscribe(&sub, &shared).expect("subscribe replies");
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
 
         let (meta, payload) = encode_publish_meta("t", 42, 1, false, b"data");
         let (ack, deliveries) = apply_publish(&publish_frame(52, 8, meta, payload), &shared).await;
@@ -1009,13 +1215,14 @@ mod tests {
         assert!(deliveries.is_empty());
     }
 
-    #[test]
-    fn unbind_detaches_connection_but_keeps_subscriptions() {
+    #[tokio::test]
+    async fn unbind_detaches_connection_but_keeps_subscriptions() {
         let shared = test_shared();
         let bind = bind_frame(71, 1, encode_bind_meta("gone-1", true, 60));
         reply_for_frame(&bind, &shared.sessions).expect("bind replies");
         let sub = subscribe_frame(71, 2, encode_subscribe_meta(1, "gone-1", &[("t", 0)]));
-        apply_subscribe(&sub, &shared).expect("subscribe replies");
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
 
         let mut unbind_meta = vec![0x00u8, 0x06u8];
         unbind_meta.extend_from_slice(b"gone-1");
@@ -1256,6 +1463,172 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&routed.payload).expect("payload is JSON");
         assert_eq!(body, serde_json::json!({ "temperature": 85.0 }));
+
+        server.abort();
+    }
+
+    async fn bind_client(
+        addr: std::net::SocketAddr,
+        conn_id: u64,
+        client_id: &str,
+        clean_start: bool,
+    ) -> FramedTransport<tokio::net::TcpStream> {
+        let io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect client");
+        let client = FramedTransport::new(io);
+        client
+            .send(bind_frame(
+                conn_id,
+                1,
+                encode_bind_meta(client_id, clean_start, 60),
+            ))
+            .await
+            .expect("bind");
+        let binding = client.recv().await.expect("recv binding");
+        assert_eq!(binding.header.opcode, OpCode::SessionBinding);
+        client
+    }
+
+    #[tokio::test]
+    async fn retained_message_delivered_to_late_subscriber() {
+        let shared = Shared::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        // Client A publishes retained state before anyone subscribes.
+        let publ = bind_client(addr, 501, "sensor-a", true).await;
+        let (meta, payload) =
+            encode_publish_meta("device/state", 0, 0, true, b"{ \"status\": \"online\" }");
+        publ.send(publish_frame(501, 2, meta, payload))
+            .await
+            .expect("publish retained");
+
+        // Client B connects later and subscribes with a wildcard.
+        let sub = bind_client(addr, 502, "watcher-b", true).await;
+        sub.send(subscribe_frame(
+            502,
+            2,
+            encode_subscribe_meta(7, "watcher-b", &[("device/+", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        // The retained message follows the SUBACK immediately.
+        let held = sub.recv().await.expect("recv retained");
+        assert_eq!(held.header.opcode, OpCode::PublishOut);
+        assert_eq!(held.header.conn_id, 502);
+        assert_eq!(held.payload, Bytes::from_static(b"{ \"status\": \"online\" }"));
+        let (topic, _, qos, retain) = decode_publish_meta_parts(&held.metadata);
+        assert_eq!(topic, "device/state");
+        assert_eq!(qos, 0);
+        assert!(retain, "replayed retained message must carry retain = true");
+
+        // Clearing with an empty retained publish removes the state.
+        let (meta, payload) = encode_publish_meta("device/state", 0, 0, true, b"");
+        publ.send(publish_frame(501, 3, meta, payload))
+            .await
+            .expect("clear retained");
+
+        // A later subscriber gets its SUBACK but no retained message.
+        let late = bind_client(addr, 503, "watcher-c", true).await;
+        late
+            .send(subscribe_frame(
+                503,
+                2,
+                encode_subscribe_meta(8, "watcher-c", &[("device/+", 0)]),
+            ))
+            .await
+            .expect("subscribe");
+        let suback = late.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+        let nothing = tokio::time::timeout(std::time::Duration::from_millis(400), late.recv()).await;
+        assert!(
+            nothing.is_err(),
+            "cleared retained state must not be delivered"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn offline_queue_replays_on_durable_reconnect() {
+        let shared = Shared::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        // Client A connects durably and subscribes.
+        let sub = bind_client(addr, 601, "worker-a", false).await;
+        sub.send(subscribe_frame(
+            601,
+            2,
+            encode_subscribe_meta(3, "worker-a", &[("job/queue", 1)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        // Unclean disconnect: TCP drops without DISCONNECT. Give the
+        // server a beat to detach the session before publishing.
+        drop(sub);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Client B publishes QoS 1 while A is detached.
+        let publ = bind_client(addr, 602, "producer-b", true).await;
+        let (meta, payload) = encode_publish_meta("job/queue", 9, 1, false, b"work-item");
+        publ.send(publish_frame(602, 2, meta, payload))
+            .await
+            .expect("publish");
+        let ack = publ.recv().await.expect("recv puback");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+
+        // Client A reconnects durably on a new connection.
+        let io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("reconnect");
+        let resumed = FramedTransport::new(io);
+        resumed
+            .send(bind_frame(603, 1, encode_bind_meta("worker-a", false, 60)))
+            .await
+            .expect("rebind");
+        let binding = resumed.recv().await.expect("recv binding");
+        assert_eq!(binding.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&binding.metadata);
+        assert!(present, "resumed session must report session_present");
+        assert_eq!(rc, 0);
+
+        // The queued message replays onto the new connection.
+        let replayed = resumed.recv().await.expect("recv replay");
+        assert_eq!(replayed.header.opcode, OpCode::PublishOut);
+        assert_eq!(replayed.header.conn_id, 603);
+        assert_eq!(replayed.payload, Bytes::from_static(b"work-item"));
+        let (topic, packet_id, qos, _) = decode_publish_meta_parts(&replayed.metadata);
+        assert_eq!(topic, "job/queue");
+        assert_eq!(qos, 1);
+        assert_ne!(packet_id, 0, "replayed QoS 1 needs a fresh packet id");
 
         server.abort();
     }

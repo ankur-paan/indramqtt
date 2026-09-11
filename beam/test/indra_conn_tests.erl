@@ -271,6 +271,24 @@ inbound_publishout_to_socket_test() ->
         teardown(LSock, Mock, Client, Conn)
     end.
 
+inbound_retained_publishout_sets_retain_bit_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6009}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-ret">>, Conn),
+        %% Retained replay must reach the socket with the RETAIN bit set.
+        Meta = indra_brokerlink:encode_publish_meta(<<"device/state">>, 0, 0, true, false),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0021}, Meta, <<"online">>),
+        {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(recv_all(Client)),
+        {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                    maps:get(flags, Pkt)),
+        ?assertEqual(<<"device/state">>, maps:get(topic, Pub)),
+        ?assertEqual(true, maps:get(retain, Pub)),
+        ?assertEqual(<<"online">>, maps:get(payload, Pub))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
 pingreq_pingresp_test() ->
     {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6005}]),
     _ = Port,

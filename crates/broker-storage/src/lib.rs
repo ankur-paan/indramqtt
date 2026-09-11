@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use broker_protocol::{QoS, Topic};
+use broker_protocol::{QoS, Topic, TopicFilter};
 use std::collections::HashMap;
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -36,6 +36,9 @@ pub trait RetainedStore: Send + Sync {
     async fn set_retained(&self, topic: Topic, qos: QoS, payload: Bytes) -> Result<()>;
     async fn get_retained(&self, topic: &Topic) -> Result<Option<StoredMessage>>;
     async fn clear_retained(&self, topic: &Topic) -> Result<()>;
+    /// All retained messages whose topic matches `filter`, ordered by
+    /// topic for deterministic delivery to new subscribers.
+    async fn find_matching(&self, filter: &TopicFilter) -> Result<Vec<StoredMessage>>;
 }
 
 #[async_trait]
@@ -108,6 +111,17 @@ impl RetainedStore for MemoryStore {
         map.remove(topic);
         Ok(())
     }
+
+    async fn find_matching(&self, filter: &TopicFilter) -> Result<Vec<StoredMessage>> {
+        let map = self.retained.read();
+        let mut matched: Vec<StoredMessage> = map
+            .values()
+            .filter(|msg| filter.matches(&msg.topic))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
+        Ok(matched)
+    }
 }
 
 #[async_trait]
@@ -143,5 +157,98 @@ mod tests {
 
         store.update_cursor(101, offset).await.unwrap();
         assert_eq!(store.get_cursor(101).await.unwrap(), offset);
+    }
+
+    #[tokio::test]
+    async fn test_retained_set_get_clear() {
+        let store = MemoryStore::new();
+        let topic = Topic::new("device/state").unwrap();
+
+        assert!(store.get_retained(&topic).await.unwrap().is_none());
+
+        store
+            .set_retained(topic.clone(), QoS::AtMostOnce, Bytes::from_static(b"online"))
+            .await
+            .unwrap();
+        let msg = store.get_retained(&topic).await.unwrap().expect("stored");
+        assert_eq!(msg.payload, Bytes::from_static(b"online"));
+        assert!(msg.retain);
+
+        // Replace keeps only the latest value.
+        store
+            .set_retained(topic.clone(), QoS::AtLeastOnce, Bytes::from_static(b"away"))
+            .await
+            .unwrap();
+        let msg = store.get_retained(&topic).await.unwrap().expect("replaced");
+        assert_eq!(msg.payload, Bytes::from_static(b"away"));
+        assert_eq!(msg.qos, QoS::AtLeastOnce);
+
+        store.clear_retained(&topic).await.unwrap();
+        assert!(store.get_retained(&topic).await.unwrap().is_none());
+
+        // Clearing an absent topic is a no-op.
+        store.clear_retained(&topic).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_matching_exact_and_wildcards() {
+        let store = MemoryStore::new();
+        for (topic, payload) in [
+            ("device/state", "online"),
+            ("device/battery", "87"),
+            ("sensors/temperature", "21.5"),
+        ] {
+            store
+                .set_retained(
+                    Topic::new(topic).unwrap(),
+                    QoS::AtMostOnce,
+                    Bytes::from(payload),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Exact filter matches one.
+        let matched = store
+            .find_matching(&TopicFilter::new("device/state").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].payload, Bytes::from_static(b"online"));
+
+        // Single-level wildcard.
+        let matched = store
+            .find_matching(&TopicFilter::new("device/+").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 2);
+        // Deterministic topic order.
+        assert_eq!(matched[0].topic.as_str(), "device/battery");
+        assert_eq!(matched[1].topic.as_str(), "device/state");
+
+        // Multi-level wildcard.
+        let matched = store
+            .find_matching(&TopicFilter::new("#").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 3);
+
+        // No match.
+        let matched = store
+            .find_matching(&TopicFilter::new("unknown/#").unwrap())
+            .await
+            .unwrap();
+        assert!(matched.is_empty());
+
+        // Cleared topics disappear from matching.
+        store
+            .clear_retained(&Topic::new("device/state").unwrap())
+            .await
+            .unwrap();
+        let matched = store
+            .find_matching(&TopicFilter::new("device/+").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
     }
 }

@@ -425,6 +425,23 @@ encode_publish_qos0_drops_packet_id_test() ->
     ?assertEqual(<<16#30, 5, 0, 1, "t", "hi">>,
                  indra_mqtt_codec:encode_publish(<<"t">>, 0, 0, <<"hi">>)).
 
+encode_publish_flag_bits_test() ->
+    %% QoS 0 + RETAIN: fixed header 0011_0001.
+    <<16#31, _/binary>> =
+        indra_mqtt_codec:encode_publish(<<"t">>, 0, 0, true, false, <<"hi">>),
+    %% QoS 1 + DUP, no RETAIN: fixed header 0011_1010.
+    <<16#3A, _/binary>> =
+        indra_mqtt_codec:encode_publish(<<"t">>, 7, 1, false, true, <<"hi">>),
+    %% QoS 1 + RETAIN + DUP: fixed header 0011_1011, and the flags
+    %% round-trip back through the decoder.
+    Bin = indra_mqtt_codec:encode_publish(<<"t">>, 7, 1, true, true, <<"hi">>),
+    <<16#3B, _/binary>> = Bin,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                maps:get(flags, Pkt)),
+    ?assertEqual(true, maps:get(retain, Pub)),
+    ?assertEqual(true, maps:get(dup, Pub)).
+
 encode_publish_bad_args_raise_test() ->
     ?assertError(badarg, indra_mqtt_codec:encode_publish(<<"t">>, 0, 1, <<"x">>)),
     ?assertError(function_clause,
