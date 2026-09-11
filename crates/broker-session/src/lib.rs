@@ -100,6 +100,18 @@ impl SessionManager {
         self.sessions.read().get(client_id).cloned()
     }
 
+    /// Sorted ids of currently connected clients (for the management API).
+    pub fn active_client_ids(&self) -> Vec<String> {
+        let sessions = self.sessions.read();
+        let mut ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, session)| *session.connected.read())
+            .map(|(client_id, _)| client_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {        let mut map = self.sessions.write();
 
         if clean_start {
@@ -152,6 +164,22 @@ mod tests {
 
         assert!(manager.get("device-001").is_some());
         assert!(manager.get("unknown-device").is_none());
+    }
+
+    #[test]
+    fn test_active_client_ids_tracks_connections() {
+        let manager = SessionManager::new();
+        assert!(manager.active_client_ids().is_empty());
+
+        manager.get_or_create("client-b", true);
+        manager.get_or_create("client-a", true);
+        assert_eq!(manager.active_client_ids(), vec!["client-a", "client-b"]);
+
+        // Detaching removes the client from the active set.
+        let (session, _) = manager.get_or_create("client-a", false);
+        *session.conn_id.write() = Some(7);
+        manager.unbind_connection("client-a", 7);
+        assert_eq!(manager.active_client_ids(), vec!["client-b"]);
     }
 
     #[test]

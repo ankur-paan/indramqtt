@@ -226,8 +226,11 @@ name = "broker-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "broker-observability",
  "broker-protocol",
+ "broker-router",
  "broker-rules",
+ "broker-session",
  "serde",
  "serde_json",
  "tokio",

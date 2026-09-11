@@ -315,14 +315,15 @@ impl RuleEngine {
     /// non-object payloads cannot be evaluated and skip the rule, a false
     /// WHERE skips its actions, and SELECT projection replaces the bytes
     /// forwarded to the sink. Sink failures are logged; remaining actions
-    /// still run.
+    /// still run. Returns the number of rules that matched (for the
+    /// `indramqtt_rules_executed_total` counter).
     pub async fn dispatch_ingress(
         &self,
         topic: &Topic,
         payload: &Bytes,
         qos: QoS,
         broker_sink: &Arc<dyn BrokerSink>,
-    ) {
+    ) -> usize {
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
         let matched: Vec<Rule> = {
@@ -365,6 +366,7 @@ impl RuleEngine {
                 }
             }
         }
+        matched.len()
     }
 }
 

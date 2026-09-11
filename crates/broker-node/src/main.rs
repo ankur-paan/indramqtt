@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use broker_cluster::{ClusterMessage, RoutingPlane};
+use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
@@ -25,6 +26,11 @@ struct Args {
     /// BrokerLink IPC listen address for BEAM edge clients (TCP loopback).
     #[arg(long, default_value = "127.0.0.1:18883")]
     brokerlink_bind: String,
+
+    /// Management REST API listen address. Empty disables the API
+    /// (useful for test environments).
+    #[arg(long, default_value = "127.0.0.1:18083")]
+    api_bind: String,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -170,6 +176,7 @@ struct Shared {
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
     cluster: Option<Arc<dyn RoutingPlane>>,
+    metrics: Arc<Metrics>,
 }
 
 impl Shared {
@@ -178,12 +185,14 @@ impl Shared {
         let router = Arc::new(Router::new());
         let conns = Arc::new(ConnTable::default());
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
+        let metrics = Arc::new(Metrics::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink.
         let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
             router: router.clone(),
             sessions: sessions.clone(),
             conns: conns.clone(),
+            metrics: metrics.clone(),
         });
         Self {
             sessions,
@@ -193,6 +202,7 @@ impl Shared {
             sink,
             retained: Arc::new(MemoryStore::new()),
             cluster: None,
+            metrics,
         }
     }
 }
@@ -203,6 +213,7 @@ struct InMemoryBrokerSink {
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     conns: Arc<ConnTable>,
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -214,9 +225,11 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
-        for (conn_id, frame) in
-            build_downlink_frames(&self.router, &self.sessions, &topic, qos, retain, &payload)
-        {
+        let deliveries =
+            build_downlink_frames(&self.router, &self.sessions, &topic, qos, retain, &payload);
+        self.metrics
+            .inc_messages_forwarded_by(deliveries.len() as u64);
+        for (conn_id, frame) in deliveries {
             self.conns.route(conn_id, frame);
         }
         Ok(())
@@ -292,6 +305,7 @@ fn detach(
     shared.conns.prune_sender(tx);
     if let Some((client_id, conn_id)) = bound {
         shared.sessions.unbind_connection(client_id, *conn_id);
+        shared.metrics.dec_connections();
     }
 }
 
@@ -312,20 +326,25 @@ where
             if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
+                shared.metrics.inc_connections();
                 // Remember who we serve so a dead socket detaches cleanly.
                 if let Ok((client_id, _)) = decode_bind_meta(&frame.metadata) {
                     *bound = Some((client_id, frame.header.conn_id));
                 }
-                replay_offline(&frame, shared).await;
+                let replayed = replay_offline(&frame, shared).await;
+                shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
         }
         OpCode::SubscribeIn => match apply_subscribe(&frame, shared).await {
             (Some(reply), retained) => {
                 transport.send(reply).await?;
                 // SUBACK first, then retained state, per MQTT ordering.
-                for held in retained {
-                    transport.send(held).await?;
+                for held in &retained {
+                    transport.send(held.clone()).await?;
                 }
+                shared
+                    .metrics
+                    .inc_messages_forwarded_by(retained.len() as u64);
             }
             (None, _) => {
                 warn!(
@@ -339,6 +358,9 @@ where
             if let Some(ack) = ack {
                 transport.send(ack).await?;
             }
+            shared
+                .metrics
+                .inc_messages_forwarded_by(deliveries.len() as u64);
             for (conn_id, routed) in deliveries {
                 shared.conns.route(conn_id, routed);
             }
@@ -469,16 +491,17 @@ async fn apply_subscribe(
 
 /// Replay a resumed durable session's offline queue onto its new
 /// connection. Runs after the `SessionBinding` reply so the edge always
-/// observes binding before backlog.
-async fn replay_offline(frame: &BrokerFrame, shared: &Shared) {
+/// observes binding before backlog. Returns the replayed frame count.
+async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     let (client_id, _) = match decode_bind_meta(&frame.metadata) {
         Ok(parts) => parts,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let session = match shared.sessions.get(&client_id) {
         Some(session) => session,
-        None => return,
+        None => return 0,
     };
+    let mut replayed = 0;
     for queued in session.drain_offline() {
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
@@ -501,8 +524,10 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) {
             queued.payload.clone(),
         ) {
             shared.conns.route(frame.header.conn_id, routed);
+            replayed += 1;
         }
     }
+    replayed
 }
 
 /// Route one `PublishIn` frame: an optional `PubAckOut` for the publisher
@@ -529,6 +554,7 @@ async fn apply_publish(
         Ok(qos) => qos,
         Err(_) => return (None, Vec::new()),
     };
+    shared.metrics.inc_messages_received();
 
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message.
@@ -549,10 +575,11 @@ async fn apply_publish(
     // Rules execute at ingress on this node, before local fan-out.
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
-    shared
+    let rules_fired = shared
         .engine
         .dispatch_ingress(&topic, &frame.payload, qos, &shared.sink)
         .await;
+    shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
     let ack = if qos == QoS::AtLeastOnce {
         let mut meta = Vec::with_capacity(3);
@@ -819,10 +846,9 @@ fn decode_unbind_meta(meta: &[u8]) -> Option<String> {
         .map(str::to_string)
     }
 
-async fn serve_brokerlink(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
     info!("BrokerLink IPC listening on {}", bind);
-    let shared = Shared::new();
 
     // Clustered mode pumps peer-forwarded messages alongside edge traffic.
     if shared.cluster.is_some() {
@@ -841,6 +867,20 @@ async fn serve_brokerlink(bind: &str) -> Result<(), Box<dyn std::error::Error>> 
     }
 }
 
+/// Serve the management REST API on an already-bound listener.
+async fn serve_api(
+    listener: tokio::net::TcpListener,
+    shared: Shared,
+) -> std::io::Result<()> {
+    let state = broker_api::ApiState::new(
+        shared.engine.clone(),
+        shared.sessions.clone(),
+        shared.router.clone(),
+        shared.metrics.clone(),
+    );
+    broker_api::serve(listener, state).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     broker_observability::init_tracing();
@@ -854,7 +894,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("BrokerLink IPC protocol initialized");
     info!("Clean-room architecture ready");
 
-    serve_brokerlink(&args.brokerlink_bind).await
+    let shared = Shared::new();
+    if !args.api_bind.is_empty() {
+        let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
+        info!("Management API listening on {}", args.api_bind);
+        let api_shared = shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_api(listener, api_shared).await {
+                warn!("Management API exited: {}", e);
+            }
+        });
+    }
+
+    serve_brokerlink(&args.brokerlink_bind, shared).await
 }
 
 #[cfg(test)]
@@ -1781,5 +1833,78 @@ mod tests {
         for task in tasks.into_iter().chain(tasks2) {
             task.abort();
         }
+    }
+
+    async fn http_get_text(port: u16, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect api");
+        let req = format!("GET {path} HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.expect("write api request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read api response");
+        let text = String::from_utf8(buf).expect("api response is UTF-8");
+        let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+        let status: u16 = head.lines().next().expect("status line")[9..12]
+            .parse()
+            .expect("status code");
+        (status, body.to_string())
+    }
+
+    #[tokio::test]
+    async fn api_metrics_reflect_edge_traffic() {
+        let shared = Shared::new();
+
+        // Management API on an ephemeral port, sharing node state.
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let api_port = api_listener.local_addr().expect("api addr").port();
+        let api_task = tokio::spawn(serve_api(api_listener, shared.clone()));
+
+        // One edge connection: bind, subscribe, publish.
+        let bl_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bl_addr = bl_listener.local_addr().expect("local addr");
+        let edge_task = tokio::spawn(async move {
+            let (stream, _) = bl_listener.accept().await.expect("accept");
+            handle_connection(stream, shared).await.expect("handle");
+        });
+
+        let client = bind_client(bl_addr, 801, "metrics-probe", true).await;
+        client
+            .send(subscribe_frame(
+                801,
+                2,
+                encode_subscribe_meta(3, "metrics-probe", &[("m/+", 0)]),
+            ))
+            .await
+            .expect("subscribe");
+        let suback = client.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+        let (meta, payload) = encode_publish_meta("m/1", 0, 0, false, b"x");
+        client
+            .send(publish_frame(801, 3, meta, payload))
+            .await
+            .expect("publish");
+        // Drain our own delivery so the mailbox cannot back up the test.
+        let delivered = client.recv().await.expect("recv delivery");
+        assert_eq!(delivered.header.opcode, OpCode::PublishOut);
+
+        let (status, body) = http_get_text(api_port, "/api/v1/metrics").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("indramqtt_messages_received_total 1\n"));
+        assert!(body.contains("indramqtt_messages_forwarded_total 1\n"));
+        assert!(body.contains("indramqtt_connections_active 1\n"));
+
+        let (status, body) = http_get_text(api_port, "/api/v1/clients").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("clients is JSON"),
+            serde_json::json!(["metrics-probe"])
+        );
+
+        edge_task.abort();
+        api_task.abort();
     }
 }

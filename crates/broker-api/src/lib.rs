@@ -5,33 +5,71 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
+use broker_router::Router as SubscriptionRouter;
 use broker_rules::{Rule, RuleAction, RuleEngine};
+use broker_session::SessionManager;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Shared rule-engine handle injected into every rules endpoint.
+/// Shared node state injected into every management endpoint: the rule
+/// engine (mutable via the rules API), session directory, subscription
+/// router, and node metrics.
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: Arc<RuleEngine>,
+    pub sessions: Arc<SessionManager>,
+    pub router: Arc<SubscriptionRouter>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ApiState {
-    pub fn new(engine: Arc<RuleEngine>) -> Self {
-        Self { engine }
+    pub fn new(
+        engine: Arc<RuleEngine>,
+        sessions: Arc<SessionManager>,
+        router: Arc<SubscriptionRouter>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            engine,
+            sessions,
+            router,
+            metrics,
+        }
+    }
+
+    /// Standalone state for tests and tools (empty sessions/router).
+    pub fn standalone(engine: Arc<RuleEngine>) -> Self {
+        Self {
+            engine,
+            sessions: Arc::new(SessionManager::new()),
+            router: Arc::new(SubscriptionRouter::new()),
+            metrics: Arc::new(Metrics::new()),
+        }
     }
 }
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "OK" }))
-        .route("/api/v1/metrics", get(|| async { "metrics_placeholder" }))
+        .route("/api/v1/nodes", get(get_nodes))
+        .route("/api/v1/clients", get(get_clients))
+        .route("/api/v1/metrics", get(get_metrics))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route(
             "/api/v1/rules/:id",
             get(get_rule).delete(delete_rule),
         )
         .with_state(state)
+}
+
+/// Serve the management API on an already-bound listener.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: ApiState,
+) -> std::io::Result<()> {
+    axum::serve(listener, router(state)).await
 }
 
 /// Creation payload: identifiers are assigned server-side (`rule-<n>`).
@@ -143,6 +181,36 @@ async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> R
     }
 }
 
+fn node_id() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "local".to_string())
+}
+
+/// Node status, version, and live connection count.
+async fn get_nodes(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "node_id": node_id(),
+        "status": "running",
+        "version": env!("CARGO_PKG_VERSION"),
+        "connections": state.metrics.connections_active(),
+    }))
+}
+
+/// Sorted ids of currently connected clients.
+async fn get_clients(State(state): State<ApiState>) -> Json<Vec<String>> {
+    Json(state.sessions.active_client_ids())
+}
+
+/// Prometheus text exposition of node counters and gauges.
+async fn get_metrics(State(state): State<ApiState>) -> Response {
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        state.metrics.render_prometheus_metrics(),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,13 +224,27 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    struct TestState {
+        engine: Arc<RuleEngine>,
+        sessions: Arc<SessionManager>,
+        metrics: Arc<Metrics>,
+    }
+
     impl TestServer {
-        async fn start() -> (Self, Arc<RuleEngine>) {
+        async fn start() -> (Self, TestState) {
             let engine = Arc::new(RuleEngine::new(
                 16,
                 broker_rules::BackpressurePolicy::DropOldest,
             ));
-            let app = router(ApiState::new(engine.clone()));
+            let sessions = Arc::new(SessionManager::new());
+            let sub_router = Arc::new(SubscriptionRouter::new());
+            let metrics = Arc::new(Metrics::new());
+            let state = TestState {
+                engine: engine.clone(),
+                sessions: sessions.clone(),
+                metrics: metrics.clone(),
+            };
+            let app = router(ApiState::new(engine, sessions, sub_router, metrics));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind test server");
@@ -170,7 +252,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.expect("serve test app");
             });
-            (Self { port, task }, engine)
+            (Self { port, task }, state)
         }
 
         async fn request(&self, raw: &str) -> (u16, Value) {
@@ -240,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_router_health() {
-        let (server, _engine) = TestServer::start().await;
+        let (server, _state) = TestServer::start().await;
         let (status, text) = server
             .request_raw("GET /healthz HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
             .await;
@@ -250,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rules_crud_lifecycle() {
-        let (server, _engine) = TestServer::start().await;
+        let (server, _state) = TestServer::start().await;
 
         // Empty at first.
         let (status, body) = server.get("/api/v1/rules").await;
@@ -304,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rules_create_rejects_invalid_input() {
-        let (server, _engine) = TestServer::start().await;
+        let (server, _state) = TestServer::start().await;
 
         // Bad topic filter.
         let (status, body) = server
@@ -355,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rules_create_with_sql_query() {
-        let (server, _engine) = TestServer::start().await;
+        let (server, _state) = TestServer::start().await;
 
         // Valid streaming SQL is accepted and echoed back verbatim.
         let (status, created) = server
@@ -393,5 +475,51 @@ mod tests {
         let (status, body) = server.get("/api/v1/rules").await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_nodes_reports_status_version_connections() {
+        let (server, state) = TestServer::start().await;
+        state.metrics.set_active_connections(3);
+
+        let (status, body) = server.get("/api/v1/nodes").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], json!("running"));
+        assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(body["connections"], json!(3));
+        assert!(body["node_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_clients_lists_connected_ids() {
+        let (server, state) = TestServer::start().await;
+
+        let (status, body) = server.get("/api/v1/clients").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        state.sessions.get_or_create("client-b", true);
+        state.sessions.get_or_create("client-a", true);
+        let (status, body) = server.get("/api/v1/clients").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!(["client-a", "client-b"]));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_exposes_prometheus_counters() {
+        let (server, state) = TestServer::start().await;
+        state.metrics.inc_messages_received();
+        state.metrics.inc_messages_forwarded_by(2);
+        state.metrics.inc_rules_executed();
+        state.metrics.set_active_connections(1);
+
+        let (status, text) = server
+            .request_raw("GET /api/v1/metrics HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+        assert!(text.contains("indramqtt_messages_received_total 1\n"));
+        assert!(text.contains("indramqtt_messages_forwarded_total 2\n"));
+        assert!(text.contains("indramqtt_rules_executed_total 1\n"));
+        assert!(text.contains("indramqtt_connections_active 1\n"));
     }
 }
