@@ -488,8 +488,43 @@ async fn create_connector(
                         as std::sync::Arc<dyn broker_connectors::Sink>,
                 ))
             }
+            "postgres" | "postgresql" => {
+                let config: broker_connectors::PostgreSqlSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid postgres config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid postgres config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpPgTransport::new(
+                        &config.connection_url,
+                        config.pool_size,
+                    )
+                    .map_err(|e| format!("invalid postgres transport: {e}"))?,
+                );
+                let sink = broker_connectors::PostgreSqlSink::new(config, transport)
+                    .map_err(|e| format!("invalid postgres sink: {e}"))?;
+                Ok(("postgres".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "redis" => {
+                let config: broker_connectors::RedisSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid redis config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid redis config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpRedisTransport::new(&config.endpoint)
+                        .map_err(|e| format!("invalid redis transport: {e}"))?,
+                );
+                let sink = broker_connectors::RedisSink::new(config, transport)
+                    .map_err(|e| format!("invalid redis sink: {e}"))?;
+                Ok(("redis".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, or logger)"
             )),
         }
     })();
@@ -1155,13 +1190,46 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("console"));
 
+        // Postgres sink: validated without touching any database.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "pg-sink-1",
+                       "kind": "postgres",
+                       "config": {"connection_url": "postgresql://u:p@127.0.0.1:5432/db",
+                                  "sql_template": "INSERT INTO t (topic, qos, payload) VALUES ($1, $2, $3)",
+                                  "pool_size": 2,
+                                  "batch_size": 50,
+                                  "batch_timeout_ms": 25}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("postgres"));
+
+        // Redis sink: XADD stream config accepted (command is flat).
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "redis-sink-1",
+                       "kind": "redis",
+                       "config": {"endpoint": "redis://127.0.0.1:6379",
+                                  "command": "xadd",
+                                  "stream_template": "events",
+                                  "maxlen": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("redis"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
             json!([{"id": "diag", "kind": "console"},
                    {"id": "kafka-sink-1", "kind": "kafka"},
-                   {"id": "rabbit-sink-1", "kind": "rabbitmq"}])
+                   {"id": "pg-sink-1", "kind": "postgres"},
+                   {"id": "rabbit-sink-1", "kind": "rabbitmq"},
+                   {"id": "redis-sink-1", "kind": "redis"}])
         );
 
         // Unknown kinds and invalid configs are 400s that store nothing.
@@ -1174,13 +1242,19 @@ mod tests {
             json!({"id": "bad-r", "kind": "rabbitmq",
                    "config": {"endpoint": "amqp://h", "exchange": "",
                               "routing_key_template": "k", "delivery_mode": 2}}),
+            json!({"id": "bad-pg", "kind": "postgres",
+                   "config": {"connection_url": "postgresql://h/db",
+                              "sql_template": "INSERT INTO t VALUES ($9)"}}),
+            json!({"id": "bad-redis", "kind": "redis",
+                   "config": {"endpoint": "redis://h",
+                              "command": {"command": "set", "key_template": ""}}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 3);
+        assert_eq!(body.as_array().expect("list").len(), 5);
     }
 
     #[tokio::test]

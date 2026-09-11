@@ -1401,4 +1401,111 @@ mod tests {
         assert!(matches!(err, RuleEngineError::InvalidRule(_)));
         assert!(engine.list_rules().is_empty());
     }
+
+    /// End to end across two database sinks: one ingress event fans out
+    /// through SQL projection into a mock Postgres batch buffer and a
+    /// mock Redis stream buffer, with secrets stripped by the SELECT.
+    #[tokio::test]
+    async fn test_sql_fans_out_to_postgres_and_redis() {
+        use broker_connectors::{
+            MemoryPgTransport, MemoryRedisTransport, PostgreSqlSink,
+            PostgreSqlSinkConfig, RedisCommandKind, RedisSink, RedisSinkConfig,
+        };
+
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+
+        let pg_transport = Arc::new(MemoryPgTransport::new());
+        let pg = Arc::new(
+            PostgreSqlSink::new(
+                PostgreSqlSinkConfig {
+                    connection_url: "postgresql://u:p@db/db".to_string(),
+                    sql_template: "INSERT INTO device_status (topic, qos, payload) VALUES ($1, $2, $3::jsonb)".to_string(),
+                    pool_size: 1,
+                    batch_size: 100,
+                    batch_timeout_ms: 50,
+                },
+                pg_transport.clone(),
+            )
+            .expect("valid pg sink"),
+        );
+        engine.connectors().register("pg-device-state", pg.clone());
+
+        let redis_transport = Arc::new(MemoryRedisTransport::new());
+        let redis = Arc::new(
+            RedisSink::new(
+                RedisSinkConfig {
+                    endpoint: "redis://127.0.0.1:6379".to_string(),
+                    command: RedisCommandKind::XAdd {
+                        stream_template: "stream:${topic}".to_string(),
+                        maxlen: Some(1000),
+                    },
+                },
+                redis_transport.clone(),
+            )
+            .expect("valid redis sink"),
+        );
+        engine.connectors().register("redis-device-state", redis);
+
+        engine
+            .create_rule(
+                "persist-status".to_string(),
+                TopicFilter::new("devices/+/status").unwrap(),
+                Some(
+                    r#"SELECT status, battery FROM "devices/+/status" WHERE battery > 0 INTO connector("pg-device-state")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("pg rule creates");
+        engine
+            .create_rule(
+                "stream-status".to_string(),
+                TopicFilter::new("devices/+/status").unwrap(),
+                Some(
+                    r#"SELECT status FROM "devices/+/status" INTO connector("redis-device-state")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("redis rule creates");
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("devices/thermostat/status").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "status": "online", "battery": 87, "secret": "hide_me" }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        pg.flush().await.expect("pg flush");
+
+        // Postgres received one projected row: secrets stripped, full
+        // topic + qos bound as parameters, never interpolated.
+        let batches = pg_transport.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].rows.len(), 1);
+        assert_eq!(batches[0].rows[0][0], b"devices/thermostat/status");
+        assert_eq!(batches[0].rows[0][1], b"0");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&batches[0].rows[0][2]).expect("stored JSON");
+        assert_eq!(
+            stored,
+            serde_json::json!({ "status": "online", "battery": 87 })
+        );
+        assert!(!batches[0].sql.contains("thermostat"), "values stay bound");
+
+        // Redis received one XADD with the projected payload.
+        let commands = redis_transport.commands();
+        assert_eq!(commands.len(), 1);
+        let encoded = String::from_utf8_lossy(&commands[0].encode_resp()).to_string();
+        assert!(encoded.contains("stream:devices/thermostat/status"), "stream key");
+        assert!(encoded.contains("MAXLEN"), "trim directive");
+        assert!(encoded.contains(r#""status":"online""#), "projected payload");
+        assert!(!encoded.contains("hide_me"), "secrets never leave the rule");
+    }
 }

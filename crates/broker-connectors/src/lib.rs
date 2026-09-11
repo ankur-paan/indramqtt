@@ -11,9 +11,13 @@ use thiserror::Error;
 
 pub mod kafka;
 pub mod rabbitmq;
+pub mod postgres;
+pub mod redis;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
+pub use postgres::{MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport};
+pub use redis::{MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply, RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {

@@ -120,6 +120,8 @@
     <select id="conn-kind">
       <option value="kafka">kafka</option>
       <option value="rabbitmq">rabbitmq</option>
+      <option value="postgres">postgres</option>
+      <option value="redis">redis</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -132,6 +134,21 @@
     <input id="conn-endpoint" placeholder="endpoint, e.g. amqp://127.0.0.1:5672/%2f" size="32">
     <input id="conn-exchange" placeholder="exchange" size="14">
     <input id="conn-routing" placeholder="routing key, e.g. sensor.${topic}" size="26">
+  </div>
+  <div class="row"><label>Postgres config</label>
+    <input id="conn-pgurl" placeholder="connection url" size="30">
+    <input id="conn-pgsql" placeholder="sql, e.g. INSERT … VALUES ($1, $2, $3)" size="34">
+  </div>
+  <div class="row"><label>Redis config</label>
+    <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
+    <select id="conn-redis-cmd">
+      <option value="set">set</option>
+      <option value="hset">hset</option>
+      <option value="publish">publish</option>
+      <option value="xadd">xadd</option>
+    </select>
+    <input id="conn-redis-key" placeholder="key/channel/stream template" size="24">
+    <input id="conn-redis-extra" placeholder="ttl secs / field / maxlen" size="20">
   </div>
   <div class="row">
     <button id="conn-add">Add connector</button>
@@ -424,6 +441,27 @@ $("conn-add").onclick = async () => {
               exchange: $("conn-exchange").value.trim(),
               routing_key_template: $("conn-routing").value.trim() || "${topic}",
               delivery_mode: 2};
+  } else if (kind === "postgres") {
+    config = {connection_url: $("conn-pgurl").value.trim(),
+              sql_template: $("conn-pgsql").value.trim() ||
+                "INSERT INTO mqtt_events (topic, qos, payload) VALUES ($1, $2, $3)"};
+  } else if (kind === "redis") {
+    const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
+          extra = $("conn-redis-extra").value.trim();
+    config = {endpoint: $("conn-redis-endpoint").value.trim() || "redis://127.0.0.1:6379",
+              command: cmd};
+    if (cmd === "set") {
+      config.key_template = key;
+      if (extra !== "") config.ttl_seconds = parseInt(extra, 10);
+    } else if (cmd === "hset") {
+      config.key_template = key;
+      config.field_template = extra || "value";
+    } else if (cmd === "publish") {
+      config.channel_template = key;
+    } else {
+      config.stream_template = key;
+      if (extra !== "") config.maxlen = parseInt(extra, 10);
+    }
   }
   const r = await fetch("/api/v1/connectors", {method: "POST",
     headers: {"content-type": "application/json"},
