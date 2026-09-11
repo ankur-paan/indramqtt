@@ -1125,7 +1125,8 @@ mod tests {
                 topic: Topic::new("alerts/critical").unwrap(),
                 qos: QoS::AtMostOnce,
             }],
-        );
+        )
+        .expect("rule creates");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -1178,6 +1179,83 @@ mod tests {
         let (topic, _, qos, _) = decode_publish_meta_parts(&routed.metadata);
         assert_eq!(topic, "alerts/critical");
         assert_eq!(qos, 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rule_sql_transforms_payload_end_to_end() {
+        use broker_rules::RuleAction;
+
+        let shared = Shared::new();
+        // Streaming SQL rule: project only `temperature` out of raw
+        // payloads. The secret field must never reach subscribers.
+        shared
+            .engine
+            .create_rule(
+                "project-temp".to_string(),
+                TopicFilter::new("raw/+").unwrap(),
+                Some(r#"SELECT temperature FROM "raw/temp" WHERE temperature > 0"#.to_string()),
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("transformed/temp").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("SQL rule creates");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        // Client A subscribes to transformed/temp as conn 401.
+        let sub_io = tokio::net::TcpStream::connect(addr).await.expect("connect sub");
+        let sub = FramedTransport::new(sub_io);
+        sub.send(bind_frame(401, 1, encode_bind_meta("dashboard", true, 60)))
+            .await
+            .expect("bind");
+        let _ = sub.recv().await.expect("recv binding");
+        sub.send(subscribe_frame(
+            401,
+            2,
+            encode_subscribe_meta(5, "dashboard", &[("transformed/temp", 1)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        // Client B publishes a wide payload to raw/temp as conn 402.
+        let pub_io = tokio::net::TcpStream::connect(addr).await.expect("connect pub");
+        let publ = FramedTransport::new(pub_io);
+        publ.send(bind_frame(402, 1, encode_bind_meta("sensor-9", true, 60)))
+            .await
+            .expect("bind");
+        let _ = publ.recv().await.expect("recv binding");
+        let raw = br#"{ "temperature": 85.0, "secret": "hide_me" }"#;
+        let (meta, payload) = encode_publish_meta("raw/temp", 0, 0, false, raw);
+        publ.send(publish_frame(402, 2, meta, payload))
+            .await
+            .expect("publish");
+
+        // Client A receives only the projected field over its transport.
+        let routed = sub.recv().await.expect("recv transformed");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert_eq!(routed.header.conn_id, 401);
+        let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "transformed/temp");
+        let body: serde_json::Value =
+            serde_json::from_slice(&routed.payload).expect("payload is JSON");
+        assert_eq!(body, serde_json::json!({ "temperature": 85.0 }));
 
         server.abort();
     }

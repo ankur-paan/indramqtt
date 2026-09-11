@@ -112,9 +112,16 @@ async fn create_rule(
         }
     }
 
-    let rule: Rule = state
-        .engine
-        .create_rule(req.name, topic_filter, req.sql_query, req.enabled, actions);
+    let rule: Rule = match state.engine.create_rule(
+        req.name,
+        topic_filter,
+        req.sql_query,
+        req.enabled,
+        actions,
+    ) {
+        Ok(rule) => rule,
+        Err(e) => return bad_request(format!("invalid sql_query: {e}")),
+    };
     (StatusCode::CREATED, Json(rule)).into_response()
 }
 
@@ -344,5 +351,47 @@ mod tests {
         let (status, body) = server.get("/api/v1/rules").await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_rules_create_with_sql_query() {
+        let (server, _engine) = TestServer::start().await;
+
+        // Valid streaming SQL is accepted and echoed back verbatim.
+        let (status, created) = server
+            .post(
+                "/api/v1/rules",
+                json!({"name": "hot-temp",
+                       "topic_filter": "sensors/+",
+                       "sql_query": "SELECT * FROM \"sensors/+\" WHERE temperature > 50.0",
+                       "enabled": true,
+                       "actions": [{"type": "republish", "topic": "alerts/hot", "qos": 0}]}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(
+            created["sql_query"],
+            json!("SELECT * FROM \"sensors/+\" WHERE temperature > 50.0")
+        );
+        let id = created["id"].as_str().expect("created rule has id").to_string();
+        let (status, _) = server.get(&format!("/api/v1/rules/{id}")).await;
+        assert_eq!(status, 200);
+
+        // Broken SQL is a 400 and stores nothing.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules",
+                json!({"name": "broken",
+                       "topic_filter": "sensors/+",
+                       "sql_query": "SELECT WHERE WHERE",
+                       "actions": []}),
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("sql_query"));
+
+        let (status, body) = server.get("/api/v1/rules").await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("list").len(), 1);
     }
 }

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use parking_lot::RwLock;
+use rekuiper_sql::{Evaluator, SelectStmt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,14 +171,22 @@ impl EventInput for BoundedEventInput {
 
 /// One native stream rule: match ingress by topic filter, run actions.
 ///
-/// `sql_query` is carried opaquely for now (projection/predicate pushdown
-/// is a later sprint); matching and actions execute natively.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `sql_query` is an optional streaming-SQL program parsed once at
+/// creation into `parsed_query`. At ingress, matching JSON payloads are
+/// filtered (WHERE) and projected (SELECT) through `rekuiper-sql`; rules
+/// without SQL pass the raw payload through. Stateful constructs
+/// (windows, GROUP BY, aggregations) are accepted by the parser but
+/// evaluated per-record for now — stateful dispatch is a later sprint.
+/// `parsed_query` is skipped in JSON output: the wire form carries the
+/// source SQL string, which re-parses on creation.
+#[derive(Debug, Clone, Serialize)]
 pub struct Rule {
     pub id: String,
     pub name: String,
     pub topic_filter: TopicFilter,
     pub sql_query: Option<String>,
+    #[serde(skip_serializing)]
+    pub parsed_query: Option<SelectStmt>,
     pub enabled: bool,
     pub actions: Vec<RuleAction>,
 }
@@ -244,6 +253,9 @@ impl RuleEngine {
     /// Build and store a rule, assigning its id (`rule-<n>`).
     /// Callers pass already-validated types; fallible parsing
     /// ([`TopicFilter::new`], [`Topic::new`]) happens at the API boundary.
+    /// A present `sql_query` is parsed immediately: invalid SQL fails
+    /// creation with [`RuleEngineError::InvalidRule`] so a broken rule
+    /// can never go live.
     pub fn create_rule(
         &self,
         name: String,
@@ -251,18 +263,35 @@ impl RuleEngine {
         sql_query: Option<String>,
         enabled: bool,
         actions: Vec<RuleAction>,
-    ) -> Rule {
+    ) -> Result<Rule, RuleEngineError> {
+        // The upstream parser only accepts bare-word stream names after
+        // FROM, while MQTT rules naturally reference quoted topic filters
+        // (`FROM "sensors/+"`). Per-record evaluation keys off the rule's
+        // `topic_filter` and never reads `stmt.from`, so the target is
+        // normalized to a dummy identifier before parsing. The original
+        // SQL string is preserved verbatim on the rule.
+        let parsed_query = match &sql_query {
+            Some(sql) => {
+                let normalized = normalize_from_target(sql);
+                let stmt = rekuiper_sql::Parser::new(&normalized)
+                    .parse_select()
+                    .map_err(|e| RuleEngineError::InvalidRule(format!("invalid sql_query: {e}")))?;
+                Some(stmt)
+            }
+            None => None,
+        };
         let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let rule = Rule {
             id: id.clone(),
             name,
             topic_filter,
             sql_query,
+            parsed_query,
             enabled,
             actions,
         };
         self.rules.write().insert(id, rule.clone());
-        rule
+        Ok(rule)
     }
 
     pub fn get_rule(&self, id: &str) -> Option<Rule> {
@@ -281,8 +310,12 @@ impl RuleEngine {
 
     /// Execute every enabled rule whose filter matches `topic`.
     /// Delivery QoS per republish is `min(ingress QoS, action QoS)` so a
-    /// rule can never upgrade delivery guarantees. Sink failures are
-    /// logged; remaining actions still run.
+    /// rule can never upgrade delivery guarantees. Rules carrying SQL
+    /// first run the payload through `rekuiper-sql`: non-JSON or
+    /// non-object payloads cannot be evaluated and skip the rule, a false
+    /// WHERE skips its actions, and SELECT projection replaces the bytes
+    /// forwarded to the sink. Sink failures are logged; remaining actions
+    /// still run.
     pub async fn dispatch_ingress(
         &self,
         topic: &Topic,
@@ -301,6 +334,9 @@ impl RuleEngine {
                 .collect()
         };
         for rule in &matched {
+            let Some(data) = apply_sql(&rule.parsed_query, payload, &rule.id) else {
+                continue;
+            };
             for action in &rule.actions {
                 match action {
                     RuleAction::Republish {
@@ -309,7 +345,7 @@ impl RuleEngine {
                     } => {
                         let effective = std::cmp::min(*action_qos, qos);
                         if let Err(e) = broker_sink
-                            .publish(dst.clone(), payload.clone(), effective, false)
+                            .publish(dst.clone(), data.clone(), effective, false)
                             .await
                         {
                             tracing::warn!(
@@ -329,6 +365,121 @@ impl RuleEngine {
                 }
             }
         }
+    }
+}
+
+/// Replace the stream reference after the first top-level FROM with a
+/// dummy identifier.
+///
+/// `rekuiper-sql` tokenizes the FROM target as a bare word, but MQTT
+/// rules name quoted topic filters (`FROM "sensors/+"`, `FROM a/#`).
+/// Rule dispatch matches on `topic_filter` and `eval_select` never reads
+/// `stmt.from`, so the target is semantically inert here. A field
+/// literally named `from` is not supported (creation fails loudly rather
+/// than misparsing silently only if the rewrite breaks the statement).
+fn normalize_from_target(sql: &str) -> String {
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let n = chars.len();
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    let mut ci = 0;
+    while ci < n {
+        let (b, c) = chars[ci];
+        let is_from = (c == 'f' || c == 'F')
+            && sql.len() - b >= 4
+            && sql[b..b + 4].eq_ignore_ascii_case("from")
+            && (b == 0 || !is_word_char(sql[..b].chars().next_back().unwrap_or(' ')))
+            && (b + 4 >= sql.len()
+                || !is_word_char(sql[b + 4..].chars().next().unwrap_or(' ')));
+        if !is_from {
+            ci += 1;
+            continue;
+        }
+        // Skip whitespace after FROM.
+        let mut cj = ci + 4;
+        while cj < n && chars[cj].1.is_whitespace() {
+            cj += 1;
+        }
+        if cj >= n {
+            return sql.to_string();
+        }
+        let jb = chars[cj].0;
+        let kb = {
+            let q = chars[cj].1;
+            if q == '"' || q == '\'' || q == '`' {
+                let mut ck = cj + 1;
+                while ck < n && chars[ck].1 != q {
+                    ck += 1;
+                }
+                if ck >= n {
+                    return sql.to_string();
+                }
+                chars[ck].0 + q.len_utf8()
+            } else {
+                let mut ck = cj;
+                while ck < n {
+                    let ch = chars[ck].1;
+                    if ch.is_whitespace() || matches!(ch, ';' | ',' | '(' | ')') {
+                        break;
+                    }
+                    ck += 1;
+                }
+                if ck < n {
+                    chars[ck].0
+                } else {
+                    sql.len()
+                }
+            }
+        };
+        return format!("{}stream{}", &sql[..jb], &sql[kb..]);
+    }
+    sql.to_string()
+}
+
+/// Run one ingress payload through an optional parsed query.
+///
+/// Returns the bytes to forward: the raw payload when no SQL is present,
+/// the projected JSON when evaluation succeeds, or `None` to skip the
+/// rule (WHERE false, non-JSON/non-object payload, serialization
+/// failure). Never panics on attacker-controlled bytes.
+fn apply_sql(
+    parsed: &Option<SelectStmt>,
+    payload: &Bytes,
+    rule_id: &str,
+) -> Option<Bytes> {
+    let stmt = match parsed {
+        None => return Some(payload.clone()),
+        Some(stmt) => stmt,
+    };
+    let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+        _ => {
+            tracing::debug!(
+                rule_id = %rule_id,
+                "SQL rule skipped: ingress payload is not a JSON object"
+            );
+            return None;
+        }
+    };
+    match Evaluator::eval_select(stmt, &record) {
+        Some(projected) => {
+            // serde_json::Map is key-sorted: deterministic wire bytes.
+            let object: serde_json::Map<String, serde_json::Value> =
+                projected.into_iter().collect();
+            match serde_json::to_vec(&serde_json::Value::Object(object)) {
+                Ok(bytes) => Some(Bytes::from(bytes)),
+                Err(e) => {
+                    tracing::warn!(
+                        rule_id = %rule_id,
+                        error = %e,
+                        "SQL rule skipped: projected payload not serializable"
+                    );
+                    None
+                }
+            }
+        }
+        // WHERE predicate false: rule does not fire.
+        None => None,
     }
 }
 
@@ -403,7 +554,8 @@ mod tests {
                 topic: Topic::new("alerts/critical").unwrap(),
                 qos: QoS::AtLeastOnce,
             }],
-        );
+        )
+        .expect("rule creates");
         let sink = Arc::new(RecordingSink::default());
         let sink_obj: Arc<dyn BrokerSink> = sink.clone();
 
@@ -439,7 +591,8 @@ mod tests {
             None,
             false,
             vec![RuleAction::Log],
-        );
+        )
+        .expect("rule creates");
         engine.create_rule(
             "other-branch".to_string(),
             TopicFilter::new("factory/#").unwrap(),
@@ -449,7 +602,8 @@ mod tests {
                 topic: Topic::new("alerts/other").unwrap(),
                 qos: QoS::AtMostOnce,
             }],
-        );
+        )
+        .expect("rule creates");
         let sink = Arc::new(RecordingSink::default());
         let sink_obj: Arc<dyn BrokerSink> = sink.clone();
 
@@ -474,7 +628,8 @@ mod tests {
             Some("SELECT * FROM a/#".to_string()),
             true,
             vec![RuleAction::Log],
-        );
+        )
+        .expect("rule creates");
         assert_eq!(rule.id, "rule-1");
         assert!(engine.get_rule("rule-1").is_some());
         assert!(engine.get_rule("rule-999").is_none());
@@ -553,5 +708,162 @@ mod tests {
                 Err(RuleEngineError::Overflow(OverflowReason::BufferFull))
             ));
         }
+    }
+
+    fn sql_rule(
+        engine: &RuleEngine,
+        sql: &str,
+        topic: &str,
+    ) -> (Arc<RecordingSink>, Arc<dyn BrokerSink>) {
+        engine
+            .create_rule(
+                "sql-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(sql.to_string()),
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new(topic).unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("SQL rule creates");
+        let sink = Arc::new(RecordingSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        (sink, sink_obj)
+    }
+
+    fn published_json(sink: &RecordingSink) -> Vec<serde_json::Value> {
+        sink.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, payload, _, _)| {
+                serde_json::from_slice(payload).expect("sink payload is JSON")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sql_where_filters_non_matching_messages() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let (sink, sink_obj) = sql_rule(
+            &engine,
+            r#"SELECT * FROM "sensors/+" WHERE temperature > 50.0"#,
+            "alerts/hot",
+        );
+        let topic = Topic::new("sensors/temperature").unwrap();
+
+        // Below threshold: predicate false, no action fires.
+        engine
+            .dispatch_ingress(
+                &topic,
+                &Bytes::from_static(br#"{ "temperature": 25.0 }"#),
+                QoS::AtMostOnce,
+                &sink_obj,
+            )
+            .await;
+        assert!(sink.published.lock().unwrap().is_empty());
+
+        // Above threshold: full record passes through SELECT *.
+        engine
+            .dispatch_ingress(
+                &topic,
+                &Bytes::from_static(br#"{ "temperature": 65.0, "unit": "C" }"#),
+                QoS::AtMostOnce,
+                &sink_obj,
+            )
+            .await;
+        assert_eq!(
+            published_json(&sink),
+            vec![serde_json::json!({ "temperature": 65.0, "unit": "C" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_select_projects_fields() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let (sink, sink_obj) = sql_rule(
+            &engine,
+            r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#,
+            "alerts/projected",
+        );
+
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/temperature").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "temperature": 72.5, "sensor_id": "temp_1", "raw_adc": 1024 }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink_obj,
+            )
+            .await;
+
+        // Only the projected field survives; secrets never reach the sink.
+        assert_eq!(
+            published_json(&sink),
+            vec![serde_json::json!({ "temperature": 72.5 })]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_skips_non_json_payloads() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let (sink, sink_obj) = sql_rule(
+            &engine,
+            r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#,
+            "alerts/x",
+        );
+        let topic = Topic::new("sensors/temperature").unwrap();
+
+        for payload in [
+            Bytes::from_static(b"not json at all"),
+            Bytes::from_static(br#"[1, 2, 3]"#),
+            Bytes::from_static(br#"42"#),
+        ] {
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtMostOnce, &sink_obj)
+                .await;
+        }
+        assert!(sink.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_sql_rejected_at_creation() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let err = engine
+            .create_rule(
+                "broken".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some("SELECT WHERE WHERE".to_string()),
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect_err("invalid SQL must fail creation");
+        assert!(matches!(err, RuleEngineError::InvalidRule(_)));
+        assert!(engine.list_rules().is_empty());
+    }
+
+    #[test]
+    fn test_normalize_from_target_vectors() {
+        assert_eq!(
+            normalize_from_target(r#"SELECT * FROM "sensors/+" WHERE temperature > 50.0"#),
+            "SELECT * FROM stream WHERE temperature > 50.0"
+        );
+        assert_eq!(
+            normalize_from_target("SELECT temperature FROM telemetry WHERE temperature > 0"),
+            "SELECT temperature FROM stream WHERE temperature > 0"
+        );
+        assert_eq!(
+            normalize_from_target("select a from s"),
+            "select a from stream"
+        );
+        // No FROM at all: untouched (the parser then reports it).
+        assert_eq!(normalize_from_target("SELECT 1"), "SELECT 1");
+        // Bare topic-style target.
+        assert_eq!(
+            normalize_from_target("SELECT * FROM a/#"),
+            "SELECT * FROM stream"
+        );
     }
 }
