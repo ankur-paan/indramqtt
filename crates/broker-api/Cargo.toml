@@ -13,7 +13,13 @@ broker-session = { workspace = true }
 broker-router = { workspace = true }
 broker-observability = { workspace = true }
 broker-auth = { workspace = true }
+brokerlink = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+broker-connectors = { workspace = true }
+async-trait = { workspace = true }

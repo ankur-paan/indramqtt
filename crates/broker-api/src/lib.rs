@@ -8,15 +8,21 @@ use axum::{
 use broker_auth::{AclAction, AclRule, MemoryAuth};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
-use broker_router::Router as SubscriptionRouter;
+use broker_router::{ConnTable, Router as SubscriptionRouter};
 use broker_rules::{Rule, RuleAction, RuleEngine};
 use broker_session::SessionManager;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub mod dashboard;
+pub mod ws;
 
 /// Shared node state injected into every management endpoint: the rule
 /// engine (mutable via the rules API), session directory, subscription
-/// router, and node metrics.
+/// router, delivery directory (shared with the BrokerLink plane so the
+/// dashboard WebSocket console receives the same fan-out), and node
+/// metrics.
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: Arc<RuleEngine>,
@@ -24,6 +30,8 @@ pub struct ApiState {
     pub router: Arc<SubscriptionRouter>,
     pub metrics: Arc<Metrics>,
     pub auth: Arc<MemoryAuth>,
+    pub conns: Arc<ConnTable>,
+    ws_conn_counter: Arc<AtomicU64>,
 }
 
 impl ApiState {
@@ -33,6 +41,7 @@ impl ApiState {
         router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
+        conns: Arc<ConnTable>,
     ) -> Self {
         Self {
             engine,
@@ -40,6 +49,8 @@ impl ApiState {
             router,
             metrics,
             auth,
+            conns,
+            ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
 
@@ -51,19 +62,33 @@ impl ApiState {
             router: Arc::new(SubscriptionRouter::new()),
             metrics: Arc::new(Metrics::new()),
             auth: Arc::new(MemoryAuth::new()),
+            conns: Arc::new(ConnTable::default()),
+            ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
+    }
+
+    /// Mint a collision-proof virtual connection id for a dashboard
+    /// WebSocket client (far above BEAM's monotonic conn ids).
+    pub fn next_ws_conn_id(&self) -> u64 {
+        self.ws_conn_counter.fetch_add(1, Ordering::SeqCst)
     }
 }
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
+        .route("/", get(redirect_to_dashboard))
+        .route("/dashboard", get(get_dashboard))
+        .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
         .route("/api/v1/nodes", get(get_nodes))
         .route("/api/v1/clients", get(get_clients))
+        .route("/api/v1/clients/:id", get(get_client))
         .route("/api/v1/metrics", get(get_metrics))
-        .route("/api/v1/auth/users", post(create_user))
-        .route("/api/v1/auth/acls", post(create_acl))
+        .route("/api/v1/connectors", get(get_connectors))
+        .route("/api/v1/auth/users", get(list_users).post(create_user))
+        .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
+        .route("/api/v1/rules/test", post(test_rule))
         .route(
             "/api/v1/rules/:id",
             get(get_rule).delete(delete_rule),
@@ -77,6 +102,23 @@ pub async fn serve(
     state: ApiState,
 ) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
+}
+
+async fn redirect_to_dashboard() -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [("location", "/dashboard")],
+        "redirecting to /dashboard",
+    )
+        .into_response()
+}
+
+async fn get_dashboard() -> Response {
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        dashboard::DASHBOARD_HTML,
+    )
+        .into_response()
 }
 
 /// Creation payload: identifiers are assigned server-side (`rule-<n>`).
@@ -195,11 +237,47 @@ async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> R
     }
 }
 
+/// Dry-run payload for the SQL studio tester.
+#[derive(Debug, Deserialize)]
+struct TestRuleRequest {
+    #[serde(default)]
+    sql_query: Option<String>,
+    #[serde(default)]
+    topic_filter: Option<String>,
+    topic: String,
+    payload: serde_json::Value,
+}
+
+/// Evaluate SQL + filter over a sample payload without storing a rule.
+async fn test_rule(
+    State(_state): State<ApiState>,
+    Json(req): Json<TestRuleRequest>,
+) -> Response {
+    match broker_rules::try_evaluate(
+        req.sql_query.as_deref(),
+        req.topic_filter.as_deref(),
+        &req.topic,
+        &req.payload,
+    ) {
+        Ok((matched, projected)) => Json(serde_json::json!({
+            "matched": matched,
+            "projected": projected,
+        }))
+        .into_response(),
+        Err(error) => bad_request(error),
+    }
+}
+
 /// Creation payload for a user credential (password is write-only).
 #[derive(Debug, Deserialize)]
 struct CreateUserRequest {
     username: String,
     password: String,
+}
+
+/// Usernames only: passwords are write-only and never listed.
+async fn list_users(State(state): State<ApiState>) -> Json<Vec<String>> {
+    Json(state.auth.usernames())
 }
 
 async fn create_user(
@@ -227,6 +305,11 @@ struct CreateAclRequest {
     action: String,
     topic_pattern: String,
     allow: bool,
+}
+
+/// Ordered ACL snapshot (first match wins on evaluation).
+async fn list_acls(State(state): State<ApiState>) -> Json<Vec<AclRule>> {
+    Json(state.auth.acl_rules())
 }
 
 async fn create_acl(
@@ -266,19 +349,33 @@ fn node_id() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
-/// Node status, version, and live connection count.
+/// Node status, version, live connection count, and rule count.
 async fn get_nodes(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "node_id": node_id(),
         "status": "running",
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.metrics.connections_active(),
+        "rules": state.engine.list_rules().len(),
     }))
 }
 
 /// Sorted ids of currently connected clients.
 async fn get_clients(State(state): State<ApiState>) -> Json<Vec<String>> {
     Json(state.sessions.active_client_ids())
+}
+
+/// Full detail row for one client session.
+async fn get_client(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    match state.sessions.client_info(&id) {
+        Some(info) => Json(info).into_response(),
+        None => not_found(&id),
+    }
+}
+
+/// Ids of registered external connectors (rule `ForwardConnector` targets).
+async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<String>> {
+    Json(state.engine.connectors().ids())
 }
 
 /// Prometheus text exposition of node counters and gauges.
@@ -320,13 +417,16 @@ mod tests {
             let sub_router = Arc::new(SubscriptionRouter::new());
             let metrics = Arc::new(Metrics::new());
             let auth = Arc::new(MemoryAuth::new());
+            let conns = Arc::new(broker_router::ConnTable::default());
             let state = TestState {
                 engine: engine.clone(),
                 sessions: sessions.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
             };
-            let app = router(ApiState::new(engine, sessions, sub_router, metrics, auth));
+            let app = router(ApiState::new(
+                engine, sessions, sub_router, metrics, auth, conns,
+            ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind test server");
@@ -689,5 +789,460 @@ mod tests {
             let (status, _) = server.post("/api/v1/auth/acls", body).await;
             assert_eq!(status, 400);
         }
+    }
+
+    #[tokio::test]
+    async fn test_auth_lists_users_and_acls() {
+        let (server, _state) = TestServer::start().await;
+
+        let (status, body) = server.get("/api/v1/auth/users").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server.get("/api/v1/auth/acls").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        server
+            .post(
+                "/api/v1/auth/users",
+                json!({"username": "alice", "password": "s3cret"}),
+            )
+            .await;
+        server
+            .post(
+                "/api/v1/auth/acls",
+                json!({"client_pattern": "alice",
+                       "action": "subscribe",
+                       "topic_pattern": "sensors/#",
+                       "allow": true}),
+            )
+            .await;
+
+        let (status, body) = server.get("/api/v1/auth/users").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!(["alice"]));
+        let (status, body) = server.get("/api/v1/auth/acls").await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("acls").len(), 1);
+        assert_eq!(body[0]["client_pattern"], json!("alice"));
+        assert_eq!(body[0]["action"], json!("subscribe"));
+        assert_eq!(body[0]["allow"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_routes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, _state) = TestServer::start().await;
+
+        // GET / redirects to the console.
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .expect("connect");
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8(buf).expect("UTF-8");
+        // Hyper echoes the HTTP/1.0 request version in the status line.
+        assert!(text.contains(" 303 "), "root must redirect, got: {text}");
+        assert!(
+            text.to_ascii_lowercase().contains("location: /dashboard"),
+            "redirect must target /dashboard, got: {text}"
+        );
+
+        // GET /dashboard serves the SPA shell.
+        let (status, html) = server
+            .request_raw("GET /dashboard HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+        for marker in [
+            "<title>IndraMQTT Console</title>",
+            "Community Edition (MIT)",
+            "id=\"metrics\"",
+            "id=\"clients\"",
+            "id=\"sql-studio\"",
+            "id=\"auth\"",
+            "id=\"console\"",
+            "/ws/mqtt",
+        ] {
+            assert!(html.contains(marker), "dashboard missing {marker}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clients_detail_endpoint() {
+        let (server, state) = TestServer::start().await;
+
+        let (session, _) = state.sessions.get_or_create("detail-1", false);
+        *session.conn_id.write() = Some(4242);
+        *session.keepalive_secs.write() = 60;
+        state.sessions.add_subscription(
+            "detail-1",
+            TopicFilter::new("sensors/+").unwrap(),
+            QoS::AtLeastOnce,
+        );
+
+        let (status, body) = server.get("/api/v1/clients/detail-1").await;
+        assert_eq!(status, 200);
+        let info: broker_session::ClientInfo =
+            serde_json::from_value(body).expect("detail row decodes");
+        assert_eq!(info.client_id, "detail-1");
+        assert_eq!(info.conn_id, Some(4242));
+        assert_eq!(info.keepalive_secs, 60);
+        assert!(!info.clean_start);
+        assert!(info.connected);
+        assert_eq!(info.subscriptions, vec!["sensors/+".to_string()]);
+
+        let (status, _) = server.get("/api/v1/clients/ghost").await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn test_connectors_endpoint_lists_registered() {
+        use broker_connectors::SinkConnector;
+
+        struct NullSink;
+        #[async_trait::async_trait]
+        impl SinkConnector for NullSink {            async fn send(
+                &self,
+                _topic: &Topic,
+                _payload: &bytes::Bytes,
+                _qos: QoS,
+            ) -> Result<(), broker_connectors::ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let (status, body) = server.get("/api/v1/connectors").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        state
+            .engine
+            .connectors()
+            .register("webhook-1", Arc::new(NullSink));
+        let (status, body) = server.get("/api/v1/connectors").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!(["webhook-1"]));
+    }
+
+    #[tokio::test]
+    async fn test_rules_test_endpoint() {
+        let (server, _state) = TestServer::start().await;
+
+        // SQL match with projection.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"sql_query": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
+                       "topic_filter": "sensors/+",
+                       "topic": "sensors/kitchen",
+                       "payload": {"temperature": 72.5, "secret": "x"}}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(true));
+        assert_eq!(body["projected"], json!({"temperature": 72.5}));
+
+        // Predicate false.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"sql_query": "SELECT * FROM \"sensors/+\" WHERE temperature > 100.0",
+                       "topic": "sensors/kitchen",
+                       "payload": {"temperature": 72.5}}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(false));
+
+        // No SQL: passthrough.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"topic": "a/b", "payload": {"v": 1}}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(true));
+        assert_eq!(body["projected"], json!({"v": 1}));
+
+        // Broken SQL is a 400.
+        let (status, _) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"sql_query": "SELECT WHERE WHERE",
+                       "topic": "a/b",
+                       "payload": {}}),
+            )
+            .await;
+        assert_eq!(status, 400);
+    }
+
+    /// Minimal WebSocket client over raw TCP (no extra deps): HTTP
+    /// upgrade with the RFC 6455 example key, masked binary sends, and
+    /// server frame parsing.
+    struct WsClient {
+        stream: tokio::net::TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl WsClient {
+        async fn connect(port: u16) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect ws");
+            // Fixed RFC example key -> fixed accept digest.
+            let req = "GET /ws/mqtt HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n\
+                       Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                       Sec-WebSocket-Version: 13\r\n\r\n";
+            stream.write_all(req.as_bytes()).await.expect("write upgrade");
+            let mut buf = Vec::new();
+            loop {
+                let mut chunk = [0u8; 512];
+                let n = stream.read(&mut chunk).await.expect("read upgrade");
+                assert!(n > 0, "upgrade response ended early");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_crlf2(&buf) {
+                    let head = String::from_utf8_lossy(&buf[..pos + 4]).to_string();
+                    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {head}");
+                    assert!(head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+                    let rest = buf[pos + 4..].to_vec();
+                    return Self { stream, buf: rest };
+                }
+            }
+        }
+
+        async fn send_bin(&mut self, payload: &[u8]) {
+            use tokio::io::AsyncWriteExt;
+            let mut frame = vec![0x82u8];
+            if payload.len() < 126 {
+                frame.push(payload.len() as u8 | 0x80);
+            } else if payload.len() < 65536 {
+                frame.push(126 | 0x80);
+                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            } else {
+                frame.push(127 | 0x80);
+                frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+            let mask = [0x11u8, 0x22, 0x33, 0x44];
+            frame.extend_from_slice(&mask);
+            for (i, byte) in payload.iter().enumerate() {
+                frame.push(byte ^ mask[i % 4]);
+            }
+            self.stream.write_all(&frame).await.expect("write frame");
+        }
+
+        /// Next server message payload (`None` on clean EOF).
+        async fn recv_msg(&mut self) -> Option<Vec<u8>> {
+            use tokio::io::AsyncReadExt;
+            loop {
+                if let Some((payload, consumed)) = parse_ws_frame(&self.buf) {
+                    self.buf.drain(..consumed);
+                    return Some(payload);
+                }
+                let mut chunk = [0u8; 4096];
+                match self.stream.read(&mut chunk).await.expect("read frame") {
+                    0 => return None,
+                    n => self.buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        }
+    }
+
+    fn find_crlf2(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    /// Parse one server frame (unmasked): `(payload, consumed)` or `None`
+    /// when incomplete. Close frames surface as empty payloads.
+    fn parse_ws_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+        if buf.len() < 2 || buf[1] & 0x80 != 0 {
+            return None;
+        }
+        let opcode = buf[0] & 0x0F;
+        let mut header = 2usize;
+        let mut length = (buf[1] & 0x7F) as usize;
+        if length == 126 {
+            if buf.len() < 4 {
+                return None;
+            }
+            length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            header = 4;
+        } else if length == 127 {
+            if buf.len() < 10 {
+                return None;
+            }
+            length = u64::from_be_bytes(buf[2..10].try_into().ok()?) as usize;
+            header = 10;
+        }
+        if buf.len() < header + length {
+            return None;
+        }
+        if opcode == 0x8 {
+            return Some((Vec::new(), header + length));
+        }
+        if opcode != 0x1 && opcode != 0x2 {
+            return None;
+        }
+        Some((buf[header..header + length].to_vec(), header + length))
+    }
+
+    // -- MQTT packet builders (mirror of the dashboard console) --
+
+    fn mqtt_remaining(mut n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (n % 128) as u8;
+            n /= 128;
+            if n > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn mqtt_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn mqtt_connect(client_id: &str, username: Option<&str>, password: Option<&[u8]>) -> Vec<u8> {
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4];
+        let mut flags = 0x02u8;
+        if username.is_some() {
+            flags |= 0x80;
+        }
+        if password.is_some() {
+            flags |= 0x40;
+        }
+        body.push(flags);
+        body.extend_from_slice(&60u16.to_be_bytes());
+        mqtt_str(&mut body, client_id);
+        if let Some(user) = username {
+            mqtt_str(&mut body, user);
+        }
+        if let Some(pass) = password {
+            body.extend_from_slice(&(pass.len() as u16).to_be_bytes());
+            body.extend_from_slice(pass);
+        }
+        let mut packet = vec![0x10];
+        packet.extend_from_slice(&mqtt_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn mqtt_subscribe(pid: u16, subs: &[(&str, u8)]) -> Vec<u8> {
+        let mut body = pid.to_be_bytes().to_vec();
+        for (filter, qos) in subs {
+            mqtt_str(&mut body, filter);
+            body.push(*qos);
+        }
+        let mut packet = vec![0x82];
+        packet.extend_from_slice(&mqtt_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn mqtt_publish(topic: &str, pid: u16, qos: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        mqtt_str(&mut body, topic);
+        if qos > 0 {
+            body.extend_from_slice(&pid.to_be_bytes());
+        }
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x30 | (qos << 1)];
+        packet.extend_from_slice(&mqtt_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn mqtt_packet_type(packet: &[u8]) -> u8 {
+        packet[0] >> 4
+    }
+
+    #[tokio::test]
+    async fn test_ws_mqtt_console_flow() {
+        let (server, _state) = TestServer::start().await;
+
+        // Subscriber console: CONNECT -> CONNACK, SUBSCRIBE -> SUBACK.
+        let mut sub = WsClient::connect(server.port).await;
+        sub.send_bin(&mqtt_connect("console-a", None, None)).await;
+        let connack = sub.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0, "CONNACK return code must be 0");
+        sub.send_bin(&mqtt_subscribe(7, &[("demo/#", 1)])).await;
+        let suback = sub.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[1], "granted QoS 1");
+
+        // Publisher console: QoS 1 publish lands on the subscriber.
+        let mut publ = WsClient::connect(server.port).await;
+        publ.send_bin(&mqtt_connect("console-b", None, None)).await;
+        let connack = publ.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        publ.send_bin(&mqtt_publish("demo/1", 42, 1, b"hi-ws")).await;
+        // Publisher gets its PUBACK...
+        let puback = publ.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        // ...and the subscriber gets the delivery with flags + payload.
+        let delivery = sub.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        assert_eq!(delivery[0] & 0x06, 0x02, "downstream QoS 1");
+        assert!(delivery
+            .windows(b"demo/1".len())
+            .any(|w| w == b"demo/1"));
+        assert!(delivery.ends_with(b"hi-ws"));
+
+        // PINGREQ -> PINGRESP on the same socket.
+        publ.send_bin(&[0xC0, 0x00]).await;
+        let pong = publ.recv_msg().await.expect("pingresp");
+        assert_eq!(pong, vec![0xD0, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_ws_auth_rejected_with_0x86() {
+        let (server, state) = TestServer::start().await;
+        state.auth.add_user("alice", b"s3cret");
+
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("console-x", Some("alice"), Some(b"wrong")))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0x86, "bad password must yield 0x86");
+        // Socket closes right after the failed CONNACK.
+        assert!(client.recv_msg().await.is_none());
+        assert!(state.sessions.get("console-x").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ws_subscribe_denied_with_0x87() {
+        let (server, state) = TestServer::start().await;
+        state.auth.add_rule(broker_auth::AclRule::new(
+            "console-y",
+            broker_auth::AclAction::All,
+            "#",
+            false,
+        ));
+
+        let mut client = WsClient::connect(server.port).await;
+        client.send_bin(&mqtt_connect("console-y", None, None)).await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+
+        client.send_bin(&mqtt_subscribe(3, &[("t", 0)])).await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0x87], "denied filter must yield 0x87");
     }
 }

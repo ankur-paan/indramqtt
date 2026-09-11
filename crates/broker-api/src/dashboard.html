@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IndraMQTT Console</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #2f81f7;
+    --green: #3fb950; --red: #f85149; --amber: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text);
+         font-family: -apple-system, "Segoe UI", sans-serif;
+         margin: 0; padding: 0 16px 64px; }
+  header { display: flex; align-items: center; gap: 12px;
+           padding: 14px 4px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 20px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  .dot { width: 10px; height: 10px; border-radius: 50%;
+         background: var(--red); display: inline-block; }
+  .dot.ok { background: var(--green); }
+  .badge { font-size: 12px; border: 1px solid var(--border);
+           border-radius: 12px; padding: 2px 10px; color: var(--dim); }
+  section { background: var(--panel); border: 1px solid var(--border);
+            border-radius: 8px; padding: 16px; margin-top: 16px; }
+  section h2 { margin: 0 0 12px; font-size: 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 12px; }
+  .card { background: var(--bg); border: 1px solid var(--border);
+          border-radius: 6px; padding: 12px; }
+  .card .v { font-size: 24px; font-weight: 600; }
+  .card .l { font-size: 12px; color: var(--dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px;
+           border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 500; }
+  input, textarea, select { background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 13px; }
+  textarea { width: 100%; font-family: monospace; }
+  button { background: var(--accent); color: #fff; border: 0;
+           border-radius: 6px; padding: 7px 14px; font-size: 13px;
+           cursor: pointer; }
+  button.ghost { background: transparent; border: 1px solid var(--border);
+                 color: var(--text); }
+  button.danger { background: var(--red); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+         margin: 8px 0; }
+  .row label { font-size: 12px; color: var(--dim); min-width: 110px; }
+  pre.log { background: var(--bg); border: 1px solid var(--border);
+            border-radius: 6px; padding: 10px; height: 220px;
+            overflow-y: auto; font-size: 12px; white-space: pre-wrap; }
+  .detail { font-size: 12px; color: var(--dim); }
+  details { margin-top: 4px; }
+  summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Indra<span>MQTT</span> Console</h1>
+  <span id="node-status" class="dot" title="node status"></span>
+  <span class="badge">Community Edition (MIT)</span>
+  <span class="badge" id="node-version">v?</span>
+</header>
+
+<section id="metrics">
+  <h2>Live Metrics</h2>
+  <div class="cards">
+    <div class="card"><div class="v" id="m-ingress">–</div><div class="l">ingress msg/s</div></div>
+    <div class="card"><div class="v" id="m-egress">–</div><div class="l">egress msg/s</div></div>
+    <div class="card"><div class="v" id="m-conns">–</div><div class="l">active connections</div></div>
+    <div class="card"><div class="v" id="m-rules">–</div><div class="l">rules</div></div>
+  </div>
+</section>
+
+<section id="clients">
+  <h2>Client Explorer</h2>
+  <div class="row"><input id="client-search" placeholder="filter client_id…" size="32"></div>
+  <table><thead><tr>
+    <th>client_id</th><th>conn</th><th>keepalive</th><th>clean</th>
+    <th>queued</th><th>subscriptions</th>
+  </tr></thead><tbody id="clients-body"></tbody></table>
+</section>
+
+<section id="sql-studio">
+  <h2>Streaming SQL Studio</h2>
+  <div class="row"><label>Rule name</label><input id="rule-name" value="hot-temp" size="24"></div>
+  <div class="row"><label>Topic filter</label><input id="rule-filter" value="sensors/+" size="24"></div>
+  <div class="row"><label style="align-self:flex-start">SQL query</label>
+    <textarea id="rule-sql" rows="3" cols="60">SELECT temperature FROM "sensors/+" WHERE temperature &gt; 40.0</textarea></div>
+  <div class="row"><label>Sink</label>
+    <select id="rule-sink">
+      <option value="republish">republish</option>
+      <option value="connector">connector</option>
+      <option value="log">log</option>
+    </select>
+    <input id="rule-sink-target" placeholder="topic or connector id" size="28" value="alerts/hot">
+    <input id="rule-sink-qos" placeholder="qos" size="4" value="0">
+  </div>
+  <div class="row">
+    <button id="rule-test">Test payload</button>
+    <input id="rule-test-topic" value="sensors/kitchen" size="20">
+    <input id="rule-test-payload" size="48" value='{"temperature": 72.5, "secret": "x"}'>
+  </div>
+  <pre class="log" id="rule-test-out" style="height:90px">test output…</pre>
+  <div class="row">
+    <button id="rule-create">Create rule</button>
+    <button id="rule-refresh" class="ghost">Refresh list</button>
+  </div>
+  <table><thead><tr><th>id</th><th>name</th><th>filter</th><th>sql</th><th></th></tr></thead>
+  <tbody id="rules-body"></tbody></table>
+</section>
+
+<section id="auth">
+  <h2>Auth &amp; ACL Manager</h2>
+  <div class="row"><label>Users</label>
+    <input id="user-name" placeholder="username" size="16">
+    <input id="user-pass" placeholder="password" type="password" size="16">
+    <button id="user-add">Add user</button>
+    <button id="user-refresh" class="ghost">Refresh</button>
+  </div>
+  <table><thead><tr><th>username</th></tr></thead><tbody id="users-body"></tbody></table>
+  <div class="row"><label>ACL rule</label>
+    <input id="acl-client" placeholder="client pattern" size="14" value="*">
+    <select id="acl-action"><option>publish</option><option>subscribe</option><option>all</option></select>
+    <input id="acl-topic" placeholder="topic pattern" size="16" value="#">
+    <label><input type="checkbox" id="acl-allow" checked> allow</label>
+    <button id="acl-add">Add rule</button>
+    <button id="acl-refresh" class="ghost">Refresh</button>
+  </div>
+  <table><thead><tr><th>#</th><th>client</th><th>action</th><th>topic</th><th>allow</th></tr></thead>
+  <tbody id="acls-body"></tbody></table>
+  <p class="detail">First match wins; unmatched is denied once rules exist.</p>
+</section>
+
+<section id="console">
+  <h2>Test Console (MQTT over WebSocket)</h2>
+  <div class="row">
+    <button id="ws-connect">Connect</button>
+    <button id="ws-disconnect" class="ghost">Disconnect</button>
+    <span id="ws-status" class="detail">disconnected</span>
+  </div>
+  <div class="row"><label>Subscribe</label>
+    <input id="ws-sub" value="test/#" size="20">
+    <button id="ws-sub-btn">Subscribe</button>
+  </div>
+  <div class="row"><label>Publish</label>
+    <input id="ws-pub-topic" value="test/demo" size="16">
+    <input id="ws-pub-payload" value='{"hello": 1}' size="30">
+    <button id="ws-pub-btn">Publish</button>
+  </div>
+  <pre class="log" id="ws-log">console output…</pre>
+</section>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? r.json() : r.text();
+}
+function log(el, msg) {
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ---- header + metrics ---- */
+let lastCounters = null, lastAt = 0;
+function parseMetrics(text) {
+  const out = {};
+  for (const line of text.split("\n")) {
+    const m = line.match(/^(indramqtt_\w+) (\d+)/);
+    if (m) out[m[1]] = parseInt(m[2], 10);
+  }
+  return out;
+}
+async function refreshMetrics() {
+  try {
+    const [text, node] = await Promise.all([
+      api("/api/v1/metrics"), api("/api/v1/nodes"),
+    ]);
+    const c = parseMetrics(text), now = Date.now();
+    if (lastCounters) {
+      const dt = Math.max((now - lastAt) / 1000, 0.001);
+      $("m-ingress").textContent =
+        ((c.indramqtt_messages_received_total - lastCounters.indramqtt_messages_received_total) / dt).toFixed(1);
+      $("m-egress").textContent =
+        ((c.indramqtt_messages_forwarded_total - lastCounters.indramqtt_messages_forwarded_total) / dt).toFixed(1);
+    }
+    lastCounters = c; lastAt = now;
+    $("m-conns").textContent = node.connections;
+    $("m-rules").textContent = node.rules;
+    $("node-version").textContent = "v" + node.version;
+    $("node-status").classList.add("ok");
+  } catch (e) { $("node-status").classList.remove("ok"); }
+}
+
+/* ---- clients ---- */
+async function refreshClients() {
+  try {
+    const q = $("client-search").value || "";
+    const ids = await api("/api/v1/clients");
+    const rows = [];
+    for (const id of ids) {
+      if (q && !id.includes(q)) continue;
+      const d = await api("/api/v1/clients/" + encodeURIComponent(id));
+      rows.push("<tr><td>" + d.client_id + "</td><td>" +
+        (d.conn_id === null || d.conn_id === undefined ? "–" : d.conn_id) +
+        "</td><td>" + d.keepalive_secs + "</td><td>" + d.clean_start +
+        "</td><td>" + d.queued + "</td><td>" +
+        d.subscriptions.map((s) => "<code>" + s + "</code>").join(" ") +
+        "</td></tr>");
+    }
+    $("clients-body").innerHTML = rows.join("") || "<tr><td colspan=6>no clients</td></tr>";
+  } catch (e) { /* keep last table on transient errors */ }
+}
+
+/* ---- rules ---- */
+function currentActions() {
+  const kind = $("rule-sink").value, target = $("rule-sink-target").value;
+  if (kind === "republish")
+    return [{type: "republish", topic: target, qos: parseInt($("rule-sink-qos").value || "0", 10)}];
+  if (kind === "connector") return [{type: "forwardconnector", connector_id: target}];
+  return [{type: "log"}];
+}
+async function refreshRules() {
+  const rules = await api("/api/v1/rules");
+  $("rules-body").innerHTML = rules.map((r) =>
+    "<tr><td>" + r.id + "</td><td>" + r.name + "</td><td><code>" +
+    r.topic_filter + "</code></td><td><code>" + (r.sql_query || "") +
+    "</code></td><td><button class='danger' data-del='" + r.id + "'>Delete</button></td></tr>"
+  ).join("");
+  document.querySelectorAll("[data-del]").forEach((b) =>
+    b.onclick = async () => {
+      await fetch("/api/v1/rules/" + b.dataset.del, {method: "DELETE"});
+      refreshRules();
+    });
+}
+
+/* ---- auth ---- */
+async function refreshUsers() {
+  const users = await api("/api/v1/auth/users");
+  $("users-body").innerHTML =
+    users.map((u) => "<tr><td>" + u + "</td></tr>").join("") || "<tr><td>none</td></tr>";
+}
+async function refreshAcls() {
+  const acls = await api("/api/v1/auth/acls");
+  $("acls-body").innerHTML = acls.map((a, i) =>
+    "<tr><td>" + i + "</td><td><code>" + a.client_pattern + "</code></td><td>" +
+    a.action + "</td><td><code>" + a.topic_pattern + "</code></td><td>" + a.allow + "</td></tr>"
+  ).join("") || "<tr><td colspan=5>allow-all (no rules)</td></tr>";
+}
+
+/* ---- minimal MQTT over WebSocket (binary frames) ---- */
+function encodeRemaining(n) {
+  const out = [];
+  do { let b = n % 128; n = Math.floor(n / 128); if (n > 0) b |= 0x80; out.push(b); }
+  while (n > 0);
+  return out;
+}
+function strBytes(s) {
+  const b = new TextEncoder().encode(s);
+  return [b.length >> 8, b.length & 0xff, ...b];
+}
+let ws = null, wsPid = 1;
+function wsSend(bytes) { ws.send(new Uint8Array(bytes)); }
+function mqttConnect() {
+  const id = "dashboard-" + Math.floor(Math.random() * 1e6);
+  const vh = [...strBytes("MQTT"), 4, 0x02, 0, 60];
+  const body = [...vh, ...strBytes(id)];
+  wsSend([0x10, ...encodeRemaining(body.length), ...body]);
+}
+function decodeRemaining(view, pos) {
+  let mul = 1, len = 0, b;
+  do { b = view[pos++]; len += (b & 0x7f) * mul; mul *= 128; } while (b & 0x80);
+  return [len, pos];
+}
+function mqttHandle(buf) {
+  const v = new Uint8Array(buf), type = v[0] >> 4;
+  const [len, pos] = decodeRemaining(v, 1);
+  if (type === 2) log($("ws-log"), "<< CONNACK rc=" + v[pos + 1]);
+  else if (type === 9) log($("ws-log"), "<< SUBACK pid=" + (v[pos] * 256 + v[pos + 1]));
+  else if (type === 3) {
+    const qos = (v[0] & 0x06) >> 1;
+    const tlen = (v[pos] << 8) | v[pos + 1];
+    const topic = new TextDecoder().decode(buf.slice(pos + 2, pos + 2 + tlen));
+    let at = pos + 2 + tlen, pid = 0;
+    if (qos > 0) { pid = (v[at] << 8) | v[at + 1]; at += 2; }
+    const payload = new TextDecoder().decode(buf.slice(at, pos + len));
+    log($("ws-log"), "<< PUBLISH " + topic + " qos=" + qos + " " + payload);
+    if (qos === 1) wsSend([0x40, 0x02, (pid >> 8) & 0xff, pid & 0xff]);
+  }
+  else if (type === 4) log($("ws-log"), "<< PUBACK");
+  else if (type === 13) log($("ws-log"), "<< PINGRESP");
+}
+function wsLogOpen() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(proto + "//" + location.host + "/ws/mqtt");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { $("ws-status").textContent = "connected"; mqttConnect(); };
+  ws.onmessage = (ev) => mqttHandle(ev.data);
+  ws.onclose = () => { $("ws-status").textContent = "disconnected"; ws = null; };
+  ws.onerror = () => log($("ws-log"), "!! websocket error");
+}
+
+/* ---- wiring ---- */
+$("rule-test").onclick = async () => {
+  try {
+    const r = await api("/api/v1/rules/test", {method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        sql_query: $("rule-sql").value,
+        topic_filter: $("rule-filter").value,
+        topic: $("rule-test-topic").value,
+        payload: JSON.parse($("rule-test-payload").value),
+      })});
+    $("rule-test-out").textContent = JSON.stringify(r, null, 1);
+  } catch (e) { $("rule-test-out").textContent = "error: " + e.message; }
+};
+$("rule-create").onclick = async () => {
+  await api("/api/v1/rules", {method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({name: $("rule-name").value,
+      topic_filter: $("rule-filter").value,
+      sql_query: $("rule-sql").value || null,
+      enabled: true, actions: currentActions()})});
+  refreshRules();
+};
+$("rule-refresh").onclick = refreshRules;
+$("user-add").onclick = async () => {
+  await api("/api/v1/auth/users", {method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({username: $("user-name").value, password: $("user-pass").value})});
+  refreshUsers();
+};
+$("user-refresh").onclick = refreshUsers;
+$("acl-add").onclick = async () => {
+  await api("/api/v1/auth/acls", {method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({client_pattern: $("acl-client").value,
+      action: $("acl-action").value, topic_pattern: $("acl-topic").value,
+      allow: $("acl-allow").checked})});
+  refreshAcls();
+};
+$("acl-refresh").onclick = refreshAcls;
+$("client-search").oninput = refreshClients;
+$("ws-connect").onclick = () => { if (!ws) wsLogOpen(); };
+$("ws-disconnect").onclick = () => { if (ws) ws.close(); };
+$("ws-sub-btn").onclick = () => {
+  if (!ws) return;
+  const t = $("ws-sub").value, pid = wsPid++;
+  const body = [(pid >> 8) & 0xff, pid & 0xff, ...strBytes(t), 0];
+  wsSend([0x82, ...encodeRemaining(body.length), ...body]);
+  log($("ws-log"), ">> SUBSCRIBE " + t);
+};
+$("ws-pub-btn").onclick = () => {
+  if (!ws) return;
+  const p = new TextEncoder().encode($("ws-pub-payload").value);
+  const t = new TextEncoder().encode($("ws-pub-topic").value);
+  const body = [t.length >> 8, t.length & 0xff, ...t, ...p];
+  wsSend([0x30, ...encodeRemaining(body.length), ...body]);
+  log($("ws-log"), ">> PUBLISH " + $("ws-pub-topic").value);
+};
+
+refreshMetrics(); refreshClients(); refreshRules(); refreshUsers(); refreshAcls();
+setInterval(refreshMetrics, 2000);
+setInterval(refreshClients, 5000);
+</script>
+</body>
+</html>

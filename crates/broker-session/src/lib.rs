@@ -4,6 +4,7 @@ use std::sync::Arc;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -17,6 +18,9 @@ pub struct Session {
     pub conn_id: RwLock<Option<u64>>,
     pub subscriptions: RwLock<HashMap<TopicFilter, broker_protocol::QoS>>,
     pub offline_queue: RwLock<VecDeque<QueuedMessage>>,
+    /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
+    /// the edge at bind time; surfaced read-only for observability.
+    pub keepalive_secs: RwLock<u16>,
     next_packet_id: AtomicU16,
 }
 
@@ -34,6 +38,19 @@ pub struct QueuedMessage {
 /// oldest entry drops so one dead client cannot balloon the node.
 pub const MAX_OFFLINE_QUEUE: usize = 1024;
 
+/// Management-API detail row for one client session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub client_id: String,
+    pub session_id: u64,
+    pub conn_id: Option<u64>,
+    pub keepalive_secs: u16,
+    pub clean_start: bool,
+    pub connected: bool,
+    pub queued: usize,
+    pub subscriptions: Vec<String>,
+}
+
 impl Session {
     pub fn new(id: SessionId, client_id: String, clean_start: bool) -> Self {
         Self {
@@ -44,6 +61,7 @@ impl Session {
             conn_id: RwLock::new(None),
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
+            keepalive_secs: RwLock::new(0),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -121,6 +139,43 @@ impl SessionManager {
         ids
     }
 
+    /// Full detail row for one client, if known (for the management API).
+    pub fn client_info(&self, client_id: &str) -> Option<ClientInfo> {
+        self.get(client_id).map(|session| ClientInfo {
+            client_id: session.client_id.clone(),
+            session_id: session.id.0,
+            conn_id: *session.conn_id.read(),
+            keepalive_secs: *session.keepalive_secs.read(),
+            clean_start: session.clean_start,
+            connected: *session.connected.read(),
+            queued: session.offline_len(),
+            subscriptions: {
+                let mut subs: Vec<String> = session
+                    .subscriptions
+                    .read()
+                    .keys()
+                    .map(|filter| filter.as_str().to_string())
+                    .collect();
+                subs.sort();
+                subs
+            },
+        })
+    }
+
+    /// Track one granted subscription on the session (mirrors the router).
+    pub fn add_subscription(&self, client_id: &str, filter: TopicFilter, qos: QoS) {
+        if let Some(session) = self.get(client_id) {
+            session.subscriptions.write().insert(filter, qos);
+        }
+    }
+
+    /// Forget one subscription (unsubscribe / connection teardown).
+    pub fn remove_subscription(&self, client_id: &str, filter: &TopicFilter) {
+        if let Some(session) = self.get(client_id) {
+            session.subscriptions.write().remove(filter);
+        }
+    }
+
     pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {        let mut map = self.sessions.write();
 
         if clean_start {
@@ -189,6 +244,44 @@ mod tests {
         *session.conn_id.write() = Some(7);
         manager.unbind_connection("client-a", 7);
         assert_eq!(manager.active_client_ids(), vec!["client-b"]);
+    }
+
+    #[test]
+    fn test_client_info_and_subscription_tracking() {
+        let manager = SessionManager::new();
+        assert!(manager.client_info("ghost").is_none());
+
+        let (session, _) = manager.get_or_create("detail-9", false);
+        *session.conn_id.write() = Some(99);
+        *session.keepalive_secs.write() = 30;
+        manager.add_subscription(
+            "detail-9",
+            TopicFilter::new("sensors/+").unwrap(),
+            broker_protocol::QoS::AtLeastOnce,
+        );
+        manager.add_subscription(
+            "detail-9",
+            TopicFilter::new("alerts").unwrap(),
+            broker_protocol::QoS::AtMostOnce,
+        );
+
+        let info = manager.client_info("detail-9").expect("known client");
+        assert_eq!(info.client_id, "detail-9");
+        assert_eq!(info.session_id, session.id.0);
+        assert_eq!(info.conn_id, Some(99));
+        assert_eq!(info.keepalive_secs, 30);
+        assert!(!info.clean_start);
+        assert!(info.connected);
+        assert_eq!(info.queued, 0);
+        assert_eq!(info.subscriptions, vec!["alerts".to_string(), "sensors/+".to_string()]);
+
+        manager.remove_subscription("detail-9", &TopicFilter::new("alerts").unwrap());
+        let info = manager.client_info("detail-9").expect("still known");
+        assert_eq!(info.subscriptions, vec!["sensors/+".to_string()]);
+
+        // Unknown clients are no-ops, never panics.
+        manager.add_subscription("ghost", TopicFilter::new("a").unwrap(), broker_protocol::QoS::AtMostOnce);
+        manager.remove_subscription("ghost", &TopicFilter::new("a").unwrap());
     }
 
     #[test]

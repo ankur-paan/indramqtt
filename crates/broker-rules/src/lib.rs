@@ -466,6 +466,59 @@ fn normalize_from_target(sql: &str) -> String {
     sql.to_string()
 }
 
+/// Dry-run SQL evaluation for the management console's payload tester.
+///
+/// Parses `sql` (if any), checks `topic_filter` coverage when given, and
+/// evaluates WHERE + SELECT over a JSON `payload`. Returns
+/// `(matched, projected)`: `projected` is `Some` with the (possibly
+/// projected) value on match and `None` when the predicate is false or
+/// the payload is not a JSON object. Invalid SQL, topics, or filters
+/// fail with a message.
+pub fn try_evaluate(
+    sql: Option<&str>,
+    topic_filter: Option<&str>,
+    topic: &str,
+    payload: &serde_json::Value,
+) -> Result<(bool, Option<serde_json::Value>), String> {
+    Topic::new(topic).map_err(|e| e.to_string())?;
+    if let Some(filter) = topic_filter {
+        if !filter.trim().is_empty() {
+            let parsed =
+                TopicFilter::new(filter).map_err(|e| format!("invalid topic_filter: {e}"))?;
+            let probe = Topic::new(topic).map_err(|e| e.to_string())?;
+            if !parsed.matches(&probe) {
+                return Ok((false, None));
+            }
+        }
+    }
+    let stmt = match sql {
+        Some(sql) if !sql.trim().is_empty() => {
+            let normalized = normalize_from_target(sql);
+            Some(
+                rekuiper_sql::Parser::new(&normalized)
+                    .parse_select()
+                    .map_err(|e| format!("invalid sql_query: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+    let record: HashMap<String, serde_json::Value> = match payload {
+        serde_json::Value::Object(map) => map.clone().into_iter().collect(),
+        _ => return Ok((false, None)),
+    };
+    match stmt {
+        None => Ok((true, Some(payload.clone()))),
+        Some(stmt) => match Evaluator::eval_select(&stmt, &record) {
+            Some(projected) => {
+                let object: serde_json::Map<String, serde_json::Value> =
+                    projected.into_iter().collect();
+                Ok((true, Some(serde_json::Value::Object(object))))
+            }
+            None => Ok((false, None)),
+        },
+    }
+}
+
 /// Run one ingress payload through an optional parsed query.
 ///
 /// Returns the bytes to forward: the raw payload when no SQL is present,
@@ -859,8 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_sql_rejected_at_creation() {
-        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    async fn test_invalid_sql_rejected_at_creation() {        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let err = engine
             .create_rule(
                 "broken".to_string(),
@@ -991,5 +1043,66 @@ mod tests {
                 &sink,
             )
             .await;
+    }
+
+    #[test]
+    fn test_try_evaluate_vectors() {
+        let payload = serde_json::json!({ "temperature": 72.5, "secret": "x" });
+
+        // SQL match with projection.
+        let (matched, projected) = try_evaluate(
+            Some(r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#),
+            Some("sensors/+"),
+            "sensors/kitchen",
+            &payload,
+        )
+        .expect("evaluates");
+        assert!(matched);
+        assert_eq!(projected, Some(serde_json::json!({ "temperature": 72.5 })));
+
+        // Predicate false: no match, no projection.
+        let (matched, projected) = try_evaluate(
+            Some(r#"SELECT * FROM "sensors/+" WHERE temperature > 100.0"#),
+            Some("sensors/+"),
+            "sensors/kitchen",
+            &payload,
+        )
+        .expect("evaluates");
+        assert!(!matched);
+        assert_eq!(projected, None);
+
+        // Filter mismatch short-circuits before SQL.
+        let (matched, projected) = try_evaluate(
+            Some(r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#),
+            Some("factory/#"),
+            "sensors/kitchen",
+            &payload,
+        )
+        .expect("evaluates");
+        assert!(!matched);
+        assert_eq!(projected, None);
+
+        // No SQL: raw passthrough on match.
+        let (matched, projected) =
+            try_evaluate(None, Some("sensors/+"), "sensors/kitchen", &payload)
+                .expect("evaluates");
+        assert!(matched);
+        assert_eq!(projected, Some(payload.clone()));
+
+        // Non-object payloads never match SQL rules.
+        let scalar = serde_json::json!(42);
+        let (matched, _) = try_evaluate(
+            Some(r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#),
+            None,
+            "sensors/kitchen",
+            &scalar,
+        )
+        .expect("evaluates");
+        assert!(!matched);
+
+        // Invalid inputs fail loudly.
+        assert!(try_evaluate(Some("SELECT WHERE WHERE"), None, "t", &payload).is_err());
+        assert!(try_evaluate(None, Some("a/#/b"), "t", &payload).is_err());
+        assert!(try_evaluate(None, None, "", &payload).is_err());
     }
 }

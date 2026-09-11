@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use broker_protocol::{Topic, TopicFilter};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -62,7 +63,8 @@ impl Authorizer for AllowAllAuth {
 }
 
 /// MQTT action gated by an ACL rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AclAction {
     Publish,
     Subscribe,
@@ -86,7 +88,7 @@ impl AclAction {
 }
 
 /// One ordered ACL entry: first match wins.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AclRule {
     pub client_pattern: String,
     pub action: AclAction,
@@ -191,9 +193,21 @@ impl MemoryAuth {
         self.users.read().len()
     }
 
+    /// Sorted usernames (passwords are write-only, never listed).
+    pub fn usernames(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.users.read().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Append an ACL rule (first match wins).
     pub fn add_rule(&self, rule: AclRule) {
         self.rules.write().push(rule);
+    }
+
+    /// Ordered snapshot of the ACL for management display.
+    pub fn acl_rules(&self) -> Vec<AclRule> {
+        self.rules.read().clone()
     }
 
     pub fn clear_rules(&self) {
