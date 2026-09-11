@@ -509,3 +509,78 @@ loop_recv(Sock, Parent, Acc) ->
         {error, _} ->
             ok
     end.
+
+%%====================================================================
+%% Sprint 11 restart immunity
+%%====================================================================
+
+reconnect_recovers_after_core_restart_test() ->
+    %% Fake core on an ephemeral port; the client reconnects with fast
+    %% backoff after we kill and re-listen.
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw},
+                                     {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(LSock),
+    Parent = self(),
+    Core1 = spawn(fun() -> accept_and_forward(LSock, Parent) end),
+    {ok, Registry} = indra_conn_registry:start_link(),
+    {ok, Pid} = indra_brokerlink:start_link([{transport, tcp},
+                                             {host, "127.0.0.1"},
+                                             {port, Port},
+                                             {reconnect, true},
+                                             {backoff_base_ms, 20},
+                                             {backoff_max_ms, 100}]),
+    try
+        %% Baseline ping works.
+        ?assertEqual(ok, indra_brokerlink:ping(Pid, 6101)),
+        receive {got_frame, _} -> ok after 5000 -> error(first_ping_timeout) end,
+        %% Kill the core: close accepted socket (via the acceptor) and
+        %% the listen socket so reconnects fail during the outage.
+        exit(Core1, kill),
+        ok = gen_tcp:close(LSock),
+        %% Sends now fail fast instead of hanging.
+        ?assertEqual({error, not_connected}, wait_send_down(Pid)),
+        %% Restart the core on the same port and serve again.
+        {ok, LSock2} = relisten(Port, 50),
+        _Core2 = spawn(fun() -> accept_and_forward(LSock2, Parent) end),
+        %% Reconnect heals without any client restart: ping flows again.
+        ?assertEqual(ok, wait_ping_up(Pid, 40)),
+        receive {got_frame, _} -> ok after 5000 -> error(reconnect_ping_timeout) end,
+        gen_tcp:close(LSock2)
+    after
+        indra_brokerlink:stop(Pid),
+        indra_conn_registry:stop(Registry),
+        catch gen_tcp:close(LSock)
+    end.
+
+%% @private Wait until ping reports steady not-connected (core down).
+%% Any other error (e.g. transient einval while the close is being
+%% processed) just means "not yet settled": keep polling.
+wait_send_down(_Pid, 0) ->
+    error(core_never_dropped);
+wait_send_down(Pid, Tries) ->
+    case indra_brokerlink:ping(Pid, 6101) of
+        {error, not_connected} -> {error, not_connected};
+        _ -> timer:sleep(50), wait_send_down(Pid, Tries - 1)
+    end.
+
+wait_send_down(Pid) ->
+    wait_send_down(Pid, 60).
+
+%% @private Wait until ping succeeds again (reconnected).
+wait_ping_up(_Pid, 0) ->
+    error(reconnect_timeout);
+wait_ping_up(Pid, Tries) ->
+    case indra_brokerlink:ping(Pid, 6101) of
+        ok -> ok;
+        {error, _} -> timer:sleep(50), wait_ping_up(Pid, Tries - 1)
+    end.
+
+%% @private Re-listen a fixed port, retrying against TIME_WAIT churn.
+relisten(_Port, 0) ->
+    error(relisten_timeout);
+relisten(Port, Tries) ->
+    case gen_tcp:listen(Port, [binary, {packet, raw},
+                               {active, false}, {reuseaddr, true}]) of
+        {ok, LSock} -> {ok, LSock};
+        {error, _} -> timer:sleep(100), relisten(Port, Tries - 1)
+    end.

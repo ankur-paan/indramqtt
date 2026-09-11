@@ -43,7 +43,37 @@ safe_without_table_test() ->
     %% No registry running: every call degrades gracefully.
     ?assertEqual({error, not_found}, indra_conn_registry:lookup(7003)),
     ?assertEqual(ok, indra_conn_registry:register(7003, self())),
-    ?assertEqual(ok, indra_conn_registry:unregister(7003)).
+    ?assertEqual(ok, indra_conn_registry:unregister(7003)),
+    ?assertEqual([], indra_conn_registry:members()),
+    ?assertEqual(ok, indra_conn_registry:notify_all({broker_down})).
+
+members_lists_everything_test() ->
+    {ok, Reg} = indra_conn_registry:start_link(),
+    try
+        ?assertEqual([], indra_conn_registry:members()),
+        Other = spawn(fun() -> timer:sleep(5000) end),
+        ?assertEqual(ok, indra_conn_registry:register(7004, self())),
+        ?assertEqual(ok, indra_conn_registry:register(7005, Other)),
+        Members = lists:sort(indra_conn_registry:members()),
+        ?assertEqual([{7004, self()}, {7005, Other}], Members),
+        exit(Other, kill)
+    after
+        indra_conn_registry:stop(Reg)
+    end.
+
+notify_all_reaches_members_test() ->
+    {ok, Reg} = indra_conn_registry:start_link(),
+    try
+        ?assertEqual(ok, indra_conn_registry:register(7006, self())),
+        ?assertEqual(ok, indra_conn_registry:notify_all({broker_down})),
+        receive
+            {'$gen_cast', {broker_down}} -> ok
+        after 2000 ->
+            error(notify_timeout)
+        end
+    after
+        indra_conn_registry:stop(Reg)
+    end.
 
 wait_gone(_ConnId, 0) ->
     error(reaper_timeout);

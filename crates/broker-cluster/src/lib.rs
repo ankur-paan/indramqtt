@@ -1,3 +1,6 @@
+pub mod license;
+pub use license::{ClusterLicense, LicensePayload, LicenseStatus};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};

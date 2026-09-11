@@ -16,7 +16,9 @@
          stop/1,
          register/2,
          unregister/1,
-         lookup/1]).
+         lookup/1,
+         members/0,
+         notify_all/1]).
 
 %% gen_server callbacks.
 -export([init/1,
@@ -74,6 +76,29 @@ lookup(ConnId) when is_integer(ConnId), ConnId >= 0 ->
                 [] -> {error, not_found}
             end
     end.
+
+%% @doc List every registered `{ConnId, Pid}` pair (e.g. for rebind
+%% sweeps). Empty when the registry is absent.
+-spec members() -> [{non_neg_integer(), pid()}].
+members() ->
+    case ets:whereis(?TABLE) of
+        undefined ->
+            [];
+        _ ->
+            [{ConnId, Pid} || [ConnId, Pid] <- ets:match(?TABLE, {'$1', '_', '$2'})]
+    end.
+
+%% @doc Send `Msg` to every registered connection process. Dead pids are
+%% skipped silently; absent registry is a no-op. Used for core
+%% up/down notifications driving the rebind state machine.
+-spec notify_all(term()) -> ok.
+notify_all(Msg) ->
+    lists:foreach(
+      fun({_ConnId, Pid}) ->
+          catch gen_statem:cast(Pid, Msg),
+          ok
+      end, members()),
+    ok.
 
 %%====================================================================
 %% gen_server callbacks

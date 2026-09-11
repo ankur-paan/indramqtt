@@ -1,18 +1,15 @@
 use async_trait::async_trait;
-use broker_auth::{AclAction, AclRule, Authenticator, Authorizer, MemoryAuth};
-use broker_cluster::{ClusterMessage, RoutingPlane};
+use broker_auth::{Authenticator, Authorizer, MemoryAuth};
+use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
-use broker_router::{split_shared_filter, Router, Subscription};
+use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager};
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -32,6 +29,14 @@ struct Args {
     /// (useful for test environments).
     #[arg(long, default_value = "127.0.0.1:18083")]
     api_bind: String,
+
+    /// Enterprise commercial license key for multi-node clustering (or via INDRA_LICENSE_KEY env).
+    #[arg(long)]
+    license_key: Option<String>,
+
+    /// Cluster seed nodes (e.g. 127.0.0.1:19883). Specifying enables distributed clustering.
+    #[arg(long)]
+    cluster_seeds: Option<String>,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -70,6 +75,7 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             // Connection != Session: pin this edge connection to the session
             // so Unbind can later verify ownership before detaching.
             *session.conn_id.write() = Some(frame.header.conn_id);
+            *session.keepalive_secs.write() = req.keepalive_secs;
             (session.id.0, present, 0u8)
         }
         Err(_) => (0u64, false, 2u8),
@@ -131,6 +137,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
 struct BindRequest {
     client_id: String,
     clean_start: bool,
+    keepalive_secs: u16,
     username: Option<String>,
     password: Option<Vec<u8>>,
 }
@@ -145,14 +152,14 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     }
     let id_bytes = &meta[2..2 + id_len];
     let flags = meta[2 + id_len];
-    // Keepalive occupies the next two bytes (validated for presence).
-    let _keepalive = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
+    let keepalive_secs = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
     let client_id = std::str::from_utf8(id_bytes).map_err(|_| "client id not UTF-8")?;
     let rest = &meta[5 + id_len..];
     let (username, password) = decode_bind_credentials(rest)?;
     Ok(BindRequest {
         client_id: client_id.to_string(),
         clean_start: flags & 0x01 != 0,
+        keepalive_secs,
         username,
         password,
     })
@@ -182,62 +189,6 @@ fn decode_bind_credentials(
     }
     let password = rest[base + 2..].to_vec();
     Ok((Some(username.to_string()), Some(password)))
-}
-
-/// Ephemeral routing table: edge `conn_id` -> mailbox of the task owning
-/// that BrokerLink IPC connection. Lets a publisher's task deliver
-/// `PublishOut` frames to a subscriber served by a different task.
-#[derive(Debug, Default)]
-struct ConnTable {
-    inner: Mutex<HashMap<u64, ConnSlot>>,
-}
-
-#[derive(Debug)]
-struct ConnSlot {
-    tx: UnboundedSender<BrokerFrame>,
-    /// Next `sequence_no` for frames routed to this connection. Starts at
-    /// 1; direct replies (Pong, SessionBinding, SubAck, PubAck) mirror the
-    /// request sequence instead.
-    next_seq: AtomicU64,
-}
-
-impl ConnTable {
-    fn register(&self, conn_id: u64, tx: UnboundedSender<BrokerFrame>) {
-        self.inner.lock().insert(
-            conn_id,
-            ConnSlot {
-                tx,
-                next_seq: AtomicU64::new(1),
-            },
-        );
-    }
-
-    fn unregister(&self, conn_id: u64) {
-        self.inner.lock().remove(&conn_id);
-    }
-
-    /// Remove every entry owned by a dead task (its sender is unique per
-    /// connection task, so channel identity is a safe ownership test).
-    fn prune_sender(&self, tx: &UnboundedSender<BrokerFrame>) {
-        self.inner
-            .lock()
-            .retain(|_, slot| !slot.tx.same_channel(tx));
-    }
-
-    /// Deliver one frame to a connection, stamping a per-destination
-    /// sequence number. Drops (and forgets) dead destinations.
-    fn route(&self, conn_id: u64, mut frame: BrokerFrame) {
-        let tx = self.inner.lock().get(&conn_id).map(|slot| {
-            let seq = slot.next_seq.fetch_add(1, Ordering::SeqCst);
-            frame.header.sequence_no = seq;
-            slot.tx.clone()
-        });
-        if let Some(tx) = tx {
-            if tx.send(frame).is_err() {
-                self.unregister(conn_id);
-            }
-        }
-    }
 }
 
 /// State shared by every BrokerLink connection task on this node.
@@ -481,6 +432,11 @@ async fn apply_subscribe(
     let mut codes = Vec::with_capacity(subs.len());
     let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
     for (filter_str, qos_raw) in subs {
+        // Delayed topics are publish-only markers, never subscriptions.
+        if strip_delayed_prefix(&filter_str).is_some() {
+            codes.push(0x80);
+            continue;
+        }
         let parsed = TopicFilter::new(filter_str).ok().and_then(|filter| {
             QoS::try_from(qos_raw)
                 .ok()
@@ -512,6 +468,11 @@ async fn apply_subscribe(
                 group,
             },
         );
+        // Mirror the grant on the session for observability (the router
+        // stays the routing authority).
+        shared
+            .sessions
+            .add_subscription(&client_id, filter.clone(), qos);
         granted.push((filter, qos_raw));
         codes.push(qos_raw);
     }
@@ -635,6 +596,12 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
 /// subscription QoS)`; QoS 1 deliveries draw their packet id from the
 /// subscriber session so each downstream flow keeps an independent id
 /// space. The raw payload bytes are forwarded untouched.
+///
+/// `$delayed/<secs>/<topic>` targets defer everything except the
+/// publisher ack: after the delay the message re-enters through
+/// [`ingress_pipeline`] with the inner topic (retained store, rules,
+/// fan-out, cluster forward), so delayed delivery observes the same
+/// semantics as immediate delivery, just later.
 async fn apply_publish(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -671,16 +638,103 @@ async fn apply_publish(
         }
     }
 
+    // Delayed delivery: ack now (the publisher must not stall), defer
+    // everything else past the timer.
+    if let Some((delay_secs, inner)) = strip_delayed_prefix(&topic_str) {
+        return apply_delayed_publish(frame, shared, delay_secs, inner, qos, retain, packet_id)
+            .await;
+    }
+
+    let ack = if qos == QoS::AtLeastOnce {
+        pub_ack_reply(frame, packet_id, 0)
+    } else {
+        None
+    };
+
+    let deliveries = ingress_pipeline(shared, &topic, qos, retain, &frame.payload).await;
+    forward_cluster(shared, &topic, qos, &frame.payload).await;
+
+    (ack, deliveries)
+}
+
+/// Upper bound for `$delayed` deferrals: beyond a day the request is
+/// dropped with a warning instead of pinning a task indefinitely.
+const MAX_DELAYED_SECS: u64 = 86_400;
+
+/// Handle a `$delayed/<secs>/<topic>` publish: immediate ack, deferred
+/// pipeline. An unparseable inner topic or an over-limit delay drops the
+/// message (it could never be delivered correctly).
+async fn apply_delayed_publish(
+    frame: &BrokerFrame,
+    shared: &Shared,
+    delay_secs: u64,
+    inner: &str,
+    qos: QoS,
+    retain: bool,
+    packet_id: u16,
+) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
+    let inner_topic = match Topic::new(inner.to_string()) {
+        Ok(topic) => topic,
+        Err(e) => {
+            warn!("Dropping delayed publish with bad inner topic: {}", e);
+            return (None, Vec::new());
+        }
+    };
+    if delay_secs > MAX_DELAYED_SECS {
+        warn!(
+            "Dropping delayed publish: {}s exceeds the {}s cap",
+            delay_secs, MAX_DELAYED_SECS
+        );
+        return (None, Vec::new());
+    }
+    let ack = if qos == QoS::AtLeastOnce {
+        pub_ack_reply(frame, packet_id, 0)
+    } else {
+        None
+    };
+    if delay_secs == 0 {
+        let deliveries =
+            ingress_pipeline(shared, &inner_topic, qos, retain, &frame.payload).await;
+        forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
+        return (ack, deliveries);
+    }
+    let shared = shared.clone();
+    let payload = frame.payload.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        let deliveries =
+            ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
+        shared
+            .metrics
+            .inc_messages_forwarded_by(deliveries.len() as u64);
+        for (conn_id, routed) in deliveries {
+            shared.conns.route(conn_id, routed);
+        }
+        forward_cluster(&shared, &inner_topic, qos, &payload).await;
+    });
+    (ack, Vec::new())
+}
+
+/// The shared ingress pipeline: retained store/clear, rule execution,
+/// and local fan-out. Used by immediate delivery and, after its timer,
+/// by delayed delivery alike.
+async fn ingress_pipeline(
+    shared: &Shared,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message.
     if retain {
-        if frame.payload.is_empty() {
-            if let Err(e) = shared.retained.clear_retained(&topic).await {
+        if payload.is_empty() {
+            if let Err(e) = shared.retained.clear_retained(topic).await {
                 warn!("Retained clear failed for {}: {}", topic.as_str(), e);
             }
         } else if let Err(e) = shared
             .retained
-            .set_retained(topic.clone(), qos, frame.payload.clone())
+            .set_retained(topic.clone(), qos, payload.clone())
             .await
         {
             warn!("Retained store failed for {}: {}", topic.as_str(), e);
@@ -692,35 +746,23 @@ async fn apply_publish(
     // never recurse through their own output.
     let rules_fired = shared
         .engine
-        .dispatch_ingress(&topic, &frame.payload, qos, &shared.sink)
+        .dispatch_ingress(topic, payload, qos, &shared.sink)
         .await;
     shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
-    let ack = if qos == QoS::AtLeastOnce {
-        pub_ack_reply(frame, packet_id, 0)
-    } else {
-        None
-    };
+    build_downlink_frames(
+        &shared.router, &shared.sessions, topic, qos, retain, payload,
+    )
+}
 
-    let deliveries = build_downlink_frames(
-        &shared.router,
-        &shared.sessions,
-        &topic,
-        qos,
-        retain,
-        &frame.payload,
-    );
-
-    // Clustered mode: one forward per matching remote node; each remote
-    // fans out locally. Local delivery above already happened.
+/// Clustered mode: one forward per matching remote node; each remote
+/// fans out locally.
+async fn forward_cluster(shared: &Shared, topic: &Topic, qos: QoS, payload: &Bytes) {
     if let Some(cluster) = &shared.cluster {
-        match cluster.resolve_route(&topic).await {
+        match cluster.resolve_route(topic).await {
             Ok(targets) => {
                 for target in targets {
-                    if let Err(e) = cluster
-                        .forward_message(&target, &topic, &frame.payload, qos)
-                        .await
-                    {
+                    if let Err(e) = cluster.forward_message(&target, topic, payload, qos).await {
                         warn!("Cluster forward to {} failed: {}", target, e);
                     }
                 }
@@ -730,8 +772,6 @@ async fn apply_publish(
             }
         }
     }
-
-    (ack, deliveries)
 }
 
 /// Build one `PublishOut` frame per router match. Shared by the standard
@@ -998,6 +1038,7 @@ async fn serve_api(
         shared.router.clone(),
         shared.metrics.clone(),
         shared.auth.clone(),
+        shared.conns.clone(),
     );
     broker_api::serve(listener, state).await
 }
@@ -1014,6 +1055,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("BrokerLink IPC protocol initialized");
     info!("Clean-room architecture ready");
+
+    if let Some(seeds) = &args.cluster_seeds {
+        info!("Cluster mode enabled with seeds: {}", seeds);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let license_key = args
+            .license_key
+            .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
+        let status = ClusterLicense::evaluate(license_key.as_deref(), 1, now);
+        ClusterLicense::log_status_banner(&status);
+    }
 
     let shared = Shared::new();
     if !args.api_bind.is_empty() {
@@ -1033,6 +1087,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use broker_auth::{AclAction, AclRule};
 
     /// Encode `BindConnection` metadata (test mirror of the BEAM
     /// `indra_brokerlink:encode_bind_meta/3` contract).
@@ -1417,7 +1472,7 @@ mod tests {
         assert!(ack.is_some(), "QoS 1 needs a PubAck");
 
         assert_eq!(deliveries.len(), 2);
-        let mut by_conn: HashMap<u64, BrokerFrame> =
+        let mut by_conn: std::collections::HashMap<u64, BrokerFrame> =
             deliveries.into_iter().map(|(c, f)| (c, f)).collect();
         let for_a = by_conn.remove(&31).expect("exact subscriber routed");
         let for_b = by_conn.remove(&32).expect("wildcard subscriber routed");
@@ -1991,6 +2046,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_serves_embedded_dashboard() {
+        let shared = Shared::new();
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let api_port = api_listener.local_addr().expect("api addr").port();
+        let api_task = tokio::spawn(serve_api(api_listener, shared));
+
+        // Root redirects to the console.
+        let (status, _) = http_get_text(api_port, "/").await;
+        assert_eq!(status, 303);
+
+        // The console shell loads with its key regions.
+        let (status, html) = http_get_text(api_port, "/dashboard").await;
+        assert_eq!(status, 200);
+        for marker in [
+            "<title>IndraMQTT Console</title>",
+            "Community Edition (MIT)",
+            "id=\"metrics\"",
+            "id=\"sql-studio\"",
+            "id=\"console\"",
+            "/ws/mqtt",
+        ] {
+            assert!(html.contains(marker), "dashboard missing {marker}");
+        }
+
+        api_task.abort();
+    }
+
+    #[tokio::test]
     async fn api_metrics_reflect_edge_traffic() {
         let shared = Shared::new();
 
@@ -2043,6 +2128,7 @@ mod tests {
         );
 
         edge_task.abort();
+        api_task.abort();
     }
 
     #[tokio::test]
@@ -2127,7 +2213,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_auth_failure_over_tcp_returns_0x86() {
-        let mut shared = Shared::new();
+        let shared = Shared::new();
         shared.auth.add_user("alice", b"s3cret");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2347,5 +2433,124 @@ mod tests {
         assert_eq!(json, serde_json::json!({ "temperature": 85.0 }));
 
         edge_task.abort();
+    }
+
+    /// Drive one delayed publish through `apply_publish` with a live
+    /// mailbox registered, returning the immediate reply.
+    async fn delayed_setup(
+        shared: &Shared,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>,
+        Option<BrokerFrame>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(951, tx);
+        let (session, _) = shared.sessions.get_or_create("delayed-sub", true);
+        *session.conn_id.write() = Some(951);
+        let sub = subscribe_frame(951, 1, encode_subscribe_meta(1, "delayed-sub", &[("alerts", 0)]));
+        let (reply, _) = apply_subscribe(&sub, shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"later");
+        let ack = apply_publish(&publish_frame(952, 1, meta, payload), shared).await;
+        (rx, ack.0)
+    }
+
+    #[tokio::test]
+    async fn delayed_publish_defers_delivery_by_one_second() {
+        let shared = test_shared();
+        let start = std::time::Instant::now();
+        let (mut rx, ack) = delayed_setup(&shared).await;
+        // QoS 0: no ack, and crucially no immediate delivery.
+        assert!(ack.is_none());
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(early.is_err(), "delayed message must not arrive early");
+
+        // ...but it arrives after the delay with the inner topic.
+        let routed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("delivery fires")
+            .expect("mailbox open");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(900));
+        let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "alerts");
+        assert_eq!(routed.payload, Bytes::from_static(b"later"));
+    }
+
+    #[tokio::test]
+    async fn delayed_publish_rejects_garbage() {
+        let shared = test_shared();
+        // Non-numeric delay is not a delayed target at all: it publishes
+        // literally (no subscribers exist for it here).
+        let (meta, payload) = encode_publish_meta("$delayed/soon/t", 0, 0, false, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(953, 1, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+
+        // Absurd delays are dropped, not scheduled.
+        let (meta, payload) =
+            encode_publish_meta("$delayed/99999999/t", 0, 0, false, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(953, 2, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+
+        // Delayed markers are not subscribable.
+        let sub = subscribe_frame(
+            954,
+            1,
+            encode_subscribe_meta(1, "c", &[("$delayed/1/t", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("suback replies");
+        assert_eq!(&reply.metadata[2..], &[0x80u8]);
+    }
+
+    #[tokio::test]
+    async fn delayed_publish_end_to_end_over_tcp() {
+        let shared = Shared::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub = bind_client(addr, 961, "patient", true).await;
+        sub.send(subscribe_frame(
+            961,
+            2,
+            encode_subscribe_meta(4, "patient", &[("alerts", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        assert_eq!(sub.recv().await.expect("suback").header.opcode, OpCode::SubAckOut);
+
+        let publ = bind_client(addr, 962, "procrastinator", true).await;
+        let start = std::time::Instant::now();
+        let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"finally");
+        publ.send(publish_frame(962, 2, meta, payload))
+            .await
+            .expect("publish delayed");
+
+        let routed = sub.recv().await.expect("recv delayed");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert_eq!(routed.header.conn_id, 961);
+        assert_eq!(routed.payload, Bytes::from_static(b"finally"));
+        let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "alerts");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "delivery must honor the 1s delay"
+        );
+
+        server.abort();
     }
 }

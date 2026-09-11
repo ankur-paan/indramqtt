@@ -7,7 +7,9 @@ repository.workspace = true
 
 [dependencies]
 broker-protocol = { workspace = true }
+brokerlink = { workspace = true }
 parking_lot = { workspace = true }
 ahash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }

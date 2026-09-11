@@ -1,7 +1,11 @@
 use ahash::{AHashMap, AHashSet};
 use broker_protocol::{QoS, Topic, TopicFilter};
-use parking_lot::RwLock;
+use brokerlink::BrokerFrame;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// One client's subscription. `client_id` is reference-counted so fan-out
 /// matching clones pointers instead of heap strings. `group` carries a
@@ -43,6 +47,19 @@ impl Subscription {
             group: Some(group.into()),
         }
     }
+}
+
+/// Split a `$delayed/<seconds>/<topic>` publish target into its delay
+/// and inner topic. Returns `None` for ordinary topics. The delay must
+/// be a non-negative integer and the inner topic non-empty; anything
+/// else is also `None` (the caller treats it as malformed).
+pub fn strip_delayed_prefix(topic: &str) -> Option<(u64, &str)> {
+    let rest = topic.strip_prefix("$delayed/")?;
+    let (secs, inner) = rest.split_once('/')?;
+    if inner.is_empty() {
+        return None;
+    }
+    secs.parse::<u64>().ok().map(|delay| (delay, inner))
 }
 
 /// Split a `$share/<group>/<filter>` request into its group and inner
@@ -301,6 +318,24 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_delayed_prefix_vectors() {
+        // Ordinary topics pass through untouched.
+        assert_eq!(strip_delayed_prefix("sensors/temp"), None);
+        assert_eq!(strip_delayed_prefix("$share/g/t"), None);
+        // Well-formed delayed targets split into delay + inner topic.
+        assert_eq!(
+            strip_delayed_prefix("$delayed/5/sensors/temp"),
+            Some((5, "sensors/temp"))
+        );
+        assert_eq!(strip_delayed_prefix("$delayed/0/a"), Some((0, "a")));
+        // Malformed variants are all rejected.
+        assert_eq!(strip_delayed_prefix("$delayed/"), None);
+        assert_eq!(strip_delayed_prefix("$delayed/5/"), None);
+        assert_eq!(strip_delayed_prefix("$delayed/soon/t"), None);
+        assert_eq!(strip_delayed_prefix("$delayed/-3/t"), None);
+    }
+
+    #[test]
     fn test_shared_group_round_robin_distributes() {
         let router = Router::new();
         let inner = TopicFilter::new("tasks").unwrap();
@@ -358,6 +393,64 @@ mod tests {
             let matched = router.matches(&Topic::new("tasks").unwrap());
             assert_eq!(matched.len(), 1);
             assert_eq!(matched.iter().next().unwrap().client_id.as_ref(), "worker-b");
+        }
+    }
+}
+
+/// Ephemeral delivery table: edge `conn_id` -> mailbox of the task owning
+/// that connection (BrokerLink IPC task or dashboard WebSocket task).
+/// Lets any publisher's task deliver `PublishOut` frames to a subscriber
+/// served by a different task. Shared by `broker-node` and `broker-api`
+/// so both transports fan out through one directory.
+#[derive(Debug, Default)]
+pub struct ConnTable {
+    inner: Mutex<HashMap<u64, ConnSlot>>,
+}
+
+#[derive(Debug)]
+struct ConnSlot {
+    tx: UnboundedSender<BrokerFrame>,
+    /// Next `sequence_no` for frames routed to this connection. Starts at
+    /// 1; direct replies (Pong, SessionBinding, SubAck, PubAck) mirror the
+    /// request sequence instead.
+    next_seq: AtomicU64,
+}
+
+impl ConnTable {
+    pub fn register(&self, conn_id: u64, tx: UnboundedSender<BrokerFrame>) {
+        self.inner.lock().insert(
+            conn_id,
+            ConnSlot {
+                tx,
+                next_seq: AtomicU64::new(1),
+            },
+        );
+    }
+
+    pub fn unregister(&self, conn_id: u64) {
+        self.inner.lock().remove(&conn_id);
+    }
+
+    /// Remove every entry owned by a dead task (its sender is unique per
+    /// connection task, so channel identity is a safe ownership test).
+    pub fn prune_sender(&self, tx: &UnboundedSender<BrokerFrame>) {
+        self.inner
+            .lock()
+            .retain(|_, slot| !slot.tx.same_channel(tx));
+    }
+
+    /// Deliver one frame to a connection, stamping a per-destination
+    /// sequence number. Drops (and forgets) dead destinations.
+    pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) {
+        let tx = self.inner.lock().get(&conn_id).map(|slot| {
+            let seq = slot.next_seq.fetch_add(1, Ordering::SeqCst);
+            frame.header.sequence_no = seq;
+            slot.tx.clone()
+        });
+        if let Some(tx) = tx {
+            if tx.send(frame).is_err() {
+                self.unregister(conn_id);
+            }
         }
     }
 }

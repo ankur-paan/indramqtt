@@ -105,7 +105,10 @@
 -type start_opt() :: {transport, tcp | uds}
                    | {host, string()}
                    | {port, inet:port_number()}
-                   | {path, string()}.
+                   | {path, string()}
+                   | {reconnect, boolean()}
+                   | {backoff_base_ms, pos_integer()}
+                   | {backoff_max_ms, pos_integer()}.
 
 %%====================================================================
 %% Framing API
@@ -586,6 +589,12 @@ start_link() ->
 %% <li>{@code {host, Host}} — TCP host, default {@code "127.0.0.1"}.</li>
 %% <li>{@code {port, Port}} — TCP port, default {@code 18883}.</li>
 %% <li>{@code {path, Path}} — UDS socket path (required for {@code uds}).</li>
+%% <li>{@code {reconnect, boolean()}} — when true, a dropped IPC socket
+%% is re-established with exponential backoff instead of stopping the
+%% server (Sprint 11 restart immunity). Default {@code false}: initial
+%% connect failures still fail startup fast.</li>
+%% <li>{@code {backoff_base_ms, Ms}} — first reconnect delay, default 100.</li>
+%% <li>{@code {backoff_max_ms, Ms}} — reconnect delay cap, default 5000.</li>
 %% </ul>
 -spec start_link([start_opt()]) -> {ok, pid()} | {error, term()}.
 start_link(Opts) when is_list(Opts) ->
@@ -616,6 +625,9 @@ init(Opts) ->
     Host = proplists:get_value(host, Opts, ?DEFAULT_HOST),
     Port = proplists:get_value(port, Opts, ?DEFAULT_PORT),
     Path = proplists:get_value(path, Opts, undefined),
+    Reconnect = proplists:get_value(reconnect, Opts, false),
+    BaseMs = proplists:get_value(backoff_base_ms, Opts, 100),
+    MaxMs = proplists:get_value(backoff_max_ms, Opts, 5000),
     case connect(Transport, Host, Port, Path) of
         {ok, Sock} ->
             State = #{sock => Sock,
@@ -626,7 +638,13 @@ init(Opts) ->
                       buffer => <<>>,
                       seq => 0,
                       last_pong => undefined,
-                      frames => []},
+                      frames => [],
+                      reconnect => Reconnect,
+                      backoff_base_ms => BaseMs,
+                      backoff_max_ms => MaxMs,
+                      attempt => 0,
+                      timer => undefined},
+            notify_up(),
             {ok, State};
         {error, Reason} ->
             {stop, Reason}
@@ -662,16 +680,23 @@ handle_info({tcp, Sock, Data}, #{sock := Sock} = State) ->
     NewState = drain_buffer(State#{buffer => Buf}),
     {noreply, NewState};
 handle_info({tcp_closed, Sock}, #{sock := Sock} = State) ->
-    {stop, {ipc_closed, tcp_closed}, State#{sock => undefined}};
+    handle_ipc_down(tcp_closed, State);
 handle_info({tcp_error, Sock, Reason}, #{sock := Sock} = State) ->
-    {stop, {ipc_error, Reason}, State};
+    handle_ipc_down({tcp_error, Reason}, State);
+handle_info({timeout, Ref, reconnect}, #{timer := Ref} = State) ->
+    attempt_reconnect(State#{timer => undefined});
+handle_info({timeout, _StaleRef, reconnect}, State) ->
+    %% Superseded timer (e.g. after a successful connect reset it).
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #{sock := Sock}) when is_port(Sock) ->
-    catch gen_tcp:close(Sock),
-    ok;
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    cancel_timer(maps:get(timer, State, undefined)),
+    case maps:get(sock, State, undefined) of
+        Sock when is_port(Sock) -> catch gen_tcp:close(Sock);
+        _ -> ok
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -692,6 +717,63 @@ transport_send(#{sock := Sock}, Frame) when is_port(Sock) ->
     gen_tcp:send(Sock, Frame);
 transport_send(_State, _Frame) ->
     {error, not_connected}.
+
+%% @private The IPC socket died: with `{reconnect, true}` stay alive,
+%% tell every connection to hold, and start backing off; otherwise stop
+%% as before (Sprint 1 semantics for supervised restarts).
+handle_ipc_down(Reason, State) ->
+    Sock = maps:get(sock, State, undefined),
+    catch gen_tcp:close(Sock),
+    State1 = State#{sock => undefined, buffer => <<>>},
+    case maps:get(reconnect, State1, false) of
+        true ->
+            notify_down(),
+            schedule_reconnect(State1#{attempt => 0});
+        false ->
+            {stop, {ipc_closed, Reason}, State1}
+    end.
+
+%% @private Schedule one reconnect attempt with backoff + jitter.
+%%
+%% Uses `erlang:start_timer/3` (not `send_after/3`) precisely because it
+%% delivers `{timeout, TimerRef, Msg}` carrying its own return value,
+%% which is what the staleness match in `handle_info` compares against.
+schedule_reconnect(#{attempt := Attempt} = State) ->
+    Base = maps:get(backoff_base_ms, State, 100),
+    Max = maps:get(backoff_max_ms, State, 5000),
+    Cap = min(Base bsl min(Attempt, 16), Max),
+    %% Half fixed, half jittered: spreads simultaneous reconnects.
+    Delay = Cap div 2 + rand:uniform(max(Cap div 2, 1)),
+    Timer = erlang:start_timer(Delay, self(), reconnect),
+    {noreply, State#{timer => Timer}}.
+
+%% @private One reconnect attempt: success sweeps connections back to
+%% the core, failure backs off further.
+attempt_reconnect(State) ->
+    #{transport := Transport, host := Host, port := Port, path := Path} = State,
+    case connect(Transport, Host, Port, Path) of
+        {ok, Sock} ->
+            notify_up(),
+            {noreply, State#{sock => Sock, buffer => <<>>, attempt => 0}};
+        {error, _Reason} ->
+            Attempt = maps:get(attempt, State, 0),
+            schedule_reconnect(State#{attempt => Attempt + 1})
+    end.
+
+cancel_timer(undefined) -> ok;
+cancel_timer(Timer) ->
+    catch erlang:cancel_timer(Timer),
+    ok.
+
+%% @private Broadcast core presence to every registered connection.
+%% Total when the registry is absent.
+notify_up() ->
+    catch indra_conn_registry:notify_all({broker_up, self()}),
+    ok.
+
+notify_down() ->
+    catch indra_conn_registry:notify_all({broker_down}),
+    ok.
 
 %% @private Drain complete frames from the reassembly buffer.
 drain_buffer(State) ->

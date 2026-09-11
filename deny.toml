@@ -18,6 +18,7 @@ allow = [
     "Unicode-DFS-2016",
     "OpenSSL",
     "Zlib",
+    "LicenseRef-Indra-Enterprise",
 ]
 confidence-threshold = 0.8
 

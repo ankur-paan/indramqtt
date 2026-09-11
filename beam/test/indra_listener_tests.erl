@@ -32,6 +32,56 @@ start_stop_ephemeral_test() ->
                                  [binary, {packet, raw}, {active, false}],
                                  500)).
 
+tls_connect_connack_test() ->
+    {Cert, Key} = test_certs(),
+    {ok, Mock} = mock_broker:start_link(),
+    {ok, Listener} = indra_listener:start_link([{transport, ssl},
+                                                {port, 0},
+                                                {certfile, Cert},
+                                                {keyfile, Key},
+                                                {conn, [{broker, Mock},
+                                                        {transport, ssl},
+                                                        {conn_id, 9101}]}]),
+    try
+        {ok, Port} = indra_listener:get_port(Listener),
+        {ok, Client} = ssl:connect("127.0.0.1", Port,
+                                   [binary, {packet, raw},
+                                    {active, false}, {verify, verify_none}],
+                                   5000),
+        try
+            ok = ssl:send(Client, connect_packet(<<"tls-dev">>, true, 60)),
+            [Sent] = wait_frames(Mock, 1),
+            ?assertEqual(16#0010, maps:get(opcode, Sent)),
+            ?assertEqual(9101, maps:get(conn_id, Sent)),
+            {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+            ?assertEqual(<<"tls-dev">>, maps:get(client_id, Bind)),
+            Conn = maps:get(from, Sent),
+            Binding = indra_brokerlink:encode_session_binding_meta(4242, false, 0),
+            ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+            {ok, Connack} = ssl:recv(Client, 4, ?RECV_TIMEOUT),
+            ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>, Connack),
+            ?assertMatch({connected, _}, sys:get_state(Conn))
+        after
+            ssl:close(Client)
+        end
+    after
+        indra_listener:stop(Listener),
+        mock_broker:stop(Mock)
+    end.
+
+tls_missing_keyfile_rejected_test() ->
+    {Cert, _Key} = test_certs(),
+    process_flag(trap_exit, true),
+    try
+        ?assertMatch({error, _},
+                     indra_listener:start_link([{transport, ssl},
+                                                {port, 0},
+                                                {certfile, Cert}])),
+        receive {'EXIT', _, _} -> ok after 1000 -> ok end
+    after
+        process_flag(trap_exit, false)
+    end.
+
 full_handshake_through_listener_test() ->
     {ok, Mock} = mock_broker:start_link(),
     {ok, Listener} = indra_listener:start_link([{port, 0},
@@ -229,3 +279,16 @@ publish_packet(Topic, PacketId, Flags, Payload) ->
     end,
     Body = <<Var/binary, Payload/binary>>,
     <<3:4, Flags:4, (byte_size(Body)), Body/binary>>.
+
+%% @private Locate the committed self-signed fixtures. Works whether the
+%% suite runs from `beam/` (rebar3) or the repo root (erl runner).
+test_certs() ->
+    Candidates = [{"test/certs/cert.pem", "test/certs/key.pem"},
+                  {"beam/test/certs/cert.pem", "beam/test/certs/key.pem"}],
+    case lists:dropwhile(
+           fun({C, K}) ->
+               filelib:is_regular(C) =:= false orelse filelib:is_regular(K) =:= false
+           end, Candidates) of
+        [{C, K} | _] -> {C, K};
+        [] -> error({missing_test_certs, Candidates})
+    end.

@@ -385,6 +385,142 @@ pipelined_connect_subscribe_test() ->
     end.
 
 %%====================================================================
+%% Sprint 11 core holding + rebind
+%%====================================================================
+
+broker_down_moves_to_await_core_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6201}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-hold">>, Conn),
+        ?assertMatch({connected, _}, sys:get_state(Conn)),
+        gen_statem:cast(Conn, {broker_down}),
+        ?assertMatch({await_core, _}, wait_state(Conn, await_core)),
+        %% Socket stays open: no EOF, and the process is alive.
+        ?assertEqual({error, timeout}, gen_tcp:recv(Client, 0, 200)),
+        ?assert(is_process_alive(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+broker_up_rebinds_session_non_clean_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6202}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-rebind">>, Conn),
+        gen_statem:cast(Conn, {broker_down}),
+        ?assertMatch({await_core, _}, wait_state(Conn, await_core)),
+        %% Replacement core announces itself (same mock pid here).
+        gen_statem:cast(Conn, {broker_up, Mock}),
+        %% Rebind observed: same client, forced non-clean, next seq.
+        [_, Rebind] = wait_frames(Mock, 2),
+        ?assertEqual(16#0010, maps:get(opcode, Rebind)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Rebind)),
+        ?assertEqual(<<"dev-rebind">>, maps:get(client_id, Bind)),
+        ?assertEqual(false, maps:get(clean_start, Bind)),
+        %% Core kept state: straight back to connected, no CONNACK repeat.
+        Binding = indra_brokerlink:encode_session_binding_meta(99, true, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertMatch({connected, _}, wait_state(Conn, connected)),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Client, 0, 200))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+rebind_without_state_resubscribes_silently_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6203}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-resub">>, Conn),
+        %% One live subscription, fully acked.
+        ok = gen_tcp:send(Client, subscribe_packet(7, [{<<"sport/tennis">>, 1}])),
+        [_Bind, _Sub] = wait_frames(Mock, 2),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0031},
+                                     indra_brokerlink:encode_suback_meta(7, [1]), <<>>),
+        ?assertEqual(<<16#90, 16#03, 16#00, 16#07, 16#01>>,
+                     recv_exact(Client, 5)),
+        %% Core flaps and loses state.
+        gen_statem:cast(Conn, {broker_down}),
+        ?assertMatch({await_core, _}, wait_state(Conn, await_core)),
+        gen_statem:cast(Conn, {broker_up, Mock}),
+        [_B1, _S1, Rebind] = wait_frames(Mock, 3),
+        ?assertEqual(16#0010, maps:get(opcode, Rebind)),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011},
+                                     indra_brokerlink:encode_session_binding_meta(100, false, 0),
+                                     <<>>),
+        %% Re-registration goes out with the original packet id...
+        [_B2, _S2, _RB, Resub] = wait_frames(Mock, 4),
+        ?assertEqual(16#0030, maps:get(opcode, Resub)),
+        {ok, ResubMeta} = indra_brokerlink:decode_subscribe_meta(maps:get(meta, Resub)),
+        ?assertEqual(7, maps:get(packet_id, ResubMeta)),
+        ?assertEqual([{<<"sport/tennis">>, 1}], maps:get(subscriptions, ResubMeta)),
+        %% ...but its SubAck is swallowed: nothing new on the socket.
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0031},
+                                     indra_brokerlink:encode_suback_meta(7, [1]), <<>>),
+        ?assertMatch({connected, _}, wait_state(Conn, connected)),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Client, 0, 300))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+pingreq_answered_while_holding_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6204}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-ping-hold">>, Conn),
+        gen_statem:cast(Conn, {broker_down}),
+        ?assertMatch({await_core, _}, wait_state(Conn, await_core)),
+        %% Edge PINGRESP keeps the peer keepalive alive across the outage.
+        ok = gen_tcp:send(Client, <<16#C0, 16#00>>),
+        ?assertEqual(<<16#D0, 16#00>>, recv_exact(Client, 2)),
+        ?assertMatch({await_core, _}, sys:get_state(Conn)),
+        %% No broker traffic was generated for the ping.
+        ?assertEqual(1, length(mock_broker:sent(Mock)))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+client_bytes_buffered_during_outage_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6205}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-buf">>, Conn),
+        gen_statem:cast(Conn, {broker_down}),
+        ?assertMatch({await_core, _}, wait_state(Conn, await_core)),
+        %% PUBLISH during the outage: buffered, nothing forwarded.
+        ok = gen_tcp:send(Client, publish_packet(<<"t">>, 0, 16#30, <<"held">>)),
+        timer:sleep(200),
+        ?assertEqual(1, length(mock_broker:sent(Mock))),
+        %% Core returns with state: drain forwards the held publish.
+        gen_statem:cast(Conn, {broker_up, Mock}),
+        [_Bind, Rebind] = wait_frames(Mock, 2),
+        ?assertEqual(16#0010, maps:get(opcode, Rebind)),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011},
+                                     indra_brokerlink:encode_session_binding_meta(7, true, 0),
+                                     <<>>),
+        ?assertMatch({connected, _}, wait_state(Conn, connected)),
+        [_B1, _RB, Pub] = wait_frames(Mock, 3),
+        ?assertEqual(16#0020, maps:get(opcode, Pub)),
+        ?assertEqual(<<"held">>, maps:get(payload, Pub))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+duplicate_broker_up_ignored_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6206}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-dup">>, Conn),
+        %% Same broker identity re-announced: no spurious rebind.
+        gen_statem:cast(Conn, {broker_up, Mock}),
+        timer:sleep(200),
+        ?assertEqual(1, length(mock_broker:sent(Mock))),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -432,6 +568,18 @@ wait_frames(Mock, N, Tries) ->
 recv_exact(Sock, N) ->
     {ok, Bin} = gen_tcp:recv(Sock, N, ?RECV_TIMEOUT),
     Bin.
+
+%% @private Poll a gen_statem until it reaches State (async transitions).
+wait_state(Pid, State) ->
+    wait_state(Pid, State, 40).
+
+wait_state(_Pid, _State, 0) ->
+    error(state_timeout);
+wait_state(Pid, State, Tries) ->
+    case sys:get_state(Pid) of
+        {State, Data} -> {State, Data};
+        _ -> timer:sleep(50), wait_state(Pid, State, Tries - 1)
+    end.
 
 %% @private Minimal MQTT 3.1.1 CONNECT (remaining length < 128 bytes).
 connect_packet(ClientId, CleanStart, Keepalive) ->

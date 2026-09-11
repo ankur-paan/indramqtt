@@ -1,0 +1,42 @@
+INDRA ENTERPRISE COMMERCIAL LICENSE
+Version 1.0 (2026)
+
+Copyright (c) 2026 I-Dacs Labs (https://i-dacs.com). All rights reserved.
+
+1. SCOPE AND APPLICABILITY
+This License governs the use, copying, modification, and distribution of the
+IndraMQTT Distributed Clustering engine ("crates/broker-cluster") and any
+components explicitly designated under this License (the "Enterprise Software").
+
+All other components of the IndraMQTT repository (including single-node broker
+runtime, BEAM edge, BrokerLink IPC, Radix router, session engine, storage engine,
+and stream processing rules) remain dual-licensed under the MIT License and the
+Apache License, Version 2.0, and are unaffected by this License.
+
+2. EVALUATION AND DEVELOPMENT USE
+Subject to the terms of this License, I-Dacs Labs grants you a non-exclusive,
+royalty-free, revocable license to compile, run, and evaluate the Enterprise
+Software for personal, development, testing, educational, and internal evaluation
+purposes only. Production use is strictly prohibited without a Commercial License.
+
+3. COMMERCIAL PRODUCTION DEPLOYMENT
+Any deployment of the Enterprise Software in a commercial, revenue-generating,
+production, or high-availability multi-node clustering environment requires an
+active Commercial Subscription or valid License Key issued by I-Dacs Labs.
+
+4. RESTRICTIONS
+You may not:
+a. Sub-license, lease, rent, or provide the Enterprise Software as a managed
+   clustering service to third parties without prior written consent.
+b. Remove, circumvent, or disable any cryptographic license verification, node
+   quota checks, or copyright notices contained within the Enterprise Software.
+c. Distribute cracked or modified versions of the Enterprise Software intended
+   to bypass license enforcement.
+
+5. WARRANTY DISCLAIMER
+THE ENTERPRISE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+For commercial licensing, enterprise support, and multi-node subscriptions:
+Contact: sales@i-dacs.com | https://i-dacs.com
