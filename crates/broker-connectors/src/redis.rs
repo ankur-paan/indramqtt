@@ -736,10 +736,7 @@ mod tests {
                 }
                 buf.extend_from_slice(&chunk[..n]);
                 // Drain every complete RESP array in the buffer.
-                loop {
-                    let Some(argv) = parse_command(&buf) else {
-                        break;
-                    };
+                while let Some(argv) = parse_command(&buf) {
                     let consumed = argv_consumed(&buf);
                     buf.drain(..consumed);
                     commands += 1;

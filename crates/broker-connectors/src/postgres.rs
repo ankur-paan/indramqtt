@@ -364,7 +364,7 @@ async fn read_msg(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
         .map_err(|_| ConnectorError::Connection("postgres read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("postgres read failed: {e}")))?;
     let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len < 4 || len > 16 * 1024 * 1024 {
+    if !(4..=16 * 1024 * 1024).contains(&len) {
         return Err(ConnectorError::Connection(format!(
             "postgres bad message length: {len}"
         )));
@@ -690,7 +690,7 @@ impl PgTransport for TcpPgTransport {
                 *guard = Some(self.dial().await?);
             }
             let stream = &mut guard.as_mut().expect("connected").stream;
-            match execute_extended(stream, &batch).await {
+            match execute_extended(stream, batch).await {
                 Ok(()) => return Ok(()),
                 Err(_) => {
                     *guard = None;

@@ -447,9 +447,29 @@ async fn create_connector(
     if req.id.trim().is_empty() {
         return bad_request("connector id must not be empty");
     }
+    let built = build_connector(&req).await;
+    match built {
+        Ok((kind, sink)) => {
+            state.engine.connectors().register(req.id.clone(), sink);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "id": req.id, "kind": kind })),
+            )
+                .into_response()
+        }
+        Err(message) => bad_request(&message),
+    }
+}
+
+/// Build one streaming connector from a creation request: parse the
+/// kind-specific config, validate it, and wire the sink to its
+/// transport. Pure construction except `disk_log`, which opens its
+/// directory (hence async).
+async fn build_connector(
+    req: &CreateConnectorRequest,
+) -> Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> {
     let kind = req.kind.to_ascii_lowercase();
-    let built: Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> = (|| {
-        match kind.as_str() {
+    match kind.as_str() {
             "kafka" => {
                 let config: broker_connectors::KafkaSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -626,22 +646,76 @@ async fn create_connector(
                 Ok(("timescaledb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "webhook" | "http" | "rest" => {
+                let config: broker_connectors::HttpSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid webhook config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid webhook config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::ReqwestHttpTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid webhook transport: {e}"))?,
+                );
+                let sink = broker_connectors::HttpSink::new(config, transport)
+                    .map_err(|e| format!("invalid webhook sink: {e}"))?;
+                Ok(("webhook".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "mqtt_bridge" | "mqtt-bridge" | "bridge" => {
+                let config: broker_connectors::MqttBridgeSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid mqtt_bridge config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid mqtt_bridge config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpMqttBridgeTransport::new(&config)
+                        .map_err(|e| format!("invalid mqtt_bridge transport: {e}"))?,
+                );
+                let sink = broker_connectors::MqttBridgeSink::new(config, transport)
+                    .map_err(|e| format!("invalid mqtt_bridge sink: {e}"))?;
+                Ok(("mqtt_bridge".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "disk_log" | "disklog" | "disk" => {
+                let config: broker_connectors::DiskLogSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid disk_log config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid disk_log config: {e}"))?;
+                let writer = std::sync::Arc::new(
+                    broker_connectors::FileDiskLogWriter::open(&config)
+                        .await
+                        .map_err(|e| format!("invalid disk_log writer: {e}"))?,
+                );
+                let sink = broker_connectors::DiskLogSink::new(config, writer)
+                    .map_err(|e| format!("invalid disk_log sink: {e}"))?;
+                Ok(("disk_log".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "sparkplug_b" | "sparkplug" | "spb" => {
+                let config: broker_connectors::SparkplugSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
+                // Frames are captured in-process; production MQTT
+                // delivery rides the mqtt_bridge connector.
+                let transport = std::sync::Arc::new(
+                    broker_connectors::MemorySparkplugTransport::new(),
+                );
+                let sink = broker_connectors::SparkplugBSink::new(config, transport)
+                    .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?;
+                Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, or logger)"
             )),
         }
-    })();
-    match built {
-        Ok((kind, sink)) => {
-            state.engine.connectors().register(req.id.clone(), sink);
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({ "id": req.id, "kind": kind })),
-            )
-                .into_response()
-        }
-        Err(error) => bad_request(error),
-    }
 }
 
 /// Prometheus text exposition of node counters and gauges.
@@ -1191,6 +1265,14 @@ mod tests {
             "conn-s3-bucket",
             "conn-es-index",
             "conn-ts-hypertable",
+            "value=\"webhook\"",
+            "value=\"mqtt_bridge\"",
+            "value=\"disk_log\"",
+            "value=\"sparkplug_b",
+            "conn-hook-url",
+            "conn-bridge-address",
+            "conn-disk-dir",
+            "conn-spb-prefix",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1446,13 +1528,92 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("timescaledb"));
 
+        // Webhook sink: validated without sending any request.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "hook-1",
+                       "kind": "webhook",
+                       "config": {"url": "https://hooks.example.com/ingest/${topic}",
+                                  "method": "post",
+                                  "headers": {},
+                                  "auth": {"type": "none"},
+                                  "body_format": "rawjson",
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 25,
+                                  "timeout_ms": 1000,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("webhook"));
+
+        // MQTT bridge sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "bridge-1",
+                       "kind": "mqtt_bridge",
+                       "config": {"broker_address": "mqtt://127.0.0.1:1883",
+                                  "client_id": "indra-bridge-test",
+                                  "clean_start": true,
+                                  "keep_alive_secs": 60,
+                                  "max_inflight": 1000,
+                                  "max_batch_size": 50,
+                                  "linger_ms": 10,
+                                  "protocol": "v311"}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("mqtt_bridge"));
+
+        // Disk log sink: validated against an isolated temp directory.
+        let disk_dir = std::env::temp_dir().join(format!("indra-test-disk-{}", std::process::id()));
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "disk-1",
+                       "kind": "disk_log",
+                       "config": {"directory": disk_dir.to_string_lossy(),
+                                  "filename_prefix": "audit",
+                                  "filename_extension": "log",
+                                  "format": "ndjson",
+                                  "compression": "none",
+                                  "sync_mode": {"mode": "osdefault"}}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("disk_log"));
+        std::fs::remove_dir_all(&disk_dir).ok();
+
+        // Sparkplug B sink: enterprise tier validated without any broker.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "spb-1",
+                       "kind": "sparkplug_b",
+                       "config": {"topic_prefix": "spBv1.0/plant1",
+                                  "tier": "enterprise",
+                                  "batch_size": 50,
+                                  "linger_ms": 25}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("sparkplug_b"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
-            json!([{"id": "ch-sink-1", "kind": "clickhouse"},
+            json!([{"id": "bridge-1", "kind": "mqtt_bridge"},
+                   {"id": "ch-sink-1", "kind": "clickhouse"},
                    {"id": "diag", "kind": "console"},
+                   {"id": "disk-1", "kind": "disk_log"},
                    {"id": "es-sink-1", "kind": "elasticsearch"},
+                   {"id": "hook-1", "kind": "webhook"},
                    {"id": "influx-sink-1", "kind": "influxdb"},
                    {"id": "kafka-sink-1", "kind": "kafka"},
                    {"id": "mysql-sink-1", "kind": "mysql"},
@@ -1460,6 +1621,7 @@ mod tests {
                    {"id": "rabbit-sink-1", "kind": "rabbitmq"},
                    {"id": "redis-sink-1", "kind": "redis"},
                    {"id": "s3-sink-1", "kind": "s3"},
+                   {"id": "spb-1", "kind": "sparkplug_b"},
                    {"id": "ts-sink-1", "kind": "timescaledb"}])
         );
 
@@ -1505,13 +1667,24 @@ mod tests {
                    "config": {"connection_url": "postgresql://u:p@h/db",
                               "hypertable": "m",
                               "sql_template": "INSERT INTO m VALUES ($1, $2)"}}),
+            json!({"id": "bad-hook", "kind": "webhook",
+                   "config": {"url": "ftp://hooks.example.com/x"}}),
+            json!({"id": "bad-bridge", "kind": "mqtt_bridge",
+                   "config": {"broker_address": "mqtt://h:1883",
+                              "client_id": "b",
+                              "qos_override": 5}}),
+            json!({"id": "bad-disk", "kind": "disk_log",
+                   "config": {"directory": "",
+                              "format": "ndjson"}}),
+            json!({"id": "bad-spb", "kind": "sparkplug_b",
+                   "config": {"tier": "community"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 11);
+        assert_eq!(body.as_array().expect("list").len(), 15);
     }
 
     #[tokio::test]

@@ -134,6 +134,10 @@
       <option value="s3">s3</option>
       <option value="elasticsearch">elasticsearch</option>
       <option value="timescaledb">timescaledb</option>
+      <option value="webhook">webhook</option>
+      <option value="mqtt_bridge">mqtt_bridge</option>
+      <option value="disk_log">disk_log</option>
+      <option value="sparkplug_b">sparkplug_b ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -186,6 +190,37 @@
     <input id="conn-ts-url" placeholder="connection url" size="30">
     <input id="conn-ts-hypertable" placeholder="hypertable, e.g. sensor_metrics" size="20">
     <input id="conn-ts-sql" placeholder="sql, e.g. INSERT … VALUES ($1, $2, $3, $4::jsonb) …" size="40">
+  </div>
+  <div class="row"><label>Webhook config</label>
+    <input id="conn-hook-url" placeholder="url, e.g. https://hooks.example.com/ingest/${topic}" size="40">
+    <select id="conn-hook-method">
+      <option value="post">post</option>
+      <option value="put">put</option>
+      <option value="patch">patch</option>
+    </select>
+    <input id="conn-hook-bearer" placeholder="bearer token (blank = none)" size="20">
+    <input id="conn-hook-hmac" placeholder="hmac secret (blank = unsigned)" type="password" size="20">
+  </div>
+  <div class="row"><label>MQTT bridge config</label>
+    <input id="conn-bridge-address" placeholder="broker, e.g. mqtt://127.0.0.1:1883" size="28">
+    <input id="conn-bridge-client" placeholder="client id, e.g. indra-bridge-edge1" size="24">
+    <input id="conn-bridge-prefix" placeholder="topic prefix, e.g. edge/station1/" size="22">
+  </div>
+  <div class="row"><label>Disk log config</label>
+    <input id="conn-disk-dir" placeholder="directory, e.g. /var/log/indra" size="24">
+    <input id="conn-disk-prefix" placeholder="prefix, e.g. telemetry" size="16">
+    <select id="conn-disk-format">
+      <option value="ndjson">ndjson</option>
+      <option value="raw">raw</option>
+      <option value="csv">csv</option>
+    </select>
+    <select id="conn-disk-compression">
+      <option value="none">none</option>
+      <option value="gzip">gzip</option>
+    </select>
+  </div>
+  <div class="row"><label>Sparkplug B config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-spb-prefix" placeholder="topic prefix, e.g. spBv1.0/plant1" size="28">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -548,6 +583,38 @@ $("conn-add").onclick = async () => {
               sql_template: $("conn-ts-sql").value.trim() ||
                 "INSERT INTO sensor_metrics (time, device_id, topic, metrics) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics",
               pool_size: 10, batch_size: 200, batch_timeout_ms: 50};
+  } else if (kind === "webhook") {
+    const bearer = $("conn-hook-bearer").value, hmac = $("conn-hook-hmac").value;
+    config = {url: $("conn-hook-url").value.trim(),
+              method: $("conn-hook-method").value,
+              headers: {},
+              auth: bearer === "" ? {type: "none"} : {type: "bearer", token: bearer},
+              body_format: "rawjson",
+              batch_size: 100, batch_bytes: 1048576, linger_ms: 50,
+              timeout_ms: 5000, max_retries: 3,
+              initial_backoff_ms: 100, max_backoff_ms: 2000};
+    if (hmac !== "") config.signature = {header_name: "X-Signature-SHA256",
+      algorithm: "sha256", secret: hmac, encoding: "hex"};
+  } else if (kind === "mqtt_bridge") {
+    config = {broker_address: $("conn-bridge-address").value.trim() || "mqtt://127.0.0.1:1883",
+              client_id: $("conn-bridge-client").value.trim() || "indra-bridge-dashboard",
+              clean_start: true,
+              keep_alive_secs: 60,
+              max_inflight: 10000, max_batch_size: 100, linger_ms: 10,
+              protocol: "v311"};
+    const prefix = $("conn-bridge-prefix").value.trim();
+    if (prefix !== "") config.topic_prefix = prefix;
+  } else if (kind === "disk_log") {
+    config = {directory: $("conn-disk-dir").value.trim(),
+              filename_prefix: $("conn-disk-prefix").value.trim() || "telemetry",
+              filename_extension: "log",
+              format: $("conn-disk-format").value,
+              compression: $("conn-disk-compression").value,
+              sync_mode: {mode: "everybatch"}};
+  } else if (kind === "sparkplug_b") {
+    config = {tier: "enterprise", batch_size: 100, linger_ms: 50};
+    const prefix = $("conn-spb-prefix").value.trim();
+    if (prefix !== "") config.topic_prefix = prefix;
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();

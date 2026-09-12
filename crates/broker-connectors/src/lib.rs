@@ -19,6 +19,10 @@ pub mod influxdb;
 pub mod s3;
 pub mod elasticsearch;
 pub mod timescaledb;
+pub mod http;
+pub mod mqtt_bridge;
+pub mod disk_log;
+pub mod sparkplug_b;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -30,6 +34,10 @@ pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
 pub use s3::{HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig, S3Transport, SigV4Request};
 pub use elasticsearch::{BulkOutcome, CapturedBulk, ElasticsearchAuth, ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport, HttpElasticsearchTransport, MockElasticsearchTransport};
 pub use timescaledb::{MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch, TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport};
+pub use http::{CapturedHttpRequest, HmacAlgorithm, HmacEncoding, HttpAuth, HttpBodyFormat, HttpConnector, HttpHmacSignature, HttpMethod, HttpRequest, HttpResponse, HttpSink, HttpSinkConfig, HttpTransport, MockHttpOutcome, MockHttpTransport, ReqwestHttpTransport};
+pub use mqtt_bridge::{BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport, MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig, MqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport, decode_publish, decode_remaining_length, encode_publish, encode_remaining_length, parse_bridge_address};
+pub use disk_log::{BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink, DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter};
+pub use sparkplug_b::{MemorySparkplugTransport, SpbAnomaly, SpbDataType, SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SparkplugBConnector, SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig, SparkplugStateMachine, SparkplugTopic, SparkplugTransport, decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint, payload_from_json, payload_to_json, tier, SPARKPLUG_TIER};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {

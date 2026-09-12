@@ -352,12 +352,19 @@ async fn drive_packets(
         }
         let packet: Vec<u8> = carry.drain(..total).collect();
         let payload = &packet[1 + header_len..];
-        handle_packet(state, socket, session, conn_id, tx, packet_type, flags, payload).await?;
+        handle_packet(state, socket, session, conn_id, tx, WsPacket { packet_type, flags, payload }).await?;
     }
 }
 
 async fn send_bin(socket: &mut WebSocket, bytes: Vec<u8>) -> bool {
-    socket.send(Message::Binary(bytes.into())).await.is_ok()
+    socket.send(Message::Binary(bytes)).await.is_ok()
+}
+
+/// One decoded dashboard-console frame for [`handle_packet`].
+struct WsPacket<'a> {
+    packet_type: u8,
+    flags: u8,
+    payload: &'a [u8],
 }
 
 async fn handle_packet(
@@ -366,10 +373,9 @@ async fn handle_packet(
     session: &mut Option<WsSession>,
     conn_id: u64,
     tx: &mpsc::UnboundedSender<BrokerFrame>,
-    packet_type: u8,
-    flags: u8,
-    payload: &[u8],
+    packet: WsPacket<'_>,
 ) -> Result<(), ()> {
+    let WsPacket { packet_type, flags, payload } = packet;
     match (session.is_none(), packet_type) {
         // First packet must be CONNECT.
         (true, 1) => {
@@ -538,7 +544,7 @@ async fn handle_publish(
         if !*target.connected.read() {
             continue;
         }
-        let Some(dest) = target.conn_id.read().clone() else {
+        let Some(dest) = *target.conn_id.read() else {
             continue;
         };
         let effective = std::cmp::min(u8::from(publish.qos), u8::from(sub.qos));

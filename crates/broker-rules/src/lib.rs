@@ -601,7 +601,7 @@ impl RuleEngine {
             if rule.tier == RuleTier::Enterprise
                 && rule.parsed_query.as_ref().is_some_and(|stmt| stmt.window.is_some())
             {
-                self.dispatch_windowed(&rule, topic, payload);
+                self.dispatch_windowed(rule, topic, payload);
                 continue;
             }
             let Some(data) = apply_sql(&rule.parsed_query, payload, &rule.id) else {
@@ -2373,7 +2373,7 @@ mod tests {
         ingress(&engine, &sink_obj, br#"{ "temperature": 8.0 }"#).await;
         ingress(&engine, &sink_obj, br#"{ "temperature": 12.0 }"#).await;
         for _ in 0..60 {
-            if probe.events.lock().unwrap().len() >= 1 {
+            if !probe.events.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3143,6 +3143,217 @@ mod tests {
         let metrics: serde_json::Value =
             serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
         assert_eq!(metrics, serde_json::json!({"avg_temp": 21.0}));
+    }
+
+    /// Industrial e2e (INDRA-217): one Sparkplug telemetry ingress
+    /// routes through streaming SQL `INTO connector(...)` rules and
+    /// fans out simultaneously to the webhook, MQTT bridge, disk log
+    /// and Sparkplug B sinks. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_industrial_sinks() {
+        use broker_connectors::{
+            DiskLogSink, DiskLogSinkConfig, HttpSink, HttpSinkConfig, MemoryDiskLogWriter,
+            MemoryMqttBridgeTransport, MemorySparkplugTransport, MqttBridgeSink,
+            MqttBridgeSinkConfig, MockHttpTransport, SparkplugBSink, SparkplugSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Webhook (auto-flush every row).
+        let hook_transport = Arc::new(MockHttpTransport::new());
+        let hook = Arc::new(
+            HttpSink::new(
+                HttpSinkConfig {
+                    url: "https://hooks.example.com/ingest/${topic}".to_string(),
+                    method: broker_connectors::HttpMethod::Post,
+                    headers: HashMap::new(),
+                    auth: broker_connectors::HttpAuth::None,
+                    body_format: broker_connectors::HttpBodyFormat::RawJson,
+                    signature: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: None,
+                    timeout_ms: Some(5_000),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                hook_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("hook-industrial", hook.clone());
+
+        // MQTT bridge (auto-flush every row).
+        let bridge_transport = Arc::new(MemoryMqttBridgeTransport::new());
+        let bridge = Arc::new(
+            MqttBridgeSink::new(
+                MqttBridgeSinkConfig {
+                    broker_address: "mqtt://upstream:1883".to_string(),
+                    client_id: "indra-bridge-test".to_string(),
+                    clean_start: true,
+                    username: None,
+                    password: None,
+                    keep_alive_secs: 60,
+                    topic_prefix: Some("upstream/".to_string()),
+                    topic_template: None,
+                    qos_override: None,
+                    retain_override: None,
+                    max_inflight: Some(10_000),
+                    max_batch_size: Some(1),
+                    linger_ms: Some(10),
+                    protocol: broker_connectors::MqttBridgeProtocol::V311,
+                },
+                bridge_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("bridge-upstream", bridge.clone());
+
+        // Disk audit log (write-through, in-memory segments).
+        let disk_writer = Arc::new(
+            MemoryDiskLogWriter::new(&DiskLogSinkConfig {
+                directory: "memory://audit".to_string(),
+                filename_prefix: "audit".to_string(),
+                filename_extension: "log".to_string(),
+                format: broker_connectors::DiskLogFormat::Ndjson,
+                max_file_size_bytes: None,
+                max_file_age_secs: None,
+                compression: broker_connectors::DiskLogCompression::None,
+                max_backup_files: None,
+                max_retention_days: None,
+                sync_mode: broker_connectors::DiskSyncMode::OsDefault,
+            })
+            .expect("valid writer"),
+        );
+        let disk = Arc::new(
+            DiskLogSink::new(
+                DiskLogSinkConfig {
+                    directory: "memory://audit".to_string(),
+                    filename_prefix: "audit".to_string(),
+                    filename_extension: "log".to_string(),
+                    format: broker_connectors::DiskLogFormat::Ndjson,
+                    max_file_size_bytes: None,
+                    max_file_age_secs: None,
+                    compression: broker_connectors::DiskLogCompression::None,
+                    max_backup_files: None,
+                    max_retention_days: None,
+                    sync_mode: broker_connectors::DiskSyncMode::OsDefault,
+                },
+                disk_writer.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("disk-audit", disk.clone());
+
+        // Sparkplug B frames (auto-flush every row).
+        let spb_transport = Arc::new(MemorySparkplugTransport::new());
+        let spb = Arc::new(
+            SparkplugBSink::new(
+                SparkplugSinkConfig {
+                    topic_prefix: Some("spBv1.0/plant1".to_string()),
+                    tier: "enterprise".to_string(),
+                    batch_size: Some(1),
+                    linger_ms: Some(50),
+                },
+                spb_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("spb-metrics", spb.clone());
+
+        // One INTO rule per sink over the same Sparkplug stream.
+        for (id, connector) in [
+            ("hook-rule", "hook-industrial"),
+            ("bridge-rule", "bridge-upstream"),
+            ("disk-rule", "disk-audit"),
+            ("spb-rule", "spb-metrics"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("spBv1.0/#").unwrap(),
+                    Some(format!(
+                        r#"SELECT metrics FROM "spBv1.0/#" WHERE metrics.Temperature > 80.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("spBv1.0/plant1/DDATA/edge7/plc3").unwrap(),
+                &Bytes::from_static(br#"{ "metrics": { "Temperature": 82.5 }, "seq": 14 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let projected = serde_json::json!({"metrics": {"Temperature": 82.5}});
+
+        // Webhook got the projected JSON at the templated URL.
+        let captured = hook_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].url,
+            "https://hooks.example.com/ingest/spBv1.0/plant1/DDATA/edge7/plc3"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].body).unwrap(),
+            projected
+        );
+
+        // Bridge got one QoS 0 frame on the prefixed topic.
+        let packets = bridge_transport.packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].topic, "upstream/spBv1.0/plant1/DDATA/edge7/plc3");
+        let decoded =
+            broker_connectors::decode_publish(&packets[0].bytes, false).unwrap();
+        assert_eq!(decoded.qos, 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded.payload).unwrap(),
+            projected
+        );
+
+        // Disk got one ndjson audit line.
+        let current = String::from_utf8(disk_writer.current_bytes()).unwrap();
+        assert_eq!(current.lines().count(), 1);
+        let row: serde_json::Value = serde_json::from_str(current.trim_end()).unwrap();
+        assert_eq!(row["topic"], "spBv1.0/plant1/DDATA/edge7/plc3");
+        assert_eq!(row["payload"], projected);
+
+        // Sparkplug got one Protobuf frame decoding back to metrics.
+        let frames = spb_transport.frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].topic, "spBv1.0/plant1/DDATA/edge7/plc3");
+        let back = broker_connectors::decode_payload(&frames[0].payload).unwrap();
+        let metrics: HashMap<String, broker_connectors::SpbValue> = back
+            .metrics
+            .into_iter()
+            .map(|metric| (metric.name.clone().unwrap(), metric.value))
+            .collect();
+        assert_eq!(
+            metrics["Temperature"],
+            broker_connectors::SpbValue::Double(82.5)
+        );
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("spBv1.0/plant1/DDATA/edge7/plc3").unwrap(),
+                &Bytes::from_static(br#"{ "metrics": { "Temperature": 70.0 } }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(hook_transport.captured().len(), 1);
+        assert_eq!(bridge_transport.packets().len(), 1);
+        let current = String::from_utf8(disk_writer.current_bytes()).unwrap();
+        assert_eq!(current.lines().count(), 1);
+        assert_eq!(spb_transport.frames().len(), 1);
     }
 
     #[tokio::test]

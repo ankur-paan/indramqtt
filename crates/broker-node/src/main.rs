@@ -844,7 +844,7 @@ fn build_downlink_frames(
         match sessions.get(&sub.client_id) {
             Some(session) => {
                 let connected = *session.connected.read();
-                let live = session.conn_id.read().clone();
+                let live = *session.conn_id.read();
                 match (connected, live) {
                     (true, Some(conn_id)) => {
                         let downlink_id = if effective == 0 {
@@ -1005,8 +1005,11 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {    if let Some(client_id
     shared.conns.unregister(frame.header.conn_id);
 }
 
+/// Decoded `(packet_id, client_id, [(filter, qos)])` subscription metadata.
+type SubscribeMeta = (u16, String, Vec<(String, u8)>);
+
 /// Decode `SubscribeMeta` into `(packet_id, client_id, [(filter, qos)])`.
-fn decode_subscribe_meta(meta: &[u8]) -> Option<(u16, String, Vec<(String, u8)>)> {
+fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
     if meta.len() < 6 {
         return None;
     }
@@ -1544,7 +1547,7 @@ mod tests {
 
         assert_eq!(deliveries.len(), 2);
         let mut by_conn: std::collections::HashMap<u64, BrokerFrame> =
-            deliveries.into_iter().map(|(c, f)| (c, f)).collect();
+            deliveries.into_iter().collect();
         let for_a = by_conn.remove(&31).expect("exact subscriber routed");
         let for_b = by_conn.remove(&32).expect("wildcard subscriber routed");
         for frame in [&for_a, &for_b] {
@@ -1627,7 +1630,7 @@ mod tests {
         apply_unbind(&unbind, &shared);
 
         let session = shared.sessions.get("gone-1").expect("session survives unbind");
-        assert_eq!(*session.connected.read(), false);
+        assert!(!*session.connected.read());
         assert_eq!(*session.conn_id.read(), None);
         // Durable subscriptions survive the detach.
         assert_eq!(
