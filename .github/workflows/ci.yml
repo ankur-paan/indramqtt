@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust-check:
+    name: Rust Core (Check, Clippy, Test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Cargo clippy (zero warnings policy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test suite
+        run: cargo test --workspace --verbose
+
+  beam-eunit:
+    name: BEAM Network Edge (EUnit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP & Rebar3
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '26.2'
+          rebar3-version: '3.22.1'
+
+      - name: Compile BEAM edge
+        working-directory: beam
+        run: rebar3 compile
+
+      - name: Run EUnit test suites
+        working-directory: beam
+        run: rebar3 eunit
+
+  benchmarks:
+    name: Benchmark Compilation Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build benchmarks
+        run: cargo test --release --bench broker_throughput --no-run

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🌐 Official Website & Documentation
+    url: https://indramqtt.com
+    about: Read official guides, benchmark reports, and deployment architectures.
+  - name: 💬 GitHub Discussions
+    url: https://github.com/ankur-paan/indramqtt/discussions
+    about: Ask questions, share ideas, and connect with the community.
+  - name: 🔒 Security Vulnerabilities
+    url: https://github.com/ankur-paan/indramqtt/security/advisories/new
+    about: Privately report a security vulnerability.

@@ -1,0 +1,50 @@
+name: "🐛 Bug Report"
+description: File a reproducible bug or unexpected behavior in IndraMQTT.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please check existing issues first.
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the problem...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Provide minimal steps or code/config to reproduce the behavior.
+      placeholder: |
+        1. Start IndraMQTT with config...
+        2. Connect MQTT client...
+        3. Publish message to topic...
+        4. Observe unexpected behavior...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS version, architecture, Rust version, Erlang version, and IndraMQTT commit/version.
+      placeholder: "e.g., Linux x86_64, Rust 1.80, OTP 26, IndraMQTT v0.1.0 (commit a09eb88)"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Error Messages
+      description: Please attach relevant broker logs or terminal output.
+      render: shell

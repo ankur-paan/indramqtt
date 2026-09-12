@@ -1,0 +1,37 @@
+# IndraMQTT One-Click Evaluation Environment
+# https://indramqtt.com
+version: '3.8'
+
+services:
+  indramqtt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: indramqtt/indramqtt:latest
+    container_name: indramqtt-broker
+    restart: unless-stopped
+    ports:
+      # Standard MQTT TCP listener
+      - "1883:1883"
+      # Secure MQTT TLS listener
+      - "8883:8883"
+      # MQTT-over-WebSocket listener
+      - "8083:8083"
+      # REST Management API & Web Dashboard SPA
+      - "18083:18083"
+    environment:
+      - RUST_LOG=info,broker_node=debug
+      - INDRA_API_BIND=0.0.0.0:18083
+    volumes:
+      - indramqtt_data:/var/lib/indramqtt
+      - ./indramqtt.example.toml:/etc/indramqtt/indramqtt.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:18083/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  indramqtt_data:
+    driver: local

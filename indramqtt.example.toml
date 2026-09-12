@@ -1,0 +1,124 @@
+# =============================================================================
+# IndraMQTT Production Configuration Template
+# Official Website: https://indramqtt.com
+# Documentation: https://indramqtt.com/docs
+# =============================================================================
+
+[node]
+# Unique identifier for this broker node within the cluster
+id = "indra-node-1"
+
+# Logging configuration (trace, debug, info, warn, error)
+log_level = "info"
+
+# Data directory for persistent segmented logs and cursor metadata
+data_dir = "/var/lib/indramqtt/data"
+
+# =============================================================================
+# Network Listeners
+# =============================================================================
+
+[listeners.tcp]
+# Standard plaintext MQTT listener (v3.1.1 & v5.0)
+enabled = true
+bind = "0.0.0.0:1883"
+max_connections = 1000000
+backlog = 1024
+
+[listeners.tls]
+# Secure TLS MQTT listener
+enabled = false
+bind = "0.0.0.0:8883"
+cert_file = "/etc/indramqtt/certs/server.crt"
+key_file = "/etc/indramqtt/certs/server.key"
+
+[listeners.websocket]
+# Binary MQTT-over-WebSocket listener
+enabled = true
+bind = "0.0.0.0:8083"
+path = "/ws/mqtt"
+
+[listeners.api]
+# Axum REST Management API & Embedded Web Dashboard SPA
+enabled = true
+bind = "0.0.0.0:18083"
+
+# =============================================================================
+# Multi-Tenant Quotas & Rate Limiting
+# =============================================================================
+
+[quotas]
+# Default max connections per authenticated username (0 = unlimited)
+default_max_connections = 10000
+
+# Default token-bucket publish rate limit in messages per second (0 = unlimited)
+default_max_publish_rate = 50000
+
+# Token bucket burst multiplier (allows burst up to burst * rate)
+burst_multiplier = 2.0
+
+# =============================================================================
+# Session & Protocol Invariants
+# =============================================================================
+
+[session]
+# Max session expiry interval in seconds (MQTT v5 Session Expiry)
+max_session_expiry_secs = 86400
+
+# Maximum queued offline messages per session (None / 0 = unbounded)
+max_offline_queue = 50000
+
+# Maximum inflight unacknowledged QoS 1 and QoS 2 messages
+max_inflight_messages = 65535
+
+# Keep-alive grace multiplier (allows up to keep_alive * multiplier before disconnect)
+keep_alive_grace = 1.5
+
+# =============================================================================
+# Embedded Stream Processing Engine (rekuiper)
+# =============================================================================
+
+[rules]
+# Ingress ring buffer channel depth for stateful window worker tasks
+window_channel_depth = 65536
+
+# Default memory backpressure policy when buffer is full:
+# Options: Block, DropNewest, DropOldest, SpillToDisk, RejectPublisher
+backpressure_policy = "DropOldest"
+
+# =============================================================================
+# Authentication & Authorization (ACL)
+# =============================================================================
+
+[auth]
+# Enable authentication checks
+enabled = true
+
+# Password hashing algorithm (sha256, bcrypt)
+password_hash = "sha256"
+
+# Anonymous connections policy (allow or deny)
+allow_anonymous = true
+
+# Superuser usernames bypassing ACL rules
+superusers = ["admin", "root"]
+
+# =============================================================================
+# Distributed Clustering (Enterprise Edition)
+# =============================================================================
+
+[cluster]
+# Enable multi-node QUIC distributed clustering mesh
+enabled = false
+
+# Gossip SWIM membership port for peer discovery
+gossip_bind = "0.0.0.0:7946"
+
+# Multiplexed QUIC data plane port for inter-broker message routing
+quic_bind = "0.0.0.0:9092"
+
+# Seed node addresses to join existing cluster
+seed_nodes = []
+
+# Path to enterprise cryptographic license key file
+license_file = "/etc/indramqtt/license.key"

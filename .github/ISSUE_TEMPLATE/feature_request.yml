@@ -1,0 +1,41 @@
+name: "💡 Feature Request / RFC"
+description: Propose a new feature, protocol connector, or performance enhancement for IndraMQTT.
+title: "[Feature]: "
+labels: ["enhancement", "proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We love ideas! Please describe the use case, why it matters, and how it fits IndraMQTT's high-performance architecture.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / Use Case
+      description: Is your feature request related to a specific challenge or limitation?
+      placeholder: "I'm trying to ingest 500k msg/sec from Siemens PLCs into..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed Solution & Architectural Fit
+      description: Describe the solution you'd like to see implemented.
+      placeholder: "Add a connector or streaming SQL function that..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative approaches or workarounds you considered?
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Open-Core Classification
+      description: Where does this feature belong?
+      options:
+        - "Community Edition (Core / Stateless SQL / Edge Sinks)"
+        - "Enterprise Edition (Clustering / Stateful Windows / Industrial & Cloud)"
+        - "Unsure / Need Discussion"
+    validations:
+      required: true

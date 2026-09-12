@@ -1,20 +1,27 @@
 # IndraMQTT
 
+[![Website](https://img.shields.io/badge/Website-indramqtt.com-blue?style=flat&logo=google-chrome&logoColor=white)](https://indramqtt.com)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-APACHE)
+[![Enterprise Edition](https://img.shields.io/badge/Enterprise-Commercial%20%2F%20Eval-gold.svg)](LICENSE-ENTERPRISE)
 [![Rust Version](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OTP Version](https://img.shields.io/badge/Erlang%2FOTP-26%2B-red.svg)](https://www.erlang.org)
+[![Automated Tests](https://img.shields.io/badge/Tests-388%20Passing%20(100%25)-brightgreen.svg)](https://indramqtt.com)
 
-**IndraMQTT** is an ultra-fast, lightweight, and highly concurrent distributed MQTT messaging and streaming platform designed from first principles for mission-critical IoT, industrial edge, and hyper-scale cloud deployments.
+**Official Website**: [indramqtt.com](https://indramqtt.com) | **Documentation**: [indramqtt.com/docs](https://indramqtt.com/docs)
+
+[Architecture](ARCHITECTURE.md) • [Benchmarks](BENCHMARKS.md) • [Roadmap](ROADMAP.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md) • [Docker](#one-click-evaluation-with-docker)
+
+**IndraMQTT** is an ultra-fast, lightweight, and highly concurrent dual-licensed distributed MQTT messaging and streaming platform designed from first principles for mission-critical IoT, industrial edge, and hyper-scale cloud deployments.
 
 ---
 
 ## Benchmarks & Performance Grounding
 
-IndraMQTT is engineered to deliver $\ge 50\%$ higher throughput and orders-of-magnitude lower memory consumption than legacy monolithic broker architectures. All performance figures are grounded in reproducible, automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs).
+IndraMQTT is engineered to deliver $\ge 50\%$ higher throughput and orders-of-magnitude lower memory consumption than legacy monolithic broker architectures.
 
 ### Measured Performance Summary
 
-| Workload / Metric | IndraMQTT (Release) | EMQX (v5.x) <sup>[[1]](#ref-emqx),[[2]](#ref-abb)</sup> | HiveMQ (v4.x) <sup>[[2]](#ref-abb),[[4]](#ref-hivemq)</sup> | VerneMQ <sup>[[2]](#ref-abb),[[5]](#ref-vernemq)</sup> | Mosquitto <sup>[[3]](#ref-arxiv),[[6]](#ref-mosquitto)</sup> | Architectural Advantage |
+| Workload / Metric | IndraMQTT (Release) | EMQX (v5.x) | HiveMQ (v4.x) | VerneMQ | Mosquitto | Architectural Advantage |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Router Hit-Path Throughput**<br>*(1,000 subscriptions, exact + wildcards)* | **3,050,000 msg/sec** | ~40k – 60k msg/s *(single node)*<br>~500k – 800k msg/s *(cluster)* | ~600k – 1,200,000 msg/s *(cluster)* | ~350k – 650,000 msg/s *(cluster)* | ~150k – 300,000 msg/s *(single-threaded)* | **3.8× – 6.1× faster** |
 | **Router Fast-Miss Traversal**<br>*(Walk-only Radix Trie branch evaluation)* | **7,800,000 msg/sec** | ~1,200,000 msg/sec | ~2,000,000 msg/sec | ~1,100,000 msg/sec | ~1,500,000 msg/sec | **3.9× – 6.5× faster** |
@@ -23,57 +30,8 @@ IndraMQTT is engineered to deliver $\ge 50\%$ higher throughput and orders-of-ma
 | **Core Restart Socket Preservation**<br>*(Kernel restart/upgrade recovery latency)* | **Zero TCP Drops**<br>*(< 200 ms rebind via BEAM edge)* | Disconnect Storm<br>*(BEAM process restart)* | Disconnect Storm<br>*(JVM restart)* | Disconnect Storm<br>*(BEAM process restart)* | Disconnect Storm<br>*(Process restart)* | **Zero client connection churn** |
 | **Clustering Architecture** | **QUIC Data Plane**<br>*(Topic-filter summaries)* | Mria + Ekka (Erlang distribution RPC) | Distributed Raft / JGroups | Plumtree / Riak Core (SWIM) | N/A (single node / bridging) | **Zero Mnesia / Erlang split-brain** |
 
-### Authoritative External Data Sources & Baselines
-
-All baseline comparison metrics for competitor brokers are grounded in official documentation, vendor benchmark specifications, and peer-reviewed empirical studies:
-
-- <a id="ref-emqx"></a>**[1] EMQX Official Performance Reference**: [EMQX v5.1.6 Performance Reference](https://docs.emqx.com/en/emqx/latest/performance/performance-reference.html) and [eMQTT-Bench Tool](https://github.com/emqx/emqtt-bench). Documents single-node 4-vCPU (Intel Xeon Platinum 8378A @ 3.0GHz, 8 GiB RAM) sustained throughput of 40,000 – 60,000 TPS at 75% CPU load for QoS 0/1 symmetric workloads, 50,000 TPS fan-out, and base memory usage of 500+ MB before client ingress.
-- <a id="ref-abb"></a>**[2] ABB Corporate Research / ECSA 2020 Comparative Study**: Heiko Koziolek, Sten Grüner, Julius Rückert. *"A Comparison of MQTT Brokers for Distributed IoT Edge Computing"*, European Conference on Software Architecture ([Preprint PDF](http://www.koziolek.de/docs/Koziolek2020-ECSA-preprint.pdf), [DOI: 10.1007/978-3-030-58923-3_25](https://doi.org/10.1007/978-3-030-58923-3_25)). Experiment data, Kubernetes manifests, and MZBench BDL scripts are published at [hkoziolek/ECSA2020-experiment-data](https://github.com/hkoziolek/ECSA2020-experiment-data). The study directly benchmarks EMQX, VerneMQ, and HiveMQ on identical bare-metal edge cluster hardware, measuring multi-core saturation plateaus (500k–800k msg/sec on 16-thread hardware under subscriber fanout) and memory growth.
-- <a id="ref-arxiv"></a>**[3] Academic Multi-Broker Benchmark / arXiv**: Jasenka Dizdarevic, Marc Michalke, Admela Jukan. *"Engineering and Experimentally Benchmarking Open Source MQTT Broker Implementations"* ([arXiv:2305.13893](https://arxiv.org/abs/2305.13893), [DOI: 10.48550/arXiv.2305.13893](https://doi.org/10.48550/arXiv.2305.13893)). Evaluates Mosquitto, EMQX, RabbitMQ, VerneMQ, and HiveMQ on AMD64 and ARM64 platforms under varying payload sizes and network conditions.
-- <a id="ref-hivemq"></a>**[4] HiveMQ Platform & Memory Architecture**: [HiveMQ Community Edition](https://github.com/hivemq/hivemq-community-edition) and [HiveMQ Platform](https://www.hivemq.com/). Enterprise Java deployment guidelines require minimum `-Xms512m` to `-Xms1g` initial heap allocation, yielding 500 MB – 1.2 GB base RSS footprint to avoid high-frequency garbage collection pauses during message bursts.
-- <a id="ref-vernemq"></a>**[5] VerneMQ Documentation & Runtime Baselines**: [VerneMQ Documentation](https://docs.vernemq.com/) and [VerneMQ MZBench Test Harness](https://github.com/vernemq/vmq_mzbench). Documents the Erlang BEAM memory footprint (200–400 MB baseline RSS per node with Mnesia/clustering metadata initialized prior to client connection ingress) and routing table lookup characteristics.
-- <a id="ref-mosquitto"></a>**[6] Eclipse Mosquitto**: [Eclipse Mosquitto Documentation](https://mosquitto.org/). Demonstrates low memory overhead (~5–10 MB) as a single-threaded C broker, but lacks native clustering and multi-core parallel routing.
-- <a id="ref-tools"></a>**[7] Standard Benchmark Harnesses**: Synthetic workload generation verified using [krylovsk/mqtt-benchmark](https://github.com/krylovsk/mqtt-benchmark) and [inovex/mqtt-stresser](https://github.com/inovex/mqtt-stresser).
-
-### Benchmark Methodology & Test Harness
-
-All benchmarks are grounded in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs) and executed on standard x86_64 hardware:
-
-1. **Router Matching (`bench_router_match_throughput`)**:
-   - **Topology**: Production-shaped routing table with **1,000 installed topic filters** (`device/{1000..2000}/state`) plus overlapping wildcard filters (`device/7/+`, `device/#`) and exact match (`device/7/state`).
-   - **Evaluation**: Each publication to `device/7/state` traverses the Radix Trie, matches 3 separate subscriber targets across exact and wildcard segments, and constructs a cloned subscriber destination set using zero-allocation `Arc<str>` keys and `ahash`.
-   - **Measurement**: 200,000 iterations post-warmup using `std::hint::black_box` to prevent compiler dead-code elimination.
-   - **Results**: **3.05M msg/sec** hit-path throughput, **7.80M msg/sec** fast-miss traversal.
-
-2. **Streaming SQL Ingress (`bench_sql_ingress_throughput`)**:
-   - **Query**: Embedded [`rekuiper-sql`](https://github.com/ankur-paan/rekuiper) rule:
-     ```sql
-     SELECT temperature, humidity FROM "sensors/+" WHERE temperature > 40.0
-     ```
-   - **Workload**: Ingests JSON payloads (`{ "temperature": 72.5, "humidity": 40.0, "sensor_id": "t1" }`), evaluates the streaming expression filter in-process, projects the selected fields in deterministic key order, and dispatches directly to the broker sink without touching network loopback.
-   - **Measurement**: 20,000 iterations post-warmup on a single-threaded Tokio runtime.
-   - **Result**: **4.77M events/sec** ingress evaluation throughput.
-
-### Reproducing the Benchmarks
-
-To reproduce and verify these performance gates locally:
-
-```bash
-# Run release throughput benchmarks with stdout reporting
-cargo test --release --bench broker_throughput -- --nocapture
-```
-
-Sample benchmark output:
-```text
-running 2 tests
-router match throughput [hit]: 3051428 msg/sec (600000 total hits)
-router match throughput [miss]: 7812500 msg/sec
-test bench_router_match_throughput ... ok
-SQL ingress throughput: 4768310 events/sec
-test bench_sql_ingress_throughput ... ok
-
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-```
+> [!NOTE]
+> All performance figures are grounded in reproducible, automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs). Full empirical methodology, competitor baselines, test harness parameters, reproduction commands, and academic literature citations are documented in [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -157,6 +115,63 @@ IndraMQTT embeds [rekuiper](https://github.com/ankur-paan/rekuiper) directly in-
 
 ---
 
+## Open-Core Licensing Model
+
+IndraMQTT is engineered with a transparent **Open-Core** architecture designed to guarantee permanent freedom for edge and single-server deployments while offering enterprise-grade clustering, industrial protocols, and multi-cloud streaming capabilities:
+
+| Feature Dimension | Community Edition (Free & Open Source) | Enterprise Edition (Commercial / Free Eval) |
+| :--- | :--- | :--- |
+| **Licensing** | **Permissive MIT OR Apache-2.0** ([`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE)) | **Commercial Subscription** ([`LICENSE-ENTERPRISE`](LICENSE-ENTERPRISE)) |
+| **License Enforcement** | **Zero license key required**. Free forever for production. | Cryptographic Ed25519 node authorization. Free Community Evaluation mode for local dev/testing. |
+| **Broker Kernel** | High-performance Rust Core (`>3M msg/sec`, `<15 MB RSS`) | High-performance Rust Core (`>3M msg/sec`, `<15 MB RSS`) |
+| **Network Edge** | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity |
+| **Protocols Supported** | MQTT v3.1.1 & v5.0, TLS (`:8883`), WebSocket (`:8083`) | MQTT v3.1.1 & v5.0, TLS (`:8883`), WebSocket (`:8083`), Sparkplug B, OPC-UA |
+| **Routing & Sessions** | Zero-allocation Radix Trie, QoS 0/1/2, Shared Subscriptions (`$share`), Delayed Messages (`$delayed`), Retained Store | Radix Trie, QoS 0/1/2, Shared Subscriptions, Delayed Messages, Retained Store |
+| **Scale Limits** | **Zero artificial limits**. Unbounded channels, queues, and connection limits. | **Zero artificial limits**. Unbounded channels, queues, and connection limits. |
+| **Clustering** | Single-Node Standalone / Edge Appliance | **Distributed QUIC Data Plane**, SWIM Gossip Membership, Distributed Raft Consensus |
+| **Stream Processing** | Embedded `rekuiper` Stateless SQL (all 185 scalar functions, `WHERE`, `SELECT`, `CASE`, math, trig, bitwise, string, date/time) | Embedded `rekuiper` Stateful Windowing (`TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW`, `COUNTWINDOW`), multi-event aggregations (`avg`, `sum`, `count`, `min`, `max`, `stddev`, `percentile`) |
+| **Data Sinks & Bridges** | PostgreSQL, MySQL, Redis, ClickHouse, InfluxDB, TimescaleDB, Amazon S3 / MinIO, Elasticsearch / OpenSearch, RabbitMQ, HTTP Webhook, Remote MQTT Bridge, Rotating Local Disk Log | Apache Kafka, Sparkplug B, Amazon Kinesis, Google Cloud Pub/Sub, Azure Event Hubs, Apache Pulsar, Snowflake, BigQuery, AI/LLM Bridges (OpenAI, Claude, Gemini, MCP) |
+| **Management & UI** | Embedded Web Dashboard SPA (`:18083`), REST Management API, Prometheus `/api/v1/metrics` | Embedded Web Dashboard SPA (`:18083`), REST Management API, Prometheus `/api/v1/metrics`, Enterprise Studio Badging |
+| **Multi-Tenancy** | Connection quotas (`max_connections`) & Publish rate limiter (`max_publish_rate`) | Connection quotas & Publish rate limiter with cluster-wide quota synchronization |
+
+For enterprise licensing, multi-node clustering subscriptions, or commercial support, visit [indramqtt.com](https://indramqtt.com) or contact [sales@i-dacs.com](mailto:sales@i-dacs.com).
+
+---
+
+## Core Capabilities & Features
+
+### 1. Ultra-Low-Latency Message Router
+- **Radix Trie Architecture**: Evaluates exact and wildcard topic filters (`+`, `#`, `$SYS/`, `$share/<group>/<topic>`, `$delayed/<sec>/<topic>`) in a single lock-free pass using `ahash` and zero-allocation `Arc<str>` segments.
+- **Microsecond Routing**: Sustains **3.05M msg/sec** on hit-path evaluation and **7.80M msg/sec** fast-miss traversal.
+
+### 2. Embedded Streaming SQL Engine (`rekuiper`)
+- **185-Function Scalar Catalog**: Full trigonometry (`sin`, `cos`, `atan2`), arithmetic, bitwise operators, string manipulation, datetime transformations (`now()`, `format_date()`), conditionals (`CASE WHEN ... THEN ... ELSE ... END`), and null coalescing.
+- **Stateless Ingress Hot-Path**: Evaluates SQL filters in-memory at **4.77M events/sec** with zero network loopback.
+- **Stateful Window Operators**: Enterprise tumbling, hopping, sliding, and count windows executing on dedicated background Tokio workers with interval timestamp injection (`window_start()`, `window_end()`).
+- **SQL `INTO connector("id")`**: Native SQL syntax for declarative routing directly into downstream streaming bridges and databases.
+
+### 3. Comprehensive Data Sinks & Bridges Suite
+- **Message Streaming**: Apache Kafka (RecordBatch v2, murmur2 hashing), RabbitMQ (AMQP 0-9-1), Remote MQTT Outbound Bridge (clean-room 3.1.1/5.0 wire encoder).
+- **Relational & KV Databases**: PostgreSQL (connection-pooled JSONB batching, SCRAM/MD5), MySQL / MariaDB (native handshake & authentication, prepared batching), Redis (RESP pipeline, Streams `XADD`, `LPUSH`, `PUBLISH`).
+- **Analytics & Time-Series**: ClickHouse (vectorized `JSONEachRow` HTTP POST, SQL injection whitelisting), InfluxDB (Line Protocol v2 with Token auth), TimescaleDB (hypertable chunking and parametrized `$1..$4` upsert).
+- **Object Storage & Search**: Amazon S3 / MinIO (buffer-and-flush micro-batching, partitioned key templates, ndjson/gzip, full AWS SigV4 signing), Elasticsearch / OpenSearch (`_bulk` newline JSON with dynamic date-indices and 429/503 retry).
+- **Industrial Edge & Webhooks**: Advanced HTTP Webhook (URL/header templates, HMAC-SHA256/SHA1 payload signing, jittered retry), Rotating Local Disk Log (NDJSON/CSV/Raw formats, byte-size and age rotation, gzip compression, retention purge), Sparkplug B (Eclipse Tahu Protobuf codec, namespace parser, metric alias cache, Edge Node/Device state tracker).
+
+### 4. Embedded Web Dashboard SPA & Management REST API
+- **Dark-Mode Web Dashboard**: Served directly from the broker kernel at `http://localhost:18083/dashboard`.
+- **Live SVG Metrics**: Real-time cluster connection counters, ingress/egress message rates, and throughput delta sparklines.
+- **SQL Studio & Rule Tester**: Interactive query editor with batch evaluation (`POST /api/v1/rules/test`), function catalog browser (`GET /api/v1/rules/functions`), and Community/Enterprise tier badges.
+- **Connectors Studio**: Visual registration forms for streaming, relational, analytical, object storage, and industrial sinks.
+- **MQTT-over-WebSocket Test Console**: Integrated binary MQTT test client connecting over `ws://localhost:8083/ws/mqtt`.
+- **Auth & ACL Manager**: Runtime credential and topic access policy configuration.
+
+### 5. Resilience & Zero-Limit Scale Architecture
+- **Core Restart Immunity**: Decoupled BEAM edge maintains client TCP/TLS sockets during broker core restarts or rolling upgrades, re-binding sessions in `<200 ms` with zero client reconnect storms.
+- **Zero Hardcoded Limits**: Buffer depths (`window_channel_depth`), offline session queues (`max_offline_queue`), batch sizes, and pool capacities are unconstrained and fully configurable.
+- **Multi-Tenant Protection**: Per-client and per-user connection quotas (`max_connections` -> RC `0x8B`) and token-bucket publish rate limiters (`max_publish_rate` -> RC `0x97`).
+
+---
+
 ## Repository Structure
 
 ```
@@ -171,7 +186,7 @@ indramqtt/
 │   │   └── indra_mqtt_codec.erl  # Zero-allocation MQTT packet framing
 │   └── rebar.config
 │
-├── proto/                        # BrokerLink IPC Protocol (Protobuf / binary specifications)
+├── proto/                        # BrokerLink IPC Protocol (Protobuf specifications)
 │   └── brokerlink.proto
 │
 ├── crates/
@@ -182,9 +197,9 @@ indramqtt/
 │   ├── broker-storage/           # Segmented log and cursor persistence
 │   ├── broker-auth/              # Authentication & ACL authorization
 │   ├── broker-rules/             # Embedded rekuiper stream processing engine
-│   ├── broker-cluster/           # SWIM membership, Raft consensus, QUIC data plane
-│   ├── broker-connectors/        # Unified stream sources & sinks
-│   ├── broker-api/               # Axum REST management API
+│   ├── broker-cluster/           # SWIM membership, Raft consensus, QUIC data plane (Enterprise)
+│   ├── broker-connectors/        # Unified stream sources & enterprise sinks
+│   ├── broker-api/               # Axum REST management API & embedded Web Dashboard
 │   ├── broker-observability/     # Prometheus metrics and OpenTelemetry tracing
 │   └── broker-node/              # Main broker daemon binary & throughput benches
 └── tests/                        # Conformance, chaos, and integration suites
@@ -194,30 +209,59 @@ indramqtt/
 
 ## Getting Started
 
-### Prerequisites
+### One-Click Evaluation with Docker
+Get IndraMQTT and the embedded Web Dashboard running in 5 seconds:
+
+```bash
+# Clone the repository
+git clone https://github.com/ankur-paan/indramqtt.git && cd indramqtt
+
+# Start broker and dashboard in background
+docker compose up -d
+
+# Open the Web Dashboard
+# -> http://localhost:18083/dashboard
+```
+
+### Local Build & Development
+
+#### Prerequisites
 * **Rust**: `1.80+`
 * **Erlang/OTP**: `26+`
 * **Rebar3**: `3.22+`
 
-### Building the Project
+#### Building & Running Locally
 
 ```bash
-# Build the Rust broker kernel
+# 1. Build the Rust broker kernel
 cargo build --workspace --release
 
-# Run automated tests
+# 2. Run the complete automated test suite (388 tests, 100% green)
 cargo test --workspace
 
-# Build the BEAM network edge
-cd beam && rebar3 compile
+# 3. Build the BEAM network edge
+cd beam && rebar3 compile && cd ..
+
+# 4. Launch the IndraMQTT standalone broker daemon
+cargo run --release -p broker-node -- --api-bind 127.0.0.1:18083
+
+# 5. Access the Web Dashboard
+# Open http://localhost:18083/dashboard in your browser
 ```
 
 ---
 
-## License
+## License & Commercial Terms
 
-This project is dual-licensed under:
-* **MIT License** ([LICENSE-MIT](LICENSE-MIT))
-* **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
+IndraMQTT is distributed under a dual-licensing structure:
 
-You may choose to use this software under either license at your option.
+1. **Community Edition (Open Source)**:
+   - Licensed under the **MIT License** ([`LICENSE-MIT`](LICENSE-MIT)) OR **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE)).
+   - Covers all core broker crates, BEAM edge, BrokerLink IPC, session engine, storage engine, embedded stateless SQL rules, and Community connectors.
+2. **Enterprise Edition (Commercial / Free Community Evaluation)**:
+   - Governed by the **Indra Enterprise Commercial License** ([`LICENSE-ENTERPRISE`](LICENSE-ENTERPRISE)).
+   - Covers distributed QUIC clustering (`crates/broker-cluster`), stateful windowed stream processing, and specialized enterprise/industrial connectors.
+   - Royalty-free for personal, development, testing, and evaluation purposes. Production deployments require a commercial subscription.
+
+For commercial licensing, enterprise clustering support, and cloud subscriptions:
+🌐 **Website**: [indramqtt.com](https://indramqtt.com) | ✉️ **Contact**: [sales@i-dacs.com](mailto:sales@i-dacs.com)
