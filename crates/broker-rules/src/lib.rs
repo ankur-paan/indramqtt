@@ -4039,6 +4039,263 @@ mod tests {
         assert_eq!(dynamodb_transport.captured().len(), 1);
     }
 
+    /// Lakehouse e2e (INDRA-222): one ingress event routes through
+    /// streaming SQL `INTO connector(...)` rules and fans out
+    /// simultaneously to the Snowflake, Databricks, Doris, BigQuery
+    /// and Redshift mocks with zero drops. All transports in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_lakehouse_sinks() {
+        use broker_connectors::{
+            BigQuerySink, BigQuerySinkConfig, DatabricksSink, DatabricksSinkConfig,
+            DorisSink, DorisSinkConfig, MockBigQueryTransport, MockDatabricksTransport,
+            MockDorisTransport, MockRedshiftTransport, MockSnowflakeTransport, RedshiftSink,
+            RedshiftSinkConfig, SnowflakeSink, SnowflakeSinkConfig,
+        };
+        use std::collections::HashMap;
+
+        // Test-only RSA key (openssl-generated, never deployed).
+        const SNOWFLAKE_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Snowflake streaming rows (auto-flush every row).
+        let snowflake_transport = Arc::new(MockSnowflakeTransport::new());
+        let snowflake = Arc::new(
+            SnowflakeSink::new(
+                SnowflakeSinkConfig {
+                    account: "xy12345.us-east-1".to_string(),
+                    user: "indra_loader".to_string(),
+                    database: "IOT".to_string(),
+                    schema: "PUBLIC".to_string(),
+                    table_template: "TELEMETRY_${topic}".to_string(),
+                    private_key_pem: SNOWFLAKE_TEST_KEY.to_string(),
+                    endpoint: None,
+                    role: None,
+                    channel: "INDRA_CHANNEL".to_string(),
+                    column_mappings: HashMap::from([
+                        ("device_id".to_string(), "${client_id}".to_string()),
+                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                    ]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                snowflake_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("snowflake-sink", snowflake.clone());
+
+        // Databricks lakehouse rows (auto-flush every row).
+        let databricks_transport = Arc::new(MockDatabricksTransport::new());
+        let databricks = Arc::new(
+            DatabricksSink::new(
+                DatabricksSinkConfig {
+                    host: "dbc-test.cloud.databricks.com".to_string(),
+                    token: "dapi-test".to_string(),
+                    catalog: "main".to_string(),
+                    schema: "default".to_string(),
+                    table_template: "sensor_readings".to_string(),
+                    http_path: None,
+                    partition_key_template: None,
+                    column_mappings: HashMap::from([
+                        ("device_id".to_string(), "${client_id}".to_string()),
+                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                    ]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                databricks_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("databricks-sink", databricks.clone());
+
+        // Doris stream load (auto-flush every row).
+        let doris_transport = Arc::new(MockDorisTransport::new());
+        let doris = Arc::new(
+            DorisSink::new(
+                DorisSinkConfig {
+                    fe_host: "127.0.0.1".to_string(),
+                    http_port: 8030,
+                    database: "telemetry".to_string(),
+                    table_template: "events".to_string(),
+                    auth: broker_connectors::DorisAuth {
+                        username: "root".to_string(),
+                        password: String::new(),
+                    },
+                    format: broker_connectors::DorisFormat::Json,
+                    jsonpaths: None,
+                    strip_outer_array: true,
+                    max_filter_ratio: Some(0.0),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                doris_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("doris-sink", doris.clone());
+
+        // BigQuery streaming rows (auto-flush every row).
+        let bigquery_transport = Arc::new(MockBigQueryTransport::new());
+        let bigquery = Arc::new(
+            BigQuerySink::new(
+                BigQuerySinkConfig {
+                    project_id: "my-iot-project".to_string(),
+                    dataset_id: "telemetry".to_string(),
+                    table_template: "sensor_logs".to_string(),
+                    endpoint: None,
+                    auth: broker_connectors::GcpAuth::None,
+                    ignore_unknown_values: true,
+                    skip_invalid_rows: false,
+                    template_suffix: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                bigquery_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("bigquery-sink", bigquery.clone());
+
+        // Redshift statements (auto-flush every row).
+        let redshift_transport = Arc::new(MockRedshiftTransport::new());
+        let redshift = Arc::new(
+            RedshiftSink::new(
+                RedshiftSinkConfig {
+                    database: "analytics".to_string(),
+                    table_template: "sensor_logs".to_string(),
+                    cluster_identifier: None,
+                    workgroup_name: Some("iot-workgroup".to_string()),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    access_key_id: "AKID".to_string(),
+                    secret_access_key: "secret".to_string(),
+                    session_token: None,
+                    db_user: None,
+                    sql_template: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                redshift_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("redshift-sink", redshift.clone());
+
+        // One INTO rule per lakehouse over the same telemetry stream.
+        for (id, connector) in [
+            ("snowflake-rule", "snowflake-sink"),
+            ("databricks-rule", "databricks-sink"),
+            ("doris-rule", "doris-sink"),
+            ("bigquery-rule", "bigquery-sink"),
+            ("redshift-rule", "redshift-sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("factory/+").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, temperature FROM "factory/+" WHERE temperature > 70.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("factory/temp").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "sensor-101", "temperature": 75.2, "status": "normal" }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let projected = serde_json::json!({"client_id": "sensor-101", "temperature": 75.2});
+
+        // Snowflake: uppercased table with mapped columns + metadata.
+        let captured = snowflake_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "TELEMETRY_FACTORY_TEMP");
+        assert_eq!(captured[0].rows.len(), 1);
+        let fields: HashMap<String, &serde_json::Value> = captured[0].rows[0]
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        assert_eq!(fields["DEVICE_ID"], &serde_json::json!("sensor-101"));
+        assert_eq!(fields["TEMPERATURE"], &serde_json::json!(75.2));
+
+        // Databricks: qualified INSERT with typed params.
+        let captured = databricks_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].statement.starts_with("INSERT INTO main.default.sensor_readings"));
+        assert!(captured[0].params.iter().any(|param| param.value == "sensor-101"));
+
+        // Doris: one JSON array load with the projected row.
+        let captured = doris_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "events");
+        let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+        assert_eq!(body.as_array().expect("array").len(), 1);
+        assert_eq!(body[0]["temperature"], serde_json::json!(75.2));
+
+        // BigQuery: one row with a UUID insert id.
+        let captured = bigquery_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "sensor_logs");
+        assert_eq!(captured[0].rows.len(), 1);
+        assert_eq!(captured[0].rows[0].json, projected);
+        assert_eq!(captured[0].rows[0].insert_id.len(), 36);
+
+        // Redshift: one statement carrying the projected payload.
+        let captured = redshift_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].workgroup_name.as_deref(), Some("iot-workgroup"));
+        assert_eq!(captured[0].statements.len(), 1);
+        assert!(captured[0].statements[0].contains("'sensor-101'"));
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("factory/temp").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor-101", "temperature": 60.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(snowflake_transport.captured().len(), 1);
+        assert_eq!(databricks_transport.captured().len(), 1);
+        assert_eq!(doris_transport.captured().len(), 1);
+        assert_eq!(bigquery_transport.captured().len(), 1);
+        assert_eq!(redshift_transport.captured().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);

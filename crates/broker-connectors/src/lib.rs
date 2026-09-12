@@ -35,6 +35,11 @@ pub mod tdengine;
 pub mod iotdb;
 pub mod timestream;
 pub mod dynamodb;
+pub mod snowflake;
+pub mod databricks;
+pub mod doris;
+pub mod bigquery;
+pub mod redshift;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -62,6 +67,11 @@ pub use tdengine::{CapturedTdengineSql, MockTdengineOutcome, MockTdengineTranspo
 pub use iotdb::{CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector, IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport, MockIotDbOutcome, MockIotDbTransport, render_tablet_body};
 pub use timestream::{HttpTimestreamTransport, MockTimestreamOutcome, MockTimestreamTransport, TimestreamConnector, TimestreamRecord, TimestreamSink, TimestreamSinkConfig, TimestreamTimeUnit, TimestreamTransport, TimestreamWriteRequest, TimestreamWriteResponse, render_write_records_body, TIMESTREAM_TARGET, TIMESTREAM_CONTENT_TYPE};
 pub use dynamodb::{DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig, DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome, MockDynamoDbTransport, build_item_body, dynamodb_attribute, parse_unprocessed, render_batch_body as render_dynamodb_batch_body, DYNAMODB_TARGET, DYNAMODB_CONTENT_TYPE};
+pub use snowflake::{CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport, SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport, build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows};
+pub use databricks::{CapturedDatabricksStatement, DatabricksConnector, DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport, HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState, parse_statement_state, render_statement_body};
+pub use doris::{CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat, DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport, MockDorisOutcome, MockDorisTransport, classify_status as classify_doris_status, parse_load_result, render_body as render_doris_body};
+pub use bigquery::{BigQueryConnector, BigQueryInsertResponse, BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert, HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, classify_insert_errors, render_insert_body as render_bigquery_body};
+pub use redshift::{HttpRedshiftTransport, MockRedshiftOutcome, MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector, RedshiftSink, RedshiftSinkConfig, RedshiftTransport, default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body, render_statement as render_redshift_statement};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -100,14 +110,15 @@ pub struct ConnectorInfo {
 }
 
 /// Open-core tier tag for a connector kind: the multi-cloud
-/// streaming bridges, Sparkplug B, the enterprise databases and the
-/// industrial time-series stores are Enterprise; everything else is
-/// Community.
+/// streaming bridges, Sparkplug B, the enterprise databases, the
+/// industrial time-series stores and the lakehouse sinks are
+/// Enterprise; everything else is Community.
 pub fn connector_tier(kind: &str) -> &'static str {
     match kind {
         "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b"
         | "mongodb" | "mssql" | "cassandra" | "couchbase"
-        | "tdengine" | "iotdb" | "timestream" | "dynamodb" => "enterprise",
+        | "tdengine" | "iotdb" | "timestream" | "dynamodb"
+        | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift" => "enterprise",
         _ => "community",
     }
 }
@@ -636,6 +647,15 @@ fn signing_hex(key: &[u8], string_to_sign: &str) -> String {
         .collect()
 }
 
+/// Test-only RSA keypair (generated with openssl, never deployed).
+/// Shared by the GCP/Snowflake/BigQuery JWT tests so the PEMs live in
+/// exactly one place.
+#[cfg(test)]
+pub(crate) mod test_rsa_keys {
+    pub const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
+    pub const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsENsOt6AdxbR4O8crECv\nDLl/UtFpGwFZcVqSxwzSHUVcQPUWtoBRaSsvI1+OVDEqMOmJ8uyL2Fhc2S+MvcqB\nYqrvi8YZSRyDuiTvPmZngaDcLg4iM4HrG2cI8kIkNjO6f+HNfGtn3xj1hQRE0+7l\ncFSid4U6fe0TezHNf3hTIprk/0wtdSPrBQmVB4K24RBty+RoN0SdjCm3FxhCMYxQ\nyXSyfUStAaKQ+pcUdWuM3mK/ohf5t/iXiTwGktecjA/rAdYOQu12dTiLATQQZx1h\n6TYWDtiKwnPZWXkks0pG0QupNaKr07qxUcx1magSkBmJx/AX7bmyD0kwYFPwTOK0\ndwIDAQAB\n-----END PUBLIC KEY-----\n";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_connector_tier_tags() {
-        // Enterprise bridges (cloud, Sparkplug, databases, time-series).
+        // Enterprise bridges (cloud, Sparkplug, databases, time-series, lakehouse).
         for kind in [
             "kinesis",
             "gcp_pubsub",
@@ -706,6 +726,11 @@ mod tests {
             "iotdb",
             "timestream",
             "dynamodb",
+            "snowflake",
+            "databricks",
+            "doris",
+            "bigquery",
+            "redshift",
         ] {
             assert_eq!(connector_tier(kind), "enterprise", "{kind} must be enterprise");
         }

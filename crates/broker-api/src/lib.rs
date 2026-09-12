@@ -913,8 +913,88 @@ async fn build_connector(
                 Ok(("dynamodb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "snowflake" | "snow" | "sf" => {
+                let config: broker_connectors::SnowflakeSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid snowflake config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid snowflake config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpSnowflakeTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid snowflake transport: {e}"))?,
+                );
+                let sink = broker_connectors::SnowflakeSink::new(config, transport)
+                    .map_err(|e| format!("invalid snowflake sink: {e}"))?;
+                Ok(("snowflake".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "databricks" | "databricks_sql" | "delta" => {
+                let config: broker_connectors::DatabricksSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid databricks config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid databricks config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpDatabricksTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid databricks transport: {e}"))?,
+                );
+                let sink = broker_connectors::DatabricksSink::new(config, transport)
+                    .map_err(|e| format!("invalid databricks sink: {e}"))?;
+                Ok(("databricks".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "doris" => {
+                let config: broker_connectors::DorisSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid doris config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid doris config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpDorisTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid doris transport: {e}"))?,
+                );
+                let sink = broker_connectors::DorisSink::new(config, transport)
+                    .map_err(|e| format!("invalid doris sink: {e}"))?;
+                Ok(("doris".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "bigquery" | "bq" | "gbq" => {
+                let config: broker_connectors::BigQuerySinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid bigquery config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid bigquery config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpBigQueryTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid bigquery transport: {e}"))?,
+                );
+                let sink = broker_connectors::BigQuerySink::new(config, transport)
+                    .map_err(|e| format!("invalid bigquery sink: {e}"))?;
+                Ok(("bigquery".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "redshift" | "rs" | "aws_redshift" => {
+                let config: broker_connectors::RedshiftSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid redshift config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid redshift config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpRedshiftTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid redshift transport: {e}"))?,
+                );
+                let sink = broker_connectors::RedshiftSink::new(config, transport)
+                    .map_err(|e| format!("invalid redshift sink: {e}"))?;
+                Ok(("redshift".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, tdengine, iotdb, timestream, dynamodb, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, tdengine, iotdb, timestream, dynamodb, snowflake, databricks, doris, bigquery, redshift, or logger)"
             )),
         }
 }
@@ -1482,6 +1562,11 @@ mod tests {
             "value=\"iotdb\"",
             "value=\"timestream\"",
             "value=\"dynamodb\"",
+            "value=\"snowflake\"",
+            "value=\"databricks\"",
+            "value=\"doris\"",
+            "value=\"bigquery\"",
+            "value=\"redshift\"",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
@@ -2100,17 +2185,138 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("dynamodb"));
 
+        // Snowflake sink: key-pair validated without touching Snowflake.
+        // Test-only RSA key (openssl-generated, never deployed).
+        const SNOWFLAKE_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "snowflake-1",
+                       "kind": "snowflake",
+                       "config": {"account": "xy12345.us-east-1",
+                                  "user": "indra_loader",
+                                  "database": "IOT",
+                                  "schema": "PUBLIC",
+                                  "table_template": "IOT_EVENTS",
+                                  "private_key_pem": SNOWFLAKE_TEST_KEY,
+                                  "channel": "INDRA_CHANNEL",
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("snowflake"));
+
+        // Databricks sink: validated without touching any workspace.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "databricks-1",
+                       "kind": "databricks",
+                       "config": {"host": "dbc-a1b2c3d4-e5f6.cloud.databricks.com",
+                                  "token": "dapi-test",
+                                  "catalog": "main",
+                                  "schema": "default",
+                                  "table_template": "sensor_readings",
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("databricks"));
+
+        // Doris sink: validated without touching any cluster.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "doris-1",
+                       "kind": "doris",
+                       "config": {"fe_host": "127.0.0.1",
+                                  "http_port": 8030,
+                                  "database": "telemetry",
+                                  "table_template": "events",
+                                  "auth": {"username": "root", "password": ""},
+                                  "format": "json",
+                                  "strip_outer_array": true,
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("doris"));
+
+        // BigQuery sink: validated without touching Google.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "bigquery-1",
+                       "kind": "bigquery",
+                       "config": {"project_id": "my-iot-project",
+                                  "dataset_id": "telemetry",
+                                  "table_template": "sensor_logs",
+                                  "auth": {"type": "none"},
+                                  "ignore_unknown_values": true,
+                                  "skip_invalid_rows": false,
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("bigquery"));
+
+        // Redshift sink: validated without touching AWS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "redshift-1",
+                       "kind": "redshift",
+                       "config": {"database": "analytics",
+                                  "table_template": "sensor_logs",
+                                  "workgroup_name": "iot-workgroup",
+                                  "region": "us-east-1",
+                                  "access_key_id": "AKID",
+                                  "secret_access_key": "secret",
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("redshift"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
             json!([{"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
+                   {"id": "bigquery-1", "kind": "bigquery", "tier": "enterprise"},
                    {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
                    {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
                    {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
                    {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
+                   {"id": "databricks-1", "kind": "databricks", "tier": "enterprise"},
                    {"id": "diag", "kind": "console", "tier": "community"},
                    {"id": "disk-1", "kind": "disk_log", "tier": "community"},
+                   {"id": "doris-1", "kind": "doris", "tier": "enterprise"},
                    {"id": "dynamodb-1", "kind": "dynamodb", "tier": "enterprise"},
                    {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
                    {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
@@ -2126,7 +2332,9 @@ mod tests {
                    {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
                    {"id": "rabbit-sink-1", "kind": "rabbitmq", "tier": "community"},
                    {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
+                   {"id": "redshift-1", "kind": "redshift", "tier": "enterprise"},
                    {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
+                   {"id": "snowflake-1", "kind": "snowflake", "tier": "enterprise"},
                    {"id": "spb-1", "kind": "sparkplug_b", "tier": "enterprise"},
                    {"id": "tdengine-1", "kind": "tdengine", "tier": "enterprise"},
                    {"id": "timestream-1", "kind": "timestream", "tier": "enterprise"},
@@ -2252,13 +2460,40 @@ mod tests {
                               "access_key_id": "AKID",
                               "secret_access_key": "secret",
                               "partition_key": {"name": "", "template": "${client_id}", "key_type": "S"}}}),
+            json!({"id": "bad-snowflake", "kind": "snowflake",
+                   "config": {"account": "",
+                              "user": "u",
+                              "database": "IOT",
+                              "schema": "PUBLIC",
+                              "table_template": "T",
+                              "private_key_pem": "not-a-key"}}),
+            json!({"id": "bad-databricks", "kind": "databricks",
+                   "config": {"host": "https://host/path",
+                              "token": "tok",
+                              "table_template": "t"}}),
+            json!({"id": "bad-doris", "kind": "doris",
+                   "config": {"fe_host": "127.0.0.1",
+                              "database": "has space",
+                              "table_template": "events",
+                              "auth": {"username": "root", "password": ""}}}),
+            json!({"id": "bad-bigquery", "kind": "bigquery",
+                   "config": {"project_id": "my-iot-project",
+                              "dataset_id": "telemetry",
+                               "table_template": "9lives",
+                               "auth": {"type": "none"}}}),
+            json!({"id": "bad-redshift", "kind": "redshift",
+                   "config": {"database": "analytics",
+                              "table_template": "t",
+                              "region": "us-east-1",
+                               "access_key_id": "AKID",
+                               "secret_access_key": "secret"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 27);
+        assert_eq!(body.as_array().expect("list").len(), 32);
     }
 
     #[tokio::test]

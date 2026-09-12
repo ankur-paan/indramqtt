@@ -150,6 +150,11 @@
       <option value="iotdb">iotdb ★ enterprise</option>
       <option value="timestream">timestream ★ enterprise</option>
       <option value="dynamodb">dynamodb ★ enterprise</option>
+      <option value="snowflake">snowflake ★ enterprise</option>
+      <option value="databricks">databricks ★ enterprise</option>
+      <option value="doris">doris ★ enterprise</option>
+      <option value="bigquery">bigquery ★ enterprise</option>
+      <option value="redshift">redshift ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -307,6 +312,43 @@
     <input id="conn-ddb-key" placeholder="access key id" size="16">
     <input id="conn-ddb-secret" placeholder="secret access key" type="password" size="18">
     <input id="conn-ddb-partition" placeholder="partition key template, e.g. ${client_id}" size="26">
+  </div>
+  <div class="row"><label>Snowflake config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-snow-account" placeholder="account, e.g. xy12345.us-east-1" size="22">
+    <input id="conn-snow-user" placeholder="user" size="12">
+    <input id="conn-snow-db" placeholder="database, e.g. IOT" size="10">
+    <input id="conn-snow-schema" placeholder="schema, e.g. PUBLIC" size="10">
+    <input id="conn-snow-table" placeholder="table template, e.g. IOT_EVENTS" size="20">
+    <input id="conn-snow-key" placeholder="PKCS#8 private key PEM" type="password" size="24">
+  </div>
+  <div class="row"><label>Databricks config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-db-host" placeholder="host, e.g. dbc-xxx.cloud.databricks.com" size="32">
+    <input id="conn-db-token" placeholder="personal access token" type="password" size="20">
+    <input id="conn-db-table" placeholder="table, e.g. sensor_readings" size="20">
+    <input id="conn-db-path" placeholder="warehouse http path (optional)" size="28">
+  </div>
+  <div class="row"><label>Doris config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-doris-fe" placeholder="FE host, e.g. 127.0.0.1" size="16">
+    <input id="conn-doris-db" placeholder="database, e.g. telemetry" size="14">
+    <input id="conn-doris-table" placeholder="table, e.g. events" size="14">
+    <input id="conn-doris-user" placeholder="username, e.g. root" size="12">
+    <select id="conn-doris-format">
+      <option value="json">json</option>
+      <option value="csv">csv</option>
+    </select>
+  </div>
+  <div class="row"><label>BigQuery config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-bq-project" placeholder="project id" size="16">
+    <input id="conn-bq-dataset" placeholder="dataset id, e.g. telemetry" size="16">
+    <input id="conn-bq-table" placeholder="table template, e.g. sensor_logs" size="20">
+  </div>
+  <div class="row"><label>Redshift config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-rs-db" placeholder="database, e.g. analytics" size="14">
+    <input id="conn-rs-table" placeholder="table template, e.g. sensor_logs" size="20">
+    <input id="conn-rs-workgroup" placeholder="workgroup (or cluster id)" size="20">
+    <input id="conn-rs-region" placeholder="region, e.g. us-east-1" size="12">
+    <input id="conn-rs-key" placeholder="access key id" size="16">
+    <input id="conn-rs-secret" placeholder="secret access key" type="password" size="18">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -808,6 +850,54 @@ $("conn-add").onclick = async () => {
               attributes_mapping: {},
               batch_size: 25, batch_bytes: 1048576, linger_ms: 10,
               max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "snowflake") {
+    config = {account: $("conn-snow-account").value.trim(),
+              user: $("conn-snow-user").value.trim(),
+              database: $("conn-snow-db").value.trim() || "IOT",
+              schema: $("conn-snow-schema").value.trim() || "PUBLIC",
+              table_template: $("conn-snow-table").value.trim() || "IOT_EVENTS",
+              private_key_pem: $("conn-snow-key").value,
+              channel: "INDRA_CHANNEL",
+              batch_size: 500, batch_bytes: 4194304, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 3000};
+  } else if (kind === "databricks") {
+    config = {host: $("conn-db-host").value.trim(),
+              token: $("conn-db-token").value,
+              catalog: "main", schema: "default",
+              table_template: $("conn-db-table").value.trim() || "sensor_readings",
+              batch_size: 200, batch_bytes: 2097152, linger_ms: 10,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+    const dbpath = $("conn-db-path").value.trim();
+    if (dbpath !== "") config.http_path = dbpath;
+  } else if (kind === "doris") {
+    config = {fe_host: $("conn-doris-fe").value.trim() || "127.0.0.1",
+              http_port: 8030,
+              database: $("conn-doris-db").value.trim() || "telemetry",
+              table_template: $("conn-doris-table").value.trim() || "events",
+              auth: {username: $("conn-doris-user").value.trim() || "root", password: ""},
+              format: $("conn-doris-format").value,
+              strip_outer_array: true,
+              batch_size: 1000, batch_bytes: 4194304, linger_ms: 10,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "bigquery") {
+    config = {project_id: $("conn-bq-project").value.trim(),
+              dataset_id: $("conn-bq-dataset").value.trim() || "telemetry",
+              table_template: $("conn-bq-table").value.trim() || "sensor_logs",
+              auth: {type: "none"},
+              ignore_unknown_values: true, skip_invalid_rows: false,
+              batch_size: 500, batch_bytes: 1048576, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2500};
+  } else if (kind === "redshift") {
+    const cluster = $("conn-rs-workgroup").value.trim();
+    config = {database: $("conn-rs-db").value.trim() || "analytics",
+              table_template: $("conn-rs-table").value.trim() || "sensor_logs",
+              region: $("conn-rs-region").value.trim() || "us-east-1",
+              access_key_id: $("conn-rs-key").value.trim(),
+              secret_access_key: $("conn-rs-secret").value,
+              batch_size: 100, batch_bytes: 1048576, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2500};
+    if (cluster.startsWith("cluster:")) config.cluster_identifier = cluster.slice(8);
+    else config.workgroup_name = cluster || "iot-workgroup";
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();
