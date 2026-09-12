@@ -247,13 +247,15 @@ impl Shared {
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         let metrics = Arc::new(Metrics::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
-        // router/mailboxes through this in-memory sink.
+        // router/mailboxes through this in-memory sink. The same sink
+        // serves window-flush republish actions (INDRA-213).
         let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
             router: router.clone(),
             sessions: sessions.clone(),
             conns: conns.clone(),
             metrics: metrics.clone(),
         });
+        engine.set_broker_sink(sink.clone());
         Self {
             sessions,
             router,
@@ -2733,5 +2735,16 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_wires_broker_sink_into_engine() {
+        // INDRA-213: window-flush republish actions resolve through the
+        // same in-memory sink as inline dispatch (no loopback).
+        let shared = Shared::new();
+        assert!(
+            shared.engine.broker_sink().is_some(),
+            "Shared::new must install the flush sink"
+        );
     }
 }

@@ -89,6 +89,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route("/api/v1/rules/test", post(test_rule))
+        .route("/api/v1/rules/functions", get(list_functions))
         .route(
             "/api/v1/rules/:id",
             get(get_rule).delete(delete_rule),
@@ -266,6 +267,11 @@ async fn test_rule(
         .into_response(),
         Err(error) => bad_request(error),
     }
+}
+
+/// The 185-function streaming-SQL catalog for the SQL studio.
+async fn list_functions() -> Json<&'static [broker_rules::FunctionMeta]> {
+    Json(broker_rules::builtin_function_metadata())
 }
 
 /// Creation payload for a user credential (password is write-only).
@@ -1074,6 +1080,10 @@ mod tests {
             "id=\"connectors\"",
             "id=\"auth\"",
             "id=\"console\"",
+            "rule-tpl-math",
+            "rule-tpl-tumbling",
+            ".badge.community",
+            ".badge.enterprise",
             "/ws/mqtt",
         ] {
             assert!(html.contains(marker), "dashboard missing {marker}");
@@ -1308,6 +1318,65 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_rules_test_endpoint_batch() {
+        let (server, _state) = TestServer::start().await;
+
+        // Array payloads aggregate as one batch: one row per group.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"sql_query": "SELECT sensor_id, avg(temperature) AS avg_temp FROM \"sensors/+\" GROUP BY sensor_id",
+                       "topic": "sensors/kitchen",
+                       "payload": [{"sensor_id": "a", "temperature": 10.0},
+                                   {"sensor_id": "b", "temperature": 30.0},
+                                   {"sensor_id": "a", "temperature": 20.0}]}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(true));
+        let rows = body["projected"].as_array().expect("projected rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["sensor_id"], json!("a"));
+        assert_eq!(rows[0]["avg_temp"], json!(15.0));
+        assert_eq!(rows[1]["sensor_id"], json!("b"));
+        assert_eq!(rows[1]["avg_temp"], json!(30.0));
+
+        // Empty batches match nothing.
+        let (status, body) = server
+            .post(
+                "/api/v1/rules/test",
+                json!({"sql_query": "SELECT avg(temperature) AS a FROM \"sensors/+\"",
+                       "topic": "sensors/kitchen",
+                       "payload": []}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(false));
+        assert_eq!(body["projected"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_rules_functions_catalog() {
+        let (server, _state) = TestServer::start().await;
+
+        let (status, body) = server.get("/api/v1/rules/functions").await;
+        assert_eq!(status, 200);
+        let catalog = body.as_array().expect("function array");
+        assert_eq!(catalog.len(), 185);
+        let sin = catalog
+            .iter()
+            .find(|entry| entry["name"] == json!("sin"))
+            .expect("sin in catalog");
+        assert_eq!(sin["category"], json!("math"));
+        assert_eq!(sin["aggregate"], json!(false));
+        let avg = catalog
+            .iter()
+            .find(|entry| entry["name"] == json!("avg"))
+            .expect("avg in catalog");
+        assert_eq!(avg["aggregate"], json!(true));
     }
 
     /// Minimal WebSocket client over raw TCP (no extra deps): HTTP

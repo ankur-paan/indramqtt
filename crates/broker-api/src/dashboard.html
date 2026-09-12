@@ -23,6 +23,8 @@
   .dot.ok { background: var(--green); }
   .badge { font-size: 12px; border: 1px solid var(--border);
            border-radius: 12px; padding: 2px 10px; color: var(--dim); }
+  .badge.community { color: #39c5cf; border-color: #39c5cf; }
+  .badge.enterprise { color: #e3b341; border-color: #e3b341; }
   section { background: var(--panel); border: 1px solid var(--border);
             border-radius: 8px; padding: 16px; margin-top: 16px; }
   section h2 { margin: 0 0 12px; font-size: 16px; }
@@ -90,6 +92,10 @@
   <div class="row"><label>Topic filter</label><input id="rule-filter" value="sensors/+" size="24"></div>
   <div class="row"><label style="align-self:flex-start">SQL query</label>
     <textarea id="rule-sql" rows="3" cols="60">SELECT temperature FROM "sensors/+" WHERE temperature &gt; 40.0</textarea></div>
+  <div class="row"><label>Templates</label>
+    <button id="rule-tpl-math" class="ghost">Math transform</button>
+    <button id="rule-tpl-tumbling" class="ghost">Tumbling window (Enterprise)</button>
+  </div>
   <div class="row"><label>Sink</label>
     <select id="rule-sink">
       <option value="republish">republish</option>
@@ -109,7 +115,7 @@
     <button id="rule-create">Create rule</button>
     <button id="rule-refresh" class="ghost">Refresh list</button>
   </div>
-  <table><thead><tr><th>id</th><th>name</th><th>filter</th><th>sql</th><th></th></tr></thead>
+  <table><thead><tr><th>id</th><th>name</th><th>tier</th><th>filter</th><th>sql</th><th></th></tr></thead>
   <tbody id="rules-body"></tbody></table>
 </section>
 
@@ -279,17 +285,31 @@ function currentActions() {
 }
 async function refreshRules() {
   const rules = await api("/api/v1/rules");
-  $("rules-body").innerHTML = rules.map((r) =>
-    "<tr><td>" + r.id + "</td><td>" + r.name + "</td><td><code>" +
-    r.topic_filter + "</code></td><td><code>" + (r.sql_query || "") +
-    "</code></td><td><button class='danger' data-del='" + r.id + "'>Delete</button></td></tr>"
-  ).join("");
+  $("rules-body").innerHTML = rules.map((r) => {
+    const tier = r.tier || "community";
+    return "<tr><td>" + r.id + "</td><td>" + r.name +
+      "</td><td><span class='badge " + tier + "'>" + tier +
+      "</span></td><td><code>" + r.topic_filter + "</code></td><td><code>" +
+      (r.sql_query || "") +
+      "</code></td><td><button class='danger' data-del='" + r.id + "'>Delete</button></td></tr>";
+  }).join("");
   document.querySelectorAll("[data-del]").forEach((b) =>
     b.onclick = async () => {
       await fetch("/api/v1/rules/" + b.dataset.del, {method: "DELETE"});
       refreshRules();
     });
 }
+
+$("rule-tpl-math").onclick = () => {
+  $("rule-filter").value = "sensors/+";
+  $("rule-sql").value =
+    'SELECT round(temperature, 1) AS temp_c, upper(sensor_id) AS id FROM "sensors/+" WHERE temperature > -50.0';
+};
+$("rule-tpl-tumbling").onclick = () => {
+  $("rule-filter").value = "sensors/+";
+  $("rule-sql").value =
+    'SELECT avg(temperature) AS avg_temp, count(*) AS n FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 10)';
+};
 
 /* ---- connectors ---- */
 async function refreshConnectors() {

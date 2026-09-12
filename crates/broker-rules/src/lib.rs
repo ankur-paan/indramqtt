@@ -3,9 +3,13 @@ use broker_connectors::ConnectorManager;
 use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use parking_lot::RwLock;
-use rekuiper_sql::{Evaluator, SelectStmt};
+use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
+
+/// The streaming-SQL function catalog (name, category, aggregate flag,
+/// arity, example) served to the dashboard SQL studio.
+pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,14 +176,25 @@ impl EventInput for BoundedEventInput {
 
 /// One native stream rule: match ingress by topic filter, run actions.
 ///
+/// Open-core licensing tier of a rule, derived from its SQL at creation:
+/// any `GROUP BY` window clause (`TUMBLINGWINDOW`, `HOPPINGWINDOW`,
+/// `SLIDINGWINDOW`, `COUNTWINDOW`) makes a rule Enterprise; everything
+/// else is Community.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleTier {
+    Community,
+    Enterprise,
+}
+
 /// `sql_query` is an optional streaming-SQL program parsed once at
-/// creation into `parsed_query`. At ingress, matching JSON payloads are
-/// filtered (WHERE) and projected (SELECT) through `rekuiper-sql`; rules
-/// without SQL pass the raw payload through. Stateful constructs
-/// (windows, GROUP BY, aggregations) are accepted by the parser but
-/// evaluated per-record for now — stateful dispatch is a later sprint.
-/// `parsed_query` is skipped in JSON output: the wire form carries the
-/// source SQL string, which re-parses on creation.
+/// creation into `parsed_query`. Community rules (no window clause) run
+/// statelessly at ingress: matching JSON payloads are filtered (WHERE)
+/// and projected (SELECT). Enterprise rules (window clause present)
+/// accumulate matching records in a background worker and evaluate
+/// multi-event aggregations per window close. `parsed_query` is skipped
+/// in JSON output: the wire form carries the source SQL string, which
+/// re-parses on creation.
 #[derive(Debug, Clone, Serialize)]
 pub struct Rule {
     pub id: String,
@@ -188,6 +203,7 @@ pub struct Rule {
     pub sql_query: Option<String>,
     #[serde(skip_serializing)]
     pub parsed_query: Option<SelectStmt>,
+    pub tier: RuleTier,
     pub enabled: bool,
     pub actions: Vec<RuleAction>,
 }
@@ -231,11 +247,67 @@ mod qos_serde {
 /// the receiving node. Republished messages flow straight into the sink
 /// and are never re-dispatched, so rules cannot recurse through their
 /// own output.
+///
+/// Enterprise (windowed) rules do not execute inline: matching records
+/// are pushed to a per-rule background worker ([`WindowWorker`]) that
+/// aggregates per window close and dispatches through the actions.
 pub struct RuleEngine {
     rules: RwLock<HashMap<String, Rule>>,
     next_id: AtomicU64,
     input: Arc<BoundedEventInput>,
     connectors: Arc<ConnectorManager>,
+    flush_ctx: Arc<FlushContext>,
+    window_workers: RwLock<HashMap<String, WindowWorker>>,
+}
+
+/// Shared flush context: what a window worker needs at flush time. The
+/// broker sink is installed post-construction via
+/// [`RuleEngine::set_broker_sink`] (the engine is built before the node
+/// sink exists); connectors are shared with the engine itself.
+struct FlushContext {
+    connectors: Arc<ConnectorManager>,
+    broker_sink: RwLock<Option<Arc<dyn BrokerSink>>>,
+}
+
+/// One timestamped record waiting inside a window buffer. The ingress
+/// topic travels along so flush dispatches carry real routing context.
+#[derive(Debug, Clone)]
+struct TimedRecord {
+    arrived_ms: u64,
+    topic: Topic,
+    record: HashMap<String, serde_json::Value>,
+}
+
+/// Background aggregation worker for one Enterprise window rule.
+struct WindowWorker {
+    handle: tokio::task::JoinHandle<()>,
+    tx: mpsc::Sender<TimedRecord>,
+}
+
+/// Worker ingress channel depth: backpressure stays at the edge input
+/// queue, so a full worker buffer drops with a warning, never blocks.
+const WINDOW_CHANNEL_DEPTH: usize = 1024;
+
+/// Wall-clock milliseconds.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Window length in milliseconds (saturating; clamped to at least 1ms so
+/// degenerate `TUMBLINGWINDOW(ss, 0)` style definitions tick instead of
+/// panicking the ticker).
+fn window_length_ms(unit: &TimeUnit, length: u64) -> u64 {
+    let per_unit: u64 = match unit {
+        TimeUnit::Ms => 1,
+        TimeUnit::Ss => 1_000,
+        TimeUnit::Mi => 60_000,
+        TimeUnit::Hh => 3_600_000,
+        TimeUnit::Dd => 86_400_000,
+    };
+    length.saturating_mul(per_unit).max(1)
 }
 
 impl RuleEngine {
@@ -243,11 +315,17 @@ impl RuleEngine {
     /// 1). The queue backs future async ingestion; the hot path calls
     /// [`RuleEngine::dispatch_ingress`] synchronously for determinism.
     pub fn new(queue_capacity: usize, policy: BackpressurePolicy) -> Self {
+        let connectors = Arc::new(ConnectorManager::new());
         Self {
             rules: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             input: BoundedEventInput::new(queue_capacity, policy),
-            connectors: Arc::new(ConnectorManager::new()),
+            connectors: connectors.clone(),
+            flush_ctx: Arc::new(FlushContext {
+                connectors,
+                broker_sink: RwLock::new(None),
+            }),
+            window_workers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -259,6 +337,23 @@ impl RuleEngine {
     /// Live outbound connectors addressable by `ForwardConnector` actions.
     pub fn connectors(&self) -> &Arc<ConnectorManager> {
         &self.connectors
+    }
+
+    /// Install (or replace) the broker sink used by window-flush
+    /// republish actions. Called once by the node after the shared sink
+    /// exists; the inline stateless path keeps taking its sink per call.
+    pub fn set_broker_sink(&self, sink: Arc<dyn BrokerSink>) {
+        *self.flush_ctx.broker_sink.write() = Some(sink);
+    }
+
+    /// The currently installed flush sink, if any.
+    pub fn broker_sink(&self) -> Option<Arc<dyn BrokerSink>> {
+        self.flush_ctx.broker_sink.read().clone()
+    }
+
+    /// Live window worker count (observability/testing hook).
+    pub fn window_worker_count(&self) -> usize {
+        self.window_workers.read().len()
     }
 
     /// Build and store a rule, assigning its id (`rule-<n>`).
@@ -312,16 +407,26 @@ impl RuleEngine {
             None => None,
         };
         let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        let tier = match &parsed_query {
+            Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
+            _ => RuleTier::Community,
+        };
         let rule = Rule {
             id: id.clone(),
             name,
             topic_filter,
             sql_query,
             parsed_query,
+            tier,
             enabled,
             actions,
         };
-        self.rules.write().insert(id, rule.clone());
+        self.rules.write().insert(id.clone(), rule.clone());
+        // Eager worker start when a runtime is available; otherwise the
+        // first matching ingress spawns it lazily (see dispatch_ingress).
+        if tier == RuleTier::Enterprise {
+            self.ensure_worker(&rule);
+        }
         Ok(rule)
     }
 
@@ -336,7 +441,99 @@ impl RuleEngine {
     }
 
     pub fn remove_rule(&self, id: &str) -> bool {
+        // Abort the window worker first so no orphan task survives its rule.
+        if let Some(worker) = self.window_workers.write().remove(id) {
+            worker.handle.abort();
+        }
         self.rules.write().remove(id).is_some()
+    }
+
+    /// Route one matching record into an Enterprise window worker: parse
+    /// the JSON payload, evaluate the rule WHERE clause, and push passing
+    /// records into the worker channel. Lazily spawns a missing worker
+    /// (creation outside a runtime defers it to this point).
+    fn dispatch_windowed(&self, rule: &Rule, topic: &Topic, payload: &Bytes) {
+        let stmt = match rule.parsed_query.as_ref() {
+            Some(stmt) => stmt,
+            None => return,
+        };
+        let record: HashMap<String, serde_json::Value> =
+            match serde_json::from_slice(payload) {
+                Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+                _ => return,
+            };
+        let passes = match stmt.where_clause.as_ref() {
+            Some(condition) => Evaluator::eval_bool(condition, &record),
+            None => true,
+        };
+        if !passes {
+            return;
+        }
+        self.ensure_worker(rule);
+        let workers = self.window_workers.read();
+        let Some(worker) = workers.get(&rule.id) else {
+            return;
+        };
+        if worker
+            .tx
+            .try_send(TimedRecord {
+                arrived_ms: now_ms(),
+                topic: topic.clone(),
+                record,
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                rule_id = %rule.id,
+                "window worker buffer full; ingress record dropped"
+            );
+        }
+    }
+
+    /// Ensure a background worker exists for an Enterprise window rule.
+    /// Idempotent: a second call for the same id is a no-op. Requires a
+    /// Tokio runtime (returns silently without one; dispatch retries).
+    fn ensure_worker(&self, rule: &Rule) {
+        let window = match rule
+            .parsed_query
+            .as_ref()
+            .and_then(|stmt| stmt.window.clone())
+        {
+            Some(window) => window,
+            None => return,
+        };
+        if self.window_workers.read().contains_key(&rule.id) {
+            return;
+        }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                tracing::warn!(
+                    rule_id = %rule.id,
+                    "no async runtime: window worker deferred until first ingress"
+                );
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel(WINDOW_CHANNEL_DEPTH);
+        let stmt = match rule.parsed_query.clone() {
+            Some(stmt) => stmt,
+            None => return,
+        };
+        let worker = WindowWorker {
+            tx,
+            handle: runtime.spawn(window_worker_loop(
+                rule.id.clone(),
+                stmt,
+                rule.actions.clone(),
+                self.flush_ctx.clone(),
+                rx,
+                window,
+            )),
+        };
+        self.window_workers
+            .write()
+            .insert(rule.id.clone(), worker);
     }
 
     /// Execute every enabled rule whose filter matches `topic`.
@@ -348,6 +545,10 @@ impl RuleEngine {
     /// forwarded to the sink. Sink failures are logged; remaining actions
     /// still run. Returns the number of rules that matched (for the
     /// `indramqtt_rules_executed_total` counter).
+    ///
+    /// Enterprise window rules never execute inline: matching records
+    /// passing the WHERE clause are pushed to the rule's background
+    /// worker instead (still counted as matched).
     pub async fn dispatch_ingress(
         &self,
         topic: &Topic,
@@ -366,56 +567,347 @@ impl RuleEngine {
                 .collect()
         };
         for rule in &matched {
+            if rule.tier == RuleTier::Enterprise
+                && rule.parsed_query.as_ref().is_some_and(|stmt| stmt.window.is_some())
+            {
+                self.dispatch_windowed(&rule, topic, payload);
+                continue;
+            }
             let Some(data) = apply_sql(&rule.parsed_query, payload, &rule.id) else {
                 continue;
             };
-            for action in &rule.actions {
-                match action {
-                    RuleAction::Republish {
-                        topic: dst,
-                        qos: action_qos,
-                    } => {
-                        let effective = std::cmp::min(*action_qos, qos);
-                        if let Err(e) = broker_sink
-                            .publish(dst.clone(), data.clone(), effective, false)
+            run_actions(
+                &rule.id,
+                &rule.actions,
+                topic,
+                data,
+                qos,
+                &self.connectors,
+                Some(broker_sink),
+            )
+            .await;
+        }
+        matched.len()
+    }
+}
+
+/// Execute one rule's actions for a single output row. Shared by the
+/// inline stateless path and window flushes. `qos_cap` floors delivery:
+/// the inline path passes the ingress QoS (`min(action, ingress)`), the
+/// flush path passes [`QoS::ExactlyOnce`] so the action QoS applies
+/// verbatim. A missing broker sink drops republish actions with a
+/// warning instead of panicking.
+#[allow(clippy::too_many_arguments)]
+async fn run_actions(
+    rule_id: &str,
+    actions: &[RuleAction],
+    topic: &Topic,
+    payload: Bytes,
+    qos_cap: QoS,
+    connectors: &Arc<ConnectorManager>,
+    broker_sink: Option<&Arc<dyn BrokerSink>>,
+) {
+    for action in actions {
+        match action {
+            RuleAction::Republish {
+                topic: dst,
+                qos: action_qos,
+            } => {
+                let effective = std::cmp::min(*action_qos, qos_cap);
+                match broker_sink {
+                    Some(sink) => {
+                        if let Err(e) = sink
+                            .publish(dst.clone(), payload.clone(), effective, false)
                             .await
                         {
                             tracing::warn!(
-                                rule_id = %rule.id,
+                                rule_id = %rule_id,
                                 error = %e,
                                 "Rule republish failed; continuing with remaining actions"
                             );
                         }
                     }
-                    RuleAction::Log => {
-                        tracing::info!(
-                            rule_id = %rule.id,
-                            topic = %topic,
-                            "Rule matched ingress event"
+                    None => {
+                        tracing::warn!(
+                            rule_id = %rule_id,
+                            "no broker sink configured; republish dropped"
                         );
                     }
-                    RuleAction::ForwardConnector { connector_id } => {
-                        if let Err(e) = self.connectors.send(
-                            connector_id,
-                            topic,
-                            &data,
-                            qos,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                rule_id = %rule.id,
-                                connector = %connector_id,
-                                error = %e,
-                                "Rule connector forward failed; continuing with remaining actions"
-                            );
+                }
+            }
+            RuleAction::Log => {
+                tracing::info!(
+                    rule_id = %rule_id,
+                    topic = %topic,
+                    "Rule matched ingress event"
+                );
+            }
+            RuleAction::ForwardConnector { connector_id } => {
+                if let Err(e) = connectors
+                    .send(connector_id, topic, &payload, qos_cap)
+                    .await
+                {
+                    tracing::warn!(
+                        rule_id = %rule_id,
+                        connector = %connector_id,
+                        error = %e,
+                        "Rule connector forward failed; continuing with remaining actions"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Background aggregation loop for one Enterprise window rule. Time
+/// windows tick; count windows flush on arrivals; sliding windows
+/// aggregate on every arrival. An empty window never dispatches.
+async fn window_worker_loop(
+    rule_id: String,
+    stmt: SelectStmt,
+    actions: Vec<RuleAction>,
+    flush_ctx: Arc<FlushContext>,
+    mut rx: mpsc::Receiver<TimedRecord>,
+    window: WindowDef,
+) {
+    match window {
+        WindowDef::TumblingTime { unit, length } => {
+            let period = std::time::Duration::from_millis(window_length_ms(&unit, length));
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut window_start = now_ms();
+            let mut buffer: Vec<TimedRecord> = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let end = now_ms();
+                        let batch = std::mem::take(&mut buffer);
+                        flush_window(&rule_id, &stmt, &actions, batch, window_start, end, &flush_ctx).await;
+                        window_start = end;
+                    }
+                    rec = rx.recv() => {
+                        match rec {
+                            Some(record) => buffer.push(record),
+                            None => break,
                         }
                     }
                 }
             }
         }
-        matched.len()
+        WindowDef::Count { size, interval } => {
+            let size = size.max(1);
+            let mut buffer: Vec<TimedRecord> = Vec::new();
+            let mut since_flush = 0usize;
+            while let Some(record) = rx.recv().await {
+                buffer.push(record);
+                since_flush += 1;
+                let step = interval.unwrap_or(size).max(1);
+                if buffer.len() >= size && since_flush >= step {
+                    let end = now_ms();
+                    let batch = if interval.is_some() {
+                        // Sliding count: aggregate the trailing window,
+                        // retain it for the next step.
+                        let start = buffer.len().saturating_sub(size);
+                        buffer[start..].to_vec()
+                    } else {
+                        std::mem::take(&mut buffer)
+                    };
+                    let start = batch.first().map(|r| r.arrived_ms).unwrap_or(end);
+                    flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx).await;
+                    since_flush = 0;
+                }
+                // Sliding retention cap: never hold more than one window.
+                if interval.is_some() {
+                    let excess = buffer.len().saturating_sub(size);
+                    buffer.drain(..excess);
+                }
+            }
+        }
+        WindowDef::HoppingTime {
+            unit,
+            length,
+            interval,
+        } => {
+            let period = std::time::Duration::from_millis(window_length_ms(&unit, interval));
+            let span = window_length_ms(&unit, length);
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut buffer: VecDeque<TimedRecord> = VecDeque::new();
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let end = now_ms();
+                        let cutoff = end.saturating_sub(span);
+                        while buffer.front().map(|r| r.arrived_ms < cutoff).unwrap_or(false) {
+                            buffer.pop_front();
+                        }
+                        let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
+                        flush_window(
+                            &rule_id,
+                            &stmt,
+                            &actions,
+                            batch,
+                            cutoff,
+                            end,
+                            &flush_ctx,
+                        )
+                        .await;
+                    }
+                    rec = rx.recv() => {
+                        match rec {
+                            Some(record) => buffer.push_back(record),
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
+        WindowDef::SlidingTime { unit, length, .. } => {
+            let span = window_length_ms(&unit, length);
+            let mut buffer: VecDeque<TimedRecord> = VecDeque::new();
+            while let Some(record) = rx.recv().await {
+                let end = now_ms();
+                let cutoff = end.saturating_sub(span);
+                buffer.push_back(record);
+                while buffer.front().map(|r| r.arrived_ms < cutoff).unwrap_or(false) {
+                    buffer.pop_front();
+                }
+                // Aggregate the trailing window on every arrival.
+                let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
+                flush_window(&rule_id, &stmt, &actions, batch, cutoff, end, &flush_ctx).await;
+            }
+        }
     }
+}
+
+/// Flush one closed window: inject `__window_start__`,
+/// `__window_end__`, `window_start`, `window_end` epoch millis into every
+/// record (so `window_start()`/`window_end()` resolve), partition by
+/// `GROUP BY` when present, evaluate aggregates per partition, and
+/// dispatch each resulting row through the rule actions. Empty windows
+/// and fully-having-filtered windows dispatch nothing. Each row routes
+/// with its partition's first record topic.
+async fn flush_window(
+    rule_id: &str,
+    stmt: &SelectStmt,
+    actions: &[RuleAction],
+    batch: Vec<TimedRecord>,
+    window_start_ms: u64,
+    window_end_ms: u64,
+    flush_ctx: &FlushContext,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = batch
+        .into_iter()
+        .map(|timed| {
+            let mut map = timed.record;
+            map.insert(
+                "__window_start__".to_string(),
+                serde_json::Value::from(window_start_ms),
+            );
+            map.insert(
+                "__window_end__".to_string(),
+                serde_json::Value::from(window_end_ms),
+            );
+            map.insert(
+                "window_start".to_string(),
+                serde_json::Value::from(window_start_ms),
+            );
+            map.insert(
+                "window_end".to_string(),
+                serde_json::Value::from(window_end_ms),
+            );
+            (timed.topic, map)
+        })
+        .collect();
+    // The sink snapshot is shared across this flush's rows.
+    let sink = flush_ctx.broker_sink.read().clone();
+    for (topic, row) in aggregate_partitioned(stmt, records) {
+        let object: serde_json::Map<String, serde_json::Value> =
+            row.into_iter().collect();
+        let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    rule_id = %rule_id,
+                    error = %e,
+                    "window row not serializable; dropped"
+                );
+                continue;
+            }
+        };
+        run_actions(
+            rule_id,
+            actions,
+            &topic,
+            bytes,
+            QoS::ExactlyOnce,
+            &flush_ctx.connectors,
+            sink.as_ref(),
+        )
+        .await;
+    }
+}
+
+/// Partition records by `GROUP BY` expressions and evaluate one
+/// aggregate row per partition (first-seen group order). Without
+/// `GROUP BY`, the whole batch is a single partition. Used by window
+/// flushes and the batch dry-run tester alike so both agree.
+fn aggregate_partitioned(
+    stmt: &SelectStmt,
+    records: Vec<(Topic, HashMap<String, serde_json::Value>)>,
+) -> Vec<(Topic, HashMap<String, serde_json::Value>)> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    if stmt.group_by.is_empty() {
+        let topic = records[0].0.clone();
+        let maps: Vec<HashMap<String, serde_json::Value>> =
+            records.into_iter().map(|(_, map)| map).collect();
+        return Evaluator::eval_aggregate(stmt, &maps)
+            .map(|row| vec![(topic, row)])
+            .unwrap_or_default();
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, (Topic, Vec<HashMap<String, serde_json::Value>>)> =
+        HashMap::new();
+    for (topic, map) in records {
+        let key = group_key(&stmt.group_by, &map);
+        let entry = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            (topic, Vec::new())
+        });
+        entry.1.push(map);
+    }
+    let mut out = Vec::new();
+    for key in order {
+        let (topic, maps) = groups.remove(&key).expect("group just inserted");
+        if let Some(row) = Evaluator::eval_aggregate(stmt, &maps) {
+            out.push((topic, row));
+        }
+    }
+    out
+}
+
+/// Canonical group key: type-tagged so `1`, `"1"` and `true` never
+/// collide across JSON types.
+fn group_key(
+    exprs: &[rekuiper_sql::Expr],
+    record: &HashMap<String, serde_json::Value>,
+) -> String {
+    exprs
+        .iter()
+        .map(|expr| match Evaluator::eval_val(expr, record) {
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(value) => format!("b:{value}"),
+            serde_json::Value::Number(value) => format!("n:{value}"),
+            serde_json::Value::String(value) => format!("s:{value}"),
+            other => format!("j:{other}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\x1f")
 }
 
 /// Replace the stream reference after the first top-level FROM with a
@@ -500,12 +992,11 @@ pub fn try_evaluate(
     topic: &str,
     payload: &serde_json::Value,
 ) -> Result<(bool, Option<serde_json::Value>), String> {
-    Topic::new(topic).map_err(|e| e.to_string())?;
+    let probe = Topic::new(topic).map_err(|e| e.to_string())?;
     if let Some(filter) = topic_filter {
         if !filter.trim().is_empty() {
             let parsed =
                 TopicFilter::new(filter).map_err(|e| format!("invalid topic_filter: {e}"))?;
-            let probe = Topic::new(topic).map_err(|e| e.to_string())?;
             if !parsed.matches(&probe) {
                 return Ok((false, None));
             }
@@ -522,20 +1013,61 @@ pub fn try_evaluate(
         }
         _ => None,
     };
-    let record: HashMap<String, serde_json::Value> = match payload {
-        serde_json::Value::Object(map) => map.clone().into_iter().collect(),
-        _ => return Ok((false, None)),
-    };
-    match stmt {
-        None => Ok((true, Some(payload.clone()))),
-        Some(stmt) => match Evaluator::eval_select(&stmt, &record) {
-            Some(projected) => {
-                let object: serde_json::Map<String, serde_json::Value> =
-                    projected.into_iter().collect();
-                Ok((true, Some(serde_json::Value::Object(object))))
+    match payload {
+        serde_json::Value::Array(elements) => {
+            // Batch dry-run: multi-event aggregation over the object
+            // elements (non-objects skipped), one row per group.
+            let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = elements
+                .iter()
+                .filter_map(|element| match element {
+                    serde_json::Value::Object(map) => Some((
+                        probe.clone(),
+                        map.clone().into_iter().collect(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if records.is_empty() {
+                return Ok((false, None));
             }
-            None => Ok((false, None)),
-        },
+            match stmt {
+                None => {
+                    // No SQL: the batch passes through as given.
+                    Ok((true, Some(payload.clone())))
+                }
+                Some(stmt) => {
+                    let rows: Vec<serde_json::Value> = aggregate_partitioned(&stmt, records)
+                        .into_iter()
+                        .map(|(_, row)| {
+                            serde_json::Value::Object(
+                                row.into_iter().collect(),
+                            )
+                        })
+                        .collect();
+                    if rows.is_empty() {
+                        Ok((false, None))
+                    } else {
+                        Ok((true, Some(serde_json::Value::Array(rows))))
+                    }
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let record: HashMap<String, serde_json::Value> =
+                map.clone().into_iter().collect();
+            match stmt {
+                None => Ok((true, Some(payload.clone()))),
+                Some(stmt) => match Evaluator::eval_select(&stmt, &record) {
+                    Some(projected) => {
+                        let object: serde_json::Map<String, serde_json::Value> =
+                            projected.into_iter().collect();
+                        Ok((true, Some(serde_json::Value::Object(object))))
+                    }
+                    None => Ok((false, None)),
+                },
+            }
+        }
+        _ => Ok((false, None)),
     }
 }
 
@@ -1043,7 +1575,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_sql_rejected_at_creation() {        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    async fn test_invalid_sql_rejected_at_creation() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let err = engine
             .create_rule(
                 "broken".to_string(),
@@ -1055,6 +1588,267 @@ mod tests {
             .expect_err("invalid SQL must fail creation");
         assert!(matches!(err, RuleEngineError::InvalidRule(_)));
         assert!(engine.list_rules().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // INDRA-210: scalar function catalog validation (Community tier).
+    // Every rule below is stateless: it must classify Community, spawn
+    // no worker, and evaluate inline on the ingress hot path.
+    // ------------------------------------------------------------------
+
+    /// Run one stateless SELECT through the real ingress path and return
+    /// the projected row.
+    async fn project_one(
+        sql: &str,
+        payload: &'static [u8],
+    ) -> serde_json::Value {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let rule = engine
+            .create_rule(
+                "probe".to_string(),
+                TopicFilter::new("t").unwrap(),
+                Some(sql.to_string()),
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("out").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("probe rule creates");
+        assert_eq!(rule.tier, RuleTier::Community);
+        assert_eq!(engine.window_worker_count(), 0);
+        let sink = Arc::new(RecordingSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        engine
+            .dispatch_ingress(
+                &Topic::new("t").unwrap(),
+                &Bytes::from_static(payload),
+                QoS::AtMostOnce,
+                &sink_obj,
+            )
+            .await;
+        let published = sink.published.lock().unwrap();
+        assert_eq!(published.len(), 1, "stateless rule must fire inline");
+        serde_json::from_slice(&published[0].1).expect("projected JSON")
+    }
+
+    fn num(value: &serde_json::Value, field: &str) -> f64 {
+        value
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| panic!("numeric field {field}: {value}"))
+    }
+
+    #[test]
+    fn test_function_catalog_has_185_entries() {
+        let catalog = rekuiper_sql::builtin_function_metadata();
+        assert_eq!(catalog.len(), 185);
+        // Spot-check categories and aggregate flags the engine honors.
+        let by_name = |name: &str| {
+            catalog
+                .iter()
+                .find(|meta| meta.name == name)
+                .unwrap_or_else(|| panic!("catalog missing {name}"))
+        };
+        assert!(!by_name("sin").aggregate);
+        assert!(!by_name("concat").aggregate);
+        assert!(!by_name("coalesce").aggregate);
+        assert!(!by_name("window_start").aggregate);
+        assert_eq!(by_name("window_start").category, "system");
+        assert!(by_name("avg").aggregate);
+        assert!(by_name("count").aggregate);
+    }
+
+    #[tokio::test]
+    async fn test_scalar_trig_identities() {
+        let row = project_one(
+            r#"SELECT sin(0.0) AS s, cos(0.0) AS c, tan(0.0) AS t FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "s"), 0.0);
+        assert_eq!(num(&row, "c"), 1.0);
+        assert_eq!(num(&row, "t"), 0.0);
+
+        let row = project_one(
+            r#"SELECT asin(0.0) AS a, acos(1.0) AS b, atan(0.0) AS c, atan2(0.0, 1.0) AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 0.0);
+        assert_eq!(num(&row, "b"), 0.0);
+        assert_eq!(num(&row, "c"), 0.0);
+        assert_eq!(num(&row, "d"), 0.0);
+
+        let row = project_one(
+            r#"SELECT sinh(0.0) AS a, cosh(0.0) AS b, tanh(0.0) AS c FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 0.0);
+        assert_eq!(num(&row, "b"), 1.0);
+        assert_eq!(num(&row, "c"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_scalar_math_functions() {
+        let row = project_one(
+            r#"SELECT sqrt(16.0) AS a, power(2.0, 10.0) AS b, pow(3.0, 2.0) AS c, exp(0.0) AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 4.0);
+        assert_eq!(num(&row, "b"), 1024.0);
+        assert_eq!(num(&row, "c"), 9.0);
+        assert_eq!(num(&row, "d"), 1.0);
+
+        let row = project_one(
+            r#"SELECT ln(1.0) AS a, log(10.0, 100.0) AS b, log2(8.0) AS c, log10(1000.0) AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 0.0);
+        assert_eq!(num(&row, "b"), 2.0);
+        assert_eq!(num(&row, "c"), 3.0);
+        assert_eq!(num(&row, "d"), 3.0);
+
+        let row = project_one(
+            r#"SELECT round(2.4) AS a, round(2.567, 2) AS b, ceil(2.1) AS c, floor(2.9) AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 2.0);
+        assert_eq!(num(&row, "b"), 2.57);
+        assert_eq!(num(&row, "c"), 3.0);
+        assert_eq!(num(&row, "d"), 2.0);
+
+        let row = project_one(
+            r#"SELECT abs(-3) AS a, abs(-2.5) AS b, sign(-5) AS c, sign(0) AS d, mod(10, 3) AS e FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 3.0);
+        assert_eq!(num(&row, "b"), 2.5);
+        assert_eq!(num(&row, "c"), -1.0);
+        assert_eq!(num(&row, "d"), 0.0);
+        assert_eq!(num(&row, "e"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_scalar_bitwise_functions() {
+        let row = project_one(
+            r#"SELECT bitand(6, 3) AS a, bitor(6, 3) AS b, bitxor(6, 3) AS c, bitnot(0) AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "a"), 2.0);
+        assert_eq!(num(&row, "b"), 7.0);
+        assert_eq!(num(&row, "c"), 5.0);
+        assert_eq!(num(&row, "d"), -1.0);
+    }
+
+    #[tokio::test]
+    async fn test_scalar_string_functions() {
+        let row = project_one(
+            r#"SELECT concat('a', 'b', 'c') AS a, lower('AbC') AS b, upper('AbC') AS c, length('hello') AS d FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!("abc"));
+        assert_eq!(row["b"], serde_json::json!("abc"));
+        assert_eq!(row["c"], serde_json::json!("ABC"));
+        assert_eq!(num(&row, "d"), 5.0);
+
+        let row = project_one(
+            r#"SELECT trim('  x  ') AS a, ltrim('  x  ') AS b, rtrim('  x  ') AS c FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!("x"));
+        assert_eq!(row["b"], serde_json::json!("x  "));
+        assert_eq!(row["c"], serde_json::json!("  x"));
+
+        let row = project_one(
+            r#"SELECT lpad('7', 3, '0') AS a, rpad('7', 3, '0') AS b, replace('aaa', 'a', 'b') AS c FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!("007"));
+        assert_eq!(row["b"], serde_json::json!("700"));
+        assert_eq!(row["c"], serde_json::json!("bbb"));
+
+        // Default pad character is a space.
+        let row = project_one(
+            r#"SELECT lpad('7', 3) AS a, rpad('7', 3) AS b FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!("  7"));
+        assert_eq!(row["b"], serde_json::json!("7  "));
+
+        let row = project_one(
+            r#"SELECT split('a,b,c', ',') AS a, reverse('abc') AS b FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(row["b"], serde_json::json!("cba"));
+
+        let row = project_one(
+            r#"SELECT substr('hello', 2, 3) AS a, substring('hello', 2) AS b FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!("ell"));
+        assert_eq!(row["b"], serde_json::json!("ello"));
+
+        let row = project_one(
+            r#"SELECT startswith('hello', 'he') AS a, endswith('hello', 'lo') AS b FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["a"], serde_json::json!(true));
+        assert_eq!(row["b"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_scalar_datetime_functions() {
+        let row = project_one(r#"SELECT now() AS ts FROM s"#, br#"{ "v": 1 }"#).await;
+        assert!(
+            num(&row, "ts") > 0.0,
+            "now() must return a positive epoch millis"
+        );
+
+        let row = project_one(
+            r#"SELECT format_date(0, '%Y') AS year FROM s"#,
+            br#"{ "v": 1 }"#,
+        )
+        .await;
+        assert_eq!(row["year"], serde_json::json!("1970"));
+    }
+
+    #[tokio::test]
+    async fn test_scalar_case_and_coalesce() {
+        let row = project_one(
+            r#"SELECT CASE WHEN temperature > 40 THEN 'hot' ELSE 'ok' END AS state FROM s"#,
+            br#"{ "temperature": 72.5 }"#,
+        )
+        .await;
+        assert_eq!(row["state"], serde_json::json!("hot"));
+
+        let row = project_one(
+            r#"SELECT CASE WHEN temperature > 40 THEN 'hot' ELSE 'ok' END AS state FROM s"#,
+            br#"{ "temperature": 20.0 }"#,
+        )
+        .await;
+        assert_eq!(row["state"], serde_json::json!("ok"));
+
+        let row = project_one(
+            r#"SELECT coalesce(missing, 42) AS v FROM s"#,
+            br#"{ "other": 1 }"#,
+        )
+        .await;
+        assert_eq!(num(&row, "v"), 42.0);
     }
 
     #[test]
@@ -1178,6 +1972,407 @@ mod tests {
                 &sink,
             )
             .await;
+    }
+
+    // ------------------------------------------------------------------
+    // INDRA-211/212/213: tiering, window workers, aggregations, flush.
+    // ------------------------------------------------------------------
+
+    /// Build an engine with one rule; returns engine, sink handle, and
+    /// the stored rule (for tier assertions). Mirrors production wiring:
+    /// the same sink serves inline dispatch and window flushes.
+    fn window_rule(
+        sql: Option<&str>,
+        actions: Vec<RuleAction>,
+    ) -> (RuleEngine, Arc<RecordingSink>, Arc<dyn BrokerSink>, Rule) {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let rule = engine
+            .create_rule(
+                "window-probe".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                sql.map(str::to_string),
+                true,
+                actions,
+            )
+            .expect("rule creates");
+        let sink = Arc::new(RecordingSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        engine.set_broker_sink(sink_obj.clone());
+        (engine, sink, sink_obj, rule)
+    }
+
+    async fn ingress(
+        engine: &RuleEngine,
+        sink: &Arc<dyn BrokerSink>,
+        payload: &'static [u8],
+    ) -> usize {
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(payload),
+                QoS::AtMostOnce,
+                sink,
+            )
+            .await
+    }
+
+    fn published_rows(sink: &RecordingSink) -> Vec<serde_json::Value> {
+        sink.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, payload, _, _)| {
+                serde_json::from_slice(payload).expect("row is JSON")
+            })
+            .collect()
+    }
+
+    async fn wait_rows(sink: &Arc<RecordingSink>, n: usize) {
+        for _ in 0..60 {
+            if sink.published.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "timed out waiting for {n} rows (got {})",
+            sink.published.lock().unwrap().len()
+        );
+    }
+
+    fn republish_action() -> Vec<RuleAction> {
+        vec![RuleAction::Republish {
+            topic: Topic::new("alerts/agg").unwrap(),
+            qos: QoS::AtMostOnce,
+        }]
+    }
+
+    #[test]
+    fn test_tier_classification() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let mk = |sql: Option<&str>| {
+            engine
+                .create_rule(
+                    "t".to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    sql.map(str::to_string),
+                    true,
+                    vec![RuleAction::Log],
+                )
+                .expect("rule creates")
+                .tier
+        };
+        // No SQL, plain SELECT, and GROUP BY without a window: Community.
+        assert_eq!(mk(None), RuleTier::Community);
+        assert_eq!(
+            mk(Some(r#"SELECT temperature FROM "sensors/+""#)),
+            RuleTier::Community
+        );
+        assert_eq!(
+            mk(Some(
+                r#"SELECT sensor_id, avg(temperature) AS a FROM "sensors/+" GROUP BY sensor_id"#
+            )),
+            RuleTier::Community
+        );
+        // Any window clause makes the rule Enterprise — even disabled.
+        assert_eq!(
+            mk(Some(
+                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 10)"#
+            )),
+            RuleTier::Enterprise
+        );
+        let disabled = engine
+            .create_rule(
+                "d".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY COUNTWINDOW(5)"#
+                        .to_string(),
+                ),
+                false,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
+        assert_eq!(disabled.tier, RuleTier::Enterprise);
+    }
+
+    #[test]
+    fn test_window_rule_created_outside_runtime_defers_worker() {
+        // Plain #[test]: no Tokio runtime, so eager spawn is impossible.
+        // Creation still succeeds; the worker arrives on first ingress.
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let rule = engine
+            .create_rule(
+                "w".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 10)"#
+                        .to_string(),
+                ),
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
+        assert_eq!(rule.tier, RuleTier::Enterprise);
+        assert_eq!(engine.window_worker_count(), 0);
+        assert!(engine.get_rule(&rule.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_window_worker_lifecycle() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        assert_eq!(engine.window_worker_count(), 0);
+        let rule = engine
+            .create_rule(
+                "w".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 30)"#
+                        .to_string(),
+                ),
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
+        assert_eq!(engine.window_worker_count(), 1);
+        // Re-creating is per-rule; removing aborts the worker.
+        assert!(engine.remove_rule(&rule.id));
+        assert_eq!(engine.window_worker_count(), 0);
+        assert!(!engine.remove_rule(&rule.id));
+        assert!(!engine.remove_rule("rule-999"));
+    }
+
+    #[tokio::test]
+    async fn test_count_window_aggregates_on_threshold() {
+        let (engine, sink, sink_obj, rule) = window_rule(
+            Some(r#"SELECT avg(temperature) AS avg_temp FROM "sensors/+" GROUP BY COUNTWINDOW(2)"#),
+            republish_action(),
+        );
+        assert_eq!(rule.tier, RuleTier::Enterprise);
+
+        // Two records close one window: exactly one aggregate row.
+        ingress(&engine, &sink_obj, br#"{ "temperature": 10.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 30.0 }"#).await;
+        wait_rows(&sink, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 1, "one row per closed window, got {rows:?}");
+        assert_eq!(rows[0]["avg_temp"], serde_json::json!(20.0));
+    }
+
+    #[tokio::test]
+    async fn test_count_window_where_gate() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS avg_temp FROM "sensors/+" WHERE temperature > 50.0 GROUP BY COUNTWINDOW(2)"#,
+            ),
+            republish_action(),
+        );
+
+        // Below-threshold ingress never reaches the buffer...
+        ingress(&engine, &sink_obj, br#"{ "temperature": 10.0 }"#).await;
+        // ...so these two close the first window alone.
+        ingress(&engine, &sink_obj, br#"{ "temperature": 60.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 70.0 }"#).await;
+        wait_rows(&sink, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["avg_temp"], serde_json::json!(65.0));
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_window_aggregates_and_skips_empty() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS avg_temp, sum(temperature) AS total, count(*) AS n, min(temperature) AS lo, max(temperature) AS hi FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ms, 150)"#,
+            ),
+            republish_action(),
+        );
+
+        ingress(&engine, &sink_obj, br#"{ "temperature": 10.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 20.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 30.0 }"#).await;
+        wait_rows(&sink, 1).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["avg_temp"], serde_json::json!(20.0));
+        assert_eq!(rows[0]["total"], serde_json::json!(60.0));
+        assert_eq!(rows[0]["n"], serde_json::json!(3));
+        assert_eq!(rows[0]["lo"], serde_json::json!(10.0));
+        assert_eq!(rows[0]["hi"], serde_json::json!(30.0));
+
+        // Empty windows dispatch nothing: still exactly one row later.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(published_rows(&sink).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_group_by_partitions_per_sensor() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT sensor_id, avg(temperature) AS avg_temp FROM "sensors/+" GROUP BY sensor_id, COUNTWINDOW(3)"#,
+            ),
+            republish_action(),
+        );
+
+        ingress(&engine, &sink_obj, br#"{ "sensor_id": "a", "temperature": 10.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "sensor_id": "b", "temperature": 30.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "sensor_id": "a", "temperature": 20.0 }"#).await;
+        wait_rows(&sink, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 2, "one row per group, got {rows:?}");
+        // First-seen group order is deterministic.
+        assert_eq!(rows[0]["sensor_id"], serde_json::json!("a"));
+        assert_eq!(rows[0]["avg_temp"], serde_json::json!(15.0));
+        assert_eq!(rows[1]["sensor_id"], serde_json::json!("b"));
+        assert_eq!(rows[1]["avg_temp"], serde_json::json!(30.0));
+    }
+
+    #[tokio::test]
+    async fn test_window_bounds_resolve_in_output() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS a, window_start() AS ws, window_end() AS we FROM "sensors/+" GROUP BY COUNTWINDOW(1)"#,
+            ),
+            republish_action(),
+        );
+
+        ingress(&engine, &sink_obj, br#"{ "temperature": 5.0 }"#).await;
+        wait_rows(&sink, 1).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 1);
+        let ws = rows[0]["ws"].as_u64().expect("window_start resolves");
+        let we = rows[0]["we"].as_u64().expect("window_end resolves");
+        assert!(ws > 0 && we >= ws, "sane bounds: ws={ws} we={we}");
+        assert!(
+            we - ws < 60_000,
+            "count-window bounds span the batch, not history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hopping_window_smoke() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY HOPPINGWINDOW(ms, 300, 150)"#,
+            ),
+            republish_action(),
+        );
+
+        ingress(&engine, &sink_obj, br#"{ "temperature": 10.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 30.0 }"#).await;
+        // Overlapping ticks eventually flush the trailing window.
+        wait_rows(&sink, 1).await;
+        let rows = published_rows(&sink);
+        assert!(!rows.is_empty());
+        assert!(rows[0]["a"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_aggregates_per_arrival() {
+        let (engine, sink, sink_obj, _) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY SLIDINGWINDOW(ss, 60)"#,
+            ),
+            republish_action(),
+        );
+
+        // Every arrival re-aggregates the trailing window, in order.
+        ingress(&engine, &sink_obj, br#"{ "temperature": 10.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 30.0 }"#).await;
+        wait_rows(&sink, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let rows = published_rows(&sink);
+        assert_eq!(rows.len(), 2, "one row per arrival, got {rows:?}");
+        assert_eq!(rows[0]["a"], serde_json::json!(10.0));
+        assert_eq!(rows[1]["a"], serde_json::json!(20.0));
+    }
+
+    #[tokio::test]
+    async fn test_window_forward_connector_dispatch() {
+        use broker_connectors::Sink as ConnectorSinkTrait;
+
+        #[derive(Debug, Default)]
+        struct ProbeConnector {
+            events: StdMutex<Vec<serde_json::Value>>,
+        }
+
+        #[async_trait]
+        impl ConnectorSinkTrait for ProbeConnector {
+            async fn send(
+                &self,
+                _topic: &Topic,
+                payload: &Bytes,
+                _qos: QoS,
+            ) -> Result<(), broker_connectors::ConnectorError> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(payload).expect("row JSON"));
+                Ok(())
+            }
+
+            fn kind(&self) -> &'static str {
+                "probe"
+            }
+        }
+
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let probe = Arc::new(ProbeConnector::default());
+        engine.connectors().register("probe", probe.clone());
+        engine
+            .create_rule(
+                "w".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY COUNTWINDOW(2)"#
+                        .to_string(),
+                ),
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "probe".to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        let sink_obj = sink;
+
+        ingress(&engine, &sink_obj, br#"{ "temperature": 8.0 }"#).await;
+        ingress(&engine, &sink_obj, br#"{ "temperature": 12.0 }"#).await;
+        for _ in 0..60 {
+            if probe.events.lock().unwrap().len() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let events = probe.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["a"], serde_json::json!(10.0));
+    }
+
+    #[tokio::test]
+    async fn test_remove_rule_stops_window_delivery() {
+        let (engine, sink, sink_obj, rule) = window_rule(
+            Some(
+                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY TUMBLINGWINDOW(ss, 30)"#,
+            ),
+            republish_action(),
+        );
+        assert_eq!(engine.window_worker_count(), 1);
+
+        // Records buffer, then the rule disappears before any close.
+        for _ in 0..5 {
+            ingress(&engine, &sink_obj, br#"{ "temperature": 1.0 }"#).await;
+        }
+        assert!(engine.remove_rule(&rule.id));
+        assert_eq!(engine.window_worker_count(), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            published_rows(&sink).is_empty(),
+            "aborted worker must not deliver"
+        );
     }
 
     #[test]
