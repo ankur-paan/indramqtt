@@ -146,6 +146,10 @@
       <option value="mssql">mssql ★ enterprise</option>
       <option value="cassandra">cassandra ★ enterprise</option>
       <option value="couchbase">couchbase ★ enterprise</option>
+      <option value="tdengine">tdengine ★ enterprise</option>
+      <option value="iotdb">iotdb ★ enterprise</option>
+      <option value="timestream">timestream ★ enterprise</option>
+      <option value="dynamodb">dynamodb ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -278,6 +282,31 @@
     <input id="conn-couch-user" placeholder="username" size="12">
     <input id="conn-couch-pass" placeholder="password" type="password" size="14">
     <input id="conn-couch-docid" placeholder="doc id template, e.g. ${client_id}::${timestamp}" size="30">
+  </div>
+  <div class="row"><label>TDengine config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-td-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:6041/rest/sql" size="32">
+    <input id="conn-td-database" placeholder="database, e.g. power" size="12">
+    <input id="conn-td-stable" placeholder="super table, e.g. meters" size="14">
+    <input id="conn-td-subtable" placeholder="sub-table template, e.g. d_${client_id}" size="24">
+  </div>
+  <div class="row"><label>IoTDB config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-iotdb-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:18080/rest/v2" size="32">
+    <input id="conn-iotdb-device" placeholder="device path, e.g. root.factory.plant1" size="26">
+    <input id="conn-iotdb-measurements" placeholder="measurements, e.g. temperature,humidity" size="26">
+  </div>
+  <div class="row"><label>Timestream config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-ts-database" placeholder="database, e.g. iot_database" size="16">
+    <input id="conn-ts-table" placeholder="table, e.g. telemetry" size="14">
+    <input id="conn-ts-region" placeholder="region, e.g. us-east-1" size="12">
+    <input id="conn-ts-key" placeholder="access key id" size="16">
+    <input id="conn-ts-secret" placeholder="secret access key" type="password" size="18">
+  </div>
+  <div class="row"><label>DynamoDB config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-ddb-table" placeholder="table, e.g. telemetry_table" size="18">
+    <input id="conn-ddb-region" placeholder="region, e.g. us-east-1" size="12">
+    <input id="conn-ddb-key" placeholder="access key id" size="16">
+    <input id="conn-ddb-secret" placeholder="secret access key" type="password" size="18">
+    <input id="conn-ddb-partition" placeholder="partition key template, e.g. ${client_id}" size="26">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -740,6 +769,45 @@ $("conn-add").onclick = async () => {
               operation: "upsert",
               batch_size: 100, batch_bytes: 2097152, linger_ms: 10,
               max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "tdengine") {
+    config = {endpoint: $("conn-td-endpoint").value.trim() || "http://127.0.0.1:6041/rest/sql",
+              database: $("conn-td-database").value.trim() || "power",
+              stable_name: $("conn-td-stable").value.trim() || "meters",
+              subtable_template: $("conn-td-subtable").value.trim() || "d_${client_id}",
+              auth: {type: "basic", username: "root", password: "taosdata"},
+              tags_template: {}, metrics_template: {},
+              batch_size: 500, batch_bytes: 4194304, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 3000};
+  } else if (kind === "iotdb") {
+    const measurements = $("conn-iotdb-measurements").value.trim() || "temperature,humidity";
+    const names = measurements.split(",").map(s => s.trim()).filter(s => s !== "");
+    config = {endpoint: $("conn-iotdb-endpoint").value.trim() || "http://127.0.0.1:18080/rest/v2",
+              device_path_template: $("conn-iotdb-device").value.trim() || "root.factory.plant1",
+              auth: {username: "root", password: "root"},
+              is_aligned: false,
+              measurements: names,
+              data_types: names.map(() => "DOUBLE"),
+              batch_size: 200, batch_bytes: 2097152, linger_ms: 10,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "timestream") {
+    config = {database_name: $("conn-ts-database").value.trim() || "iot_database",
+              table_name: $("conn-ts-table").value.trim() || "telemetry",
+              region: $("conn-ts-region").value.trim() || "us-east-1",
+              access_key_id: $("conn-ts-key").value.trim(),
+              secret_access_key: $("conn-ts-secret").value,
+              dimensions: {}, time_unit: "milliseconds",
+              multi_measure_mappings: {},
+              batch_size: 100, batch_bytes: 1048576, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2500};
+  } else if (kind === "dynamodb") {
+    config = {table_name: $("conn-ddb-table").value.trim() || "telemetry_table",
+              region: $("conn-ddb-region").value.trim() || "us-east-1",
+              access_key_id: $("conn-ddb-key").value.trim(),
+              secret_access_key: $("conn-ddb-secret").value,
+              partition_key: {name: "device_id", template: $("conn-ddb-partition").value.trim() || "${client_id}", key_type: "S"},
+              attributes_mapping: {},
+              batch_size: 25, batch_bytes: 1048576, linger_ms: 10,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2000};
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();

@@ -849,8 +849,72 @@ async fn build_connector(
                 Ok(("couchbase".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "tdengine" | "td" | "taos" => {
+                let config: broker_connectors::TdengineSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid tdengine config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid tdengine config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpTdengineTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid tdengine transport: {e}"))?,
+                );
+                let sink = broker_connectors::TdengineSink::new(config, transport)
+                    .map_err(|e| format!("invalid tdengine sink: {e}"))?;
+                Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "iotdb" | "iot_db" => {
+                let config: broker_connectors::IotDbSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid iotdb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid iotdb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpIotDbTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid iotdb transport: {e}"))?,
+                );
+                let sink = broker_connectors::IotDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid iotdb sink: {e}"))?;
+                Ok(("iotdb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "timestream" | "ts" | "aws_timestream" => {
+                let config: broker_connectors::TimestreamSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid timestream config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid timestream config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpTimestreamTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid timestream transport: {e}"))?,
+                );
+                let sink = broker_connectors::TimestreamSink::new(config, transport)
+                    .map_err(|e| format!("invalid timestream sink: {e}"))?;
+                Ok(("timestream".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "dynamodb" | "dynamo" | "ddb" => {
+                let config: broker_connectors::DynamoDbSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid dynamodb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid dynamodb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpDynamoDbTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid dynamodb transport: {e}"))?,
+                );
+                let sink = broker_connectors::DynamoDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid dynamodb sink: {e}"))?;
+                Ok(("dynamodb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, tdengine, iotdb, timestream, dynamodb, or logger)"
             )),
         }
 }
@@ -1414,6 +1478,10 @@ mod tests {
             "value=\"mssql\"",
             "value=\"cassandra\"",
             "value=\"couchbase\"",
+            "value=\"tdengine\"",
+            "value=\"iotdb\"",
+            "value=\"timestream\"",
+            "value=\"dynamodb\"",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
@@ -1426,6 +1494,10 @@ mod tests {
             "conn-mssql-host",
             "conn-cass-contact",
             "conn-couch-url",
+            "conn-td-endpoint",
+            "conn-iotdb-device",
+            "conn-ts-database",
+            "conn-ddb-table",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1933,6 +2005,101 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("couchbase"));
 
+        // TDengine sink: validated without touching any server.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "tdengine-1",
+                       "kind": "tdengine",
+                       "config": {"endpoint": "http://127.0.0.1:6041/rest/sql",
+                                  "database": "power",
+                                  "stable_name": "meters",
+                                  "subtable_template": "d_${client_id}",
+                                  "auth": {"type": "basic", "username": "root", "password": "taosdata"},
+                                  "tags_template": {},
+                                  "metrics_template": {},
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("tdengine"));
+
+        // IoTDB sink: validated without touching any server.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "iotdb-1",
+                       "kind": "iotdb",
+                       "config": {"endpoint": "http://127.0.0.1:18080/rest/v2",
+                                  "device_path_template": "root.factory.plant1",
+                                  "auth": {"username": "root", "password": "root"},
+                                  "is_aligned": false,
+                                  "measurements": ["temperature"],
+                                  "data_types": ["DOUBLE"],
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("iotdb"));
+
+        // Timestream sink: validated without touching AWS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "timestream-1",
+                       "kind": "timestream",
+                       "config": {"database_name": "iot_database",
+                                  "table_name": "telemetry",
+                                  "region": "us-east-1",
+                                  "access_key_id": "AKID",
+                                  "secret_access_key": "secret",
+                                  "dimensions": {},
+                                  "time_unit": "milliseconds",
+                                  "multi_measure_mappings": {"temperature": "DOUBLE"},
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("timestream"));
+
+        // DynamoDB sink: validated without touching AWS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "dynamodb-1",
+                       "kind": "dynamodb",
+                       "config": {"table_name": "telemetry_table",
+                                  "region": "us-east-1",
+                                  "access_key_id": "AKID",
+                                  "secret_access_key": "secret",
+                                  "partition_key": {"name": "device_id", "template": "${client_id}", "key_type": "S"},
+                                  "attributes_mapping": {},
+                                  "batch_size": 25,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("dynamodb"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
@@ -1944,10 +2111,12 @@ mod tests {
                    {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
                    {"id": "diag", "kind": "console", "tier": "community"},
                    {"id": "disk-1", "kind": "disk_log", "tier": "community"},
+                   {"id": "dynamodb-1", "kind": "dynamodb", "tier": "enterprise"},
                    {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
                    {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
                    {"id": "hook-1", "kind": "webhook", "tier": "community"},
                    {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
+                   {"id": "iotdb-1", "kind": "iotdb", "tier": "enterprise"},
                    {"id": "kafka-sink-1", "kind": "kafka", "tier": "community"},
                    {"id": "kinesis-1", "kind": "kinesis", "tier": "enterprise"},
                    {"id": "mongo-1", "kind": "mongodb", "tier": "enterprise"},
@@ -1959,6 +2128,8 @@ mod tests {
                    {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
                    {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
                    {"id": "spb-1", "kind": "sparkplug_b", "tier": "enterprise"},
+                   {"id": "tdengine-1", "kind": "tdengine", "tier": "enterprise"},
+                   {"id": "timestream-1", "kind": "timestream", "tier": "enterprise"},
                    {"id": "ts-sink-1", "kind": "timescaledb", "tier": "community"}])
         );
 
@@ -2058,13 +2229,36 @@ mod tests {
                               "auth": {"username": "", "password": "secret"},
                               "doc_id_template": "k",
                               "operation": "upsert"}}),
+            json!({"id": "bad-tdengine", "kind": "tdengine",
+                   "config": {"endpoint": "http://127.0.0.1:6041/rest/sql",
+                              "database": "has space",
+                              "stable_name": "meters",
+                              "subtable_template": "d_${client_id}"}}),
+            json!({"id": "bad-iotdb", "kind": "iotdb",
+                   "config": {"endpoint": "http://127.0.0.1:18080/rest/v2",
+                              "device_path_template": "factory.plant1",
+                              "auth": {"username": "root", "password": "root"},
+                              "measurements": ["temperature"],
+                              "data_types": ["DOUBLE"]}}),
+            json!({"id": "bad-timestream", "kind": "timestream",
+                   "config": {"database_name": "iot_database",
+                              "table_name": "",
+                              "region": "us-east-1",
+                              "access_key_id": "AKID",
+                              "secret_access_key": "secret"}}),
+            json!({"id": "bad-dynamodb", "kind": "dynamodb",
+                   "config": {"table_name": "telemetry_table",
+                              "region": "us-east-1",
+                              "access_key_id": "AKID",
+                              "secret_access_key": "secret",
+                              "partition_key": {"name": "", "template": "${client_id}", "key_type": "S"}}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 23);
+        assert_eq!(body.as_array().expect("list").len(), 27);
     }
 
     #[tokio::test]

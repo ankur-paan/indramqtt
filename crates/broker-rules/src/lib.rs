@@ -3803,6 +3803,242 @@ mod tests {
         assert_eq!(couchbase_transport.captured().len(), 1);
     }
 
+    /// Time-series e2e (INDRA-221): one ingress event routes through
+    /// streaming SQL `INTO connector(...)` rules and fans out
+    /// simultaneously to the TDengine, IoTDB, Timestream and DynamoDB
+    /// mocks with zero drops. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_timeseries_sinks() {
+        use broker_connectors::{
+            DynamoDbSink, DynamoDbSinkConfig, IotDbSink, IotDbSinkConfig, MockDynamoDbTransport,
+            MockIotDbTransport, MockTdengineTransport, MockTimestreamTransport, TdengineSink,
+            TdengineSinkConfig, TimestreamSink, TimestreamSinkConfig,
+        };
+        use std::collections::HashMap;
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // TDengine super-table rows (auto-flush every row).
+        let tdengine_transport = Arc::new(MockTdengineTransport::new());
+        let tdengine = Arc::new(
+            TdengineSink::new(
+                TdengineSinkConfig {
+                    endpoint: "http://127.0.0.1:6041/rest/sql".to_string(),
+                    database: "power".to_string(),
+                    stable_name: "meters".to_string(),
+                    subtable_template: "d_${client_id}".to_string(),
+                    auth: broker_connectors::TdengineAuth::Basic {
+                        username: "root".to_string(),
+                        password: "taosdata".to_string(),
+                    },
+                    tags_template: HashMap::new(),
+                    metrics_template: HashMap::from([
+                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                        ("humidity".to_string(), "${payload.humidity}".to_string()),
+                    ]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                tdengine_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("tdengine-sink", tdengine.clone());
+
+        // IoTDB tablet rows (auto-flush every row).
+        let iotdb_transport = Arc::new(MockIotDbTransport::new());
+        let iotdb = Arc::new(
+            IotDbSink::new(
+                IotDbSinkConfig {
+                    endpoint: "http://127.0.0.1:18080/rest/v2".to_string(),
+                    device_path_template: "root.factory.${payload.plant_id}.${client_id}"
+                        .to_string(),
+                    auth: broker_connectors::IotDbAuth {
+                        username: "root".to_string(),
+                        password: "root".to_string(),
+                    },
+                    is_aligned: false,
+                    measurements: vec!["temperature".to_string(), "humidity".to_string()],
+                    data_types: vec![
+                        broker_connectors::IotDbDataType::Double,
+                        broker_connectors::IotDbDataType::Double,
+                    ],
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                iotdb_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("iotdb-sink", iotdb.clone());
+
+        // Timestream multi-measure records (auto-flush every row).
+        let timestream_transport = Arc::new(MockTimestreamTransport::new());
+        let timestream = Arc::new(
+            TimestreamSink::new(
+                TimestreamSinkConfig {
+                    database_name: "iot_database".to_string(),
+                    table_name: "telemetry".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    access_key_id: "AKID".to_string(),
+                    secret_access_key: "secret".to_string(),
+                    session_token: None,
+                    dimensions: HashMap::from([(
+                        "device_id".to_string(),
+                        "${client_id}".to_string(),
+                    )]),
+                    time_unit: broker_connectors::TimestreamTimeUnit::Milliseconds,
+                    measure_name_template: Some("sensor_metrics".to_string()),
+                    multi_measure_mappings: HashMap::from([
+                        ("temperature".to_string(), "DOUBLE".to_string()),
+                        ("humidity".to_string(), "DOUBLE".to_string()),
+                    ]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                timestream_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("timestream-sink", timestream.clone());
+
+        // DynamoDB items (auto-flush every row).
+        let dynamodb_transport = Arc::new(MockDynamoDbTransport::new());
+        let dynamodb = Arc::new(
+            DynamoDbSink::new(
+                DynamoDbSinkConfig {
+                    table_name: "telemetry_table".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    access_key_id: "AKID".to_string(),
+                    secret_access_key: "secret".to_string(),
+                    session_token: None,
+                    partition_key: broker_connectors::DynamoKeyConfig {
+                        name: "device_id".to_string(),
+                        template: "${client_id}".to_string(),
+                        key_type: "S".to_string(),
+                    },
+                    sort_key: None,
+                    ttl_attribute: None,
+                    ttl_secs: None,
+                    attributes_mapping: HashMap::from([(
+                        "temperature".to_string(),
+                        "${payload.temperature}".to_string(),
+                    )]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                dynamodb_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("dynamodb-sink", dynamodb.clone());
+
+        // One INTO rule per store over the same telemetry stream.
+        for (id, connector) in [
+            ("tdengine-rule", "tdengine-sink"),
+            ("iotdb-rule", "iotdb-sink"),
+            ("timestream-rule", "timestream-sink"),
+            ("dynamodb-rule", "dynamodb-sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, plant_id, temperature, humidity FROM "sensors/+" WHERE temperature > 20.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "sensor101", "plant_id": "plant1", "temperature": 24.5, "humidity": 61.2 }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // TDengine: one INSERT with the sub-table + measures.
+        let captured = tdengine_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].database, "power");
+        assert!(captured[0].sql.starts_with("INSERT INTO d_sensor101 USING meters TAGS ()"));
+        assert!(captured[0].sql.contains("61.2, 24.5"));
+
+        // IoTDB: one tablet on the hierarchical device path.
+        let captured = iotdb_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].tablet.device, "root.factory.plant1.sensor101");
+        assert_eq!(captured[0].tablet.values.len(), 1);
+        assert_eq!(captured[0].tablet.values[0][0], serde_json::json!(24.5));
+        assert_eq!(captured[0].tablet.values[0][1], serde_json::json!(61.2));
+
+        // Timestream: one multi-measure record with dimensions.
+        let captured = timestream_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].database, "iot_database");
+        assert_eq!(captured[0].records.len(), 1);
+        assert_eq!(captured[0].records[0].measure_name, "sensor_metrics");
+        assert!(captured[0].records[0]
+            .dimensions
+            .iter()
+            .any(|(name, value)| name == "device_id" && value == "sensor101"));
+        assert!(captured[0].records[0].measures.iter().any(
+            |(name, value, measure_type)| name == "temperature"
+                && value == "24.5"
+                && measure_type == "DOUBLE"
+        ));
+
+        // DynamoDB: one item keyed by client_id with the unpacked doc.
+        let captured = dynamodb_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "telemetry_table");
+        assert_eq!(captured[0].items.len(), 1);
+        let item: serde_json::Value =
+            serde_json::from_str(&captured[0].items[0].body).unwrap();
+        assert_eq!(item["device_id"], serde_json::json!({"S": "sensor101"}));
+        assert_eq!(item["temperature"], serde_json::json!({"N": "24.5"}));
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor101", "temperature": 10.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(tdengine_transport.captured().len(), 1);
+        assert_eq!(iotdb_transport.captured().len(), 1);
+        assert_eq!(timestream_transport.captured().len(), 1);
+        assert_eq!(dynamodb_transport.captured().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);

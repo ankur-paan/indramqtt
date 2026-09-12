@@ -31,6 +31,10 @@ pub mod mongodb;
 pub mod mssql;
 pub mod cassandra;
 pub mod couchbase;
+pub mod tdengine;
+pub mod iotdb;
+pub mod timestream;
+pub mod dynamodb;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -54,6 +58,10 @@ pub use mongodb::{BsonDocument, BsonValue, CapturedMongoBulk, MockMongoDbTranspo
 pub use mssql::{CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth, MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport, NativeMssqlTransport, TdsReply, days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password, parse_reply_tokens};
 pub use cassandra::{CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink, CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError, CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport, decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token, parse_contact_point};
 pub use couchbase::{CapturedCouchbaseBatch, CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation, CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, KvResponse, MockCouchbaseOutcome, MockCouchbaseTransport, NativeCouchbaseTransport, decode_response as decode_kv_response, encode_mutation as encode_kv_mutation, parse_connection_string as parse_couchbase_connection_string};
+pub use tdengine::{CapturedTdengineSql, MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse, TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport, HttpTdengineTransport, parse_rest_response, render_insert};
+pub use iotdb::{CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector, IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport, MockIotDbOutcome, MockIotDbTransport, render_tablet_body};
+pub use timestream::{HttpTimestreamTransport, MockTimestreamOutcome, MockTimestreamTransport, TimestreamConnector, TimestreamRecord, TimestreamSink, TimestreamSinkConfig, TimestreamTimeUnit, TimestreamTransport, TimestreamWriteRequest, TimestreamWriteResponse, render_write_records_body, TIMESTREAM_TARGET, TIMESTREAM_CONTENT_TYPE};
+pub use dynamodb::{DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig, DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome, MockDynamoDbTransport, build_item_body, dynamodb_attribute, parse_unprocessed, render_batch_body as render_dynamodb_batch_body, DYNAMODB_TARGET, DYNAMODB_CONTENT_TYPE};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -92,12 +100,14 @@ pub struct ConnectorInfo {
 }
 
 /// Open-core tier tag for a connector kind: the multi-cloud
-/// streaming bridges, Sparkplug B and the enterprise databases are
-/// Enterprise; everything else is Community.
+/// streaming bridges, Sparkplug B, the enterprise databases and the
+/// industrial time-series stores are Enterprise; everything else is
+/// Community.
 pub fn connector_tier(kind: &str) -> &'static str {
     match kind {
         "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b"
-        | "mongodb" | "mssql" | "cassandra" | "couchbase" => "enterprise",
+        | "mongodb" | "mssql" | "cassandra" | "couchbase"
+        | "tdengine" | "iotdb" | "timestream" | "dynamodb" => "enterprise",
         _ => "community",
     }
 }
@@ -681,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_connector_tier_tags() {
-        // Enterprise bridges (cloud, Sparkplug, databases).
+        // Enterprise bridges (cloud, Sparkplug, databases, time-series).
         for kind in [
             "kinesis",
             "gcp_pubsub",
@@ -692,6 +702,10 @@ mod tests {
             "mssql",
             "cassandra",
             "couchbase",
+            "tdengine",
+            "iotdb",
+            "timestream",
+            "dynamodb",
         ] {
             assert_eq!(connector_tier(kind), "enterprise", "{kind} must be enterprise");
         }
