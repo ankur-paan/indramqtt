@@ -74,3 +74,16 @@ jobs:
 
       - name: Build benchmarks
         run: cargo test --release --bench broker_throughput --no-run
+
+  cargo-deny:
+    name: Security & License Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --config deny.toml

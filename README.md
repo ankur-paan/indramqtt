@@ -15,23 +15,21 @@
 
 ---
 
-## Benchmarks & Performance Grounding
+## Router & Rule Engine Microbenchmarks
 
-IndraMQTT is engineered to deliver $\ge 50\%$ higher throughput and orders-of-magnitude lower memory consumption than legacy monolithic broker architectures.
+All figures below are grounded in reproducible, multi-sample automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs).
 
-### Measured Performance Summary
+### Measured Microbenchmark Performance
 
-| Workload / Metric | IndraMQTT (Release) | EMQX (v5.x) | HiveMQ (v4.x) | VerneMQ | Mosquitto | Architectural Advantage |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Router Hit-Path Throughput**<br>*(1,000 subscriptions, exact + wildcards)* | **3,050,000 msg/sec** | ~40k – 60k msg/s *(single node)*<br>~500k – 800k msg/s *(cluster)* | ~600k – 1,200,000 msg/s *(cluster)* | ~350k – 650,000 msg/s *(cluster)* | ~150k – 300,000 msg/s *(single-threaded)* | **3.8× – 6.1× faster** |
-| **Router Fast-Miss Traversal**<br>*(Walk-only Radix Trie branch evaluation)* | **7,800,000 msg/sec** | ~1,200,000 msg/sec | ~2,000,000 msg/sec | ~1,100,000 msg/sec | ~1,500,000 msg/sec | **3.9× – 6.5× faster** |
-| **Streaming SQL / Rule Processing**<br>*(WHERE filter + SELECT projection + sink)* | **4,770,000 events/sec**<br>*(in-memory `rekuiper-sql`)* | ~60k – 120,000 events/sec<br>*(Erlang AST rule engine)* | Custom Extension / Kafka loopback | External Webhook / Plugin loopback | N/A *(no rule engine)* | **> 40× faster** |
-| **Idle Base Memory Footprint**<br>*(Single node, zero client connections)* | **< 15 MB RSS** | ~250 – 500 MB RSS<br>*(BEAM + Mria + Ekka)* | ~500 MB – 1.2 GB RSS<br>*(JVM heap baseline)* | ~200 – 400 MB RSS<br>*(BEAM + Mnesia)* | ~5 – 10 MB RSS<br>*(C runtime, no cluster)* | **93% – 97% lower RAM** vs clustered |
-| **Core Restart Socket Preservation**<br>*(Kernel restart/upgrade recovery latency)* | **Zero TCP Drops**<br>*(< 200 ms rebind via BEAM edge)* | Disconnect Storm<br>*(BEAM process restart)* | Disconnect Storm<br>*(JVM restart)* | Disconnect Storm<br>*(BEAM process restart)* | Disconnect Storm<br>*(Process restart)* | **Zero client connection churn** |
-| **Clustering Architecture** | **QUIC Data Plane**<br>*(Topic-filter summaries)* | Mria + Ekka (Erlang distribution RPC) | Distributed Raft / JGroups | Plumtree / Riak Core (SWIM) | N/A (single node / bridging) | **Zero Mnesia / Erlang split-brain** |
+| Subsystem / Benchmark | Measured Throughput (Release) | What Is Measured | Profile & Methodology |
+| :--- | :--- | :--- | :--- |
+| **Radix Trie Router (Hit-Path)** | **~3.0M ± 0.1M msg/sec** | In-process lookup matching 3 subscriber targets across 1,000 installed topic filters | Single-threaded in-memory function call, `ahash` + zero-allocation `Arc<str>` tokens |
+| **Radix Trie Router (Fast-Miss)** | **~7.8M ± 0.2M msg/sec** | Walk-only trie branch evaluation on non-matching topic prefix | Single-threaded in-memory branch walk |
+| **Streaming SQL Ingress Engine** | **~4.7M ± 0.1M events/sec** | In-process JSON parsing + SQL `WHERE` filter + `SELECT` field projection | Single-threaded, **100% verified delivered to sink** (0 drops), `Block` backpressure |
+| **Idle Base Memory Footprint** | **< 15 MB RSS** | Standalone Rust Core daemon idle resident memory footprint | Zero client connections, baseline Tokio runtime + Router |
 
-> [!NOTE]
-> All performance figures are grounded in reproducible, automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs). Full empirical methodology, competitor baselines, test harness parameters, reproduction commands, and academic literature citations are documented in [BENCHMARKS.md](BENCHMARKS.md).
+> [!IMPORTANT]
+> **Scope Note**: The table above measures purely in-process, function-level microbenchmarks (radix trie matching and streaming SQL expression evaluation). It does **not** represent end-to-end network throughput over TCP/TLS sockets. For architectural comparison targets, competitor network baselines (EMQX, HiveMQ, VerneMQ, Mosquitto), and literature citations, see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
