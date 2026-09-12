@@ -131,6 +131,9 @@
       <option value="mysql">mysql</option>
       <option value="clickhouse">clickhouse</option>
       <option value="influxdb">influxdb</option>
+      <option value="s3">s3</option>
+      <option value="elasticsearch">elasticsearch</option>
+      <option value="timescaledb">timescaledb</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -164,6 +167,25 @@
     <input id="conn-influx-org" placeholder="org" size="12">
     <input id="conn-influx-token" placeholder="token" type="password" size="16">
     <input id="conn-influx-measurement" placeholder="measurement, e.g. mqtt_events" size="18">
+  </div>
+  <div class="row"><label>S3 config</label>
+    <input id="conn-s3-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:9000" size="30">
+    <input id="conn-s3-bucket" placeholder="bucket, e.g. telemetry-cold-store" size="20">
+    <input id="conn-s3-key" placeholder="key template, e.g. telemetry/${topic}_${seq}.ndjson" size="36">
+    <select id="conn-s3-compression">
+      <option value="none">none</option>
+      <option value="gzip">gzip</option>
+    </select>
+  </div>
+  <div class="row"><label>Elasticsearch config</label>
+    <input id="conn-es-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:9200" size="30">
+    <input id="conn-es-index" placeholder="index template, e.g. iot-telemetry-${YYYY.MM.dd}" size="32">
+    <input id="conn-es-docid" placeholder="doc id template (blank = auto)" size="24">
+  </div>
+  <div class="row"><label>TimescaleDB config</label>
+    <input id="conn-ts-url" placeholder="connection url" size="30">
+    <input id="conn-ts-hypertable" placeholder="hypertable, e.g. sensor_metrics" size="20">
+    <input id="conn-ts-sql" placeholder="sql, e.g. INSERT … VALUES ($1, $2, $3, $4::jsonb) …" size="40">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -504,6 +526,28 @@ $("conn-add").onclick = async () => {
               measurement_template: $("conn-influx-measurement").value.trim() || "mqtt_events",
               precision: "ms",
               batch_size: 200, batch_timeout_ms: 50};
+  } else if (kind === "s3") {
+    config = {endpoint: $("conn-s3-endpoint").value.trim() || "http://127.0.0.1:9000",
+              bucket: $("conn-s3-bucket").value.trim() || "telemetry-cold-store",
+              region: "us-east-1",
+              key_template: $("conn-s3-key").value.trim() ||
+                "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson",
+              compression: $("conn-s3-compression").value,
+              batch_size: 1000, batch_bytes: 5242880, batch_timeout_ms: 60000};
+  } else if (kind === "elasticsearch") {
+    const docid = $("conn-es-docid").value.trim();
+    config = {endpoint: $("conn-es-endpoint").value.trim() || "http://127.0.0.1:9200",
+              index_template: $("conn-es-index").value.trim() || "iot-telemetry-${YYYY.MM.dd}",
+              auth: {type: "none"},
+              batch_size: 500, batch_timeout_ms: 100, max_retries: 5};
+    if (docid !== "") config.doc_id_template = docid;
+  } else if (kind === "timescaledb") {
+    config = {connection_url: $("conn-ts-url").value.trim(),
+              hypertable: $("conn-ts-hypertable").value.trim() || "sensor_metrics",
+              time_column: "time",
+              sql_template: $("conn-ts-sql").value.trim() ||
+                "INSERT INTO sensor_metrics (time, device_id, topic, metrics) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics",
+              pool_size: 10, batch_size: 200, batch_timeout_ms: 50};
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();

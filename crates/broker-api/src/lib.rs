@@ -572,8 +572,62 @@ async fn create_connector(
                 Ok(("influxdb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "s3" | "minio" => {
+                let config: broker_connectors::S3SinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid s3 config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid s3 config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpS3Transport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid s3 transport: {e}"))?,
+                );
+                let sink = broker_connectors::S3Sink::new(config, transport)
+                    .map_err(|e| format!("invalid s3 sink: {e}"))?;
+                Ok(("s3".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "elasticsearch" | "elastic" | "es" | "opensearch" => {
+                let config: broker_connectors::ElasticsearchSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid elasticsearch config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid elasticsearch config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpElasticsearchTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid elasticsearch transport: {e}"))?,
+                );
+                let sink = broker_connectors::ElasticsearchSink::new(config, transport)
+                    .map_err(|e| format!("invalid elasticsearch sink: {e}"))?;
+                Ok(("elasticsearch".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "timescaledb" | "timescale" => {
+                let config: broker_connectors::TimescaleDbSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid timescaledb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid timescaledb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpTimescaleTransport::new(
+                        &config.connection_url,
+                        config.pool_size,
+                    )
+                    .map_err(|e| format!("invalid timescaledb transport: {e}"))?,
+                );
+                let sink = broker_connectors::TimescaleDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid timescaledb sink: {e}"))?;
+                Ok(("timescaledb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, or logger)"
             )),
         }
     })();
@@ -1128,9 +1182,15 @@ mod tests {
             "value=\"mysql\"",
             "value=\"clickhouse\"",
             "value=\"influxdb\"",
+            "value=\"s3\"",
+            "value=\"elasticsearch\"",
+            "value=\"timescaledb\"",
             "conn-mysql-url",
             "conn-ch-endpoint",
             "conn-influx-endpoint",
+            "conn-s3-bucket",
+            "conn-es-index",
+            "conn-ts-hypertable",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1332,18 +1392,75 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("influxdb"));
 
+        // S3 sink: validated without touching any object store.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "s3-sink-1",
+                       "kind": "s3",
+                       "config": {"endpoint": "http://127.0.0.1:9000",
+                                  "bucket": "telemetry-cold-store",
+                                  "region": "us-east-1",
+                                  "key_template": "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson",
+                                  "compression": "none",
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "batch_timeout_ms": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("s3"));
+
+        // Elasticsearch sink: validated without touching any cluster.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "es-sink-1",
+                       "kind": "elasticsearch",
+                       "config": {"endpoint": "http://127.0.0.1:9200",
+                                  "index_template": "iot-telemetry-${YYYY.MM.dd}",
+                                  "auth": {"type": "none"},
+                                  "batch_size": 100,
+                                  "batch_timeout_ms": 50,
+                                  "max_retries": 3}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("elasticsearch"));
+
+        // TimescaleDB sink: validated without touching any database.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "ts-sink-1",
+                       "kind": "timescaledb",
+                       "config": {"connection_url": "postgresql://u:p@127.0.0.1:5432/timeseries",
+                                  "hypertable": "sensor_metrics",
+                                  "time_column": "time",
+                                  "sql_template": "INSERT INTO sensor_metrics (time, device_id, topic, metrics) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics",
+                                  "pool_size": 2,
+                                  "batch_size": 50,
+                                  "batch_timeout_ms": 25}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("timescaledb"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
             json!([{"id": "ch-sink-1", "kind": "clickhouse"},
                    {"id": "diag", "kind": "console"},
+                   {"id": "es-sink-1", "kind": "elasticsearch"},
                    {"id": "influx-sink-1", "kind": "influxdb"},
                    {"id": "kafka-sink-1", "kind": "kafka"},
                    {"id": "mysql-sink-1", "kind": "mysql"},
                    {"id": "pg-sink-1", "kind": "postgres"},
                    {"id": "rabbit-sink-1", "kind": "rabbitmq"},
-                   {"id": "redis-sink-1", "kind": "redis"}])
+                   {"id": "redis-sink-1", "kind": "redis"},
+                   {"id": "s3-sink-1", "kind": "s3"},
+                   {"id": "ts-sink-1", "kind": "timescaledb"}])
         );
 
         // Unknown kinds and invalid configs are 400s that store nothing.
@@ -1376,13 +1493,25 @@ mod tests {
                    "config": {"endpoint": "http://h:8086",
                               "bucket": "b", "org": "o", "token": "",
                               "measurement_template": "m", "precision": "ms"}}),
+            json!({"id": "bad-s3", "kind": "s3",
+                   "config": {"endpoint": "http://h:9000",
+                              "bucket": "UPPERCASE",
+                              "key_template": "t/${topic}.ndjson"}}),
+            json!({"id": "bad-es", "kind": "elasticsearch",
+                   "config": {"endpoint": "http://h:9200",
+                              "index_template": "-leading",
+                              "auth": {"type": "none"}}}),
+            json!({"id": "bad-ts", "kind": "timescaledb",
+                   "config": {"connection_url": "postgresql://u:p@h/db",
+                              "hypertable": "m",
+                              "sql_template": "INSERT INTO m VALUES ($1, $2)"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 8);
+        assert_eq!(body.as_array().expect("list").len(), 11);
     }
 
     #[tokio::test]

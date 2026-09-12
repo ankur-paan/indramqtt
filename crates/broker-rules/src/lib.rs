@@ -258,6 +258,7 @@ pub struct RuleEngine {
     connectors: Arc<ConnectorManager>,
     flush_ctx: Arc<FlushContext>,
     window_workers: RwLock<HashMap<String, WindowWorker>>,
+    window_channel_depth: usize,
 }
 
 /// Shared flush context: what a window worker needs at flush time. The
@@ -284,9 +285,14 @@ struct WindowWorker {
     tx: mpsc::Sender<TimedRecord>,
 }
 
-/// Worker ingress channel depth: backpressure stays at the edge input
-/// queue, so a full worker buffer drops with a warning, never blocks.
-const WINDOW_CHANNEL_DEPTH: usize = 1024;
+/// Default per-rule window worker ingress depth (INDRA-215): large
+/// enough for high-scale bursts without drops, still bounded so a
+/// stalled worker cannot grow memory without limit. Backpressure stays
+/// at the edge input queue; a full worker buffer drops with a warning,
+/// never blocks. Override per engine via
+/// [`RuleEngine::new_with_window_depth`] or
+/// [`RuleEngine::with_window_channel_depth`].
+pub const DEFAULT_WINDOW_CHANNEL_DEPTH: usize = 65_536;
 
 /// Wall-clock milliseconds.
 fn now_ms() -> u64 {
@@ -314,7 +320,19 @@ impl RuleEngine {
     /// Create an engine with a bounded ingress queue (`capacity` floors at
     /// 1). The queue backs future async ingestion; the hot path calls
     /// [`RuleEngine::dispatch_ingress`] synchronously for determinism.
+    /// Window worker channels use [`DEFAULT_WINDOW_CHANNEL_DEPTH`].
     pub fn new(queue_capacity: usize, policy: BackpressurePolicy) -> Self {
+        Self::new_with_window_depth(queue_capacity, policy, DEFAULT_WINDOW_CHANNEL_DEPTH)
+    }
+
+    /// Create an engine with an explicit per-rule window worker channel
+    /// depth (`depth` floors at 1, no ceiling). Use 65,536+ for
+    /// high-scale bursts.
+    pub fn new_with_window_depth(
+        queue_capacity: usize,
+        policy: BackpressurePolicy,
+        window_channel_depth: usize,
+    ) -> Self {
         let connectors = Arc::new(ConnectorManager::new());
         Self {
             rules: RwLock::new(HashMap::new()),
@@ -326,7 +344,20 @@ impl RuleEngine {
                 broker_sink: RwLock::new(None),
             }),
             window_workers: RwLock::new(HashMap::new()),
+            window_channel_depth: window_channel_depth.max(1),
         }
+    }
+
+    /// Override the window worker channel depth after construction
+    /// (floors at 1, no ceiling). Applies to workers spawned from here on.
+    pub fn with_window_channel_depth(mut self, depth: usize) -> Self {
+        self.window_channel_depth = depth.max(1);
+        self
+    }
+
+    /// Configured per-rule window worker channel depth.
+    pub fn window_channel_depth(&self) -> usize {
+        self.window_channel_depth
     }
 
     /// Bounded ingress queue for flood protection at outer boundaries.
@@ -515,7 +546,7 @@ impl RuleEngine {
                 return;
             }
         };
-        let (tx, rx) = mpsc::channel(WINDOW_CHANNEL_DEPTH);
+        let (tx, rx) = mpsc::channel(self.window_channel_depth);
         let stmt = match rule.parsed_query.clone() {
             Some(stmt) => stmt,
             None => return,
@@ -2352,6 +2383,121 @@ mod tests {
         assert_eq!(events[0]["a"], serde_json::json!(10.0));
     }
 
+    #[test]
+    fn test_window_channel_depth_configurable() {
+        // INDRA-215: default is the high-scale 65,536; the constructor
+        // and builder override with a floor of 1 and no ceiling.
+        assert_eq!(DEFAULT_WINDOW_CHANNEL_DEPTH, 65_536);
+        assert_eq!(
+            RuleEngine::new(16, BackpressurePolicy::DropOldest).window_channel_depth(),
+            65_536
+        );
+        assert_eq!(
+            RuleEngine::new_with_window_depth(16, BackpressurePolicy::DropOldest, 10_000)
+                .window_channel_depth(),
+            10_000
+        );
+        assert_eq!(
+            RuleEngine::new(16, BackpressurePolicy::DropOldest)
+                .with_window_channel_depth(1_000_000)
+                .window_channel_depth(),
+            1_000_000
+        );
+        assert_eq!(
+            RuleEngine::new(16, BackpressurePolicy::DropOldest)
+                .with_window_channel_depth(0)
+                .window_channel_depth(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_window_channel_depth_reaches_worker() {
+        // The spawned worker's channel bound equals the configured depth.
+        async fn worker_capacity(depth: usize) -> usize {
+            let engine = RuleEngine::new_with_window_depth(16, BackpressurePolicy::DropOldest, depth);
+            let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+            engine
+                .create_rule(
+                    "w".to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    Some(
+                        r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY COUNTWINDOW(2)"#
+                            .to_string(),
+                    ),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+            ingress(&engine, &sink, br#"{ "temperature": 1.0 }"#).await;
+            let workers = engine.window_workers.read();
+            let worker = workers.get("rule-1").expect("worker spawned");
+            worker.tx.max_capacity()
+        }
+        assert_eq!(worker_capacity(65_536).await, 65_536);
+        assert_eq!(worker_capacity(10_000).await, 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_window_burst_twelve_k_without_drop() {
+        // INDRA-215: 12,000 ingress events over COUNTWINDOW(100) flush
+        // 120 windows with zero drops at the default depth.
+        #[derive(Debug, Default)]
+        struct BurstProbe {
+            events: StdMutex<Vec<serde_json::Value>>,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for BurstProbe {
+            async fn send(
+                &self,
+                _topic: &Topic,
+                payload: &Bytes,
+                _qos: QoS,
+            ) -> Result<(), broker_connectors::ConnectorError> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(payload).expect("row JSON"));
+                Ok(())
+            }
+
+            fn kind(&self) -> &'static str {
+                "burst-probe"
+            }
+        }
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let probe = Arc::new(BurstProbe::default());
+        engine.connectors().register("burst", probe.clone());
+        engine
+            .create_rule(
+                "burst-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY COUNTWINDOW(100)"#
+                        .to_string(),
+                ),
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "burst".to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        for _ in 0..12_000 {
+            ingress(&engine, &sink, br#"{ "temperature": 20.0 }"#).await;
+        }
+        for _ in 0..400 {
+            if probe.events.lock().unwrap().len() >= 120 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let events = probe.events.lock().unwrap();
+        assert_eq!(events.len(), 120, "burst dropped window flushes");
+        assert_eq!(events[0]["a"], serde_json::json!(20.0));
+    }
+
     #[tokio::test]
     async fn test_remove_rule_stops_window_delivery() {
         let (engine, sink, sink_obj, rule) = window_rule(
@@ -2811,6 +2957,192 @@ mod tests {
         assert_eq!(mysql_transport.batches().len(), 1);
         assert_eq!(ch_body.lock().lines().count(), 1);
         assert_eq!(influx_body.lock().lines().count(), 1);
+    }
+
+    /// Sprint 18 e2e (INDRA-216): streaming SQL rules with `INTO
+    /// connector(...)` fan out to the object-storage and search sinks.
+    /// A stateless cold-storage rule feeds mock S3, a stateless log
+    /// rule feeds mock Elasticsearch, and a count-window metrics rule
+    /// feeds the mock TimescaleDB hypertable. No broker anywhere.
+    #[tokio::test]
+    async fn test_into_fans_out_to_s3_elasticsearch_timescaledb() {
+        use broker_connectors::{
+            ElasticsearchSink, ElasticsearchSinkConfig, MockElasticsearchTransport,
+            MockS3Transport, MockTimescaleTransport, S3Sink, S3SinkConfig,
+            TimescaleDbSink, TimescaleDbSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // S3 cold storage (auto-flush every row).
+        let s3_transport = Arc::new(MockS3Transport::new());
+        let s3 = Arc::new(
+            S3Sink::new(
+                S3SinkConfig {
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    bucket: "telemetry-cold-store".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: String::new(),
+                    secret_access_key: String::new(),
+                    key_template:
+                        "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson"
+                            .to_string(),
+                    compression: broker_connectors::S3Compression::None,
+                    batch_size: 1,
+                    batch_bytes: 5 * 1024 * 1024,
+                    batch_timeout_ms: 60_000,
+                },
+                s3_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("s3-telemetry-archive", s3.clone());
+
+        // Elasticsearch log search (auto-flush every row).
+        let es_transport = Arc::new(MockElasticsearchTransport::new());
+        let es = Arc::new(
+            ElasticsearchSink::new(
+                ElasticsearchSinkConfig {
+                    endpoint: "http://127.0.0.1:9200".to_string(),
+                    index_template: "iot-telemetry-${YYYY.MM.dd}".to_string(),
+                    doc_id_template: None,
+                    auth: broker_connectors::ElasticsearchAuth::None,
+                    batch_size: 1,
+                    batch_timeout_ms: 100,
+                    max_retries: 3,
+                },
+                es_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("es-cluster", es.clone());
+
+        // TimescaleDB metrics hypertable (auto-flush every row).
+        let ts_transport = Arc::new(MockTimescaleTransport::new());
+        let ts = Arc::new(
+            TimescaleDbSink::new(
+                TimescaleDbSinkConfig {
+                    connection_url: "postgresql://u:p@unused:5432/timeseries".to_string(),
+                    hypertable: "sensor_metrics".to_string(),
+                    time_column: "time".to_string(),
+                    sql_template:
+                        "INSERT INTO sensor_metrics (time, device_id, topic, metrics) \
+                         VALUES ($1, $2, $3, $4::jsonb) \
+                         ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics"
+                            .to_string(),
+                    pool_size: 1,
+                    batch_size: 1,
+                    batch_timeout_ms: 50,
+                },
+                ts_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("timescale-metrics", ts.clone());
+
+        // One INTO rule per sink, mirroring the directive's SQL shapes
+        // (count windows keep the test fast; tumbling time windows use
+        // the same dispatch path).
+        for (id, sql) in [
+            (
+                "cold-store",
+                r#"SELECT * FROM "sensors/#" INTO connector("s3-telemetry-archive")"#,
+            ),
+            (
+                "log-search",
+                r#"SELECT device_id, message FROM "logs/+" INTO connector("es-cluster")"#,
+            ),
+            (
+                "metrics",
+                r#"SELECT avg(temp) AS avg_temp FROM "sensors/+" GROUP BY COUNTWINDOW(2) INTO connector("timescale-metrics")"#,
+            ),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new(if id == "log-search" { "logs/+" } else { "sensors/+" })
+                        .unwrap(),
+                    Some(sql.to_string()),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        // Two sensor rows close one count window; one log row feeds ES.
+        for payload in [
+            &br#"{ "device_id": "d7", "temp": 20.0 }"#[..],
+            &br#"{ "device_id": "d7", "temp": 22.0 }"#[..],
+        ] {
+            engine
+                .dispatch_ingress(
+                    &Topic::new("sensors/kitchen").unwrap(),
+                    &Bytes::from_static(payload),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
+                .await;
+        }
+        engine
+            .dispatch_ingress(
+                &Topic::new("logs/app").unwrap(),
+                &Bytes::from_static(br#"{ "device_id": "d7", "message": "ok" }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // S3 + ES flushed inline (batch_size 1); the window flush
+        // arrives in the background.
+        for _ in 0..200 {
+            if !ts_transport.batches().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // S3: two partitioned ndjson objects with full projected rows.
+        let puts = s3_transport.puts();
+        assert_eq!(puts.len(), 2);
+        assert!(puts[0].key.starts_with("telemetry/year="));
+        assert!(puts[0].key.contains("sensors/kitchen"));
+        assert!(puts[0].key.ends_with(".ndjson"));
+        let row: serde_json::Value =
+            serde_json::from_str(String::from_utf8(puts[0].body.clone()).unwrap().trim_end())
+                .unwrap();
+        assert_eq!(row["topic"], "sensors/kitchen");
+        assert_eq!(row["payload"]["temp"], 20.0);
+
+        // Elasticsearch: one _bulk with the projected log document.
+        let captured = es_transport.captured();
+        assert_eq!(captured.len(), 1);
+        let body = String::from_utf8(captured[0].body.clone()).unwrap();
+        assert!(body.ends_with('\n'));
+        let mut body_lines = body.lines();
+        let action: serde_json::Value =
+            serde_json::from_str(body_lines.next().unwrap()).unwrap();
+        assert!(action["index"]["_index"]
+            .as_str()
+            .unwrap()
+            .starts_with("iot-telemetry-"));
+        let doc: serde_json::Value =
+            serde_json::from_str(body_lines.next().unwrap()).unwrap();
+        assert!(body_lines.next().is_none());
+        assert_eq!(doc["topic"], "logs/app");
+        assert_eq!(doc["payload"]["message"], "ok");
+        assert!(doc["payload"].get("temp").is_none());
+
+        // TimescaleDB: one window row (avg 21.0); no device_id in the
+        // projection, so the topic backs the device column.
+        let batches = ts_transport.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].rows.len(), 1);
+        assert_eq!(batches[0].rows[0][1], b"sensors/kitchen".to_vec());
+        assert_eq!(batches[0].rows[0][2], b"sensors/kitchen".to_vec());
+        let metrics: serde_json::Value =
+            serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
+        assert_eq!(metrics, serde_json::json!({"avg_temp": 21.0}));
     }
 
     #[tokio::test]

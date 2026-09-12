@@ -83,7 +83,9 @@ impl PostgreSqlSinkConfig {
 /// and comments. Only `$1..=$3` exist (`$1` topic, `$2` QoS, `$3`
 /// payload); anything else is rejected so unbound parameters can never
 /// reach the server.
-fn referenced_params(template: &str) -> Result<Vec<u32>> {
+/// All `$n` markers referenced outside strings/comments, in order.
+/// Shared with the TimescaleDB sink (same wire protocol, wider shape).
+pub(crate) fn referenced_params(template: &str) -> Result<Vec<u32>> {
     let chars: Vec<char> = template.chars().collect();
     let n = chars.len();
     let mut found = Vec::new();

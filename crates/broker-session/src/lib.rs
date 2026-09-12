@@ -42,6 +42,13 @@ pub struct QueuedMessage {
 /// oldest entry drops so one dead client cannot balloon the node.
 pub const MAX_OFFLINE_QUEUE: usize = 1024;
 
+/// Default offline queue cap for [`SessionManager::new`] (INDRA-215):
+/// 10,000 messages per detached session, high enough for reconnect
+/// storms without drops. Override per manager via
+/// [`SessionManager::new_with_limits`], or pass `None` there for an
+/// unbounded memory-backed queue.
+pub const DEFAULT_MAX_OFFLINE_QUEUE: usize = 10_000;
+
 /// Management-API detail row for one client session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientInfo {
@@ -83,9 +90,19 @@ impl Session {
     /// Buffer one message for later replay, evicting the oldest entry
     /// past [`MAX_OFFLINE_QUEUE`].
     pub fn push_offline(&self, message: QueuedMessage) {
+        self.push_offline_with_limit(message, Some(MAX_OFFLINE_QUEUE));
+    }
+
+    /// Buffer one message with an explicit cap: `Some(n)` evicts the
+    /// oldest entries past `n` (floored at holding one), `None` queues
+    /// without bound (memory-bounded by the caller).
+    pub fn push_offline_with_limit(&self, message: QueuedMessage, limit: Option<usize>) {
         let mut queue = self.offline_queue.write();
-        while queue.len() >= MAX_OFFLINE_QUEUE {
-            queue.pop_front();
+        if let Some(limit) = limit {
+            let limit = limit.max(1);
+            while queue.len() >= limit {
+                queue.pop_front();
+            }
         }
         queue.push_back(message);
     }
@@ -147,6 +164,9 @@ pub struct SessionManager {
     /// Pruned on unbind so reconnects start full and state cannot grow
     /// without bound.
     buckets: RwLock<HashMap<String, TokenBucket>>,
+    /// Offline queue cap applied by [`SessionManager::queue_offline`];
+    /// `None` queues without bound.
+    max_offline_queue: Option<usize>,
 }
 
 impl Default for SessionManager {
@@ -157,11 +177,36 @@ impl Default for SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
+        Self::new_with_limits(Some(DEFAULT_MAX_OFFLINE_QUEUE))
+    }
+
+    /// Create a manager with an explicit offline queue cap: `Some(n)`
+    /// evicts oldest past `n` per detached session (floored at 1, no
+    /// ceiling), `None` queues without bound.
+    pub fn new_with_limits(max_offline_queue: Option<usize>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
+            max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
+        }
+    }
+
+    /// Configured offline queue cap (`None` = unbounded).
+    pub fn max_offline_queue(&self) -> Option<usize> {
+        self.max_offline_queue
+    }
+
+    /// Buffer one message for a detached session, applying this
+    /// manager's offline cap. False when the client has no session.
+    pub fn queue_offline(&self, client_id: &str, message: QueuedMessage) -> bool {
+        match self.get(client_id) {
+            Some(session) => {
+                session.push_offline_with_limit(message, self.max_offline_queue);
+                true
+            }
+            None => false,
         }
     }
 
@@ -442,6 +487,69 @@ mod tests {
             drained[0].payload,
             Bytes::from(10u32.to_be_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn test_offline_queue_limit_configurable() {
+        use super::{QueuedMessage, DEFAULT_MAX_OFFLINE_QUEUE};
+
+        fn message(i: u32) -> QueuedMessage {
+            QueuedMessage {
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtMostOnce,
+                retain: false,
+                payload: Bytes::from(i.to_be_bytes().to_vec()),
+            }
+        }
+
+        // Default manager caps at 10,000.
+        let manager = SessionManager::new();
+        assert_eq!(manager.max_offline_queue(), Some(DEFAULT_MAX_OFFLINE_QUEUE));
+        assert_eq!(DEFAULT_MAX_OFFLINE_QUEUE, 10_000);
+        manager.get_or_create("capped", false);
+        for i in 0..(DEFAULT_MAX_OFFLINE_QUEUE + 100) {
+            assert!(manager.queue_offline("capped", message(i as u32)));
+        }
+        let session = manager.get("capped").unwrap();
+        assert_eq!(session.offline_len(), DEFAULT_MAX_OFFLINE_QUEUE);
+        assert_eq!(
+            session.drain_offline()[0].payload,
+            Bytes::from(100u32.to_be_bytes().to_vec())
+        );
+
+        // Unknown clients queue nothing.
+        assert!(!manager.queue_offline("ghost", message(0)));
+
+        // Custom small cap evicts oldest past the limit.
+        let manager = SessionManager::new_with_limits(Some(3));
+        assert_eq!(manager.max_offline_queue(), Some(3));
+        manager.get_or_create("tiny", false);
+        for i in 0..5u32 {
+            assert!(manager.queue_offline("tiny", message(i)));
+        }
+        let session = manager.get("tiny").unwrap();
+        assert_eq!(session.offline_len(), 3);
+        let drained = session.drain_offline();
+        assert_eq!(drained[0].payload, Bytes::from(2u32.to_be_bytes().to_vec()));
+
+        // Zero floors at one; huge caps have no ceiling.
+        assert_eq!(
+            SessionManager::new_with_limits(Some(0)).max_offline_queue(),
+            Some(1)
+        );
+        assert_eq!(
+            SessionManager::new_with_limits(Some(10_000_000)).max_offline_queue(),
+            Some(10_000_000)
+        );
+
+        // None queues without bound.
+        let manager = SessionManager::new_with_limits(None);
+        assert_eq!(manager.max_offline_queue(), None);
+        manager.get_or_create("free", false);
+        for i in 0..20_000u32 {
+            assert!(manager.queue_offline("free", message(i)));
+        }
+        assert_eq!(manager.get("free").unwrap().offline_len(), 20_000);
     }
 
     #[test]

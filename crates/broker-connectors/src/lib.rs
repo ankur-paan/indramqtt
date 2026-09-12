@@ -16,6 +16,9 @@ pub mod redis;
 pub mod mysql;
 pub mod clickhouse;
 pub mod influxdb;
+pub mod s3;
+pub mod elasticsearch;
+pub mod timescaledb;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -24,6 +27,9 @@ pub use redis::{MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply
 pub use mysql::{MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig, MySqlTransport, TcpMySqlTransport};
 pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
 pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
+pub use s3::{HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig, S3Transport, SigV4Request};
+pub use elasticsearch::{BulkOutcome, CapturedBulk, ElasticsearchAuth, ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport, HttpElasticsearchTransport, MockElasticsearchTransport};
+pub use timescaledb::{MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch, TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -365,6 +371,101 @@ impl BackoffState {
     }
 }
 
+/// Strict `${name}` template renderer shared by the object-storage and
+/// search sinks (S3 keys, Elasticsearch indices/doc ids). Every
+/// `${...}` must close and must name a key present in `vars`; anything
+/// else is a dispatch error, so typos fail loudly at buffer time
+/// instead of silently producing wrong object names.
+pub(crate) fn render_template(template: &str, vars: &[(&str, String)]) -> Result<String> {
+    let mut out = String::with_capacity(template.len() + 32);
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "unclosed template variable in {template:?}"
+                )));
+            }
+            let name = &template[start..end];
+            if name.is_empty() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "empty template variable in {template:?}"
+                )));
+            }
+            let value = vars
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone());
+            match value {
+                Some(value) => out.push_str(&value),
+                None => {
+                    return Err(ConnectorError::Dispatch(format!(
+                        "unknown template variable {name:?} in {template:?}"
+                    )))
+                }
+            }
+            i = end + 1;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Wall-clock milliseconds since the Unix epoch (saturating at zero).
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Split Unix millis into civil (year, month, day) via Howard Hinnant's
+/// days-from-civil inverse (proleptic Gregorian, UTC). Negative inputs
+/// clamp to the epoch so templates never render year 1969 surprises.
+pub(crate) fn ymd_from_millis(millis: i64) -> (i32, u32, u32) {
+    let days = millis.max(0).div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    if m <= 2 {
+        y += 1;
+    }
+    (y as i32, m, d)
+}
+
+/// Split Unix millis into (hour, minute, second, milli) UTC time of day.
+pub(crate) fn hms_milli_from_millis(millis: i64) -> (u32, u32, u32, u32) {
+    let day_millis = millis.max(0).rem_euclid(86_400_000) as u64;
+    let secs = day_millis / 1_000;
+    (
+        (secs / 3_600) as u32,
+        ((secs / 60) % 60) as u32,
+        (secs % 60) as u32,
+        (day_millis % 1_000) as u32,
+    )
+}
+
+/// RFC 3339 UTC timestamp with millis (`2026-09-12T11:18:09.123Z`).
+pub(crate) fn rfc3339_millis(millis: i64) -> String {
+    let (y, mo, d) = ymd_from_millis(millis);
+    let (h, mi, s, ms) = hms_milli_from_millis(millis);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +633,36 @@ mod tests {
         assert!(matches!(err, ConnectorError::Connection(_)));
 
         server.abort();
+    }
+
+    #[test]
+    fn test_render_template_strict() {
+        let vars = vec![
+            ("topic", "sensors/t1".to_string()),
+            ("YYYY", "2026".to_string()),
+        ];
+        assert_eq!(
+            render_template("a/${topic}/${YYYY}.ndjson", &vars).unwrap(),
+            "a/sensors/t1/2026.ndjson"
+        );
+        assert_eq!(render_template("plain", &vars).unwrap(), "plain");
+        assert!(render_template("a/${nope}", &vars).is_err());
+        assert!(render_template("a/${topic", &vars).is_err());
+        assert!(render_template("a/${}", &vars).is_err());
+        assert!(render_template("price: $5", &vars).is_ok());
+    }
+
+    #[test]
+    fn test_ymd_and_rfc3339_vectors() {
+        assert_eq!(ymd_from_millis(0), (1970, 1, 1));
+        // 2024-02-29T00:00:00Z (leap day) and 2026-09-12T11:18:09.123Z.
+        assert_eq!(ymd_from_millis(1_709_164_800_000), (2024, 2, 29));
+        assert_eq!(ymd_from_millis(1_789_211_889_123), (2026, 9, 12));
+        assert_eq!(hms_milli_from_millis(1_789_211_889_123), (11, 18, 9, 123));
+        assert_eq!(
+            rfc3339_millis(1_789_211_889_123),
+            "2026-09-12T11:18:09.123Z"
+        );
+        assert_eq!(ymd_from_millis(-1), (1970, 1, 1));
     }
 }
