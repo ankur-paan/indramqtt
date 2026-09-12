@@ -529,8 +529,51 @@ async fn create_connector(
                 Ok(("redis".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "mysql" | "mariadb" => {
+                let config: broker_connectors::MySqlSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid mysql config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid mysql config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpMySqlTransport::new(
+                        &config.connection_url,
+                        config.pool_size,
+                    )
+                    .map_err(|e| format!("invalid mysql transport: {e}"))?,
+                );
+                let sink = broker_connectors::MySqlSink::new(config, transport)
+                    .map_err(|e| format!("invalid mysql sink: {e}"))?;
+                Ok(("mysql".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "clickhouse" | "ch" => {
+                let config: broker_connectors::ClickHouseSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid clickhouse config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid clickhouse config: {e}"))?;
+                let sink = broker_connectors::ClickHouseSink::new(config, reqwest::Client::new())
+                    .map_err(|e| format!("invalid clickhouse sink: {e}"))?;
+                Ok(("clickhouse".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "influxdb" | "influx" => {
+                let config: broker_connectors::InfluxDbSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid influxdb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid influxdb config: {e}"))?;
+                let sink = broker_connectors::InfluxDbSink::new(config, reqwest::Client::new())
+                    .map_err(|e| format!("invalid influxdb sink: {e}"))?;
+                Ok(("influxdb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, or logger)"
             )),
         }
     })();
@@ -1082,6 +1125,12 @@ mod tests {
             "id=\"console\"",
             "rule-tpl-math",
             "rule-tpl-tumbling",
+            "value=\"mysql\"",
+            "value=\"clickhouse\"",
+            "value=\"influxdb\"",
+            "conn-mysql-url",
+            "conn-ch-endpoint",
+            "conn-influx-endpoint",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1231,12 +1280,67 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("redis"));
 
+        // MySQL sink: validated without touching any database.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "mysql-sink-1",
+                       "kind": "mysql",
+                       "config": {"connection_url": "mysql://u:p@127.0.0.1:3306/db",
+                                  "sql_template": "INSERT INTO t (topic, qos, payload) VALUES (?, ?, ?)",
+                                  "pool_size": 2,
+                                  "batch_size": 50,
+                                  "batch_timeout_ms": 25}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("mysql"));
+
+        // ClickHouse sink: validated without touching any server.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "ch-sink-1",
+                       "kind": "clickhouse",
+                       "config": {"endpoint": "http://127.0.0.1:8123",
+                                  "database": "indra",
+                                  "table": "mqtt_events",
+                                  "format": "JSONEachRow",
+                                  "batch_size": 100,
+                                  "batch_timeout_ms": 50}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("clickhouse"));
+
+        // InfluxDB sink: validated without touching any server.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "influx-sink-1",
+                       "kind": "influxdb",
+                       "config": {"endpoint": "http://127.0.0.1:8086",
+                                  "bucket": "mqtt",
+                                  "org": "indra",
+                                  "token": "secret",
+                                  "measurement_template": "mqtt_events",
+                                  "precision": "ms",
+                                  "batch_size": 100,
+                                  "batch_timeout_ms": 50}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("influxdb"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
-            json!([{"id": "diag", "kind": "console"},
+            json!([{"id": "ch-sink-1", "kind": "clickhouse"},
+                   {"id": "diag", "kind": "console"},
+                   {"id": "influx-sink-1", "kind": "influxdb"},
                    {"id": "kafka-sink-1", "kind": "kafka"},
+                   {"id": "mysql-sink-1", "kind": "mysql"},
                    {"id": "pg-sink-1", "kind": "postgres"},
                    {"id": "rabbit-sink-1", "kind": "rabbitmq"},
                    {"id": "redis-sink-1", "kind": "redis"}])
@@ -1258,13 +1362,27 @@ mod tests {
             json!({"id": "bad-redis", "kind": "redis",
                    "config": {"endpoint": "redis://h",
                               "command": {"command": "set", "key_template": ""}}}),
+            json!({"id": "bad-mysql", "kind": "mysql",
+                   "config": {"connection_url": "mysql://u:p@h/db",
+                              "sql_template": "INSERT INTO t VALUES (?, ?)",
+                              "pool_size": 1, "batch_size": 10, "batch_timeout_ms": 10}}),
+            json!({"id": "bad-ch", "kind": "clickhouse",
+                   "config": {"endpoint": "http://h:8123",
+                              "database": "db; DROP TABLE x;",
+                              "table": "t",
+                              "format": "JSONEachRow",
+                              "batch_size": 10, "batch_timeout_ms": 10}}),
+            json!({"id": "bad-influx", "kind": "influxdb",
+                   "config": {"endpoint": "http://h:8086",
+                              "bucket": "b", "org": "o", "token": "",
+                              "measurement_template": "m", "precision": "ms"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 5);
+        assert_eq!(body.as_array().expect("list").len(), 8);
     }
 
     #[tokio::test]

@@ -6,18 +6,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub mod kafka;
 pub mod rabbitmq;
 pub mod postgres;
 pub mod redis;
+pub mod mysql;
+pub mod clickhouse;
+pub mod influxdb;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
 pub use postgres::{MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport};
 pub use redis::{MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply, RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport};
+pub use mysql::{MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig, MySqlTransport, TcpMySqlTransport};
+pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
+pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -258,6 +264,104 @@ impl ConnectorManager {
             Some(sink) => sink.send(topic, payload, qos).await,
             None => Err(ConnectorError::UnknownConnector(id.to_string())),
         }
+    }
+}
+
+/// Size- and linger-bounded row buffer shared by batching sinks
+/// (Postgres, MySQL, ClickHouse, InfluxDB). Rows accumulate until the
+/// batch is full or the oldest row outlives the linger window; failures
+/// restore rows in order instead of dropping them.
+pub(crate) struct BatchQueue<T> {
+    rows: Vec<T>,
+    oldest: Option<Instant>,
+    max_rows: usize,
+    linger: Duration,
+}
+
+impl<T> BatchQueue<T> {
+    pub(crate) fn new(max_rows: usize, linger: Duration) -> Self {
+        Self {
+            rows: Vec::new(),
+            oldest: None,
+            max_rows: max_rows.max(1),
+            linger,
+        }
+    }
+
+    /// Push one row; true means flush now (full or stale).
+    pub(crate) fn push(&mut self, row: T) -> bool {
+        if self.is_empty() {
+            self.oldest = Some(Instant::now());
+        }
+        self.rows.push(row);
+        self.rows.len() >= self.max_rows || self.is_stale()
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        self.oldest
+            .map(|oldest| oldest.elapsed() >= self.linger)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Take all rows, resetting the linger clock. Callers restore via
+    /// [`BatchQueue::restore`] when the transport fails.
+    pub(crate) fn take_batch(&mut self) -> (Vec<T>, Option<Instant>) {
+        let rows = std::mem::take(&mut self.rows);
+        let oldest = self.oldest.take();
+        (rows, oldest)
+    }
+
+    /// Restore a failed batch at the front, preserving order and the
+    /// original linger clock.
+    pub(crate) fn restore(&mut self, mut rows: Vec<T>, oldest: Option<Instant>) {
+        rows.append(&mut self.rows);
+        self.rows = rows;
+        if self.oldest.is_none() {
+            self.oldest = oldest;
+        }
+    }
+}
+
+/// Exponential backoff state (2s, 4s, 8s ... capped at 30s) for failing
+/// transports. While backing off, flushes fail fast without touching
+/// the transport.
+#[derive(Default)]
+pub(crate) struct BackoffState {
+    consecutive_errors: u32,
+    retry_after: Option<Instant>,
+}
+
+impl BackoffState {
+    pub(crate) fn check(&self) -> Result<()> {
+        if let Some(retry_after) = self.retry_after {
+            if Instant::now() < retry_after {
+                return Err(ConnectorError::Connection(
+                    "sink backing off after errors".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn success(&mut self) {
+        self.consecutive_errors = 0;
+        self.retry_after = None;
+    }
+
+    pub(crate) fn failure(&mut self) {
+        self.consecutive_errors += 1;
+        let secs = 2u64
+            .saturating_pow(self.consecutive_errors.min(5))
+            .min(30);
+        self.retry_after = Some(Instant::now() + Duration::from_secs(secs));
     }
 }
 

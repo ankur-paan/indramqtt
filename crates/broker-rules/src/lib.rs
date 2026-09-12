@@ -2581,6 +2581,238 @@ mod tests {
         assert_eq!(transport.records_flat().len(), 1);
     }
 
+    /// Sprint 17 e2e: one rule fans out to all five analytical sinks
+    /// (Kafka, Redis, MySQL, ClickHouse, InfluxDB) via distinct
+    /// connectors. TCP sinks use in-memory transports, HTTP sinks use
+    /// in-process axum fakes: no broker anywhere in the loop.
+    #[tokio::test]
+    async fn test_rule_fans_out_to_five_analytical_sinks() {
+        use axum::{extract::State, routing::post, Router};
+        use broker_connectors::{
+            ClickHouseSink, ClickHouseSinkConfig, InfluxDbSink, InfluxDbSinkConfig,
+            KafkaSink, KafkaSinkConfig, MemoryKafkaTransport, MemoryMySqlTransport,
+            MemoryRedisTransport, MySqlSink, MySqlSinkConfig, RedisCommandKind,
+            RedisSink, RedisSinkConfig,
+        };
+        use tokio::net::TcpListener;
+
+        async fn serve_capture(route: &str, captured: Arc<parking_lot::Mutex<String>>) -> u16 {
+            async fn handler(
+                State(captured): State<Arc<parking_lot::Mutex<String>>>,
+                body: String,
+            ) -> axum::http::StatusCode {
+                *captured.lock() = body;
+                axum::http::StatusCode::OK
+            }
+            let app = Router::new().route(route, post(handler)).with_state(captured);
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            port
+        }
+
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+
+        // Kafka (memory transport).
+        let kafka_transport = Arc::new(MemoryKafkaTransport::new());
+        let kafka = Arc::new(
+            KafkaSink::new(
+                KafkaSinkConfig {
+                    bootstrap_servers: "unused:9092".to_string(),
+                    topic_template: "out-${topic}".to_string(),
+                    partition_key_field: None,
+                    partitions: 4,
+                    client_id: "test".to_string(),
+                    acks: "1".to_string(),
+                    batch_max_records: 100,
+                    batch_max_bytes: 1024 * 1024,
+                },
+                kafka_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("kafka-an", kafka.clone());
+
+        // Redis (memory transport, immediate dispatch).
+        let redis_transport = Arc::new(MemoryRedisTransport::new());
+        let redis = Arc::new(
+            RedisSink::new(
+                RedisSinkConfig {
+                    endpoint: "redis://unused:6379".to_string(),
+                    command: RedisCommandKind::Publish {
+                        channel_template: "fanout".to_string(),
+                    },
+                },
+                redis_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("redis-an", redis.clone());
+
+        // MySQL (memory transport).
+        let mysql_transport = Arc::new(MemoryMySqlTransport::new());
+        let mysql = Arc::new(
+            MySqlSink::new(
+                MySqlSinkConfig {
+                    connection_url: "mysql://u:p@unused:3306/db".to_string(),
+                    sql_template:
+                        "INSERT INTO mqtt_events (topic, qos, payload) VALUES (?, ?, ?)"
+                            .to_string(),
+                    pool_size: 1,
+                    batch_size: 100,
+                    batch_timeout_ms: 50,
+                },
+                mysql_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("mysql-an", mysql.clone());
+
+        // ClickHouse (axum fake).
+        let ch_body = Arc::new(parking_lot::Mutex::new(String::new()));
+        let ch_port = serve_capture("/", ch_body.clone()).await;
+        let clickhouse = Arc::new(
+            ClickHouseSink::new(
+                ClickHouseSinkConfig {
+                    endpoint: format!("http://127.0.0.1:{ch_port}"),
+                    database: "indra".to_string(),
+                    table: "mqtt_events".to_string(),
+                    format: "JSONEachRow".to_string(),
+                    batch_size: 100,
+                    batch_timeout_ms: 100,
+                },
+                reqwest::Client::new(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("ch-an", clickhouse.clone());
+
+        // InfluxDB (axum fake).
+        let influx_body = Arc::new(parking_lot::Mutex::new(String::new()));
+        let influx_port = serve_capture("/api/v2/write", influx_body.clone()).await;
+        let influx = Arc::new(
+            InfluxDbSink::new(
+                InfluxDbSinkConfig {
+                    endpoint: format!("http://127.0.0.1:{influx_port}"),
+                    bucket: "mqtt".to_string(),
+                    org: "indra".to_string(),
+                    token: "secret".to_string(),
+                    measurement_template: "mqtt_events".to_string(),
+                    precision: "ms".to_string(),
+                    batch_size: 100,
+                    batch_timeout_ms: 50,
+                },
+                reqwest::Client::new(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("influx-an", influx.clone());
+
+        // One rule, five ForwardConnector actions, SQL projection.
+        engine
+            .create_rule(
+                "fanout-five".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(r#"SELECT temperature FROM "sensors/+""#.to_string()),
+                true,
+                ["kafka-an", "redis-an", "mysql-an", "ch-an", "influx-an"]
+                    .into_iter()
+                    .map(|id| RuleAction::ForwardConnector {
+                        connector_id: id.to_string(),
+                    })
+                    .collect(),
+            )
+            .expect("rule creates");
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "temperature": 72.5, "secret": "hide_me" }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // Buffered sinks flush explicitly (Redis dispatches inline).
+        kafka.flush().await.expect("kafka flush");
+        mysql.flush().await.expect("mysql flush");
+        clickhouse.flush().await.expect("clickhouse flush");
+        influx.flush().await.expect("influx flush");
+
+        let projected = serde_json::json!({ "temperature": 72.5 });
+
+        let records = kafka_transport.records_flat();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&records[0].value).unwrap(),
+            projected
+        );
+
+        let commands = redis_transport.commands();
+        assert_eq!(commands.len(), 1);
+        let argv = &commands[0].argv;
+        assert_eq!(argv[0], b"PUBLISH".to_vec());
+        assert_eq!(argv[1], b"fanout".to_vec());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&argv[2]).unwrap(),
+            projected
+        );
+
+        let batches = mysql_transport.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].rows.len(), 1);
+        assert_eq!(batches[0].rows[0][0], b"sensors/kitchen".to_vec());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&batches[0].rows[0][2]).unwrap(),
+            projected
+        );
+
+        let ch_lines: Vec<String> = ch_body
+            .lock()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(ch_lines.len(), 1);
+        let ch_row: serde_json::Value = serde_json::from_str(&ch_lines[0]).unwrap();
+        assert_eq!(ch_row["topic"], "sensors/kitchen");
+        assert_eq!(ch_row["payload"], projected.to_string());
+
+        let influx_lines: Vec<String> = influx_body
+            .lock()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(influx_lines.len(), 1);
+        assert!(
+            influx_lines[0].starts_with("mqtt_events,topic=sensors/kitchen "),
+            "unexpected line: {}",
+            influx_lines[0]
+        );
+        assert!(influx_lines[0].contains("payload=\"{\\\"temperature\\\":72.5}\""));
+
+        // Non-JSON ingress matches nothing: all five sinks stay silent.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(b"not json"),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        kafka.flush().await.expect("kafka flush");
+        mysql.flush().await.expect("mysql flush");
+        clickhouse.flush().await.expect("clickhouse flush");
+        influx.flush().await.expect("influx flush");
+        assert_eq!(kafka_transport.records_flat().len(), 1);
+        assert_eq!(redis_transport.commands().len(), 1);
+        assert_eq!(mysql_transport.batches().len(), 1);
+        assert_eq!(ch_body.lock().lines().count(), 1);
+        assert_eq!(influx_body.lock().lines().count(), 1);
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
@@ -771,12 +771,6 @@ async fn execute_extended(stream: &mut TcpStream, batch: &PgBatch) -> Result<()>
 // Sink.
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct RowBuffer {
-    rows: Vec<Vec<Vec<u8>>>,
-    oldest: Option<Instant>,
-}
-
 /// PostgreSQL sink: buffers MQTT events as 3-column rows
 /// (`$1` topic, `$2` QoS, `$3` payload) and flushes full or stale
 /// batches through the transport. Transport failures back off
@@ -784,25 +778,20 @@ struct RowBuffer {
 pub struct PostgreSqlSink {
     config: PostgreSqlSinkConfig,
     transport: Arc<dyn PgTransport>,
-    buffer: parking_lot::Mutex<RowBuffer>,
-    backoff: parking_lot::Mutex<BackoffState>,
+    buffer: parking_lot::Mutex<super::BatchQueue<Vec<Vec<u8>>>>,
+    backoff: parking_lot::Mutex<super::BackoffState>,
     sent_batches: AtomicU64,
-}
-
-#[derive(Default)]
-struct BackoffState {
-    consecutive_errors: u32,
-    retry_after: Option<Instant>,
 }
 
 impl PostgreSqlSink {
     pub fn new(config: PostgreSqlSinkConfig, transport: Arc<dyn PgTransport>) -> Result<Self> {
         config.validate()?;
+        let linger = Duration::from_millis(config.batch_timeout_ms);
         Ok(Self {
+            buffer: parking_lot::Mutex::new(super::BatchQueue::new(config.batch_size, linger)),
             config,
             transport,
-            buffer: parking_lot::Mutex::new(RowBuffer::default()),
-            backoff: parking_lot::Mutex::new(BackoffState::default()),
+            backoff: parking_lot::Mutex::new(super::BackoffState::default()),
             sent_batches: AtomicU64::new(0),
         })
     }
@@ -816,79 +805,41 @@ impl PostgreSqlSink {
     }
 
     pub fn buffered_rows(&self) -> usize {
-        self.buffer.lock().rows.len()
+        self.buffer.lock().len()
     }
 
     /// Flush buffered rows as one batch (no-op when empty). While
     /// backing off, fails fast without touching the transport.
     pub async fn flush(&self) -> Result<()> {
-        {
-            let backoff = self.backoff.lock();
-            if let Some(retry_after) = backoff.retry_after {
-                if Instant::now() < retry_after {
-                    return Err(ConnectorError::Connection(
-                        "postgres sink backing off after errors".to_string(),
-                    ));
-                }
-            }
+        self.backoff.lock().check()?;
+        let (rows, oldest) = self.buffer.lock().take_batch();
+        if rows.is_empty() {
+            return Ok(());
         }
-        let (batch, oldest) = {
-            let mut buffer = self.buffer.lock();
-            if buffer.rows.is_empty() {
-                return Ok(());
-            }
-            let rows = std::mem::take(&mut buffer.rows);
-            let oldest = buffer.oldest.take();
-            (
-                PgBatch {
-                    sql: self.config.sql_template.clone(),
-                    rows,
-                },
-                oldest,
-            )
+        let batch = PgBatch {
+            sql: self.config.sql_template.clone(),
+            rows,
         };
         match self.transport.execute_batch(&batch).await {
             Ok(()) => {
-                let mut backoff = self.backoff.lock();
-                backoff.consecutive_errors = 0;
-                backoff.retry_after = None;
+                self.backoff.lock().success();
                 self.sent_batches.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                // Restore the batch at the front (order preserved) so a
-                // failed flush loses nothing.
-                let mut buffer = self.buffer.lock();
-                let mut restored = batch.rows;
-                restored.append(&mut buffer.rows);
-                buffer.rows = restored;
-                if buffer.oldest.is_none() {
-                    buffer.oldest = oldest;
-                }
-                let mut backoff = self.backoff.lock();
-                backoff.consecutive_errors += 1;
-                let secs = 2u64.saturating_pow(backoff.consecutive_errors.min(5)).min(30);
-                backoff.retry_after = Some(Instant::now() + Duration::from_secs(secs));
+                self.buffer.lock().restore(batch.rows, oldest);
+                self.backoff.lock().failure();
                 Err(e)
             }
         }
     }
 
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> bool {
-        let mut buffer = self.buffer.lock();
-        if buffer.rows.is_empty() {
-            buffer.oldest = Some(Instant::now());
-        }
-        buffer.rows.push(vec![
+        self.buffer.lock().push(vec![
             topic.as_str().as_bytes().to_vec(),
             u8::from(qos).to_string().into_bytes(),
             payload.to_vec(),
-        ]);
-        let stale = buffer
-            .oldest
-            .map(|oldest| oldest.elapsed().as_millis() >= u128::from(self.config.batch_timeout_ms))
-            .unwrap_or(false);
-        buffer.rows.len() >= self.config.batch_size || stale
+        ])
     }
 }
 
