@@ -28,7 +28,7 @@ All microbenchmarks run via `cargo test --release --bench broker_throughput -- -
   - 5 independent measurement passes of 50,000 lookups each.
   - Computes sample mean ($\mu$) and standard deviation ($\sigma$).
 - **Measured Results**:
-  - **Hit-Path Lookups**: **~3.0M ± 0.1M lookups/sec** (evaluating 3 matched subscriber targets per publication using zero-allocation `Arc<str>` tokens and `ahash`).
+  - **Hit-Path Lookups**: **~3.05M ± 0.10M lookups/sec** (evaluating 3 matched subscriber targets per publication using zero-allocation `Arc<str>` tokens and `ahash`).
   - **Fast-Miss Traversal**: **~7.8M ± 0.2M lookups/sec** (walk-only branch traversal when topic prefix has no matching subscribers).
 
 ### 2. Streaming SQL Ingress Evaluation (`bench_sql_ingress_throughput`)
