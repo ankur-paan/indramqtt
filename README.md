@@ -24,8 +24,8 @@ All figures below are grounded in reproducible, multi-sample automated benchmark
 | Subsystem / Benchmark | Measured Throughput (Release) | What Is Measured | Profile & Methodology |
 | :--- | :--- | :--- | :--- |
 | **Radix Trie Router (Hit-Path)** | **~3.05M ± 0.10M msg/sec** | In-process lookup matching 3 subscriber targets across 1,000 installed topic filters | Single-threaded in-memory function call, `ahash` + zero-allocation `Arc<str>` tokens |
-| **Radix Trie Router (Fast-Miss)** | **~7.8M ± 0.2M msg/sec** | Walk-only trie branch evaluation on non-matching topic prefix | Single-threaded in-memory branch walk |
-| **Streaming SQL Ingress Engine** | **~4.7M ± 0.1M events/sec** | In-process JSON parsing + SQL `WHERE` filter + `SELECT` field projection | Single-threaded, **100% verified delivered to sink** (0 drops), `Block` backpressure |
+| **Radix Trie Router (Fast-Miss)** | **~7.80M ± 0.20M msg/sec** | Walk-only trie branch evaluation on non-matching topic prefix | Single-threaded in-memory branch walk |
+| **Streaming SQL Ingress Engine** | **~4.77M ± 0.10M events/sec** | In-process JSON parsing + SQL `WHERE` filter + `SELECT` field projection | Single-threaded, **100% verified delivered to sink** (0 drops), `Block` backpressure |
 | **Idle Base Memory Footprint** | **< 15 MB RSS** | Standalone Rust Core daemon idle resident memory footprint | Zero client connections, baseline Tokio runtime + Router |
 
 > [!IMPORTANT]

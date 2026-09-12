@@ -29,7 +29,7 @@ All microbenchmarks run via `cargo test --release --bench broker_throughput -- -
   - Computes sample mean ($\mu$) and standard deviation ($\sigma$).
 - **Measured Results**:
   - **Hit-Path Lookups**: **~3.05M ± 0.10M lookups/sec** (evaluating 3 matched subscriber targets per publication using zero-allocation `Arc<str>` tokens and `ahash`).
-  - **Fast-Miss Traversal**: **~7.8M ± 0.2M lookups/sec** (walk-only branch traversal when topic prefix has no matching subscribers).
+  - **Fast-Miss Traversal**: **~7.80M ± 0.20M lookups/sec** (walk-only branch traversal when topic prefix has no matching subscribers).
 
 ### 2. Streaming SQL Ingress Evaluation (`bench_sql_ingress_throughput`)
 - **What It Measures**: Single-threaded in-memory JSON payload parsing, SQL `WHERE` expression filtering, `SELECT` field projection, and delivery to the broker sink.
@@ -43,7 +43,7 @@ All microbenchmarks run via `cargo test --release --bench broker_throughput -- -
   - 5 measurement passes across 20,000 total iterations under `BackpressurePolicy::Block`.
   - **Crucial Assertion**: Asserts `sink.count == 20,000` to verify that **100% of evaluated events were received by the sink**, guaranteeing the measured rate is not an artifact of queue dropping.
 - **Measured Results**:
-  - **Throughput**: **~4.7M ± 0.1M events/sec**.
+  - **Throughput**: **~4.77M ± 0.10M events/sec**.
 
 ---
 
