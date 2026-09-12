@@ -142,6 +142,10 @@
       <option value="gcp_pubsub">gcp_pubsub ★ enterprise</option>
       <option value="azure_eventhubs">azure_eventhubs ★ enterprise</option>
       <option value="pulsar">pulsar ★ enterprise</option>
+      <option value="mongodb">mongodb ★ enterprise</option>
+      <option value="mssql">mssql ★ enterprise</option>
+      <option value="cassandra">cassandra ★ enterprise</option>
+      <option value="couchbase">couchbase ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -250,6 +254,30 @@
     <input id="conn-pulsar-namespace" placeholder="namespace, e.g. default" size="12">
     <input id="conn-pulsar-topic" placeholder="topic, e.g. ${topic}" size="18">
     <input id="conn-pulsar-token" placeholder="JWT token (blank = none)" size="20">
+  </div>
+  <div class="row"><label>MongoDB config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-mongo-url" placeholder="connection string, e.g. mongodb://u:p@127.0.0.1:27017" size="36">
+    <input id="conn-mongo-db" placeholder="database, e.g. telemetry" size="14">
+    <input id="conn-mongo-coll" placeholder="collection template, e.g. readings" size="20">
+  </div>
+  <div class="row"><label>SQL Server config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-mssql-host" placeholder="host, e.g. 127.0.0.1" size="16">
+    <input id="conn-mssql-db" placeholder="database, e.g. telemetry" size="14">
+    <input id="conn-mssql-table" placeholder="table, e.g. dbo.SensorEvents" size="22">
+    <input id="conn-mssql-user" placeholder="username, e.g. sa" size="12">
+    <input id="conn-mssql-pass" placeholder="password" type="password" size="14">
+  </div>
+  <div class="row"><label>Cassandra config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-cass-contact" placeholder="contact points, e.g. 10.0.0.1:9042" size="24">
+    <input id="conn-cass-keyspace" placeholder="keyspace, e.g. telemetry" size="14">
+    <input id="conn-cass-table" placeholder="table template, e.g. events" size="16">
+  </div>
+  <div class="row"><label>Couchbase config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-couch-url" placeholder="connection string, e.g. couchbase://127.0.0.1" size="30">
+    <input id="conn-couch-bucket" placeholder="bucket, e.g. telemetry" size="14">
+    <input id="conn-couch-user" placeholder="username" size="12">
+    <input id="conn-couch-pass" placeholder="password" type="password" size="14">
+    <input id="conn-couch-docid" placeholder="doc id template, e.g. ${client_id}::${timestamp}" size="30">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -676,6 +704,41 @@ $("conn-add").onclick = async () => {
               topic: $("conn-pulsar-topic").value.trim() || "${topic}",
               auth: token === "" ? {type: "none"} : {type: "token", token: token},
               batch_size: 200, batch_bytes: 2097152, linger_ms: 10,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "mongodb") {
+    config = {connection_string: $("conn-mongo-url").value.trim() || "mongodb://127.0.0.1:27017",
+              database: $("conn-mongo-db").value.trim() || "telemetry",
+              collection_template: $("conn-mongo-coll").value.trim() || "readings",
+              operation: {type: "insert_one"},
+              batch_size: 500, batch_bytes: 4194304, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 3000};
+  } else if (kind === "mssql") {
+    config = {host: $("conn-mssql-host").value.trim() || "127.0.0.1",
+              database: $("conn-mssql-db").value.trim() || "telemetry",
+              table_template: $("conn-mssql-table").value.trim() || "dbo.SensorEvents",
+              auth: {type: "sql_password", username: $("conn-mssql-user").value.trim(),
+                     password: $("conn-mssql-pass").value},
+              query_mode: {mode: "insertjson"},
+              trust_server_certificate: true,
+              batch_size: 200, batch_bytes: 2097152, linger_ms: 20,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2500};
+  } else if (kind === "cassandra") {
+    config = {contact_points: [$("conn-cass-contact").value.trim() || "127.0.0.1:9042"],
+              keyspace: $("conn-cass-keyspace").value.trim() || "telemetry",
+              table_template: $("conn-cass-table").value.trim() || "events",
+              auth: {type: "none"},
+              consistency: "localquorum",
+              partition_key_template: "${topic}",
+              cql_statement_template: "INSERT INTO telemetry.events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)",
+              batch_size: 100, batch_bytes: 1048576, linger_ms: 10,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "couchbase") {
+    config = {connection_string: $("conn-couch-url").value.trim() || "couchbase://127.0.0.1",
+              bucket: $("conn-couch-bucket").value.trim() || "telemetry",
+              auth: {username: $("conn-couch-user").value.trim(), password: $("conn-couch-pass").value},
+              doc_id_template: $("conn-couch-docid").value.trim() || "${client_id}::${timestamp}",
+              operation: "upsert",
+              batch_size: 100, batch_bytes: 2097152, linger_ms: 10,
               max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),

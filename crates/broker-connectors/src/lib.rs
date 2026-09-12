@@ -27,6 +27,10 @@ pub mod kinesis;
 pub mod gcp_pubsub;
 pub mod azure_eventhubs;
 pub mod pulsar;
+pub mod mongodb;
+pub mod mssql;
+pub mod cassandra;
+pub mod couchbase;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -46,6 +50,10 @@ pub use kinesis::{HttpKinesisTransport, KinesisConnector, KinesisPutRecordsReque
 pub use gcp_pubsub::{CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport, build_jwt_assertion, parse_publish_response, render_publish_body, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL};
 pub use azure_eventhubs::{AzureEventHubsConnector, AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem, CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome, render_batch_body as render_azure_batch_body, sas_token};
 pub use pulsar::{CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport, TcpPulsarTransport, crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url};
+pub use mongodb::{BsonDocument, BsonValue, CapturedMongoBulk, MockMongoDbTransport, MockMongoOutcome, MongoDbConnector, MongoDbDocumentItem, MongoDbSink, MongoDbSinkConfig, MongoDbTransport, MongoEndpoint, MongoOperation, NativeMongoDbTransport, decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string, scram_client_proof};
+pub use mssql::{CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth, MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport, NativeMssqlTransport, TdsReply, days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password, parse_reply_tokens};
+pub use cassandra::{CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink, CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError, CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport, decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token, parse_contact_point};
+pub use couchbase::{CapturedCouchbaseBatch, CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation, CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, KvResponse, MockCouchbaseOutcome, MockCouchbaseTransport, NativeCouchbaseTransport, decode_response as decode_kv_response, encode_mutation as encode_kv_mutation, parse_connection_string as parse_couchbase_connection_string};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -83,12 +91,13 @@ pub struct ConnectorInfo {
     pub kind: String,
 }
 
-/// Open-core tier tag for a connector kind: the four multi-cloud
-/// streaming bridges plus Sparkplug B are Enterprise; everything else
-/// is Community.
+/// Open-core tier tag for a connector kind: the multi-cloud
+/// streaming bridges, Sparkplug B and the enterprise databases are
+/// Enterprise; everything else is Community.
 pub fn connector_tier(kind: &str) -> &'static str {
     match kind {
-        "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b" => "enterprise",
+        "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b"
+        | "mongodb" | "mssql" | "cassandra" | "couchbase" => "enterprise",
         _ => "community",
     }
 }
@@ -668,6 +677,28 @@ mod tests {
 
         assert!(manager.unregister("rec"));
         assert!(!manager.unregister("rec"));
+    }
+
+    #[test]
+    fn test_connector_tier_tags() {
+        // Enterprise bridges (cloud, Sparkplug, databases).
+        for kind in [
+            "kinesis",
+            "gcp_pubsub",
+            "azure_eventhubs",
+            "pulsar",
+            "sparkplug_b",
+            "mongodb",
+            "mssql",
+            "cassandra",
+            "couchbase",
+        ] {
+            assert_eq!(connector_tier(kind), "enterprise", "{kind} must be enterprise");
+        }
+        // Everything else is community (including unknown kinds).
+        for kind in ["kafka", "postgres", "redis", "webhook", "logger", "nope"] {
+            assert_eq!(connector_tier(kind), "community", "{kind} must be community");
+        }
     }
 
     #[tokio::test]

@@ -785,8 +785,72 @@ async fn build_connector(
                 Ok(("pulsar".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "mongodb" | "mongo" | "documentdb" => {
+                let config: broker_connectors::MongoDbSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid mongodb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid mongodb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::NativeMongoDbTransport::new(&config)
+                        .map_err(|e| format!("invalid mongodb transport: {e}"))?,
+                );
+                let sink = broker_connectors::MongoDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid mongodb sink: {e}"))?;
+                Ok(("mongodb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "mssql" | "sqlserver" | "azuresql" => {
+                let config: broker_connectors::MssqlSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid mssql config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid mssql config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::NativeMssqlTransport::new(&config)
+                        .map_err(|e| format!("invalid mssql transport: {e}"))?,
+                );
+                let sink = broker_connectors::MssqlSink::new(config, transport)
+                    .map_err(|e| format!("invalid mssql sink: {e}"))?;
+                Ok(("mssql".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "cassandra" | "scylla" | "cql" => {
+                let config: broker_connectors::CassandraSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid cassandra config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid cassandra config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::NativeCassandraTransport::new(&config)
+                        .map_err(|e| format!("invalid cassandra transport: {e}"))?,
+                );
+                let sink = broker_connectors::CassandraSink::new(config, transport)
+                    .map_err(|e| format!("invalid cassandra sink: {e}"))?;
+                Ok(("cassandra".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "couchbase" | "couch" | "cb" => {
+                let config: broker_connectors::CouchbaseSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid couchbase config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid couchbase config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::NativeCouchbaseTransport::new(&config)
+                        .map_err(|e| format!("invalid couchbase transport: {e}"))?,
+                );
+                let sink = broker_connectors::CouchbaseSink::new(config, transport)
+                    .map_err(|e| format!("invalid couchbase sink: {e}"))?;
+                Ok(("couchbase".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, or logger)"
             )),
         }
 }
@@ -1346,6 +1410,10 @@ mod tests {
             "value=\"gcp_pubsub\"",
             "value=\"azure_eventhubs\"",
             "value=\"pulsar\"",
+            "value=\"mongodb\"",
+            "value=\"mssql\"",
+            "value=\"cassandra\"",
+            "value=\"couchbase\"",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
@@ -1354,6 +1422,10 @@ mod tests {
             "conn-gcp-project",
             "conn-azure-ns",
             "conn-pulsar-url",
+            "conn-mongo-url",
+            "conn-mssql-host",
+            "conn-cass-contact",
+            "conn-couch-url",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1771,13 +1843,105 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("pulsar"));
 
+        // MongoDB sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "mongo-1",
+                       "kind": "mongodb",
+                       "config": {"connection_string": "mongodb://u:p@127.0.0.1:27017",
+                                  "database": "telemetry",
+                                  "collection_template": "readings",
+                                  "operation": {"type": "insert_one"},
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("mongodb"));
+
+        // MSSQL sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "mssql-1",
+                       "kind": "mssql",
+                       "config": {"host": "127.0.0.1",
+                                  "database": "telemetry",
+                                  "table_template": "dbo.SensorEvents",
+                                  "auth": {"type": "sql_password", "username": "sa", "password": "secret"},
+                                  "query_mode": {"mode": "insertjson"},
+                                  "trust_server_certificate": true,
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("mssql"));
+
+        // Cassandra sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "cassandra-1",
+                       "kind": "cassandra",
+                       "config": {"contact_points": ["10.0.0.1:9042"],
+                                  "keyspace": "telemetry",
+                                  "table_template": "events",
+                                  "auth": {"type": "none"},
+                                  "consistency": "localquorum",
+                                  "partition_key_template": "${topic}",
+                                  "cql_statement_template": "INSERT INTO telemetry.events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)",
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("cassandra"));
+
+        // Couchbase sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "couchbase-1",
+                       "kind": "couchbase",
+                       "config": {"connection_string": "couchbase://127.0.0.1",
+                                  "bucket": "telemetry",
+                                  "auth": {"username": "Administrator", "password": "secret"},
+                                  "doc_id_template": "${client_id}::${timestamp}",
+                                  "operation": "upsert",
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("couchbase"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
             json!([{"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
                    {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
+                   {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
                    {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
+                   {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
                    {"id": "diag", "kind": "console", "tier": "community"},
                    {"id": "disk-1", "kind": "disk_log", "tier": "community"},
                    {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
@@ -1786,6 +1950,8 @@ mod tests {
                    {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
                    {"id": "kafka-sink-1", "kind": "kafka", "tier": "community"},
                    {"id": "kinesis-1", "kind": "kinesis", "tier": "enterprise"},
+                   {"id": "mongo-1", "kind": "mongodb", "tier": "enterprise"},
+                   {"id": "mssql-1", "kind": "mssql", "tier": "enterprise"},
                    {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
                    {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
                    {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
@@ -1869,13 +2035,36 @@ mod tests {
                               "namespace": "default",
                               "topic": "",
                               "auth": {"type": "none"}}}),
+            json!({"id": "bad-mongo", "kind": "mongodb",
+                   "config": {"connection_string": "mongodb://127.0.0.1:27017",
+                              "database": "",
+                              "collection_template": "readings",
+                              "operation": {"type": "insert_one"}}}),
+            json!({"id": "bad-mssql", "kind": "mssql",
+                   "config": {"host": "",
+                              "database": "telemetry",
+                              "table_template": "dbo.T",
+                              "auth": {"type": "integrated"},
+                              "query_mode": {"mode": "insertjson"}}}),
+            json!({"id": "bad-cassandra", "kind": "cassandra",
+                   "config": {"contact_points": [],
+                              "keyspace": "telemetry",
+                              "table_template": "events",
+                              "partition_key_template": "${topic}",
+                              "cql_statement_template": "INSERT INTO t VALUES (?, ?, ?, ?)"}}),
+            json!({"id": "bad-couchbase", "kind": "couchbase",
+                   "config": {"connection_string": "couchbase://127.0.0.1",
+                              "bucket": "telemetry",
+                              "auth": {"username": "", "password": "secret"},
+                              "doc_id_template": "k",
+                              "operation": "upsert"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 19);
+        assert_eq!(body.as_array().expect("list").len(), 23);
     }
 
     #[tokio::test]

@@ -3577,6 +3577,232 @@ mod tests {
         base64::engine::general_purpose::STANDARD.decode(input).unwrap()
     }
 
+    /// Multi-store e2e (INDRA-220): one ingress event routes through
+    /// streaming SQL `INTO connector(...)` rules and fans out
+    /// simultaneously to the MongoDB, MSSQL, Cassandra and Couchbase
+    /// mocks with zero drops. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_database_sinks() {
+        use broker_connectors::{
+            CassandraSink, CassandraSinkConfig, CouchbaseSink, CouchbaseSinkConfig,
+            MockCassandraTransport, MockCouchbaseTransport, MockMongoDbTransport,
+            MockMssqlTransport, MongoDbSink, MongoDbSinkConfig, MssqlSink, MssqlSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // MongoDB documents (auto-flush every row).
+        let mongo_transport = Arc::new(MockMongoDbTransport::new());
+        let mongo = Arc::new(
+            MongoDbSink::new(
+                MongoDbSinkConfig {
+                    connection_string: "mongodb://u:p@unused:27017".to_string(),
+                    database: "telemetry".to_string(),
+                    collection_template: "readings".to_string(),
+                    operation: broker_connectors::MongoOperation::InsertOne,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                mongo_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("mongodb-sink", mongo.clone());
+
+        // MSSQL rows (auto-flush every row).
+        let mssql_transport = Arc::new(MockMssqlTransport::new());
+        let mssql = Arc::new(
+            MssqlSink::new(
+                MssqlSinkConfig {
+                    host: "unused".to_string(),
+                    port: None,
+                    database: "telemetry".to_string(),
+                    table_template: "dbo.SensorEvents".to_string(),
+                    auth: broker_connectors::MssqlAuth::Integrated,
+                    query_mode: broker_connectors::MssqlQueryMode::InsertJson,
+                    trust_server_certificate: true,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                mssql_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("mssql-sink", mssql.clone());
+
+        // Cassandra statements (auto-flush every row).
+        let cassandra_transport = Arc::new(MockCassandraTransport::new());
+        let cassandra = Arc::new(
+            CassandraSink::new(
+                CassandraSinkConfig {
+                    contact_points: vec!["10.0.0.1:9042".to_string()],
+                    keyspace: "telemetry".to_string(),
+                    table_template: "events".to_string(),
+                    auth: broker_connectors::CassandraAuth::None,
+                    consistency: broker_connectors::CqlConsistency::LocalQuorum,
+                    partition_key_template: "${client_id}".to_string(),
+                    cql_statement_template: "INSERT INTO telemetry.events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)".to_string(),
+                    ttl_secs: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                cassandra_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("cassandra-sink", cassandra.clone());
+
+        // Couchbase documents (auto-flush every row).
+        let couchbase_transport = Arc::new(MockCouchbaseTransport::new());
+        couchbase_transport.set_operation_tag(0);
+        let couchbase = Arc::new(
+            CouchbaseSink::new(
+                CouchbaseSinkConfig {
+                    connection_string: "couchbase://unused".to_string(),
+                    bucket: "telemetry".to_string(),
+                    scope: None,
+                    collection: None,
+                    auth: broker_connectors::CouchbaseAuth {
+                        username: "Administrator".to_string(),
+                        password: "secret".to_string(),
+                    },
+                    doc_id_template: "${client_id}::${timestamp}".to_string(),
+                    operation: broker_connectors::CouchbaseOperation::Upsert,
+                    expiry_secs: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                couchbase_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("couchbase-sink", couchbase.clone());
+
+        // One INTO rule per store.
+        for (id, connector) in [
+            ("mongo-rule", "mongodb-sink"),
+            ("mssql-rule", "mssql-sink"),
+            ("cassandra-rule", "cassandra-sink"),
+            ("couchbase-rule", "couchbase-sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, device_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "device-42", "device_id": "device-42", "temp": 22.5 }"#,
+                ),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let projected =
+            serde_json::json!({"client_id": "device-42", "device_id": "device-42", "temp": 22.5});
+
+        // MongoDB: one document with _mqtt metadata in `readings`.
+        let captured = mongo_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].db, "telemetry");
+        assert_eq!(captured[0].collection, "readings");
+        assert_eq!(captured[0].docs.len(), 1);
+        let document = &captured[0].docs[0].document;
+        assert!(matches!(
+            document.get("_id"),
+            Some(broker_connectors::BsonValue::ObjectId(_))
+        ));
+        assert_eq!(
+            document.get("temp"),
+            Some(&broker_connectors::BsonValue::Double(22.5))
+        );
+        assert_eq!(
+            document.get("_mqtt").and_then(|meta| match meta {
+                broker_connectors::BsonValue::Document(meta) => meta.get("topic").cloned(),
+                _ => None,
+            }),
+            Some(broker_connectors::BsonValue::String("sensors/kitchen".to_string()))
+        );
+
+        // MSSQL: one typed row in dbo.SensorEvents.
+        let captured = mssql_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "dbo.SensorEvents");
+        assert_eq!(captured[0].rows.len(), 1);
+        assert_eq!(captured[0].rows[0].topic, "sensors/kitchen");
+        assert_eq!(captured[0].rows[0].client_id, "device-42");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&captured[0].rows[0].payload_json).unwrap(),
+            projected
+        );
+
+        // Cassandra: one bound statement keyed by client_id.
+        let captured = cassandra_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].keyspace, "telemetry");
+        assert_eq!(captured[0].batch.len(), 1);
+        assert_eq!(captured[0].batch[0].values[0], b"device-42");
+        assert_eq!(
+            captured[0].batch[0].partition_token,
+            broker_connectors::murmur3_token(b"device-42")
+        );
+
+        // Couchbase: one document under client_id::timestamp.
+        let captured = couchbase_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].bucket, "telemetry");
+        assert_eq!(captured[0].scope, "_default");
+        assert_eq!(captured[0].collection, "_default");
+        assert_eq!(captured[0].items.len(), 1);
+        assert!(captured[0].items[0].key.starts_with("device-42::"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].items[0].body).unwrap()["temp"],
+            serde_json::json!(22.5)
+        );
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 10.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(mongo_transport.captured().len(), 1);
+        assert_eq!(mssql_transport.captured().len(), 1);
+        assert_eq!(cassandra_transport.captured().len(), 1);
+        assert_eq!(couchbase_transport.captured().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
