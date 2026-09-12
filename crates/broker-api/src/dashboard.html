@@ -142,6 +142,11 @@
       <option value="gcp_pubsub">gcp_pubsub ★ enterprise</option>
       <option value="azure_eventhubs">azure_eventhubs ★ enterprise</option>
       <option value="pulsar">pulsar ★ enterprise</option>
+      <option value="oci_streaming">oci_streaming ★ enterprise</option>
+      <option value="aws_iot">aws_iot ★ enterprise</option>
+      <option value="azure_iot">azure_iot ★ enterprise</option>
+      <option value="gcp_iot">gcp_iot ★ enterprise</option>
+      <option value="opc_ua">opc_ua ★ enterprise</option>
       <option value="mongodb">mongodb ★ enterprise</option>
       <option value="mssql">mssql ★ enterprise</option>
       <option value="cassandra">cassandra ★ enterprise</option>
@@ -263,6 +268,42 @@
     <input id="conn-pulsar-namespace" placeholder="namespace, e.g. default" size="12">
     <input id="conn-pulsar-topic" placeholder="topic, e.g. ${topic}" size="18">
     <input id="conn-pulsar-token" placeholder="JWT token (blank = none)" size="20">
+  </div>
+  <div class="row"><label>OCI Streaming config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-oci-endpoint" placeholder="endpoint, e.g. https://cell-1.streaming.us-east-1.oci.oraclecloud.com" size="40">
+    <input id="conn-oci-pool" placeholder="stream pool OCID, e.g. ocid1.streampool.oc1..aaa" size="26">
+    <input id="conn-oci-stream" placeholder="stream OCID, e.g. ocid1.stream.oc1..aaa" size="26">
+    <input id="conn-oci-tenancy" placeholder="tenancy OCID" size="24">
+    <input id="conn-oci-user" placeholder="user OCID" size="24">
+    <input id="conn-oci-fingerprint" placeholder="key fingerprint, e.g. 20:3b:.." size="20">
+    <input id="conn-oci-partition" placeholder="partition key template, e.g. ${client_id}" size="24">
+    <textarea id="conn-oci-key" rows="2" cols="60" placeholder="RSA private key PEM (PKCS#1 or PKCS#8)"></textarea>
+  </div>
+  <div class="row"><label>AWS IoT Core config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-awsiot-endpoint" placeholder="endpoint, e.g. abc-ats.iot.us-east-1.amazonaws.com" size="36">
+    <input id="conn-awsiot-region" placeholder="region, e.g. us-east-1" size="14">
+    <input id="conn-awsiot-client" placeholder="client id, e.g. emqx-bridge-1" size="20">
+    <input id="conn-awsiot-key" placeholder="access key id (SigV4)" size="18">
+    <input id="conn-awsiot-secret" placeholder="secret access key (SigV4)" type="password" size="20">
+  </div>
+  <div class="row"><label>Azure IoT Hub config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-aziot-hub" placeholder="hub name, e.g. my-hub" size="16">
+    <input id="conn-aziot-device" placeholder="device id, e.g. emqx-bridge-1" size="20">
+    <input id="conn-aziot-keyname" placeholder="key name, e.g. device" size="14">
+    <input id="conn-aziot-key" placeholder="shared access key" type="password" size="20">
+  </div>
+  <div class="row"><label>GCP IoT Core config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-gcpiot-project" placeholder="project id" size="16">
+    <input id="conn-gcpiot-region" placeholder="region, e.g. us-central1" size="14">
+    <input id="conn-gcpiot-registry" placeholder="registry id" size="16">
+    <input id="conn-gcpiot-device" placeholder="device id" size="16">
+    <input id="conn-gcpiot-endpoint" placeholder="bridge endpoint, e.g. mqtt.googleapis.com:8883" size="28">
+    <textarea id="conn-gcpiot-key" rows="2" cols="60" placeholder="RSA private key PEM for JWT (RS256)"></textarea>
+  </div>
+  <div class="row"><label>OPC-UA config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-opcua-url" placeholder="endpoint url, e.g. opc.tcp://127.0.0.1:4840" size="32">
+    <input id="conn-opcua-node" placeholder="node id, e.g. ns=2;s=Temperature" size="26">
+    <input id="conn-opcua-topic" placeholder="publish topic template, e.g. opcua/${node}" size="24">
   </div>
   <div class="row"><label>MongoDB config <span class="badge enterprise">enterprise</span></label>
     <input id="conn-mongo-url" placeholder="connection string, e.g. mongodb://u:p@127.0.0.1:27017" size="36">
@@ -776,6 +817,51 @@ $("conn-add").onclick = async () => {
               auth: token === "" ? {type: "none"} : {type: "token", token: token},
               batch_size: 200, batch_bytes: 2097152, linger_ms: 10,
               max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+  } else if (kind === "oci_streaming") {
+    config = {endpoint: $("conn-oci-endpoint").value.trim(),
+              stream_pool_id: $("conn-oci-pool").value.trim(),
+              stream_id: $("conn-oci-stream").value.trim(),
+              tenancy_ocid: $("conn-oci-tenancy").value.trim(),
+              user_ocid: $("conn-oci-user").value.trim(),
+              fingerprint: $("conn-oci-fingerprint").value.trim(),
+              private_key_pem: $("conn-oci-key").value,
+              partition_key_template: $("conn-oci-partition").value.trim() || "${client_id}",
+              batch_size: 500, batch_bytes: 1048576, linger_ms: 100,
+              max_retries: 5, initial_backoff_ms: 100, max_backoff_ms: 2500};
+  } else if (kind === "aws_iot") {
+    config = {endpoint: $("conn-awsiot-endpoint").value.trim(),
+              region: $("conn-awsiot-region").value.trim() || "us-east-1",
+              client_id: $("conn-awsiot-client").value.trim() || "emqx-bridge-1",
+              auth: {type: "sigv4", access_key_id: $("conn-awsiot-key").value.trim(),
+                     secret_access_key: $("conn-awsiot-secret").value,
+                     session_token: null},
+              topic_mappings: [{local_topic: "#", remote_topic: "emqx/${topic}",
+                                direction: "LocalToRemote"}],
+              batch_size: 200, linger_ms: 50, max_retries: 5};
+  } else if (kind === "azure_iot") {
+    config = {iot_hub_name: $("conn-aziot-hub").value.trim(),
+              device_id: $("conn-aziot-device").value.trim() || "emqx-bridge-1",
+              auth: {type: "sharedaccesskey", key: $("conn-aziot-key").value,
+                     key_name: $("conn-aziot-keyname").value.trim() || null},
+              api_version: "2021-04-12",
+              direct_methods_enabled: false, twin_sync_enabled: false,
+              batch_size: 200, linger_ms: 50, max_retries: 5};
+  } else if (kind === "gcp_iot") {
+    config = {project_id: $("conn-gcpiot-project").value.trim(),
+              cloud_region: $("conn-gcpiot-region").value.trim() || "us-central1",
+              registry_id: $("conn-gcpiot-registry").value.trim(),
+              device_id: $("conn-gcpiot-device").value.trim(),
+              private_key_pem: $("conn-gcpiot-key").value,
+              algorithm: "RS256", token_lifetime_secs: 3600,
+              endpoint: $("conn-gcpiot-endpoint").value.trim() || "mqtt.googleapis.com:8883",
+              batch_size: 200, linger_ms: 50, max_retries: 5};
+  } else if (kind === "opc_ua") {
+    config = {endpoint_url: $("conn-opcua-url").value.trim() || "opc.tcp://127.0.0.1:4840",
+              security_policy: "None", security_mode: "none", auth: {type: "anonymous"},
+              node_subscriptions: [{node_id: $("conn-opcua-node").value.trim() || "ns=2;s=Temperature",
+                                    sampling_interval_ms: 1000,
+                                    publish_topic_template: $("conn-opcua-topic").value.trim() || "opcua/${node}"}],
+              batch_size: 200, linger_ms: 50};
   } else if (kind === "mongodb") {
     config = {connection_string: $("conn-mongo-url").value.trim() || "mongodb://127.0.0.1:27017",
               database: $("conn-mongo-db").value.trim() || "telemetry",

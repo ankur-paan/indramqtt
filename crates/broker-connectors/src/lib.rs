@@ -40,6 +40,11 @@ pub mod databricks;
 pub mod doris;
 pub mod bigquery;
 pub mod redshift;
+pub mod opc_ua;
+pub mod aws_iot;
+pub mod azure_iot;
+pub mod gcp_iot;
+pub mod oci_streaming;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -72,6 +77,11 @@ pub use databricks::{CapturedDatabricksStatement, DatabricksConnector, Databrick
 pub use doris::{CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat, DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport, MockDorisOutcome, MockDorisTransport, classify_status as classify_doris_status, parse_load_result, render_body as render_doris_body};
 pub use bigquery::{BigQueryConnector, BigQueryInsertResponse, BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert, HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, classify_insert_errors, render_insert_body as render_bigquery_body};
 pub use redshift::{HttpRedshiftTransport, MockRedshiftOutcome, MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector, RedshiftSink, RedshiftSinkConfig, RedshiftTransport, default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body, render_statement as render_redshift_statement};
+pub use opc_ua::{MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector, OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport, datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant, encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json};
+pub use aws_iot::{AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping, MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TcpAwsIotTransport, shadow_update_document, sign_websocket_url};
+pub use azure_iot::{AzureIotAuth, AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink, AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TcpAzureIotTransport, TwinTopics, d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token};
+pub use gcp_iot::{CapturedGcpIotPublish, DownlinkRoute, GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport, MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink, state_topic, telemetry_topic, validate_state_snapshot};
+pub use oci_streaming::{HttpOciStreamingTransport, MockOciOutcome, MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage, OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport, authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages, rfc1123_date, rsa_sign, signing_string};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -118,7 +128,8 @@ pub fn connector_tier(kind: &str) -> &'static str {
         "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b"
         | "mongodb" | "mssql" | "cassandra" | "couchbase"
         | "tdengine" | "iotdb" | "timestream" | "dynamodb"
-        | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift" => "enterprise",
+        | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
+        | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua" => "enterprise",
         _ => "community",
     }
 }

@@ -785,6 +785,89 @@ async fn build_connector(
                 Ok(("pulsar".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "oci_streaming" | "oci" | "oracle_streaming" => {
+                let config: broker_connectors::OciStreamingSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid oci_streaming config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid oci_streaming config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpOciStreamingTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid oci_streaming transport: {e}"))?,
+                );
+                let sink = broker_connectors::OciStreamingSink::new(config, transport)
+                    .map_err(|e| format!("invalid oci_streaming sink: {e}"))?;
+                Ok(("oci_streaming".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "aws_iot" | "aws_iot_core" => {
+                let config: broker_connectors::AwsIotConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid aws_iot config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid aws_iot config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpAwsIotTransport::new(&config.endpoint)
+                        .map_err(|e| format!("invalid aws_iot transport: {e}"))?,
+                );
+                let sink = broker_connectors::AwsIotSink::new(config, transport)
+                    .map_err(|e| format!("invalid aws_iot sink: {e}"))?;
+                Ok(("aws_iot".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "azure_iot" | "azure_iothub" | "iothub" => {
+                let config: broker_connectors::AzureIotConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid azure_iot config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid azure_iot config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpAzureIotTransport::new(&config.iot_hub_name)
+                        .map_err(|e| format!("invalid azure_iot transport: {e}"))?,
+                );
+                let sink = broker_connectors::AzureIotSink::new(config, transport)
+                    .map_err(|e| format!("invalid azure_iot sink: {e}"))?;
+                Ok(("azure_iot".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
+                let config: broker_connectors::GcpIotConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid gcp_iot config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid gcp_iot config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpGcpIotTransport::new(&config.endpoint)
+                        .map_err(|e| format!("invalid gcp_iot transport: {e}"))?,
+                );
+                let sink = broker_connectors::GcpIotSink::new(config, transport)
+                    .map_err(|e| format!("invalid gcp_iot sink: {e}"))?;
+                Ok(("gcp_iot".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "opc_ua" | "opcua" => {
+                let config: broker_connectors::OpcUaSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid opc_ua config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid opc_ua config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpOpcUaTransport::new(&config)
+                        .map_err(|e| format!("invalid opc_ua transport: {e}"))?,
+                );
+                let sink = broker_connectors::OpcUaSink::new(config, transport)
+                    .map_err(|e| format!("invalid opc_ua sink: {e}"))?;
+                Ok(("opc_ua".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             "mongodb" | "mongo" | "documentdb" => {
                 let config: broker_connectors::MongoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1658,6 +1741,18 @@ mod tests {
     async fn test_connectors_create_kafka_rabbitmq_logger() {
         let (server, _state) = TestServer::start().await;
 
+        // Per-test RSA key for the OCI + GCP-IoT creation legs below
+        // (1024-bit, in-memory, never deployed).
+        let test_pem = {
+            use rsa::pkcs8::EncodePrivateKey;
+            let mut rng = rand::thread_rng();
+            rsa::RsaPrivateKey::new(&mut rng, 1024)
+                .expect("test RSA key")
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("test PEM")
+                .to_string()
+        };
+
         // Kafka sink: validated, lazily connected, listed with its kind.
         let (status, created) = server
             .post(
@@ -2303,11 +2398,127 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("redshift"));
 
+        // OCI Streaming sink: Cavage-signed, validated without touching OCI.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "oci-1",
+                       "kind": "oci_streaming",
+                       "config": {"endpoint": "https://cell-1.streaming.us-east-1.oci.oraclecloud.com",
+                                  "stream_pool_id": "ocid1.streampool.oc1..testpool",
+                                  "stream_id": "ocid1.stream.oc1..teststream",
+                                  "tenancy_ocid": "ocid1.tenancy.oc1..test",
+                                  "user_ocid": "ocid1.user.oc1..test",
+                                  "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55",
+                                  "private_key_pem": test_pem.clone(),
+                                  "partition_key_template": "${client_id}",
+                                  "batch_size": 500,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 100,
+                                  "max_retries": 5,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("oci_streaming"));
+
+        // AWS IoT Core sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "aws-iot-1",
+                       "kind": "aws_iot",
+                       "config": {"endpoint": "abc-ats.iot.us-east-1.amazonaws.com",
+                                  "region": "us-east-1",
+                                  "client_id": "emqx-bridge-1",
+                                  "auth": {"type": "sigv4",
+                                            "access_key_id": "AKID",
+                                            "secret_access_key": "secret",
+                                            "session_token": null},
+                                  "topic_mappings": [{"local_topic": "sensors/+",
+                                                      "remote_topic": "emqx/up",
+                                                      "direction": "localtoremote"}],
+                                  "batch_size": 200,
+                                  "linger_ms": 50,
+                                  "max_retries": 5}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("aws_iot"));
+
+        // Azure IoT Hub sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "azure-iot-1",
+                       "kind": "azure_iot",
+                       "config": {"iot_hub_name": "e2e-hub",
+                                  "device_id": "e2e-device",
+                                  "module_id": null,
+                                  "auth": {"type": "sharedaccesskey",
+                                            "key": "c2VjcmV0",
+                                            "key_name": "device"},
+                                  "api_version": "2021-04-12",
+                                  "direct_methods_enabled": false,
+                                  "twin_sync_enabled": false,
+                                  "batch_size": 200,
+                                  "linger_ms": 50,
+                                  "max_retries": 5}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("azure_iot"));
+
+        // GCP IoT Core sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "gcp-iot-1",
+                       "kind": "gcp_iot",
+                       "config": {"project_id": "e2e-project",
+                                  "cloud_region": "us-central1",
+                                  "registry_id": "e2e-registry",
+                                  "device_id": "e2e-device",
+                                  "private_key_pem": test_pem,
+                                  "algorithm": "RS256",
+                                  "token_lifetime_secs": 3600,
+                                  "endpoint": "mqtt.googleapis.com:8883",
+                                  "batch_size": 200,
+                                  "linger_ms": 50,
+                                  "max_retries": 5}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("gcp_iot"));
+
+        // OPC-UA sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "opcua-1",
+                       "kind": "opc_ua",
+                       "config": {"endpoint_url": "opc.tcp://127.0.0.1:4840",
+                                  "security_policy": "None",
+                                  "security_mode": "none",
+                                  "auth": {"type": "anonymous"},
+                                  "node_subscriptions": [{"node_id": "ns=2;s=Temperature",
+                                                          "sampling_interval_ms": 1000,
+                                                          "publish_topic_template": "opcua/temperature"}],
+                                  "batch_size": 200,
+                                  "linger_ms": 50}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("opc_ua"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
-            json!([{"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
+             json!([{"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
+                    {"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
+                    {"id": "azure-iot-1", "kind": "azure_iot", "tier": "enterprise"},
                    {"id": "bigquery-1", "kind": "bigquery", "tier": "enterprise"},
                    {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
                    {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
@@ -2319,7 +2530,8 @@ mod tests {
                    {"id": "doris-1", "kind": "doris", "tier": "enterprise"},
                    {"id": "dynamodb-1", "kind": "dynamodb", "tier": "enterprise"},
                    {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
-                   {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
+                    {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
+                    {"id": "gcp-iot-1", "kind": "gcp_iot", "tier": "enterprise"},
                    {"id": "hook-1", "kind": "webhook", "tier": "community"},
                    {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
                    {"id": "iotdb-1", "kind": "iotdb", "tier": "enterprise"},
@@ -2327,8 +2539,10 @@ mod tests {
                    {"id": "kinesis-1", "kind": "kinesis", "tier": "enterprise"},
                    {"id": "mongo-1", "kind": "mongodb", "tier": "enterprise"},
                    {"id": "mssql-1", "kind": "mssql", "tier": "enterprise"},
-                   {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
-                   {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
+                    {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
+                    {"id": "oci-1", "kind": "oci_streaming", "tier": "enterprise"},
+                    {"id": "opcua-1", "kind": "opc_ua", "tier": "enterprise"},
+                    {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
                    {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
                    {"id": "rabbit-sink-1", "kind": "rabbitmq", "tier": "community"},
                    {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
@@ -2493,7 +2707,7 @@ mod tests {
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 32);
+        assert_eq!(body.as_array().expect("list").len(), 37);
     }
 
     #[tokio::test]

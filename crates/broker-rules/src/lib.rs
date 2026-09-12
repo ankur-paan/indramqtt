@@ -3572,6 +3572,294 @@ mod tests {
         assert_eq!(pulsar_transport.captured().len(), 1);
     }
 
+    /// IoT + industrial e2e (INDRA-219/220): one ingress event fans
+    /// out through streaming SQL `INTO connector(...)` rules to the
+    /// OCI, AWS IoT, Azure IoT and GCP IoT mocks, while a raw scalar
+    /// ingress forwards (no SQL projection, bytes verbatim) into the
+    /// OPC-UA memory transport as a typed node write. All transports
+    /// are in-memory; the RSA key is generated per test (1024-bit,
+    /// never deployed).
+    #[tokio::test]
+    async fn test_into_fans_out_to_iot_industrial_sinks() {
+        use broker_connectors::{
+            AwsIotAuth, AwsIotConfig, AwsIotSink, AzureIotAuth, AzureIotConfig, AzureIotSink,
+            BridgeTopicMapping, GcpIotAlgorithm, GcpIotConfig, GcpIotSink, MemoryOpcUaTransport,
+            MockAwsIotTransport, MockAzureIotTransport, MockGcpIotTransport,
+            MockOciStreamingTransport, NodeSubscriptionConfig, OciStreamingSink,
+            OciStreamingSinkConfig, OpcUaAuth, OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSink,
+            OpcUaSinkConfig, OpcUaVariant,
+        };
+        use rsa::pkcs8::EncodePrivateKey;
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Per-test RSA key for the OCI signature + GCP JWT legs.
+        let mut rng = rand::thread_rng();
+        let test_key = rsa::RsaPrivateKey::new(&mut rng, 1024).expect("test RSA key");
+        let test_pem = test_key
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("test PEM")
+            .to_string();
+
+        // OCI Streaming (auto-flush every row, clean mock).
+        let oci_transport = Arc::new(MockOciStreamingTransport::new());
+        let oci = Arc::new(
+            OciStreamingSink::new(
+                OciStreamingSinkConfig {
+                    endpoint:
+                        "https://cell-1.streaming.us-east-1.oci.oraclecloud.com".to_string(),
+                    stream_pool_id: "ocid1.streampool.oc1..testpool".to_string(),
+                    stream_id: "ocid1.stream.oc1..teststream".to_string(),
+                    tenancy_ocid: "ocid1.tenancy.oc1..test".to_string(),
+                    user_ocid: "ocid1.user.oc1..test".to_string(),
+                    fingerprint: "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55".to_string(),
+                    private_key_pem: test_pem.clone(),
+                    partition_key_template: "${client_id}".to_string(),
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(5),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                oci_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("oci-sink", oci.clone());
+
+        // AWS IoT Core (SigV4 dummies; the mock never signs).
+        let aws_transport = Arc::new(MockAwsIotTransport::new());
+        let aws = Arc::new(
+            AwsIotSink::new(
+                AwsIotConfig {
+                    endpoint: "abc-ats.iot.us-east-1.amazonaws.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    client_id: "e2e-bridge".to_string(),
+                    auth: AwsIotAuth::SigV4 {
+                        access_key_id: "AKID".to_string(),
+                        secret_access_key: "secret".to_string(),
+                        session_token: None,
+                    },
+                    topic_mappings: vec![BridgeTopicMapping {
+                        local_topic: "sensors/+".to_string(),
+                        remote_topic: "emqx/up".to_string(),
+                        direction: broker_connectors::BridgeDirection::LocalToRemote,
+                    }],
+                    shadow_sync: None,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(5),
+                },
+                aws_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("aws-iot-sink", aws.clone());
+
+        // Azure IoT Hub (SAS minted locally with HMAC, no network).
+        let azure_transport = Arc::new(MockAzureIotTransport::new());
+        let azure = Arc::new(
+            AzureIotSink::new(
+                AzureIotConfig {
+                    iot_hub_name: "e2e-hub".to_string(),
+                    device_id: "e2e-device".to_string(),
+                    module_id: None,
+                    auth: AzureIotAuth::SharedAccessKey {
+                        key: "c2VjcmV0".to_string(),
+                        key_name: Some("device".to_string()),
+                    },
+                    api_version: "2021-04-12".to_string(),
+                    direct_methods_enabled: false,
+                    twin_sync_enabled: false,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(5),
+                },
+                azure_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("azure-iot-sink", azure.clone());
+
+        // GCP IoT Core (RS256 JWT minted with the test key).
+        let gcp_transport = Arc::new(MockGcpIotTransport::new());
+        let gcp = Arc::new(
+            GcpIotSink::new(
+                GcpIotConfig {
+                    project_id: "e2e-project".to_string(),
+                    cloud_region: "us-central1".to_string(),
+                    registry_id: "e2e-registry".to_string(),
+                    device_id: "e2e-device".to_string(),
+                    private_key_pem: test_pem,
+                    algorithm: GcpIotAlgorithm::Rs256,
+                    token_lifetime_secs: 3_600,
+                    endpoint: "mqtt.googleapis.com:8883".to_string(),
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(5),
+                },
+                gcp_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("gcp-iot-sink", gcp.clone());
+
+        // OPC-UA (memory transport; the write leg matches a raw scalar
+        // ingress against `write_topic_pattern`, no SQL projection).
+        let opcua_transport = Arc::new(MemoryOpcUaTransport::new());
+        let opcua = Arc::new(
+            OpcUaSink::new(
+                OpcUaSinkConfig {
+                    endpoint_url: "opc.tcp://127.0.0.1:4840".to_string(),
+                    security_policy: OpcUaSecurityPolicy::None,
+                    security_mode: OpcUaSecurityMode::None,
+                    auth: OpcUaAuth::Anonymous,
+                    node_subscriptions: vec![NodeSubscriptionConfig {
+                        node_id: "ns=2;s=Setpoint".to_string(),
+                        sampling_interval_ms: 1_000,
+                        publish_topic_template: "opcua/setpoint".to_string(),
+                        write_topic_pattern: Some("factory/setpoint/+".to_string()),
+                    }],
+                    buffer_capacity: None,
+                    batch_size: Some(1),
+                    linger_ms: Some(10),
+                },
+                opcua_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("opcua-sink", opcua.clone());
+
+        // One INTO rule per IoT cloud.
+        for (id, connector) in [
+            ("oci-rule", "oci-sink"),
+            ("aws-rule", "aws-iot-sink"),
+            ("azure-rule", "azure-iot-sink"),
+            ("gcp-rule", "gcp-iot-sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+        // OPC-UA: verbatim forward, no projection (scalars only).
+        engine
+            .create_rule(
+                "opcua-rule".to_string(),
+                TopicFilter::new("factory/setpoint/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "opcua-sink".to_string(),
+                }],
+            )
+            .expect("rule creates");
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let projected = serde_json::json!({"client_id": "device-42", "temp": 22.5});
+
+        // OCI: one entry, partitioned by client_id, signed auth attached.
+        let captured = oci_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].messages.len(), 1);
+        assert_eq!(
+            base64_decode(&captured[0].messages[0].key_b64),
+            b"device-42".to_vec()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&base64_decode(
+                &captured[0].messages[0].value_b64
+            ))
+            .unwrap(),
+            projected
+        );
+        assert!(captured[0]
+            .auth
+            .authorization
+            .starts_with("Signature version=\"1\""));
+
+        // AWS IoT: one frame on the mapped remote topic.
+        let captured = aws_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].remote_topic, "emqx/up");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].payload).unwrap(),
+            projected
+        );
+
+        // Azure IoT: one D2C publish with a SAS token.
+        let captured = azure_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].topic.contains("e2e-device"));
+        assert!(captured[0]
+            .sas_token
+            .starts_with("SharedAccessSignature sr="));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].body).unwrap(),
+            projected
+        );
+
+        // GCP IoT: one telemetry publish with a JWT password.
+        let captured = gcp_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].topic.contains("e2e-device"));
+        assert_eq!(captured[0].password_token.split('.').count(), 3);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].body).unwrap(),
+            projected
+        );
+
+        // OPC-UA: raw scalar ingress becomes a typed node write.
+        engine
+            .dispatch_ingress(
+                &Topic::new("factory/setpoint/line1").unwrap(),
+                &Bytes::from_static(b"22.5"),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        let writes = opcua_transport.writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].variant, OpcUaVariant::Double(22.5));
+        assert!(format!("{:?}", writes[0].node_id).contains("Setpoint"));
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 10.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(oci_transport.captured().len(), 1);
+        assert_eq!(aws_transport.captured().len(), 1);
+        assert_eq!(azure_transport.captured().len(), 1);
+        assert_eq!(gcp_transport.captured().len(), 1);
+        assert_eq!(opcua_transport.writes().len(), 1);
+    }
+
     fn base64_decode(input: &str) -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.decode(input).unwrap()

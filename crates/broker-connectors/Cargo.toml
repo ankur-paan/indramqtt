@@ -23,6 +23,8 @@ base64 = { workspace = true }
 flate2 = { workspace = true }
 uuid = { workspace = true }
 jsonwebtoken = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
