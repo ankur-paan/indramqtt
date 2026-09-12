@@ -138,6 +138,10 @@
       <option value="mqtt_bridge">mqtt_bridge</option>
       <option value="disk_log">disk_log</option>
       <option value="sparkplug_b">sparkplug_b ★ enterprise</option>
+      <option value="kinesis">kinesis ★ enterprise</option>
+      <option value="gcp_pubsub">gcp_pubsub ★ enterprise</option>
+      <option value="azure_eventhubs">azure_eventhubs ★ enterprise</option>
+      <option value="pulsar">pulsar ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -221,6 +225,31 @@
   </div>
   <div class="row"><label>Sparkplug B config <span class="badge enterprise">enterprise</span></label>
     <input id="conn-spb-prefix" placeholder="topic prefix, e.g. spBv1.0/plant1" size="28">
+  </div>
+  <div class="row"><label>AWS Kinesis config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-kinesis-stream" placeholder="stream, e.g. telemetry-stream" size="20">
+    <input id="conn-kinesis-region" placeholder="region, e.g. us-east-1" size="14">
+    <input id="conn-kinesis-key" placeholder="access key id" size="18">
+    <input id="conn-kinesis-secret" placeholder="secret access key" type="password" size="20">
+    <input id="conn-kinesis-partition" placeholder="partition key template, e.g. ${topic}" size="24">
+  </div>
+  <div class="row"><label>GCP Pub/Sub config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-gcp-project" placeholder="project id, e.g. my-iot-project" size="20">
+    <input id="conn-gcp-topic" placeholder="topic id, e.g. telemetry-events" size="20">
+    <input id="conn-gcp-ordering" placeholder="ordering key template, e.g. ${client_id}" size="26">
+  </div>
+  <div class="row"><label>Azure Event Hubs config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-azure-ns" placeholder="namespace, e.g. my-eventhub-ns" size="20">
+    <input id="conn-azure-hub" placeholder="event hub, e.g. telemetry-hub" size="18">
+    <input id="conn-azure-keyname" placeholder="key name, e.g. SendPolicy" size="16">
+    <input id="conn-azure-key" placeholder="shared access key" type="password" size="20">
+  </div>
+  <div class="row"><label>Apache Pulsar config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-pulsar-url" placeholder="service url, e.g. pulsar://127.0.0.1:6650" size="30">
+    <input id="conn-pulsar-tenant" placeholder="tenant, e.g. public" size="12">
+    <input id="conn-pulsar-namespace" placeholder="namespace, e.g. default" size="12">
+    <input id="conn-pulsar-topic" placeholder="topic, e.g. ${topic}" size="18">
+    <input id="conn-pulsar-token" placeholder="JWT token (blank = none)" size="20">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -615,6 +644,39 @@ $("conn-add").onclick = async () => {
     config = {tier: "enterprise", batch_size: 100, linger_ms: 50};
     const prefix = $("conn-spb-prefix").value.trim();
     if (prefix !== "") config.topic_prefix = prefix;
+  } else if (kind === "kinesis") {
+    config = {stream_name: $("conn-kinesis-stream").value.trim() || "telemetry-stream",
+              region: $("conn-kinesis-region").value.trim() || "us-east-1",
+              access_key_id: $("conn-kinesis-key").value.trim(),
+              secret_access_key: $("conn-kinesis-secret").value,
+              partition_key_template: $("conn-kinesis-partition").value.trim() || "${topic}",
+              batch_size: 500, batch_bytes: 4194304, linger_ms: 20,
+              max_retries: 5, initial_backoff_ms: 100, max_backoff_ms: 3000};
+  } else if (kind === "gcp_pubsub") {
+    config = {project_id: $("conn-gcp-project").value.trim() || "my-iot-project",
+              topic_id: $("conn-gcp-topic").value.trim() || "telemetry-events",
+              auth: {type: "none"},
+              batch_size: 1000, batch_bytes: 8388608, linger_ms: 10,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
+    const ordering = $("conn-gcp-ordering").value.trim();
+    if (ordering !== "") config.ordering_key_template = ordering;
+  } else if (kind === "azure_eventhubs") {
+    config = {namespace: $("conn-azure-ns").value.trim() || "my-eventhub-ns",
+              event_hub: $("conn-azure-hub").value.trim() || "telemetry-hub",
+              shared_access_key_name: $("conn-azure-keyname").value.trim() || "SendPolicy",
+              shared_access_key: $("conn-azure-key").value,
+              token_ttl_secs: 3600,
+              batch_size: 100, batch_bytes: 1048576, linger_ms: 20,
+              max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2500};
+  } else if (kind === "pulsar") {
+    const token = $("conn-pulsar-token").value;
+    config = {service_url: $("conn-pulsar-url").value.trim() || "pulsar://127.0.0.1:6650",
+              tenant: $("conn-pulsar-tenant").value.trim() || "public",
+              namespace: $("conn-pulsar-namespace").value.trim() || "default",
+              topic: $("conn-pulsar-topic").value.trim() || "${topic}",
+              auth: token === "" ? {type: "none"} : {type: "token", token: token},
+              batch_size: 200, batch_bytes: 2097152, linger_ms: 10,
+              max_retries: 3, initial_backoff_ms: 100, max_backoff_ms: 2000};
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();

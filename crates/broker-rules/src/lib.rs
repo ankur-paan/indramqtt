@@ -3356,6 +3356,227 @@ mod tests {
         assert_eq!(spb_transport.frames().len(), 1);
     }
 
+    /// Multi-cloud e2e (INDRA-218): one ingress event routes through
+    /// streaming SQL `INTO connector(...)` rules and fans out
+    /// simultaneously to the Kinesis, GCP Pub/Sub, Azure Event Hubs
+    /// and Pulsar mocks. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_cloud_sinks() {
+        use broker_connectors::{
+            AzureEventHubsSink, AzureEventHubsSinkConfig, GcpPubSubSink, GcpPubSubSinkConfig,
+            KinesisSink, KinesisSinkConfig, MemoryPulsarTransport, MockAzureEventHubsTransport,
+            MockGcpPubSubTransport, MockKinesisTransport, PulsarSink, PulsarSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Kinesis (auto-flush every row, clean mock).
+        let kinesis_transport = Arc::new(MockKinesisTransport::new());
+        let kinesis = Arc::new(
+            KinesisSink::new(
+                KinesisSinkConfig {
+                    stream_name: "telemetry-stream".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    access_key_id: "AKID".to_string(),
+                    secret_access_key: "secret".to_string(),
+                    session_token: None,
+                    partition_key_template: Some("${client_id}".to_string()),
+                    explicit_hash_key: None,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(5),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                kinesis_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("aws-kinesis", kinesis.clone());
+
+        // GCP Pub/Sub (auto-flush every row).
+        let gcp_transport = Arc::new(MockGcpPubSubTransport::new());
+        let gcp = Arc::new(
+            GcpPubSubSink::new(
+                GcpPubSubSinkConfig {
+                    project_id: "my-iot-project".to_string(),
+                    topic_id: "telemetry-events".to_string(),
+                    endpoint: None,
+                    auth: broker_connectors::GcpAuth::None,
+                    ordering_key_template: Some("${client_id}".to_string()),
+                    attributes: HashMap::from([("source".to_string(), "indramqtt".to_string())]),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                gcp_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("gcp-pubsub", gcp.clone());
+
+        // Azure Event Hubs (auto-flush every row).
+        let azure_transport = Arc::new(MockAzureEventHubsTransport::new());
+        let azure = Arc::new(
+            AzureEventHubsSink::new(
+                AzureEventHubsSinkConfig {
+                    namespace: "my-eventhub-ns".to_string(),
+                    event_hub: "telemetry-hub".to_string(),
+                    endpoint: None,
+                    shared_access_key_name: "SendPolicy".to_string(),
+                    shared_access_key: "c2VjcmV0".to_string(),
+                    partition_key_template: Some("${client_id}".to_string()),
+                    user_properties: HashMap::new(),
+                    token_ttl_secs: 3_600,
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(20),
+                    max_retries: Some(4),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                azure_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("azure-eventhubs", azure.clone());
+
+        // Pulsar (auto-flush every row).
+        let pulsar_transport = Arc::new(MemoryPulsarTransport::new());
+        let pulsar = Arc::new(
+            PulsarSink::new(
+                PulsarSinkConfig {
+                    service_url: "pulsar://unused:6650".to_string(),
+                    tenant: "public".to_string(),
+                    namespace: "default".to_string(),
+                    topic: "${topic}".to_string(),
+                    auth: broker_connectors::PulsarAuth::None,
+                    partition_key_template: Some("${client_id}".to_string()),
+                    properties: HashMap::new(),
+                    batch_size: Some(1),
+                    batch_bytes: None,
+                    linger_ms: Some(10),
+                    max_retries: Some(3),
+                    initial_backoff_ms: Some(1),
+                    max_backoff_ms: Some(2),
+                },
+                pulsar_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("pulsar-sink", pulsar.clone());
+
+        // One INTO rule per cloud.
+        for (id, connector) in [
+            ("kinesis-rule", "aws-kinesis"),
+            ("gcp-rule", "gcp-pubsub"),
+            ("azure-rule", "azure-eventhubs"),
+            ("pulsar-rule", "pulsar-sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("sensors/+").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let projected = serde_json::json!({"client_id": "device-42", "temp": 22.5});
+
+        // Kinesis: one batch, keyed by client_id, base64 body.
+        let captured = kinesis_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].stream_name, "telemetry-stream");
+        assert_eq!(captured[0].records.len(), 1);
+        assert_eq!(captured[0].records[0].partition_key, "device-42");
+        let payload = base64_decode(&captured[0].records[0].data_b64);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            projected
+        );
+
+        // GCP: one message with ordering key + attributes.
+        let captured = gcp_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].project, "my-iot-project");
+        assert_eq!(captured[0].messages.len(), 1);
+        assert_eq!(captured[0].messages[0].ordering_key.as_deref(), Some("device-42"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &base64_decode(&captured[0].messages[0].data_b64)
+            )
+            .unwrap(),
+            projected
+        );
+
+        // Azure: one event with the partition key + SAS token.
+        let captured = azure_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].hub, "telemetry-hub");
+        assert_eq!(captured[0].events.len(), 1);
+        assert_eq!(captured[0].events[0].partition_key.as_deref(), Some("device-42"));
+        assert!(captured[0].sas_token.starts_with("SharedAccessSignature sr="));
+        let payload = base64_decode(&captured[0].events[0].body_b64);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            projected
+        );
+
+        // Pulsar: one message on the canonical topic path.
+        let captured = pulsar_transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].topic_path, "persistent://public/default/sensors.kitchen");
+        assert_eq!(captured[0].messages.len(), 1);
+        assert_eq!(captured[0].messages[0].sequence_id, 0);
+        assert_eq!(
+            captured[0].messages[0].partition_key.as_deref(),
+            Some("device-42")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&captured[0].messages[0].payload).unwrap(),
+            projected
+        );
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 10.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(kinesis_transport.captured().len(), 1);
+        assert_eq!(gcp_transport.captured().len(), 1);
+        assert_eq!(azure_transport.captured().len(), 1);
+        assert_eq!(pulsar_transport.captured().len(), 1);
+    }
+
+    fn base64_decode(input: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(input).unwrap()
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);

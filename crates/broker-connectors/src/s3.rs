@@ -18,15 +18,14 @@ use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    hms_milli_from_millis, now_millis, render_template, ymd_from_millis, BackoffState,
-    BatchQueue, ConnectorError, Result, Sink,
+    now_millis, render_template, ymd_from_millis, BackoffState, BatchQueue, ConnectorError,
+    Result, Sink,
 };
 
 /// Object body compression.
@@ -237,56 +236,6 @@ fn gzip_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 // AWS Signature Version 4 (PUT, unsigned query, signed payload).
 // ---------------------------------------------------------------------------
 
-/// HMAC-SHA256 (sha2 only, no extra dependency).
-fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = Sha256::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// SigV4 percent-encoding for canonical URIs: every byte except
-/// unreserved marks and the `/` path separator becomes `%XX`.
-fn aws_encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-fn amz_date(millis: i64) -> String {
-    let (year, month, day) = ymd_from_millis(millis);
-    let (hour, minute, second, _) = hms_milli_from_millis(millis);
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
 /// Inputs to [`sigv4_authorization`]: `PUT /<bucket>/<key>` with a
 /// signed payload hash at `millis` (UTC).
 pub struct SigV4Request<'a> {
@@ -302,34 +251,24 @@ pub struct SigV4Request<'a> {
 
 /// Build the `Authorization` header value for `PUT /<bucket>/<key>`.
 /// Public for the known-answer test; the transport calls it per flush.
+/// Delegates to the shared SigV4 core in `super`.
 pub fn sigv4_authorization(request: &SigV4Request<'_>) -> String {
-    let date = amz_date(request.millis);
-    let short_date = &date[..8];
-    let canonical_uri = aws_encode_path(&format!("/{}/{}", request.bucket, request.key));
-    let canonical_headers = format!(
-        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{date}\n",
-        request.host, request.payload_sha256_hex
-    );
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_request = format!(
-        "PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{}",
-        request.payload_sha256_hex
-    );
-    let scope = format!("{short_date}/{}/s3/aws4_request", request.region);
-    let canonical_hash = hex(&Sha256::digest(canonical_request.as_bytes()));
-    let string_to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{canonical_hash}");
-    let mut key = hmac_sha256(
-        format!("AWS4{}", request.secret_access_key).as_bytes(),
-        short_date.as_bytes(),
-    );
-    for part in [request.region, "s3", "aws4_request"] {
-        key = hmac_sha256(&key, part.as_bytes());
-    }
-    let signature = hex(&hmac_sha256(&key, string_to_sign.as_bytes()));
-    format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
-        request.access_key_id, scope
-    )
+    super::sigv4_authorization(&super::SigV4Signing {
+        method: "PUT",
+        canonical_uri: super::aws_encode_path(&format!("/{}/{}", request.bucket, request.key)),
+        canonical_query: String::new(),
+        headers: vec![
+            ("host".to_string(), request.host.to_string()),
+            ("x-amz-content-sha256".to_string(), request.payload_sha256_hex.to_string()),
+            ("x-amz-date".to_string(), super::amz_date(request.millis)),
+        ],
+        payload_hash: request.payload_sha256_hex.to_string(),
+        access_key_id: request.access_key_id,
+        secret_access_key: request.secret_access_key,
+        region: request.region,
+        service: "s3",
+        millis: request.millis,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +358,7 @@ impl HttpS3Transport {
 impl S3Transport for HttpS3Transport {
     async fn put_object(&self, put: &S3Put) -> Result<()> {
         let url = format!("{}/{}/{}", self.endpoint, put.bucket, put.key);
-        let payload_hash = hex(&Sha256::digest(&put.body));
+        let payload_hash = super::sha256_hex(&put.body);
         let mut request = self
             .client
             .put(&url)
@@ -438,7 +377,7 @@ impl S3Transport for HttpS3Transport {
                 .next()
                 .unwrap_or_default();
             let millis = now_millis();
-            let date = amz_date(millis);
+            let date = super::amz_date(millis);
             let auth = sigv4_authorization(&SigV4Request {
                 access_key_id: &self.access_key_id,
                 secret_access_key: &self.secret_access_key,

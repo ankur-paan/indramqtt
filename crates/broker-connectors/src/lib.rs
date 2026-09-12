@@ -23,6 +23,10 @@ pub mod http;
 pub mod mqtt_bridge;
 pub mod disk_log;
 pub mod sparkplug_b;
+pub mod kinesis;
+pub mod gcp_pubsub;
+pub mod azure_eventhubs;
+pub mod pulsar;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -38,6 +42,10 @@ pub use http::{CapturedHttpRequest, HmacAlgorithm, HmacEncoding, HttpAuth, HttpB
 pub use mqtt_bridge::{BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport, MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig, MqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport, decode_publish, decode_remaining_length, encode_publish, encode_remaining_length, parse_bridge_address};
 pub use disk_log::{BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink, DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter};
 pub use sparkplug_b::{MemorySparkplugTransport, SpbAnomaly, SpbDataType, SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SparkplugBConnector, SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig, SparkplugStateMachine, SparkplugTopic, SparkplugTransport, decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint, payload_from_json, payload_to_json, tier, SPARKPLUG_TIER};
+pub use kinesis::{HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse, KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport, MockKinesisOutcome, MockKinesisTransport, KINESIS_TARGET, KINESIS_CONTENT_TYPE};
+pub use gcp_pubsub::{CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport, build_jwt_assertion, parse_publish_response, render_publish_body, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL};
+pub use azure_eventhubs::{AzureEventHubsConnector, AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem, CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome, render_batch_body as render_azure_batch_body, sas_token};
+pub use pulsar::{CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport, TcpPulsarTransport, crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -73,6 +81,16 @@ pub trait Connector: Send + Sync {
 pub struct ConnectorInfo {
     pub id: String,
     pub kind: String,
+}
+
+/// Open-core tier tag for a connector kind: the four multi-cloud
+/// streaming bridges plus Sparkplug B are Enterprise; everything else
+/// is Community.
+pub fn connector_tier(kind: &str) -> &'static str {
+    match kind {
+        "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b" => "enterprise",
+        _ => "community",
+    }
 }
 
 /// Manager-side handle pairing an id with its sink.
@@ -472,6 +490,131 @@ pub(crate) fn rfc3339_millis(millis: i64) -> String {
     let (y, mo, d) = ymd_from_millis(millis);
     let (h, mi, s, ms) = hms_milli_from_millis(millis);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+}
+
+// ---------------------------------------------------------------------------
+// AWS Signature Version 4 core (shared by the S3 and Kinesis signers).
+// ---------------------------------------------------------------------------
+
+/// HMAC-SHA256 (sha2 only, no extra dependency).
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = sha2::Sha256::digest(key);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let mut inner = sha2::Sha256::new();
+    use sha2::Digest;
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = sha2::Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().to_vec()
+}
+
+/// Lowercase hex SHA-256 of `data`.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SigV4 `x-amz-date` timestamp (`YYYYMMDDTHHMMSSZ`, UTC).
+pub(crate) fn amz_date(millis: i64) -> String {
+    let (year, month, day) = ymd_from_millis(millis);
+    let (hour, minute, second, _) = hms_milli_from_millis(millis);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// SigV4 percent-encoding for canonical URIs: every byte except
+/// unreserved marks and the `/` path separator becomes `%XX`.
+pub(crate) fn aws_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Inputs to [`sigv4_authorization`]. Header names must already be
+/// lowercase; values trimmed. The signer sorts headers by name.
+pub(crate) struct SigV4Signing<'a> {
+    pub method: &'a str,
+    pub canonical_uri: String,
+    pub canonical_query: String,
+    pub headers: Vec<(String, String)>,
+    pub payload_hash: String,
+    pub access_key_id: &'a str,
+    pub secret_access_key: &'a str,
+    pub region: &'a str,
+    pub service: &'a str,
+    pub millis: i64,
+}
+
+/// Build an AWS Signature Version 4 `Authorization` header value.
+pub(crate) fn sigv4_authorization(signing: &SigV4Signing<'_>) -> String {
+    let date = amz_date(signing.millis);
+    let short_date = &date[..8];
+    let mut headers = signing.headers.clone();
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut canonical_headers = String::new();
+    let mut signed_names = Vec::with_capacity(headers.len());
+    for (name, value) in &headers {
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value.trim());
+        canonical_headers.push('\n');
+        signed_names.push(name.clone());
+    }
+    let signed_headers = signed_names.join(";");
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        signing.method,
+        signing.canonical_uri,
+        signing.canonical_query,
+        canonical_headers,
+        signed_headers,
+        signing.payload_hash
+    );
+    let scope = format!("{short_date}/{}/{}/aws4_request", signing.region, signing.service);
+    let canonical_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{canonical_hash}");
+    let mut key = hmac_sha256(
+        format!("AWS4{}", signing.secret_access_key).as_bytes(),
+        short_date.as_bytes(),
+    );
+    for part in [signing.region, signing.service, "aws4_request"] {
+        key = hmac_sha256(&key, part.as_bytes());
+    }
+    // NOTE: the signature is hex(HMAC(key, string_to_sign)) — the
+    // HMAC output is raw bytes, hexed directly (never hashed again).
+    let signature = signing_hex(&key, &string_to_sign);
+    format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
+        signing.access_key_id, scope
+    )
+}
+
+/// Hex of HMAC-SHA256(key, message): the SigV4 signature.
+fn signing_hex(key: &[u8], string_to_sign: &str) -> String {
+    hmac_sha256(key, string_to_sign.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

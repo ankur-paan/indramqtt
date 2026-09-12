@@ -21,7 +21,7 @@ edition = "2021"
 authors = ["I-Dacs Labs <measure@i-dacs.com>", "IndraMQTT Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ankur-paan/indramqtt"
-homepage = "https://i-dacs.com"
+homepage = "https://indramqtt.com"
 readme = "README.md"
 keywords = ["mqtt", "broker", "iot", "stream-processing", "distributed"]
 categories = ["network-programming", "asynchronous"]
@@ -45,6 +45,7 @@ sha1 = "0.10"
 base64 = "0.22"
 flate2 = "1.1"
 uuid = { version = "1", features = ["v4"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 reqwest = { version = "0.12", features = ["json"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -61,3 +62,9 @@ broker-connectors = { path = "crates/broker-connectors" }
 broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
 broker-observability = { path = "crates/broker-observability" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

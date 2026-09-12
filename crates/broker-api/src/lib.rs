@@ -415,7 +415,7 @@ async fn get_client(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     }
 }
 
-/// Registered connectors with kinds for the dashboard.
+/// Registered connectors with kinds and tier tags for the dashboard.
 async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<serde_json::Value>> {
     Json(
         state
@@ -423,7 +423,13 @@ async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<serde_json::V
             .connectors()
             .infos()
             .iter()
-            .map(|info| serde_json::json!({ "id": info.id, "kind": info.kind }))
+            .map(|info| {
+                serde_json::json!({
+                    "id": info.id,
+                    "kind": info.kind,
+                    "tier": broker_connectors::connector_tier(&info.kind),
+                })
+            })
             .collect(),
     )
 }
@@ -712,8 +718,75 @@ async fn build_connector(
                 Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "kinesis" | "aws_kinesis" => {
+                let config: broker_connectors::KinesisSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid kinesis config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid kinesis config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpKinesisTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid kinesis transport: {e}"))?,
+                );
+                let sink = broker_connectors::KinesisSink::new(config, transport)
+                    .map_err(|e| format!("invalid kinesis sink: {e}"))?;
+                Ok(("kinesis".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "gcp_pubsub" | "gcp" | "pubsub" => {
+                let config: broker_connectors::GcpPubSubSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid gcp_pubsub config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid gcp_pubsub config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpGcpPubSubTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid gcp_pubsub transport: {e}"))?,
+                );
+                let sink = broker_connectors::GcpPubSubSink::new(config, transport)
+                    .map_err(|e| format!("invalid gcp_pubsub sink: {e}"))?;
+                Ok(("gcp_pubsub".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "azure_eventhubs" | "azure" | "eventhubs" => {
+                let config: broker_connectors::AzureEventHubsSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid azure_eventhubs config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid azure_eventhubs config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpAzureEventHubsTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid azure_eventhubs transport: {e}"))?,
+                );
+                let sink = broker_connectors::AzureEventHubsSink::new(config, transport)
+                    .map_err(|e| format!("invalid azure_eventhubs sink: {e}"))?;
+                Ok(("azure_eventhubs".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "pulsar" => {
+                let config: broker_connectors::PulsarSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid pulsar config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid pulsar config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpPulsarTransport::new(&config)
+                        .map_err(|e| format!("invalid pulsar transport: {e}"))?,
+                );
+                let sink = broker_connectors::PulsarSink::new(config, transport)
+                    .map_err(|e| format!("invalid pulsar sink: {e}"))?;
+                Ok(("pulsar".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, or logger)"
             )),
         }
 }
@@ -1269,10 +1342,18 @@ mod tests {
             "value=\"mqtt_bridge\"",
             "value=\"disk_log\"",
             "value=\"sparkplug_b",
+            "value=\"kinesis\"",
+            "value=\"gcp_pubsub\"",
+            "value=\"azure_eventhubs\"",
+            "value=\"pulsar\"",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
             "conn-spb-prefix",
+            "conn-kinesis-stream",
+            "conn-gcp-project",
+            "conn-azure-ns",
+            "conn-pulsar-url",
             ".badge.community",
             ".badge.enterprise",
             "/ws/mqtt",
@@ -1341,7 +1422,7 @@ mod tests {
             .register("webhook-1", Arc::new(NullSink));
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!([{"id": "webhook-1", "kind": "test"}]));
+        assert_eq!(body, json!([{"id": "webhook-1", "kind": "test", "tier": "community"}]));
     }
 
     #[tokio::test]
@@ -1604,25 +1685,115 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("sparkplug_b"));
 
+        // Kinesis sink: validated without touching AWS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "kinesis-1",
+                       "kind": "kinesis",
+                       "config": {"stream_name": "telemetry-stream",
+                                  "region": "us-east-1",
+                                  "access_key_id": "AKID",
+                                  "secret_access_key": "secret",
+                                  "partition_key_template": "${topic}",
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 3,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("kinesis"));
+
+        // GCP Pub/Sub sink: validated without touching Google.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "gcp-1",
+                       "kind": "gcp_pubsub",
+                       "config": {"project_id": "my-iot-project",
+                                  "topic_id": "telemetry-events",
+                                  "auth": {"type": "none"},
+                                  "batch_size": 100,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("gcp_pubsub"));
+
+        // Azure Event Hubs sink: validated without touching Azure.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "azure-1",
+                       "kind": "azure_eventhubs",
+                       "config": {"namespace": "my-eventhub-ns",
+                                  "event_hub": "telemetry-hub",
+                                  "shared_access_key_name": "SendPolicy",
+                                  "shared_access_key": "secret",
+                                  "token_ttl_secs": 3600,
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 20,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("azure_eventhubs"));
+
+        // Pulsar sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "pulsar-1",
+                       "kind": "pulsar",
+                       "config": {"service_url": "pulsar://127.0.0.1:6650",
+                                  "tenant": "public",
+                                  "namespace": "default",
+                                  "topic": "iot-telemetry",
+                                  "auth": {"type": "none"},
+                                  "batch_size": 50,
+                                  "batch_bytes": 65536,
+                                  "linger_ms": 10,
+                                  "max_retries": 2,
+                                  "initial_backoff_ms": 10,
+                                  "max_backoff_ms": 100}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("pulsar"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
-            json!([{"id": "bridge-1", "kind": "mqtt_bridge"},
-                   {"id": "ch-sink-1", "kind": "clickhouse"},
-                   {"id": "diag", "kind": "console"},
-                   {"id": "disk-1", "kind": "disk_log"},
-                   {"id": "es-sink-1", "kind": "elasticsearch"},
-                   {"id": "hook-1", "kind": "webhook"},
-                   {"id": "influx-sink-1", "kind": "influxdb"},
-                   {"id": "kafka-sink-1", "kind": "kafka"},
-                   {"id": "mysql-sink-1", "kind": "mysql"},
-                   {"id": "pg-sink-1", "kind": "postgres"},
-                   {"id": "rabbit-sink-1", "kind": "rabbitmq"},
-                   {"id": "redis-sink-1", "kind": "redis"},
-                   {"id": "s3-sink-1", "kind": "s3"},
-                   {"id": "spb-1", "kind": "sparkplug_b"},
-                   {"id": "ts-sink-1", "kind": "timescaledb"}])
+            json!([{"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
+                   {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
+                   {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
+                   {"id": "diag", "kind": "console", "tier": "community"},
+                   {"id": "disk-1", "kind": "disk_log", "tier": "community"},
+                   {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
+                   {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
+                   {"id": "hook-1", "kind": "webhook", "tier": "community"},
+                   {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
+                   {"id": "kafka-sink-1", "kind": "kafka", "tier": "community"},
+                   {"id": "kinesis-1", "kind": "kinesis", "tier": "enterprise"},
+                   {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
+                   {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
+                   {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
+                   {"id": "rabbit-sink-1", "kind": "rabbitmq", "tier": "community"},
+                   {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
+                   {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
+                   {"id": "spb-1", "kind": "sparkplug_b", "tier": "enterprise"},
+                   {"id": "ts-sink-1", "kind": "timescaledb", "tier": "community"}])
         );
 
         // Unknown kinds and invalid configs are 400s that store nothing.
@@ -1678,13 +1849,33 @@ mod tests {
                               "format": "ndjson"}}),
             json!({"id": "bad-spb", "kind": "sparkplug_b",
                    "config": {"tier": "community"}}),
+            json!({"id": "bad-kinesis", "kind": "kinesis",
+                   "config": {"stream_name": "",
+                              "region": "us-east-1",
+                              "access_key_id": "AKID",
+                              "secret_access_key": "secret"}}),
+            json!({"id": "bad-gcp", "kind": "gcp_pubsub",
+                   "config": {"project_id": "UPPER",
+                              "topic_id": "telemetry-events",
+                              "auth": {"type": "none"}}}),
+            json!({"id": "bad-azure", "kind": "azure_eventhubs",
+                   "config": {"namespace": "my-eventhub-ns",
+                              "event_hub": "telemetry-hub",
+                              "shared_access_key_name": "",
+                              "shared_access_key": "secret"}}),
+            json!({"id": "bad-pulsar", "kind": "pulsar",
+                   "config": {"service_url": "pulsar://127.0.0.1:6650",
+                              "tenant": "public",
+                              "namespace": "default",
+                              "topic": "",
+                              "auth": {"type": "none"}}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 15);
+        assert_eq!(body.as_array().expect("list").len(), 19);
     }
 
     #[tokio::test]
