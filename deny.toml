@@ -8,7 +8,6 @@ targets = [
 
 [licenses]
 version = 2
-unlicensed = "warn"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -24,9 +23,9 @@ allow = [
 confidence-threshold = 0.8
 
 exceptions = [
-    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-core" },
-    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-sql" },
-    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-conf" },
+    { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-core" },
+    { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-sql" },
+    { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-conf" },
 ]
 
 [licenses.private]
@@ -51,3 +50,10 @@ ignore = [
 [bans]
 multiple-versions = "warn"
 highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-git = [
+    "https://github.com/ankur-paan/rekuiper.git",
+]
