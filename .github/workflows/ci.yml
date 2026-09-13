@@ -33,10 +33,29 @@ jobs:
         run: cargo check --workspace --all-targets
 
       - name: Cargo clippy (zero warnings policy)
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
+        run: cargo clippy --workspace --all-targets -- -D warnings -A unknown-lints -A clippy::chunks_exact_to_as_chunks
 
       - name: Cargo test suite
         run: cargo test --workspace --verbose
+
+  deep-soak-and-chaos:
+    name: Deep Soak, Multi-Target Sinks & Chaos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run E2E Integration Suite
+        run: cargo test -p broker-node --test e2e_integration -- --nocapture
+
+      - name: Run Deep Soak & Chaos Test Suite
+        run: cargo test -p broker-node --test soak_chaos_suite -- --nocapture
 
   beam-eunit:
     name: BEAM Network Edge (EUnit)

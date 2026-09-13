@@ -335,7 +335,7 @@ pub struct FileDiskLogWriter {
     prefix: String,
     extension: String,
     compression: DiskLogCompression,
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     next_index: parking_lot::Mutex<u64>,
 }
 
@@ -370,7 +370,7 @@ impl FileDiskLogWriter {
             prefix: config.filename_prefix.clone(),
             extension: config.filename_extension.clone(),
             compression: config.compression,
-            file: tokio::sync::Mutex::new(file),
+            file: tokio::sync::Mutex::new(Some(file)),
             next_index: parking_lot::Mutex::new(next_index),
         })
     }
@@ -400,22 +400,26 @@ fn backup_index(prefix: &str, extension: &str, name: &str) -> Option<u64> {
 impl DiskLogWriter for FileDiskLogWriter {
     async fn write_record(&self, record: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        self.file
-            .lock()
-            .await
-            .write_all(record)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("disk log write failed: {e}")))?;
+        let mut file_guard = self.file.lock().await;
+        if let Some(ref mut file) = *file_guard {
+            file.write_all(record)
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("disk log write failed: {e}")))?;
+        }
         Ok(())
     }
 
     async fn rotate(&self) -> Result<Option<String>> {
         use tokio::io::AsyncWriteExt;
-        let mut file = self.file.lock().await;
-        file.flush()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("disk log flush failed: {e}")))?;
-        drop(file);
+        let mut file_guard = self.file.lock().await;
+        if let Some(ref mut file) = *file_guard {
+            file.flush()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("disk log flush failed: {e}")))?;
+        }
+        // Take and drop file handle to release lock on Windows while keeping Mutex held
+        let _ = file_guard.take();
+
         let active = self.active_path();
         let meta = tokio::fs::metadata(&active)
             .await
@@ -428,7 +432,7 @@ impl DiskLogWriter for FileDiskLogWriter {
                 .open(&active)
                 .await
                 .map_err(|e| ConnectorError::Connection(format!("disk log reopen failed: {e}")))?;
-            *self.file.lock().await = reopened;
+            *file_guard = Some(reopened);
             return Ok(None);
         }
         let index = {
@@ -471,19 +475,21 @@ impl DiskLogWriter for FileDiskLogWriter {
             .open(&active)
             .await
             .map_err(|e| ConnectorError::Connection(format!("disk log reopen failed: {e}")))?;
-        *self.file.lock().await = reopened;
+        *file_guard = Some(reopened);
         Ok(Some(name))
     }
 
     async fn flush(&self) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let mut file = self.file.lock().await;
-        file.flush()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("disk log flush failed: {e}")))?;
-        file.sync_all()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("disk log sync failed: {e}")))?;
+        let mut file_guard = self.file.lock().await;
+        if let Some(ref mut file) = *file_guard {
+            file.flush()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("disk log flush failed: {e}")))?;
+            file.sync_all()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("disk log sync failed: {e}")))?;
+        }
         Ok(())
     }
 
