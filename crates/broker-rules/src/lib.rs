@@ -5075,4 +5075,258 @@ mod tests {
         assert_eq!(confluent_transport.records_flat().len(), 1);
         assert_eq!(rmq_transport.envelopes().len(), 1);
     }
+
+    /// Sprint 26 studio fanout (INDRA-225): one ingress event routes
+    /// through six streaming SQL `INTO connector(...)` rules and lands
+    /// simultaneously in the Oracle, CockroachDB, AlloyDB, OpenTSDB,
+    /// GreptimeDB, and Datalayers mocks. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_databases_and_timeseries_sinks() {
+        use broker_connectors::{
+            AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbSink, CockroachDbConfig,
+            CockroachDbSink, DatalayersConfig, DatalayersSink, GreptimeDbConfig, GreptimeDbSink,
+            GreptimeFormat, GreptimePrecision, MockAlloydbTransport, MockCockroachDbTransport,
+            MockDatalayersTransport, MockGreptimeDbTransport, MockOpenTsdbTransport,
+            MockOracleTransport, OpenTsdbCompression, OpenTsdbConfig, OpenTsdbProtocol,
+            OpenTsdbSink, OracleSink, OracleSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // 1. Oracle (MERGE INTO atomic upsert)
+        let oracle_transport = Arc::new(MockOracleTransport::new());
+        let oracle = Arc::new(
+            OracleSink::new(
+                OracleSinkConfig {
+                    url: "https://oracle-host:8080/ords/admin/_/sql".to_string(),
+                    schema: "ADMIN".to_string(),
+                    table: "telemetry".to_string(),
+                    username: "admin".to_string(),
+                    password: "secret".to_string(),
+                    custom_upsert: None,
+                    key_columns: vec!["device_id".to_string()],
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                oracle_transport.clone(),
+            )
+            .expect("valid oracle sink"),
+        );
+        engine.connectors().register("oracle_sink", oracle.clone());
+
+        // 2. CockroachDB (multi-row UPSERT)
+        let cockroach_transport = Arc::new(MockCockroachDbTransport::new());
+        let cockroach = Arc::new(
+            CockroachDbSink::new(
+                CockroachDbConfig {
+                    connection_string: "postgresql://root@127.0.0.1:26257/defaultdb".to_string(),
+                    table: "telemetry".to_string(),
+                    upsert_conflict_columns: vec!["device_id".to_string()],
+                    batch_size: Some(1),
+                    max_retry_attempts: 5,
+                    buffer_capacity: None,
+                },
+                cockroach_transport.clone(),
+            )
+            .expect("valid cockroach sink"),
+        );
+        engine
+            .connectors()
+            .register("cockroach_sink", cockroach.clone());
+
+        // 3. AlloyDB (accelerated multi-row INSERT)
+        let alloydb_transport = Arc::new(MockAlloydbTransport::new());
+        let alloydb = Arc::new(
+            AlloydbSink::new(
+                AlloydbConfig {
+                    host: "10.0.0.1".to_string(),
+                    port: 5432,
+                    database: "telemetry".to_string(),
+                    username: "postgres".to_string(),
+                    auth: AlloydbAuth::Password {
+                        password: "secret".to_string(),
+                    },
+                    table: "readings".to_string(),
+                    column_mappings: vec![
+                        AlloydbColumnMapping {
+                            db_column: "device_id".to_string(),
+                            source_field: "device_id".to_string(),
+                            data_type: None,
+                        },
+                        AlloydbColumnMapping {
+                            db_column: "temp".to_string(),
+                            source_field: "temp".to_string(),
+                            data_type: None,
+                        },
+                    ],
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                alloydb_transport.clone(),
+            )
+            .expect("valid alloydb sink"),
+        );
+        engine
+            .connectors()
+            .register("alloydb_sink", alloydb.clone());
+
+        // 4. OpenTSDB (HTTP PUT summary)
+        let opentsdb_transport = Arc::new(MockOpenTsdbTransport::new());
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("device".to_string(), "${payload.device_id}".to_string());
+        let opentsdb = Arc::new(
+            OpenTsdbSink::new(
+                OpenTsdbConfig {
+                    endpoint: "http://127.0.0.1:4242".to_string(),
+                    protocol: OpenTsdbProtocol::Http,
+                    metric_template: "factory.temp".to_string(),
+                    tag_mappings: tags,
+                    value_field: "temp".to_string(),
+                    summary: true,
+                    compression: OpenTsdbCompression::None,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                opentsdb_transport.clone(),
+            )
+            .expect("valid opentsdb sink"),
+        );
+        engine
+            .connectors()
+            .register("opentsdb_sink", opentsdb.clone());
+
+        // 5. GreptimeDB (SQL INSERT / Influx Line Protocol)
+        let greptimedb_transport = Arc::new(MockGreptimeDbTransport::new());
+        let greptimedb = Arc::new(
+            GreptimeDbSink::new(
+                GreptimeDbConfig {
+                    endpoint: "http://127.0.0.1:4000".to_string(),
+                    database: "public".to_string(),
+                    auth: None,
+                    format: GreptimeFormat::SqlInsert,
+                    table_template: "sensor_readings".to_string(),
+                    timestamp_precision: GreptimePrecision::Millisecond,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                greptimedb_transport.clone(),
+            )
+            .expect("valid greptimedb sink"),
+        );
+        engine
+            .connectors()
+            .register("greptimedb_sink", greptimedb.clone());
+
+        // 6. Datalayers (industrial time-series write)
+        let datalayers_transport = Arc::new(MockDatalayersTransport::new());
+        let datalayers = Arc::new(
+            DatalayersSink::new(
+                DatalayersConfig {
+                    endpoint: "http://127.0.0.1:8360".to_string(),
+                    database: "telemetry".to_string(),
+                    table: "metrics".to_string(),
+                    auth_token: Some("secret-bearer-token".to_string()),
+                    timestamp_field: None,
+                    tag_columns: vec!["device_id".to_string()],
+                    field_columns: vec!["temp".to_string()],
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                datalayers_transport.clone(),
+            )
+            .expect("valid datalayers sink"),
+        );
+        engine
+            .connectors()
+            .register("datalayers_sink", datalayers.clone());
+
+        // Six INTO rules routing to the six database & TS sinks
+        for (id, connector) in [
+            ("oracle-rule", "oracle_sink"),
+            ("cockroach-rule", "cockroach_sink"),
+            ("alloydb-rule", "alloydb_sink"),
+            ("opentsdb-rule", "opentsdb_sink"),
+            ("greptimedb-rule", "greptimedb_sink"),
+            ("datalayers-rule", "datalayers_sink"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("factory/+/telemetry").unwrap(),
+                    Some(format!(
+                        r#"SELECT device_id, temp FROM "factory/+/telemetry" WHERE temp > 50.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+
+        // Ingress above threshold: temp = 68.5 > 50.0
+        engine
+            .dispatch_ingress(
+                &Topic::new("factory/line1/telemetry").unwrap(),
+                &Bytes::from_static(br#"{ "device_id": "sensor-01", "temp": 68.5 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // Verify executions inside isolated block so all MutexGuards drop before next await
+        {
+            let ora_execs = oracle_transport.executions.lock();
+            assert_eq!(ora_execs.len(), 1);
+            assert!(ora_execs[0].statement.contains("MERGE INTO telemetry"));
+
+            let crdb_execs = cockroach_transport.executions.lock();
+            assert_eq!(crdb_execs.len(), 1);
+            assert!(
+                crdb_execs[0].query.contains("INTO telemetry")
+                    && crdb_execs[0]
+                        .query
+                        .contains("ON CONFLICT (device_id) DO UPDATE SET")
+            );
+
+            let alloy_execs = alloydb_transport.executions.lock();
+            assert_eq!(alloy_execs.len(), 1);
+            assert!(alloy_execs[0].query.contains("INSERT INTO readings"));
+
+            let opentsdb_pts = opentsdb_transport.captured_points.lock();
+            assert_eq!(opentsdb_pts.len(), 1);
+            assert_eq!(opentsdb_pts[0].metric, "factory.temp");
+            assert_eq!(opentsdb_pts[0].value, 68.5);
+
+            let grep_sqls = greptimedb_transport.captured_sqls.lock();
+            assert_eq!(grep_sqls.len(), 1);
+            assert!(grep_sqls[0].contains("INSERT INTO sensor_readings"));
+
+            let dl_reqs = datalayers_transport.captured_requests.lock();
+            assert_eq!(dl_reqs.len(), 1);
+            assert_eq!(dl_reqs[0].table, "metrics");
+            assert_eq!(dl_reqs[0].records.len(), 1);
+            assert_eq!(
+                dl_reqs[0].records[0].tags.get("device_id").unwrap(),
+                "sensor-01"
+            );
+        }
+
+        // Ingress below threshold: temp = 32.0 <= 50.0 -> no actions should fire
+        engine
+            .dispatch_ingress(
+                &Topic::new("factory/line1/telemetry").unwrap(),
+                &Bytes::from_static(br#"{ "device_id": "sensor-01", "temp": 32.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        assert_eq!(oracle_transport.executions.lock().len(), 1);
+        assert_eq!(cockroach_transport.executions.lock().len(), 1);
+        assert_eq!(alloydb_transport.executions.lock().len(), 1);
+        assert_eq!(opentsdb_transport.captured_points.lock().len(), 1);
+        assert_eq!(greptimedb_transport.captured_sqls.lock().len(), 1);
+        assert_eq!(datalayers_transport.captured_requests.lock().len(), 1);
+    }
 }

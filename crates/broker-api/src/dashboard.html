@@ -165,6 +165,12 @@
       <option value="doris">doris ★ enterprise</option>
       <option value="bigquery">bigquery ★ enterprise</option>
       <option value="redshift">redshift ★ enterprise</option>
+      <option value="oracle">oracle ★ enterprise</option>
+      <option value="cockroachdb">cockroachdb ★ enterprise</option>
+      <option value="alloydb">alloydb ★ enterprise</option>
+      <option value="opentsdb">opentsdb</option>
+      <option value="greptimedb">greptimedb</option>
+      <option value="datalayers">datalayers ★ enterprise</option>
       <option value="logger">logger</option>
     </select>
   </div>
@@ -437,6 +443,50 @@
     <input id="conn-rs-region" placeholder="region, e.g. us-east-1" size="12">
     <input id="conn-rs-key" placeholder="access key id" size="16">
     <input id="conn-rs-secret" placeholder="secret access key" type="password" size="18">
+  </div>
+  <div class="row"><label>Oracle config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-ora-url" placeholder="ORDS url, e.g. https://127.0.0.1:8080/ords/admin/_/sql" size="34">
+    <input id="conn-ora-table" placeholder="table, e.g. telemetry" size="14">
+    <input id="conn-ora-user" placeholder="username" size="12">
+    <input id="conn-ora-pass" placeholder="password" type="password" size="14">
+    <input id="conn-ora-keys" placeholder="key columns, e.g. device_id" size="20">
+  </div>
+  <div class="row"><label>CockroachDB config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-crdb-url" placeholder="connection string, e.g. postgresql://root@127.0.0.1:26257/defaultdb" size="36">
+    <input id="conn-crdb-table" placeholder="table, e.g. telemetry" size="14">
+    <input id="conn-crdb-keys" placeholder="upsert conflict columns, e.g. device_id" size="26">
+  </div>
+  <div class="row"><label>AlloyDB config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-alloy-host" placeholder="host, e.g. 10.0.0.1" size="16">
+    <input id="conn-alloy-port" placeholder="port, e.g. 5432" size="8" value="5432">
+    <input id="conn-alloy-db" placeholder="database, e.g. telemetry" size="14">
+    <input id="conn-alloy-user" placeholder="username, e.g. postgres" size="14">
+    <input id="conn-alloy-table" placeholder="table, e.g. readings" size="14">
+    <input id="conn-alloy-token" placeholder="IAM token / password" type="password" size="20">
+  </div>
+  <div class="row"><label>OpenTSDB config <span class="badge community">community</span></label>
+    <input id="conn-otsdb-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:4242" size="28">
+    <input id="conn-otsdb-metric" placeholder="metric template, e.g. sensor.temp" size="22">
+    <input id="conn-otsdb-value" placeholder="value field, e.g. value" size="14">
+    <select id="conn-otsdb-proto">
+      <option value="http">http</option>
+      <option value="telnet">telnet</option>
+    </select>
+  </div>
+  <div class="row"><label>GreptimeDB config <span class="badge community">community</span></label>
+    <input id="conn-grep-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:4000" size="28">
+    <input id="conn-grep-db" placeholder="database, e.g. public" size="12" value="public">
+    <input id="conn-grep-table" placeholder="table template, e.g. sensor_readings" size="22">
+    <select id="conn-grep-format">
+      <option value="sql">sql</option>
+      <option value="influx">influx</option>
+    </select>
+  </div>
+  <div class="row"><label>Datalayers config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-dl-endpoint" placeholder="endpoint, e.g. http://127.0.0.1:8360" size="28">
+    <input id="conn-dl-db" placeholder="database, e.g. telemetry" size="14">
+    <input id="conn-dl-table" placeholder="table, e.g. metrics" size="14">
+    <input id="conn-dl-token" placeholder="Bearer auth token" type="password" size="18">
   </div>
   <div class="row"><label>Redis config</label>
     <input id="conn-redis-endpoint" placeholder="endpoint, e.g. redis://127.0.0.1:6379" size="30">
@@ -1083,6 +1133,66 @@ $("conn-add").onclick = async () => {
               max_retries: 4, initial_backoff_ms: 100, max_backoff_ms: 2500};
     if (cluster.startsWith("cluster:")) config.cluster_identifier = cluster.slice(8);
     else config.workgroup_name = cluster || "iot-workgroup";
+  } else if (kind === "oracle") {
+    const keys = ($("conn-ora-keys").value.trim() || "device_id").split(",").map(s => s.trim()).filter(Boolean);
+    config = {
+      url: $("conn-ora-url").value.trim() || "https://127.0.0.1:8080/ords/admin/_/sql",
+      schema: "ADMIN",
+      table: $("conn-ora-table").value.trim() || "telemetry",
+      username: $("conn-ora-user").value.trim() || "admin",
+      password: $("conn-ora-pass").value,
+      key_columns: keys,
+      batch_size: 500
+    };
+  } else if (kind === "cockroachdb") {
+    const conflict = ($("conn-crdb-keys").value.trim() || "device_id").split(",").map(s => s.trim()).filter(Boolean);
+    config = {
+      connection_string: $("conn-crdb-url").value.trim() || "postgresql://root@127.0.0.1:26257/defaultdb",
+      table: $("conn-crdb-table").value.trim() || "telemetry",
+      upsert_conflict_columns: conflict,
+      batch_size: 500,
+      max_retry_attempts: 5
+    };
+  } else if (kind === "alloydb") {
+    const token = $("conn-alloy-token").value;
+    config = {
+      host: $("conn-alloy-host").value.trim() || "127.0.0.1",
+      port: parseInt($("conn-alloy-port").value.trim() || "5432", 10),
+      database: $("conn-alloy-db").value.trim() || "telemetry",
+      username: $("conn-alloy-user").value.trim() || "postgres",
+      auth: token.startsWith("ya29.") ? {type: "iam_token", token: token} : {type: "password", password: token},
+      table: $("conn-alloy-table").value.trim() || "readings",
+      batch_size: 1000
+    };
+  } else if (kind === "opentsdb") {
+    config = {
+      endpoint: $("conn-otsdb-endpoint").value.trim() || "http://127.0.0.1:4242",
+      protocol: $("conn-otsdb-proto").value,
+      metric_template: $("conn-otsdb-metric").value.trim() || "sensor.temp",
+      tag_mappings: {},
+      value_field: $("conn-otsdb-value").value.trim() || "value",
+      summary: true,
+      compression: "none",
+      batch_size: 1000
+    };
+  } else if (kind === "greptimedb") {
+    config = {
+      endpoint: $("conn-grep-endpoint").value.trim() || "http://127.0.0.1:4000",
+      database: $("conn-grep-db").value.trim() || "public",
+      format: $("conn-grep-format").value,
+      table_template: $("conn-grep-table").value.trim() || "sensor_readings",
+      timestamp_precision: "millisecond",
+      batch_size: 1000
+    };
+  } else if (kind === "datalayers") {
+    const token = $("conn-dl-token").value.trim();
+    config = {
+      endpoint: $("conn-dl-endpoint").value.trim() || "http://127.0.0.1:8360",
+      database: $("conn-dl-db").value.trim() || "telemetry",
+      table: $("conn-dl-table").value.trim() || "metrics",
+      auth_token: token !== "" ? token : null,
+      batch_size: 500
+    };
   } else if (kind === "redis") {
     const cmd = $("conn-redis-cmd").value, key = $("conn-redis-key").value.trim(),
           extra = $("conn-redis-extra").value.trim();

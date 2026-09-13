@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod alloydb;
 pub mod aws_iot;
 pub mod azure_blob;
 pub mod azure_eventhubs;
@@ -19,15 +20,18 @@ pub mod azure_iot;
 pub mod bigquery;
 pub mod cassandra;
 pub mod clickhouse;
+pub mod cockroachdb;
 pub mod confluent;
 pub mod couchbase;
 pub mod databricks;
+pub mod datalayers;
 pub mod disk_log;
 pub mod doris;
 pub mod dynamodb;
 pub mod elasticsearch;
 pub mod gcp_iot;
 pub mod gcp_pubsub;
+pub mod greptimedb;
 pub mod http;
 pub mod influxdb;
 pub mod iotdb;
@@ -39,6 +43,8 @@ pub mod mssql;
 pub mod mysql;
 pub mod oci_streaming;
 pub mod opc_ua;
+pub mod opentsdb;
+pub mod oracle;
 pub mod postgres;
 pub mod pulsar;
 pub mod rabbitmq;
@@ -54,6 +60,12 @@ pub mod tdengine;
 pub mod timescaledb;
 pub mod timestream;
 
+pub use alloydb::{
+    build_alloydb_insert_query, classify_alloydb_error, extract_alloydb_row, AlloydbAuth,
+    AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
+    AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
+    CapturedAlloydbExecution, MockAlloydbTransport, TcpAlloydbTransport,
+};
 pub use aws_iot::{
     shadow_update_document, sign_websocket_url, AwsIotAuth, AwsIotConfig, AwsIotConnector,
     AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping,
@@ -88,6 +100,12 @@ pub use cassandra::{
     CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport,
 };
 pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
+pub use cockroachdb::{
+    build_native_upsert_query, build_on_conflict_upsert_query, classify_cockroach_sqlstate,
+    extract_cockroach_row, CapturedCockroachExecution, CockroachDbConfig, CockroachDbConnector,
+    CockroachDbSink, CockroachDbTransport, CockroachErrorClassification, CockroachQueryResult,
+    CockroachRow, CockroachValue, MockCockroachDbTransport, TcpCockroachDbTransport,
+};
 pub use confluent::{
     classify_kafka_error, frame_schema_registry, parse_scram_server_first,
     resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template,
@@ -109,6 +127,11 @@ pub use databricks::{
     parse_statement_state, render_statement_body, CapturedDatabricksStatement, DatabricksConnector,
     DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport,
     HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState,
+};
+pub use datalayers::{
+    extract_datalayers_record, extract_microsecond_timestamp, DatalayersConfig,
+    DatalayersConnector, DatalayersRecord, DatalayersSink, DatalayersTransport,
+    DatalayersWriteRequest, HttpDatalayersTransport, MockDatalayersTransport,
 };
 pub use disk_log::{
     BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink,
@@ -143,6 +166,12 @@ pub use gcp_pubsub::{
     GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport,
     GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport,
     GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
+};
+pub use greptimedb::{
+    build_greptime_sql_insert, build_influx_line_protocol, extract_greptime_record,
+    resolve_table_name as resolve_greptime_table, GreptimeDbAuth, GreptimeDbConfig,
+    GreptimeDbConnector, GreptimeDbSink, GreptimeDbTransport, GreptimeFormat, GreptimePrecision,
+    GreptimeRecord, GreptimeValue, HttpGreptimeDbTransport, MockGreptimeDbTransport,
 };
 pub use http::{
     CapturedHttpRequest, HmacAlgorithm, HmacEncoding, HttpAuth, HttpBodyFormat, HttpConnector,
@@ -198,6 +227,18 @@ pub use opc_ua::{
     OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode,
     OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport,
     OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
+};
+pub use opentsdb::{
+    extract_opentsdb_point, sanitize_opentsdb_string, serialize_telnet_lines,
+    MockOpenTsdbTransport, NetworkOpenTsdbTransport, OpenTsdbCompression, OpenTsdbConfig,
+    OpenTsdbConnector, OpenTsdbDataPoint, OpenTsdbProtocol, OpenTsdbSink, OpenTsdbSummaryResponse,
+    OpenTsdbTransport,
+};
+pub use oracle::{
+    build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
+    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OracleBindParam,
+    OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig, OracleTransport,
+    OracleValue,
 };
 pub use postgres::{
     MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport,
@@ -329,7 +370,8 @@ pub fn connector_tier(kind: &str) -> &'static str {
         | "mssql" | "cassandra" | "couchbase" | "tdengine" | "iotdb" | "timestream"
         | "dynamodb" | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
         | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua" | "azure_blob"
-        | "tablestore" | "s3_tables" | "confluent" | "rocketmq" => "enterprise",
+        | "tablestore" | "s3_tables" | "confluent" | "rocketmq" | "oracle" | "cockroachdb"
+        | "alloydb" | "datalayers" => "enterprise",
         _ => "community",
     }
 }

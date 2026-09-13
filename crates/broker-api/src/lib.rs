@@ -1156,8 +1156,98 @@ async fn build_connector(
                 Ok(("redshift".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "oracle" | "oracle_db" | "ords" => {
+                let config: broker_connectors::OracleSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid oracle config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid oracle config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpOracleTransport::new(&config),
+                );
+                let sink = broker_connectors::OracleSink::new(config, transport)
+                    .map_err(|e| format!("invalid oracle sink: {e}"))?;
+                Ok(("oracle".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "cockroachdb" | "cockroach" | "crdb" => {
+                let config: broker_connectors::CockroachDbConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid cockroachdb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid cockroachdb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpCockroachDbTransport::new(&config),
+                );
+                let sink = broker_connectors::CockroachDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid cockroachdb sink: {e}"))?;
+                Ok(("cockroachdb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "alloydb" | "google_alloydb" | "alloy_db" => {
+                let config: broker_connectors::AlloydbConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid alloydb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid alloydb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpAlloydbTransport::new(&config),
+                );
+                let sink = broker_connectors::AlloydbSink::new(config, transport)
+                    .map_err(|e| format!("invalid alloydb sink: {e}"))?;
+                Ok(("alloydb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "opentsdb" | "open_tsdb" | "tsdb" => {
+                let config: broker_connectors::OpenTsdbConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid opentsdb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid opentsdb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::NetworkOpenTsdbTransport::new(&config),
+                );
+                let sink = broker_connectors::OpenTsdbSink::new(config, transport)
+                    .map_err(|e| format!("invalid opentsdb sink: {e}"))?;
+                Ok(("opentsdb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "greptimedb" | "greptime" | "greptime_db" => {
+                let config: broker_connectors::GreptimeDbConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid greptimedb config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid greptimedb config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpGreptimeDbTransport::new(&config),
+                );
+                let sink = broker_connectors::GreptimeDbSink::new(config, transport)
+                    .map_err(|e| format!("invalid greptimedb sink: {e}"))?;
+                Ok(("greptimedb".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "datalayers" | "data_layers" | "datalayers_db" => {
+                let config: broker_connectors::DatalayersConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid datalayers config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid datalayers config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpDatalayersTransport::new(&config),
+                );
+                let sink = broker_connectors::DatalayersSink::new(config, transport)
+                    .map_err(|e| format!("invalid datalayers sink: {e}"))?;
+                Ok(("datalayers".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             other => Err(format!(
-                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, tdengine, iotdb, timestream, dynamodb, snowflake, databricks, doris, bigquery, redshift, or logger)"
+                "unknown connector kind {other:?} (expected kafka, rabbitmq, postgres, redis, mysql, clickhouse, influxdb, s3, elasticsearch, timescaledb, webhook, mqtt_bridge, disk_log, sparkplug_b, kinesis, gcp_pubsub, azure_eventhubs, pulsar, mongodb, mssql, cassandra, couchbase, tdengine, iotdb, timestream, dynamodb, snowflake, databricks, doris, bigquery, redshift, oracle, cockroachdb, alloydb, opentsdb, greptimedb, datalayers, or logger)"
             )),
         }
 }
@@ -1741,11 +1831,23 @@ mod tests {
             "value=\"s3_tables\"",
             "value=\"confluent\"",
             "value=\"rocketmq\"",
+            "value=\"oracle\"",
+            "value=\"cockroachdb\"",
+            "value=\"alloydb\"",
+            "value=\"opentsdb\"",
+            "value=\"greptimedb\"",
+            "value=\"datalayers\"",
             "conn-azblob-account",
             "conn-ots-endpoint",
             "conn-s3t-arn",
             "conn-cfl-servers",
             "conn-rmq-endpoints",
+            "conn-ora-url",
+            "conn-crdb-url",
+            "conn-alloy-host",
+            "conn-otsdb-endpoint",
+            "conn-grep-endpoint",
+            "conn-dl-endpoint",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
@@ -2710,11 +2812,115 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("rocketmq"));
 
+        // Oracle sink: validated without touching ORDS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "oracle-1",
+                       "kind": "oracle",
+                       "config": {"url": "https://oracle-host:8080/ords/admin/_/sql",
+                                  "schema": "ADMIN",
+                                  "table": "telemetry",
+                                  "username": "admin",
+                                  "password": "secret",
+                                  "key_columns": ["device_id"],
+                                  "batch_size": 500}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("oracle"));
+
+        // CockroachDB sink: validated without touching CockroachDB.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "cockroach-1",
+                       "kind": "cockroachdb",
+                       "config": {"connection_string": "postgresql://root@127.0.0.1:26257/defaultdb",
+                                  "table": "telemetry",
+                                  "upsert_conflict_columns": ["device_id"],
+                                  "batch_size": 500,
+                                  "max_retry_attempts": 5}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("cockroachdb"));
+
+        // AlloyDB sink: validated without touching AlloyDB.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "alloydb-1",
+                       "kind": "alloydb",
+                       "config": {"host": "10.0.0.1",
+                                  "port": 5432,
+                                  "database": "telemetry",
+                                  "username": "postgres",
+                                  "auth": {"type": "password", "password": "secret"},
+                                  "table": "readings",
+                                  "batch_size": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("alloydb"));
+
+        // OpenTSDB sink: validated without touching OpenTSDB.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "opentsdb-1",
+                       "kind": "opentsdb",
+                       "config": {"endpoint": "http://127.0.0.1:4242",
+                                  "protocol": "http",
+                                  "metric_template": "sensor.temp",
+                                  "value_field": "value",
+                                  "summary": true,
+                                  "compression": "none",
+                                  "batch_size": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("opentsdb"));
+
+        // GreptimeDB sink: validated without touching GreptimeDB.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "greptimedb-1",
+                       "kind": "greptimedb",
+                       "config": {"endpoint": "http://127.0.0.1:4000",
+                                  "database": "public",
+                                  "format": "sql_insert",
+                                  "table_template": "sensor_readings",
+                                  "timestamp_precision": "millisecond",
+                                  "batch_size": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("greptimedb"));
+
+        // Datalayers sink: validated without touching Datalayers.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "datalayers-1",
+                       "kind": "datalayers",
+                       "config": {"endpoint": "http://127.0.0.1:8360",
+                                  "database": "telemetry",
+                                  "table": "metrics",
+                                  "auth_token": "secret-token",
+                                  "batch_size": 500}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("datalayers"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
-            json!([{"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
+            json!([{"id": "alloydb-1", "kind": "alloydb", "tier": "enterprise"},
+                    {"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
                     {"id": "azblob-1", "kind": "azure_blob", "tier": "enterprise"},
                     {"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
                     {"id": "azure-iot-1", "kind": "azure_iot", "tier": "enterprise"},
@@ -2722,9 +2928,11 @@ mod tests {
                    {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
                    {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
                     {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
+                    {"id": "cockroach-1", "kind": "cockroachdb", "tier": "enterprise"},
                     {"id": "confluent-1", "kind": "confluent", "tier": "enterprise"},
                    {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
                    {"id": "databricks-1", "kind": "databricks", "tier": "enterprise"},
+                   {"id": "datalayers-1", "kind": "datalayers", "tier": "enterprise"},
                    {"id": "diag", "kind": "console", "tier": "community"},
                    {"id": "disk-1", "kind": "disk_log", "tier": "community"},
                    {"id": "doris-1", "kind": "doris", "tier": "enterprise"},
@@ -2732,6 +2940,7 @@ mod tests {
                    {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
                     {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
                     {"id": "gcp-iot-1", "kind": "gcp_iot", "tier": "enterprise"},
+                    {"id": "greptimedb-1", "kind": "greptimedb", "tier": "community"},
                    {"id": "hook-1", "kind": "webhook", "tier": "community"},
                    {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
                    {"id": "iotdb-1", "kind": "iotdb", "tier": "enterprise"},
@@ -2742,6 +2951,8 @@ mod tests {
                     {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
                     {"id": "oci-1", "kind": "oci_streaming", "tier": "enterprise"},
                      {"id": "opcua-1", "kind": "opc_ua", "tier": "enterprise"},
+                     {"id": "opentsdb-1", "kind": "opentsdb", "tier": "community"},
+                     {"id": "oracle-1", "kind": "oracle", "tier": "enterprise"},
                      {"id": "ots-1", "kind": "tablestore", "tier": "enterprise"},
                     {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
                    {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
@@ -2932,13 +3143,41 @@ mod tests {
             json!({"id": "bad-rmq", "kind": "rocketmq",
                    "config": {"endpoints": ["127.0.0.1:8081"],
                               "topic": ""}}),
+            json!({"id": "bad-ora", "kind": "oracle",
+                   "config": {"url": "https://oracle-host:8080/ords/admin/_/sql",
+                              "schema": "",
+                              "table": "telemetry",
+                              "username": "admin",
+                              "password": "secret",
+                              "key_columns": ["device_id"]}}),
+            json!({"id": "bad-crdb", "kind": "cockroachdb",
+                   "config": {"connection_string": "postgresql://root@127.0.0.1:26257/defaultdb",
+                              "table": "",
+                              "upsert_conflict_columns": ["device_id"]}}),
+            json!({"id": "bad-alloy", "kind": "alloydb",
+                   "config": {"host": "",
+                              "database": "telemetry",
+                              "username": "postgres",
+                              "table": "readings"}}),
+            json!({"id": "bad-opentsdb", "kind": "opentsdb",
+                   "config": {"endpoint": "",
+                              "metric_template": "sensor.temp",
+                              "value_field": "value"}}),
+            json!({"id": "bad-greptimedb", "kind": "greptimedb",
+                   "config": {"endpoint": "http://127.0.0.1:4000",
+                              "database": "",
+                              "table_template": "sensor_readings"}}),
+            json!({"id": "bad-datalayers", "kind": "datalayers",
+                   "config": {"endpoint": "",
+                              "database": "telemetry",
+                              "table": "metrics"}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 42);
+        assert_eq!(body.as_array().expect("list").len(), 48);
     }
 
     #[tokio::test]
