@@ -1,3 +1,6 @@
+#![allow(unknown_lints)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;

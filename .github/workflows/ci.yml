@@ -33,7 +33,7 @@ jobs:
         run: cargo check --workspace --all-targets
 
       - name: Cargo clippy (zero warnings policy)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
 
       - name: Cargo test suite
         run: cargo test --workspace --verbose

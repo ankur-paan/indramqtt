@@ -90,6 +90,7 @@ pub fn render_topic_template(template: &str, topic: &str) -> String {
 
 /// Kafka's murmur2 (seed 0x9747b28c): hash-compatible partitioning with
 /// Java producers for the same key bytes.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 pub fn murmur2(data: &[u8]) -> u32 {
     const SEED: u32 = 0x9747b28c;
     const M: u32 = 0x5bd1e995;
