@@ -35,7 +35,7 @@ jobs:
             binary_path: target/aarch64-apple-darwin/release/broker-node
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
