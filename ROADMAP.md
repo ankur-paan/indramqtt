@@ -2,7 +2,7 @@
 
 **IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is on a mission to build the world's most concurrent, low-latency, and extensible distributed MQTT and stream processing platform.
 
-This roadmap outlines our completed milestones, active sprint, and future capabilities.
+This roadmap outlines our completed milestones, active capabilities, and future platform vision.
 
 ---
 
@@ -23,59 +23,57 @@ gantt
     section Stream Engine
     rekuiper Scalar Functions (Sprint 16)    :done, 2026-08, 2026-08
     Stateful Window Operators (Sprint 16)    :done, 2026-08, 2026-08
-    section Enterprise Sinks
+    section 48 Enterprise Sinks
     Kafka & RabbitMQ (Sprint 14)             :done, 2026-07, 2026-08
     PostgreSQL & Redis (Sprint 15)           :done, 2026-08, 2026-08
     MySQL, ClickHouse, InfluxDB (Sprint 17)  :done, 2026-08, 2026-09
     S3, Elasticsearch, TimescaleDB (Sprint 18):done, 2026-09, 2026-09
     Webhook, MQTT Bridge, Disk Log, Sparkplug B (Sprint 19):done, 2026-09, 2026-09
-    Hyperscaler Cloud Streaming (Sprint 20)  :active, 2026-09, 2026-10
-    AI & Model Context Protocol (Sprint 21)  : 2026-10, 2026-11
+    Hyperscaler Cloud Streaming (Sprint 20)  :done, 2026-09, 2026-09
+    Enterprise NoSQL & Relational (Sprint 21):done, 2026-09, 2026-09
+    Time-Series & Industrial (Sprint 22)     :done, 2026-09, 2026-09
+    Cloud Lakehouse & Warehouse (Sprint 23)  :done, 2026-09, 2026-09
+    Edge Industrial & IoT Hubs (Sprint 24)   :done, 2026-09, 2026-09
+    Storage Formats & Managed Stream (Sprint 25):done, 2026-09, 2026-09
+    Distributed Relational & TS Sinks (Sprint 26):done, 2026-09, 2026-09
+    section Enterprise Clustering
+    SWIM Gossip Membership & Failure Detector:done, 2026-09, 2026-10
 ```
 
 ---
 
-## 2. Active Engineering Focus: Sprint 20
+## 2. Completed Enterprise Sink Suite (All 48 Non-AI Connectors)
 
-### Hyperscaler Cloud Streaming & Enterprise Pub/Sub
-- [ ] **INDRA-197: Amazon Kinesis Data Streams Sink** (`crates/broker-connectors/src/kinesis.rs`)
-  - `PutRecords` batch ingestion, SigV4 signing, partition key derivation, partial-failure backoff retry.
-- [ ] **INDRA-199: Google Cloud Pub/Sub Sink** (`crates/broker-connectors/src/gcp_pubsub.rs`)
-  - `publish` batch API, ordering keys, dynamic attributes, OAuth2/JWT token signing.
-- [ ] **INDRA-198: Azure Event Hubs Sink** (`crates/broker-connectors/src/azure_eventhubs.rs`)
-  - REST/AMQP batch ingestion, Shared Access Signature (SAS) token generation, partition hashing.
-- [ ] **INDRA-153: Apache Pulsar Producer Sink** (`crates/broker-connectors/src/pulsar.rs`)
-  - Multi-tenancy (`tenant/namespace/topic`), keyed partition routing, monotonic sequence tracking.
-- [ ] **INDRA-218: Cloud Streaming Studio** (`crates/broker-api` & `crates/broker-rules`)
-  - REST registration, Web Dashboard management forms, and multi-cloud SQL `INTO` fanout.
+- [x] **Message Streaming (6/6)**: Apache Kafka, RabbitMQ, Confluent Cloud, Apache Pulsar, Apache RocketMQ, Remote MQTT Broker.
+- [x] **Relational & Key-Value (10/10)**: PostgreSQL, MySQL, Redis, MongoDB, Microsoft SQL Server, Oracle Database, Apache Cassandra, Couchbase, CockroachDB, Google AlloyDB.
+- [x] **Time-Series & Industrial (9/9)**: TimescaleDB, InfluxDB, TDengine, Apache IoTDB, OpenTSDB, GreptimeDB, Datalayers, Amazon Timestream, Amazon DynamoDB.
+- [x] **Data Analytics & Warehousing (7/7)**: ClickHouse, Snowflake, Databricks, Elasticsearch/OpenSearch, Apache Doris, Google BigQuery, Amazon Redshift.
+- [x] **Object Storage & Lakehouse (4/4)**: Amazon S3, Azure Blob Storage, Alibaba Tablestore, S3 Tables (Apache Iceberg).
+- [x] **Cloud IoT Platforms & Industrial Edge (11/11)**: HTTP Webhook, AWS IoT Core, Azure IoT Hub, Google Cloud IoT, Oracle Cloud (OCI), Amazon Kinesis, Azure Event Hubs, GCP Pub/Sub, Sparkplug B, OPC-UA Bridge, Local Rotating Disk Log.
+- [x] **Embedded Web Dashboard SPA & SQL Studio**: Live management console, metric delta visualizer, 48 connector configuration cards with Enterprise/Community tier badges, and WebSocket console.
 
 ---
 
-## 3. Upcoming Milestones
+## 3. Completed Enterprise Clustering & Decentralized Mesh
 
-### Sprint 21: AI, LLM & Model Context Protocol (MCP) Suite
-* **INDRA-141: OpenAI Sink**: Streaming completions and tool calling over MQTT; prompt templates hydrated by streaming SQL events.
-* **INDRA-142: Anthropic Claude Sink**: Claude Messages API integration with batched inference triggers from IoT event streams.
-* **INDRA-143: Google Gemini Sink**: Gemini multimodal & structured JSON output connector using REST/gRPC API.
-* **INDRA-144: Model Context Protocol (MCP) Bridge**: MCP client bridge allowing LLM agents to inspect broker state and invoke tools.
-* **INDRA-145: MCP over MQTT**: Protocol adapter transporting JSON-RPC MCP messages natively across MQTT topic hierarchies.
+- [x] **SWIM Gossip Failure Detector (`crates/broker-cluster/src/swim.rs`)**:
+  - Direct probe (`Ping` -> `Ack`) with indirect fallback (`PingReq` via $k$ peers).
+  - Suspicion lifecycle (`Alive` -> `Suspect` -> `Dead`) with configurable timeouts.
+  - Incarnation numbers with automatic self-refutation of false suspicions.
+  - Piggybacked gossip dissemination on ping/ack envelopes.
+  - Automatic purging of dead node topic filter routes from `ClusterRouteTable`.
+  - Cryptographic Ed25519 cluster license evaluation and node quota enforcement.
+  - Multi-node in-process channel transport (`ChannelSwimTransport`) and UDP network transport (`UdpSwimTransport`).
+- [x] **Broker Node Runtime Wiring (`crates/broker-node/src/main.rs`)**:
+  - `--cluster-seeds <addr>` and `--cluster-bind <addr>` CLI flags.
+  - Dynamic discovery and mesh bootstrapping.
 
-### Sprint 22: Enterprise Document & NoSQL Sinks
-* **INDRA-164: MongoDB Sink**: BSON document insert/update targeting collections derived from topic patterns.
-* **INDRA-179: Amazon DynamoDB Sink**: Low-latency NoSQL document put-item / batch-write sink with TTL attributes.
-* **INDRA-167: Apache Cassandra Sink**: CQL binary protocol sink with partitioned token-aware writes and tunable consistency.
-* **INDRA-168: Couchbase Sink**: Key-Value and N1QL JSON document sink.
+---
 
-### Sprint 23: Industrial Automation & Field Protocols
-* **INDRA-201: OPC-UA Industrial Bridge**: Bi-directional OPC-UA server node bridging to MQTT topics with binary codec.
-* **INDRA-174: Apache IoTDB Sink**: Aligned time-series session pool for industrial plant telemetry.
-* **INDRA-173: TDengine Sink**: High-performance super-table and sub-table connector.
+## 4. Deferred Milestones
 
-### Sprint 24: Cloud Data Warehousing & Lakehouse Formats
-* **INDRA-182: Snowflake Sink**: Direct Snowpipe micro-batch loading into Snowflake tables.
-* **INDRA-183: Databricks Delta Lake Sink**: Direct Parquet streaming ingestion into Delta tables.
-* **INDRA-186: Google BigQuery Sink**: BigQuery Storage Write API (gRPC) for exactly-once streaming.
-* **INDRA-191: S3 Tables (Apache Iceberg) Sink**: Native Apache Iceberg metadata and data file writer backed by S3 Tables.
+- **Category A: AI & LLM Suite (`INDRA-141..INDRA-146`)**: OpenAI, Anthropic, Gemini, MCP Bridge, MCP over MQTT, Realtime AI. Bypassed per project directive.
+- **Deep Soak / Chaos Suite (WSL)**: 5-hour high-concurrency soak and chaos test suite scheduled for execution on-demand in WSL.
 
 ---
 

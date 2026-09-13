@@ -1,10 +1,16 @@
 pub mod license;
+pub mod swim;
 pub use license::{ClusterLicense, LicensePayload, LicenseStatus};
+pub use swim::{
+    ChannelSwimNetwork, ChannelSwimTransport, GossipItem, MemberState, NodeStatus, SwimConfig,
+    SwimMembership, SwimMessage, SwimTransport, UdpSwimTransport,
+};
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
@@ -21,7 +27,7 @@ pub enum ClusterError {
 
 pub type Result<T> = std::result::Result<T, ClusterError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
 impl NodeId {
@@ -157,6 +163,23 @@ impl ClusterRouteTable {
                 curr.exact_nodes.remove(node_id);
                 return;
             }
+        }
+    }
+
+    /// Purge all routes for an evicted or dead node from the entire directory.
+    pub fn remove_all_for_node(&self, node_id: &NodeId) {
+        let mut root = self.root.write();
+        Self::remove_node_recursive(&mut root, node_id);
+    }
+
+    fn remove_node_recursive(node: &mut RouteTrieNode, node_id: &NodeId) {
+        node.multi_wildcard_nodes.remove(node_id);
+        node.exact_nodes.remove(node_id);
+        if let Some(ref mut single) = node.single_wildcard {
+            Self::remove_node_recursive(single, node_id);
+        }
+        for child in node.children.values_mut() {
+            Self::remove_node_recursive(child, node_id);
         }
     }
 
@@ -401,6 +424,10 @@ mod tests {
             table.resolve_nodes(&topic("sensors/temp")),
             HashSet::from([node("node-b")])
         );
+
+        // Purge all routes for node-b
+        table.remove_all_for_node(&node("node-b"));
+        assert!(table.resolve_nodes(&topic("sensors/temp")).is_empty());
     }
 
     #[tokio::test]

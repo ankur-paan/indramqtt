@@ -41,6 +41,14 @@ struct Args {
     /// Cluster seed nodes (e.g. 127.0.0.1:19883). Specifying enables distributed clustering.
     #[arg(long)]
     cluster_seeds: Option<String>,
+
+    /// Cluster UDP/gossip bind address for distributed clustering (e.g. 127.0.0.1:19883).
+    #[arg(long, default_value = "127.0.0.1:19883")]
+    cluster_bind: String,
+
+    /// Unique cluster node identity. Defaults to "indra-node-1".
+    #[arg(long, default_value = "indra-node-1")]
+    node_id: String,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -1126,6 +1134,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("BrokerLink IPC protocol initialized");
     info!("Clean-room architecture ready");
 
+    let shared = Shared::new();
+
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
         let now = std::time::SystemTime::now()
@@ -1137,9 +1147,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
         let status = ClusterLicense::evaluate(license_key.as_deref(), 1, now);
         ClusterLicense::log_status_banner(&status);
-    }
 
-    let shared = Shared::new();
+        let local_node = broker_cluster::NodeId::new(&args.node_id);
+        if let Ok(bind_addr) = args.cluster_bind.parse::<std::net::SocketAddr>() {
+            match broker_cluster::UdpSwimTransport::bind(local_node.clone(), bind_addr).await {
+                Ok(transport) => {
+                    let swim = broker_cluster::SwimMembership::new(
+                        local_node.clone(),
+                        Some(args.cluster_bind.clone()),
+                        broker_cluster::SwimConfig::default(),
+                        transport.clone(),
+                    );
+                    swim.set_license_key(license_key);
+                    let route_table =
+                        Arc::new(broker_cluster::ClusterRouteTable::new(local_node.clone()));
+                    swim.attach_route_table(route_table);
+                    swim.clone().run_background();
+
+                    for seed_str in seeds.split(',') {
+                        let seed_str = seed_str.trim();
+                        if !seed_str.is_empty() {
+                            if let Ok(seed_addr) = seed_str.parse::<std::net::SocketAddr>() {
+                                let seed_node =
+                                    broker_cluster::NodeId::new(format!("seed-{}", seed_addr));
+                                transport.register_peer(seed_node.clone(), seed_addr);
+                                let _ = swim.join_seed(&seed_node).await;
+                            }
+                        }
+                    }
+                    info!(
+                        "SWIM gossip cluster engine initialized for node {}",
+                        args.node_id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to bind cluster UDP socket on {}: {}",
+                        args.cluster_bind, e
+                    );
+                }
+            }
+        }
+    }
     if !args.api_bind.is_empty() {
         let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
         info!("Management API listening on {}", args.api_bind);
@@ -2128,6 +2177,42 @@ mod tests {
         for task in tasks.into_iter().chain(tasks2) {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn cluster_swim_membership_and_discovery_e2e() {
+        use broker_cluster::{
+            ChannelSwimNetwork, ClusterMembership, NodeId, SwimConfig, SwimMembership,
+        };
+
+        let net = ChannelSwimNetwork::new();
+        let t1 = net.register(NodeId::new("node-alpha"));
+        let t2 = net.register(NodeId::new("node-beta"));
+
+        let swim1 = SwimMembership::new(NodeId::new("node-alpha"), None, SwimConfig::default(), t1);
+        let swim2 = SwimMembership::new(NodeId::new("node-beta"), None, SwimConfig::default(), t2);
+
+        // Start background tasks for both nodes
+        let h1 = swim1.clone().run_background();
+        let h2 = swim2.clone().run_background();
+
+        // Node-2 joins Node-1
+        swim2
+            .join_seed(&NodeId::new("node-alpha"))
+            .await
+            .expect("join seed");
+
+        // Wait a brief tick for Join/JoinAck exchange
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let active1 = swim1.active_nodes().await.expect("active nodes 1");
+        let active2 = swim2.active_nodes().await.expect("active nodes 2");
+
+        assert!(active1.contains(&NodeId::new("node-beta")));
+        assert!(active2.contains(&NodeId::new("node-alpha")));
+
+        h1.abort();
+        h2.abort();
     }
 
     async fn http_get_text(port: u16, path: &str) -> (u16, String) {
