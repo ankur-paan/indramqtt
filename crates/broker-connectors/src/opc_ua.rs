@@ -25,9 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 // ---------------------------------------------------------------------------
 // Status codes.
@@ -124,13 +122,9 @@ impl OpcUaNodeId {
         })?;
         let namespace: u16 = ns_part
             .strip_prefix("ns=")
-            .ok_or_else(|| {
-                ConnectorError::Dispatch(format!("opc-ua node id needs ns=: {text:?}"))
-            })?
+            .ok_or_else(|| ConnectorError::Dispatch(format!("opc-ua node id needs ns=: {text:?}")))?
             .parse()
-            .map_err(|_| {
-                ConnectorError::Dispatch(format!("opc-ua bad namespace in {text:?}"))
-            })?;
+            .map_err(|_| ConnectorError::Dispatch(format!("opc-ua bad namespace in {text:?}")))?;
         let (kind, value) = id_part.split_once('=').ok_or_else(|| {
             ConnectorError::Dispatch(format!("opc-ua node id needs <t>=<v>: {text:?}"))
         })?;
@@ -139,25 +133,24 @@ impl OpcUaNodeId {
                 "opc-ua node id value is empty: {text:?}"
             )));
         }
-        let id = match kind {
-            "i" => OpcUaNodeIdValue::Numeric(value.parse().map_err(|_| {
-                ConnectorError::Dispatch(format!("opc-ua bad numeric id in {text:?}"))
-            })?),
-            "s" => OpcUaNodeIdValue::Text(value.to_string()),
-            "g" => OpcUaNodeIdValue::Guid(parse_guid(value).ok_or_else(|| {
-                ConnectorError::Dispatch(format!("opc-ua bad GUID in {text:?}"))
-            })?),
-            "b" => OpcUaNodeIdValue::Opaque(
-                base64_decode(value).ok_or_else(|| {
+        let id =
+            match kind {
+                "i" => OpcUaNodeIdValue::Numeric(value.parse().map_err(|_| {
+                    ConnectorError::Dispatch(format!("opc-ua bad numeric id in {text:?}"))
+                })?),
+                "s" => OpcUaNodeIdValue::Text(value.to_string()),
+                "g" => OpcUaNodeIdValue::Guid(parse_guid(value).ok_or_else(|| {
+                    ConnectorError::Dispatch(format!("opc-ua bad GUID in {text:?}"))
+                })?),
+                "b" => OpcUaNodeIdValue::Opaque(base64_decode(value).ok_or_else(|| {
                     ConnectorError::Dispatch(format!("opc-ua bad opaque base64 in {text:?}"))
-                })?,
-            ),
-            _ => {
-                return Err(ConnectorError::Dispatch(format!(
-                    "opc-ua node id type must be i/s/g/b: {text:?}"
-                )))
-            }
-        };
+                })?),
+                _ => {
+                    return Err(ConnectorError::Dispatch(format!(
+                        "opc-ua node id type must be i/s/g/b: {text:?}"
+                    )))
+                }
+            };
         Ok(Self { namespace, id })
     }
 
@@ -176,13 +169,7 @@ impl OpcUaNodeId {
     pub fn sanitized_id(&self) -> String {
         self.display()
             .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c
-                } else {
-                    '_'
-                }
-            })
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect()
     }
 }
@@ -345,16 +332,14 @@ impl OpcUaVariant {
                 .as_f64()
                 .map(Self::Double)
                 .ok_or_else(|| type_mismatch("Double")),
-            (OpcUaVariantKind::Text, serde_json::Value::String(v)) => {
-                Ok(Self::Text(v.clone()))
-            }
+            (OpcUaVariantKind::Text, serde_json::Value::String(v)) => Ok(Self::Text(v.clone())),
             (OpcUaVariantKind::DateTime, serde_json::Value::Number(n)) => n
                 .as_i64()
                 .map(Self::DateTime)
                 .ok_or_else(|| type_mismatch("DateTime")),
-            (OpcUaVariantKind::ByteString, serde_json::Value::String(v)) => {
-                base64_decode(v).map(Self::ByteString).ok_or_else(|| type_mismatch("ByteString"))
-            }
+            (OpcUaVariantKind::ByteString, serde_json::Value::String(v)) => base64_decode(v)
+                .map(Self::ByteString)
+                .ok_or_else(|| type_mismatch("ByteString")),
             _ => Err(type_mismatch("variant")),
         }
     }
@@ -396,7 +381,9 @@ pub fn datetime_to_rfc3339(ticks: i64) -> String {
 
 /// Whole-second DateTime ticks for a Unix millis timestamp.
 pub fn datetime_from_millis(millis: i64) -> i64 {
-    millis.saturating_mul(10_000).saturating_add(DATETIME_UNIX_OFFSET)
+    millis
+        .saturating_mul(10_000)
+        .saturating_add(DATETIME_UNIX_OFFSET)
 }
 
 fn encode_u32(value: u32, out: &mut Vec<u8>) {
@@ -424,23 +411,33 @@ fn decode_exact<'a>(cursor: &mut &'a [u8], n: usize, what: &str) -> Result<&'a [
 }
 
 fn decode_u16(cursor: &mut &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(decode_exact(cursor, 2, "u16")?.try_into().expect("2 bytes")))
+    Ok(u16::from_le_bytes(
+        decode_exact(cursor, 2, "u16")?.try_into().expect("2 bytes"),
+    ))
 }
 
 fn decode_u32(cursor: &mut &[u8]) -> Result<u32> {
-    Ok(u32::from_le_bytes(decode_exact(cursor, 4, "u32")?.try_into().expect("4 bytes")))
+    Ok(u32::from_le_bytes(
+        decode_exact(cursor, 4, "u32")?.try_into().expect("4 bytes"),
+    ))
 }
 
 fn decode_i32(cursor: &mut &[u8]) -> Result<i32> {
-    Ok(i32::from_le_bytes(decode_exact(cursor, 4, "i32")?.try_into().expect("4 bytes")))
+    Ok(i32::from_le_bytes(
+        decode_exact(cursor, 4, "i32")?.try_into().expect("4 bytes"),
+    ))
 }
 
 fn decode_u64(cursor: &mut &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(decode_exact(cursor, 8, "u64")?.try_into().expect("8 bytes")))
+    Ok(u64::from_le_bytes(
+        decode_exact(cursor, 8, "u64")?.try_into().expect("8 bytes"),
+    ))
 }
 
 fn decode_i64(cursor: &mut &[u8]) -> Result<i64> {
-    Ok(i64::from_le_bytes(decode_exact(cursor, 8, "i64")?.try_into().expect("8 bytes")))
+    Ok(i64::from_le_bytes(
+        decode_exact(cursor, 8, "i64")?.try_into().expect("8 bytes"),
+    ))
 }
 
 fn decode_string(cursor: &mut &[u8]) -> Result<String> {
@@ -482,11 +479,17 @@ pub fn encode_variant(variant: &OpcUaVariant, out: &mut Vec<u8>) {
 pub fn decode_variant(cursor: &mut &[u8]) -> Result<OpcUaVariant> {
     let type_id = decode_exact(cursor, 1, "variant mask")?[0];
     match type_id {
-        1 => Ok(OpcUaVariant::Boolean(decode_exact(cursor, 1, "bool")?[0] != 0)),
-        2 => Ok(OpcUaVariant::SByte(decode_exact(cursor, 1, "sbyte")?[0] as i8)),
+        1 => Ok(OpcUaVariant::Boolean(
+            decode_exact(cursor, 1, "bool")?[0] != 0,
+        )),
+        2 => Ok(OpcUaVariant::SByte(
+            decode_exact(cursor, 1, "sbyte")?[0] as i8,
+        )),
         3 => Ok(OpcUaVariant::Byte(decode_exact(cursor, 1, "byte")?[0])),
         4 => Ok(OpcUaVariant::Int16(i16::from_le_bytes(
-            decode_exact(cursor, 2, "int16")?.try_into().expect("2 bytes"),
+            decode_exact(cursor, 2, "int16")?
+                .try_into()
+                .expect("2 bytes"),
         ))),
         5 => Ok(OpcUaVariant::UInt16(decode_u16(cursor)?)),
         6 => Ok(OpcUaVariant::Int32(decode_i32(cursor)?)),
@@ -494,10 +497,14 @@ pub fn decode_variant(cursor: &mut &[u8]) -> Result<OpcUaVariant> {
         8 => Ok(OpcUaVariant::Int64(decode_i64(cursor)?)),
         9 => Ok(OpcUaVariant::UInt64(decode_u64(cursor)?)),
         10 => Ok(OpcUaVariant::Float(f32::from_le_bytes(
-            decode_exact(cursor, 4, "float")?.try_into().expect("4 bytes"),
+            decode_exact(cursor, 4, "float")?
+                .try_into()
+                .expect("4 bytes"),
         ))),
         11 => Ok(OpcUaVariant::Double(f64::from_le_bytes(
-            decode_exact(cursor, 8, "double")?.try_into().expect("8 bytes"),
+            decode_exact(cursor, 8, "double")?
+                .try_into()
+                .expect("8 bytes"),
         ))),
         12 => Ok(OpcUaVariant::Text(decode_string(cursor)?)),
         13 => Ok(OpcUaVariant::DateTime(decode_i64(cursor)?)),
@@ -736,9 +743,7 @@ impl OpcUaSecurityPolicy {
     pub fn uri(self) -> &'static str {
         match self {
             Self::None => "http://opcfoundation.org/UA/SecurityPolicy#None",
-            Self::Basic256Sha256 => {
-                "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256"
-            }
+            Self::Basic256Sha256 => "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
             Self::Aes128Sha256RsaOaep => {
                 "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep"
             }
@@ -762,8 +767,14 @@ pub enum OpcUaSecurityMode {
 pub enum OpcUaAuth {
     #[default]
     Anonymous,
-    UsernamePassword { username: String, password: String },
-    Certificate { cert_pem: String, key_pem: String },
+    UsernamePassword {
+        username: String,
+        password: String,
+    },
+    Certificate {
+        cert_pem: String,
+        key_pem: String,
+    },
 }
 
 /// One node subscription: polled node → MQTT topic template.
@@ -878,7 +889,9 @@ impl OpcUaSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_buffer(&self) -> usize {
@@ -886,7 +899,11 @@ impl OpcUaSinkConfig {
     }
 
     /// Render a subscription's publish topic for a node.
-    pub fn publish_topic(&self, subscription: &NodeSubscriptionConfig, node: &OpcUaNodeId) -> Result<String> {
+    pub fn publish_topic(
+        &self,
+        subscription: &NodeSubscriptionConfig,
+        node: &OpcUaNodeId,
+    ) -> Result<String> {
         render_template(
             &subscription.publish_topic_template,
             &[("node.sanitized_id", node.sanitized_id())],
@@ -1025,16 +1042,19 @@ impl OpcUaTransport for TcpOpcUaTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("opc-ua connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("opc-ua connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("opc-ua connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("opc-ua connect failed: {e}")))?;
         let mut body = Vec::new();
         self.hello.encode(&mut body);
-        stream.write_all(&encode_chunk(OpcUaChunk::Hello, &body)).await.map_err(|e| {
-            ConnectorError::Connection(format!("opc-ua hello write failed: {e}"))
-        })?;
+        stream
+            .write_all(&encode_chunk(OpcUaChunk::Hello, &body))
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua hello write failed: {e}")))?;
         let mut header = [0u8; 8];
         tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
             .await
@@ -1047,9 +1067,10 @@ impl OpcUaTransport for TcpOpcUaTransport {
             ));
         }
         let mut rest = vec![0u8; length - 8];
-        stream.read_exact(&mut rest).await.map_err(|e| {
-            ConnectorError::Connection(format!("opc-ua ack read failed: {e}"))
-        })?;
+        stream
+            .read_exact(&mut rest)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua ack read failed: {e}")))?;
         let mut full = header.to_vec();
         full.extend_from_slice(&rest);
         let (kind, _) = decode_chunk(&full)?;
@@ -1074,12 +1095,13 @@ impl OpcUaTransport for TcpOpcUaTransport {
         channel.extend_from_slice(&frame.bytes);
         let packet = encode_chunk(OpcUaChunk::OpenSecureChannel, &channel);
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("opc-ua not connected".to_string())
-        })?;
-        stream.write_all(&packet).await.map_err(|e| {
-            ConnectorError::Connection(format!("opc-ua write failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("opc-ua not connected".to_string()))?;
+        stream
+            .write_all(&packet)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua write failed: {e}")))?;
         Ok(())
     }
 }
@@ -1219,12 +1241,10 @@ impl OpcUaSink {
                     topic.as_str()
                 ))
             })?;
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("opc-ua payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("opc-ua payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("opc-ua payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("opc-ua payload must be JSON".to_string()))?;
         let variant = match &value {
             serde_json::Value::Bool(v) => OpcUaVariant::Boolean(*v),
             serde_json::Value::Number(n) => {
@@ -1380,7 +1400,10 @@ mod tests {
         let frame = encode_chunk(OpcUaChunk::Hello, &body);
         assert_eq!(&frame[..3], b"HEL");
         assert_eq!(frame[3], b'F');
-        assert_eq!(u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize, frame.len());
+        assert_eq!(
+            u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize,
+            frame.len()
+        );
         let (kind, back) = decode_chunk(&frame).unwrap();
         assert_eq!(kind, OpcUaChunk::Hello);
         let mut cursor = back.as_slice();
@@ -1423,12 +1446,17 @@ mod tests {
         );
         let guid = OpcUaNodeId::parse("ns=2;g=12345678-1234-5678-1234-567812345678").unwrap();
         assert!(matches!(guid.id, OpcUaNodeIdValue::Guid(_)));
-        assert_eq!(guid.display(), "ns=2;g=12345678-1234-5678-1234-567812345678");
+        assert_eq!(
+            guid.display(),
+            "ns=2;g=12345678-1234-5678-1234-567812345678"
+        );
         let opaque = OpcUaNodeId::parse("ns=2;b=aGVsbG8=").unwrap();
         assert_eq!(opaque.id, OpcUaNodeIdValue::Opaque(b"hello".to_vec()));
         // Display + sanitize round-trips.
         assert_eq!(
-            OpcUaNodeId::parse("ns=2;s=Line1.Temperature").unwrap().sanitized_id(),
+            OpcUaNodeId::parse("ns=2;s=Line1.Temperature")
+                .unwrap()
+                .sanitized_id(),
             "ns_2_s_Line1_Temperature"
         );
         for bad in [
@@ -1513,21 +1541,35 @@ mod tests {
             OpcUaVariant::Int32(5)
         );
         // Range violations and shape mismatches are terminal.
-        assert!(OpcUaVariant::coerce_from(OpcUaVariantKind::Int32, &serde_json::json!(1i64 << 40)).is_err());
-        assert!(OpcUaVariant::coerce_from(OpcUaVariantKind::Boolean, &serde_json::json!(1)).is_err());
+        assert!(
+            OpcUaVariant::coerce_from(OpcUaVariantKind::Int32, &serde_json::json!(1i64 << 40))
+                .is_err()
+        );
+        assert!(
+            OpcUaVariant::coerce_from(OpcUaVariantKind::Boolean, &serde_json::json!(1)).is_err()
+        );
         assert!(OpcUaVariant::coerce_from(OpcUaVariantKind::Text, &serde_json::json!({})).is_err());
     }
 
     #[test]
     fn test_error_classification() {
-        assert_eq!(OpcUaStatus(OpcUaStatus::GOOD).severity(), OpcUaSeverity::Good);
-        assert_eq!(OpcUaStatus(OpcUaStatus::UNCERTAIN).severity(), OpcUaSeverity::Uncertain);
+        assert_eq!(
+            OpcUaStatus(OpcUaStatus::GOOD).severity(),
+            OpcUaSeverity::Good
+        );
+        assert_eq!(
+            OpcUaStatus(OpcUaStatus::UNCERTAIN).severity(),
+            OpcUaSeverity::Uncertain
+        );
         assert_eq!(OpcUaStatus(0x8034_0000).severity(), OpcUaSeverity::Bad);
         assert!(OpcUaStatus(OpcUaStatus::BAD_SESSION_ID_INVALID).is_transient());
         assert!(OpcUaStatus(OpcUaStatus::BAD_SECURE_CHANNEL_CLOSED).is_transient());
         assert!(!OpcUaStatus(OpcUaStatus::BAD_NODE_ID_UNKNOWN).is_transient());
         assert!(!OpcUaStatus(OpcUaStatus::BAD_TYPE_MISMATCH).is_transient());
-        assert_eq!(OpcUaStatus(OpcUaStatus::BAD_NODE_ID_UNKNOWN).text(), "BadNodeIdUnknown");
+        assert_eq!(
+            OpcUaStatus(OpcUaStatus::BAD_NODE_ID_UNKNOWN).text(),
+            "BadNodeIdUnknown"
+        );
     }
 
     #[tokio::test]
@@ -1538,12 +1580,20 @@ mod tests {
         let sink = Arc::new(OpcUaSink::new(config, transport.clone()).unwrap());
 
         // Matched setpoint: Int64 for whole numbers, Double for fractions.
-        sink.send(&Topic::new("factory/setpoint/zone1").unwrap(), &Bytes::from("5"), QoS::AtMostOnce)
-            .await
-            .unwrap();
-        sink.send(&Topic::new("factory/setpoint/zone2").unwrap(), &Bytes::from("75.2"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("factory/setpoint/zone1").unwrap(),
+            &Bytes::from("5"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("factory/setpoint/zone2").unwrap(),
+            &Bytes::from("75.2"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.connect_calls(), 1);
         let writes = transport.writes();
@@ -1555,7 +1605,11 @@ mod tests {
 
         // Unmatched topics fail loudly (no silent blackhole).
         assert!(sink
-            .send(&Topic::new("factory/other").unwrap(), &Bytes::from("1"), QoS::AtMostOnce)
+            .send(
+                &Topic::new("factory/other").unwrap(),
+                &Bytes::from("1"),
+                QoS::AtMostOnce
+            )
             .await
             .is_err());
     }
@@ -1589,7 +1643,10 @@ mod tests {
                 endpoint_url: hello.endpoint_url,
             }
             .encode(&mut ack);
-            stream.write_all(&encode_chunk(OpcUaChunk::Acknowledge, &ack)).await.expect("ack");
+            stream
+                .write_all(&encode_chunk(OpcUaChunk::Acknowledge, &ack))
+                .await
+                .expect("ack");
             // One OPN write frame follows (setpoint delivery).
             let mut header = [0u8; 8];
             stream.read_exact(&mut header).await.expect("opn head");

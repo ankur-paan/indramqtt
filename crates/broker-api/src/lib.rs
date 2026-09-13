@@ -12,8 +12,8 @@ use broker_router::{ConnTable, Router as SubscriptionRouter};
 use broker_rules::{Rule, RuleAction, RuleEngine};
 use broker_session::SessionManager;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub mod dashboard;
 pub mod ws;
@@ -84,24 +84,21 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/clients/:id", get(get_client))
         .route("/api/v1/metrics", get(get_metrics))
-        .route("/api/v1/connectors", get(get_connectors).post(create_connector))
+        .route(
+            "/api/v1/connectors",
+            get(get_connectors).post(create_connector),
+        )
         .route("/api/v1/auth/users", get(list_users).post(create_user))
         .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
-        .route(
-            "/api/v1/rules/:id",
-            get(get_rule).delete(delete_rule),
-        )
+        .route("/api/v1/rules/:id", get(get_rule).delete(delete_rule))
         .with_state(state)
 }
 
 /// Serve the management API on an already-bound listener.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    state: ApiState,
-) -> std::io::Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
 }
 
@@ -207,16 +204,14 @@ async fn create_rule(
         }
     }
 
-    let rule: Rule = match state.engine.create_rule(
-        req.name,
-        topic_filter,
-        req.sql_query,
-        req.enabled,
-        actions,
-    ) {
-        Ok(rule) => rule,
-        Err(e) => return bad_request(format!("invalid sql_query: {e}")),
-    };
+    let rule: Rule =
+        match state
+            .engine
+            .create_rule(req.name, topic_filter, req.sql_query, req.enabled, actions)
+        {
+            Ok(rule) => rule,
+            Err(e) => return bad_request(format!("invalid sql_query: {e}")),
+        };
     (StatusCode::CREATED, Json(rule)).into_response()
 }
 
@@ -250,10 +245,7 @@ struct TestRuleRequest {
 }
 
 /// Evaluate SQL + filter over a sample payload without storing a rule.
-async fn test_rule(
-    State(_state): State<ApiState>,
-    Json(req): Json<TestRuleRequest>,
-) -> Response {
+async fn test_rule(State(_state): State<ApiState>, Json(req): Json<TestRuleRequest>) -> Response {
     match broker_rules::try_evaluate(
         req.sql_query.as_deref(),
         req.topic_filter.as_deref(),
@@ -321,7 +313,9 @@ async fn create_user(
     if req.password.is_empty() {
         return bad_request("password must not be empty");
     }
-    state.auth.add_user(req.username.clone(), req.password.as_bytes());
+    state
+        .auth
+        .add_user(req.username.clone(), req.password.as_bytes());
     if let Some(quotas) = req.quotas.map(|dto| broker_auth::UserQuotas {
         max_connections: dto.max_connections,
         max_publish_rate: dto.max_publish_rate,
@@ -354,10 +348,7 @@ async fn list_acls(State(state): State<ApiState>) -> Json<Vec<AclRule>> {
     Json(state.auth.acl_rules())
 }
 
-async fn create_acl(
-    State(state): State<ApiState>,
-    Json(req): Json<CreateAclRequest>,
-) -> Response {
+async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequest>) -> Response {
     if req.client_pattern.trim().is_empty() {
         return bad_request("client_pattern must not be empty");
     }
@@ -1250,16 +1241,10 @@ mod tests {
                 .expect("write request");
             // HTTP/1.0 + Connection: close => the server closes when done.
             let mut buf = Vec::new();
-            stream
-                .read_to_end(&mut buf)
-                .await
-                .expect("read response");
+            stream.read_to_end(&mut buf).await.expect("read response");
             let text = String::from_utf8(buf).expect("response is UTF-8");
             let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
-            let status: u16 = head
-                .lines()
-                .next()
-                .expect("status line")[9..12]
+            let status: u16 = head.lines().next().expect("status line")[9..12]
                 .parse()
                 .expect("status code");
             (status, body.to_string())
@@ -1331,7 +1316,10 @@ mod tests {
         assert_eq!(created["topic_filter"], json!("sensors/+"));
         assert_eq!(created["actions"][0]["type"], json!("republish"));
         assert_eq!(created["actions"][0]["qos"], json!(1));
-        let id = created["id"].as_str().expect("created rule has id").to_string();
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
 
         // List shows it.
         let (status, body) = server.get("/api/v1/rules").await;
@@ -1430,7 +1418,10 @@ mod tests {
             created["sql_query"],
             json!("SELECT * FROM \"sensors/+\" WHERE temperature > 50.0")
         );
-        let id = created["id"].as_str().expect("created rule has id").to_string();
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
         let (status, _) = server.get(&format!("/api/v1/rules/{id}")).await;
         assert_eq!(status, 200);
 
@@ -1654,7 +1645,10 @@ mod tests {
             )
             .await;
         assert_eq!(status, 201);
-        assert_eq!(created["quotas"]["max_connections"], serde_json::Value::Null);
+        assert_eq!(
+            created["quotas"]["max_connections"],
+            serde_json::Value::Null
+        );
 
         // Listing shows both shapes side by side.
         let (status, body) = server.get("/api/v1/auth/users").await;
@@ -1664,7 +1658,10 @@ mod tests {
         assert_eq!(users[0]["username"], json!("capped"));
         assert_eq!(users[0]["quotas"]["max_connections"], json!(100));
         assert_eq!(users[1]["username"], json!("plain"));
-        assert_eq!(users[1]["quotas"]["max_publish_rate"], serde_json::Value::Null);
+        assert_eq!(
+            users[1]["quotas"]["max_publish_rate"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
@@ -1833,7 +1830,10 @@ mod tests {
             .register("webhook-1", Arc::new(NullSink));
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!([{"id": "webhook-1", "kind": "test", "tier": "community"}]));
+        assert_eq!(
+            body,
+            json!([{"id": "webhook-1", "kind": "test", "tier": "community"}])
+        );
     }
 
     #[tokio::test]
@@ -2714,7 +2714,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             body,
-             json!([{"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
+            json!([{"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
                     {"id": "azblob-1", "kind": "azure_blob", "tier": "enterprise"},
                     {"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
                     {"id": "azure-iot-1", "kind": "azure_iot", "tier": "enterprise"},
@@ -3071,7 +3071,10 @@ mod tests {
             let req = "GET /ws/mqtt HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n\
                        Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                        Sec-WebSocket-Version: 13\r\n\r\n";
-            stream.write_all(req.as_bytes()).await.expect("write upgrade");
+            stream
+                .write_all(req.as_bytes())
+                .await
+                .expect("write upgrade");
             let mut buf = Vec::new();
             loop {
                 let mut chunk = [0u8; 512];
@@ -3080,7 +3083,10 @@ mod tests {
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = find_crlf2(&buf) {
                     let head = String::from_utf8_lossy(&buf[..pos + 4]).to_string();
-                    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {head}");
+                    assert!(
+                        head.starts_with("HTTP/1.1 101"),
+                        "expected 101, got: {head}"
+                    );
                     assert!(head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
                     let rest = buf[pos + 4..].to_vec();
                     return Self { stream, buf: rest };
@@ -3260,7 +3266,8 @@ mod tests {
         publ.send_bin(&mqtt_connect("console-b", None, None)).await;
         let connack = publ.recv_msg().await.expect("connack");
         assert_eq!(connack[3], 0);
-        publ.send_bin(&mqtt_publish("demo/1", 42, 1, b"hi-ws")).await;
+        publ.send_bin(&mqtt_publish("demo/1", 42, 1, b"hi-ws"))
+            .await;
         // Publisher gets its PUBACK...
         let puback = publ.recv_msg().await.expect("puback");
         assert_eq!(mqtt_packet_type(&puback), 4);
@@ -3268,9 +3275,7 @@ mod tests {
         let delivery = sub.recv_msg().await.expect("delivery");
         assert_eq!(mqtt_packet_type(&delivery), 3);
         assert_eq!(delivery[0] & 0x06, 0x02, "downstream QoS 1");
-        assert!(delivery
-            .windows(b"demo/1".len())
-            .any(|w| w == b"demo/1"));
+        assert!(delivery.windows(b"demo/1".len()).any(|w| w == b"demo/1"));
         assert!(delivery.ends_with(b"hi-ws"));
 
         // PINGREQ -> PINGRESP on the same socket.
@@ -3307,7 +3312,9 @@ mod tests {
         ));
 
         let mut client = WsClient::connect(server.port).await;
-        client.send_bin(&mqtt_connect("console-y", None, None)).await;
+        client
+            .send_bin(&mqtt_connect("console-y", None, None))
+            .await;
         let connack = client.recv_msg().await.expect("connack");
         assert_eq!(connack[3], 0);
 

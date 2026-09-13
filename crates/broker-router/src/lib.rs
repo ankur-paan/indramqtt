@@ -127,7 +127,8 @@ impl Router {
         while let Some(level) = levels.next() {
             if level == "#" {
                 // Re-subscribing from a new connection replaces the old copy.
-                curr.multi_wildcard_subs.retain(|s| s.client_id != sub.client_id);
+                curr.multi_wildcard_subs
+                    .retain(|s| s.client_id != sub.client_id);
                 curr.multi_wildcard_subs.insert(sub);
                 return;
             } else if level == "+" {
@@ -154,7 +155,8 @@ impl Router {
 
         while let Some(level) = levels.next() {
             if level == "#" {
-                curr.multi_wildcard_subs.retain(|s| s.client_id.as_ref() != client_id);
+                curr.multi_wildcard_subs
+                    .retain(|s| s.client_id.as_ref() != client_id);
                 return;
             } else if level == "+" {
                 if let Some(ref mut child) = curr.single_wildcard {
@@ -169,7 +171,8 @@ impl Router {
             }
 
             if levels.peek().is_none() {
-                curr.exact_subs.retain(|s| s.client_id.as_ref() != client_id);
+                curr.exact_subs
+                    .retain(|s| s.client_id.as_ref() != client_id);
                 return;
             }
         }
@@ -280,14 +283,8 @@ mod tests {
         let router = Router::new();
         let filter = TopicFilter::new("sports/tennis").unwrap();
 
-        router.subscribe(
-            &filter,
-            Subscription::new("c1", 101, QoS::AtMostOnce),
-        );
-        router.subscribe(
-            &filter,
-            Subscription::new("c1", 202, QoS::AtLeastOnce),
-        );
+        router.subscribe(&filter, Subscription::new("c1", 101, QoS::AtMostOnce));
+        router.subscribe(&filter, Subscription::new("c1", 202, QoS::AtLeastOnce));
 
         let matches = router.matches(&Topic::new("sports/tennis").unwrap());
         assert_eq!(matches.len(), 1);
@@ -339,8 +336,14 @@ mod tests {
     fn test_shared_group_round_robin_distributes() {
         let router = Router::new();
         let inner = TopicFilter::new("tasks").unwrap();
-        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"));
-        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"));
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"),
+        );
 
         // Four sequential matches alternate deterministically (members
         // sort by client id; cursor starts at zero).
@@ -353,8 +356,12 @@ mod tests {
         }
         assert_eq!(
             owners,
-            vec!["worker-a".to_string(), "worker-b".to_string(),
-                 "worker-a".to_string(), "worker-b".to_string()]
+            vec![
+                "worker-a".to_string(),
+                "worker-b".to_string(),
+                "worker-a".to_string(),
+                "worker-b".to_string()
+            ]
         );
     }
 
@@ -362,8 +369,14 @@ mod tests {
     fn test_shared_and_plain_subscribers_coexist() {
         let router = Router::new();
         let inner = TopicFilter::new("jobs/+").unwrap();
-        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "pool"));
-        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "pool"));
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-a", 1, QoS::AtMostOnce, "pool"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-b", 2, QoS::AtMostOnce, "pool"),
+        );
         router.subscribe(
             &TopicFilter::new("jobs/+").unwrap(),
             Subscription::new("plain-c", 3, QoS::AtMostOnce),
@@ -374,10 +387,7 @@ mod tests {
             let matched = router.matches(&Topic::new("jobs/9").unwrap());
             assert_eq!(matched.len(), 2);
             assert!(matched.iter().any(|s| s.client_id.as_ref() == "plain-c"));
-            assert_eq!(
-                matched.iter().filter(|s| s.group.is_some()).count(),
-                1
-            );
+            assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 1);
         }
     }
 
@@ -385,14 +395,23 @@ mod tests {
     fn test_shared_unsubscribe_removes_member() {
         let router = Router::new();
         let inner = TopicFilter::new("tasks").unwrap();
-        router.subscribe(&inner, Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"));
-        router.subscribe(&inner, Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"));
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-a", 1, QoS::AtMostOnce, "group1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-b", 2, QoS::AtMostOnce, "group1"),
+        );
 
         router.unsubscribe(&inner, "worker-a");
         for _ in 0..3 {
             let matched = router.matches(&Topic::new("tasks").unwrap());
             assert_eq!(matched.len(), 1);
-            assert_eq!(matched.iter().next().unwrap().client_id.as_ref(), "worker-b");
+            assert_eq!(
+                matched.iter().next().unwrap().client_id.as_ref(),
+                "worker-b"
+            );
         }
     }
 }

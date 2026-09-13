@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
-use std::collections::HashMap;
+use bytes::Bytes;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -147,7 +147,12 @@ mod tests {
         let store = MemoryStore::new();
         let topic = Topic::new("telemetry/temp").unwrap();
         let offset = store
-            .append(topic.clone(), QoS::AtLeastOnce, false, Bytes::from_static(b"25.4"))
+            .append(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                Bytes::from_static(b"25.4"),
+            )
             .await
             .unwrap();
 
@@ -167,7 +172,11 @@ mod tests {
         assert!(store.get_retained(&topic).await.unwrap().is_none());
 
         store
-            .set_retained(topic.clone(), QoS::AtMostOnce, Bytes::from_static(b"online"))
+            .set_retained(
+                topic.clone(),
+                QoS::AtMostOnce,
+                Bytes::from_static(b"online"),
+            )
             .await
             .unwrap();
         let msg = store.get_retained(&topic).await.unwrap().expect("stored");

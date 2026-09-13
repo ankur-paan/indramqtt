@@ -21,9 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// AWS IoT authentication mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +54,11 @@ impl Default for AwsIotAuth {
 impl AwsIotAuth {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Mtls { ca_cert_pem, client_cert_pem, client_key_pem } => {
+            Self::Mtls {
+                ca_cert_pem,
+                client_cert_pem,
+                client_key_pem,
+            } => {
                 for (label, pem, marker) in [
                     ("ca_cert_pem", ca_cert_pem, "BEGIN CERTIFICATE"),
                     ("client_cert_pem", client_cert_pem, "BEGIN CERTIFICATE"),
@@ -70,7 +72,11 @@ impl AwsIotAuth {
                 }
                 Ok(())
             }
-            Self::SigV4 { access_key_id, secret_access_key, .. } => {
+            Self::SigV4 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } => {
                 if access_key_id.trim().is_empty() || secret_access_key.is_empty() {
                     return Err(ConnectorError::Dispatch(
                         "aws-iot SigV4 needs an access key + secret".to_string(),
@@ -121,10 +127,7 @@ impl BridgeTopicMapping {
 
     /// Render the remote topic for one client id.
     pub fn resolve_remote(&self, client_id: &str) -> Result<String> {
-        let topic = render_template(
-            &self.remote_topic,
-            &[("client_id", client_id.to_string())],
-        )?;
+        let topic = render_template(&self.remote_topic, &[("client_id", client_id.to_string())])?;
         if topic.trim().is_empty() || topic.contains('+') || topic.contains('#') {
             return Err(ConnectorError::Dispatch(format!(
                 "aws-iot remote topic resolved invalid: {topic:?}"
@@ -223,7 +226,10 @@ impl AwsIotConfig {
                     "aws-iot thing_name_template must not be empty".to_string(),
                 ));
             }
-            render_template(&shadow.thing_name_template, &[("client_id", "dummy".to_string())])?;
+            render_template(
+                &shadow.thing_name_template,
+                &[("client_id", "dummy".to_string())],
+            )?;
         }
         if self.batch_size == Some(0) {
             return Err(ConnectorError::Dispatch(
@@ -238,7 +244,9 @@ impl AwsIotConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_buffer(&self) -> usize {
@@ -278,7 +286,10 @@ pub fn sign_websocket_url(
     let short_date = &date[..8];
     let credential = format!("{access_key_id}/{short_date}/{region}/iotdevicegateway/aws4_request");
     let mut params = vec![
-        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("X-Amz-Credential".to_string(), credential),
         ("X-Amz-Date".to_string(), date.clone()),
         ("X-Amz-Expires".to_string(), "86400".to_string()),
@@ -293,7 +304,8 @@ pub fn sign_websocket_url(
         .map(|(key, value)| format!("{}={}", sigv4_encode(key), sigv4_encode(value)))
         .collect();
     let canonical_qs = canonical_qs.join("&");
-    let canonical_request = format!("GET\n/mqtt\n{canonical_qs}\nhost:{endpoint}\n\nhost\nUNSIGNED-PAYLOAD");
+    let canonical_request =
+        format!("GET\n/mqtt\n{canonical_qs}\nhost:{endpoint}\n\nhost\nUNSIGNED-PAYLOAD");
     let scope = format!("{short_date}/{region}/iotdevicegateway/aws4_request");
     let canonical_hash = super::sha256_hex(canonical_request.as_bytes());
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{canonical_hash}");
@@ -316,7 +328,10 @@ pub fn sign_websocket_url(
 // ---------------------------------------------------------------------------
 
 /// Build a shadow update document: reported state + client token.
-pub fn shadow_update_document(reported: &serde_json::Value, client_token: &str) -> serde_json::Value {
+pub fn shadow_update_document(
+    reported: &serde_json::Value,
+    client_token: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "state": { "reported": reported },
         "clientToken": client_token,
@@ -392,7 +407,9 @@ pub enum MockAwsIotOutcome {
     /// Throttle (429 / TooManyRequestsException → retry).
     Throttled,
     /// Authorization rejection (terminal, no retry).
-    Rejected { message: String },
+    Rejected {
+        message: String,
+    },
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -441,9 +458,7 @@ impl AwsIotTransport for MockAwsIotTransport {
             Some(MockAwsIotOutcome::Throttled) => Err(ConnectorError::Connection(
                 "mock aws-iot throttled".to_string(),
             )),
-            Some(MockAwsIotOutcome::Rejected { message }) => {
-                Err(ConnectorError::Dispatch(message))
-            }
+            Some(MockAwsIotOutcome::Rejected { message }) => Err(ConnectorError::Dispatch(message)),
         }
     }
 }
@@ -490,24 +505,34 @@ impl AwsIotTransport for TcpAwsIotTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("aws-iot connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("aws-iot connect failed: {e}")))?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("aws-iot connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("aws-iot connect failed: {e}")))?;
         *self.stream.lock().await = Some(stream);
         Ok(())
     }
 
     async fn publish(&self, frame: &AwsIotFrame) -> Result<()> {
-        let bytes = super::mqtt_bridge::encode_publish(&frame.remote_topic, 1, false, 1, &frame.payload, false)?;
+        let bytes = super::mqtt_bridge::encode_publish(
+            &frame.remote_topic,
+            1,
+            false,
+            1,
+            &frame.payload,
+            false,
+        )?;
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("aws-iot not connected".to_string())
-        })?;
-        stream.write_all(&bytes).await.map_err(|e| {
-            ConnectorError::Connection(format!("aws-iot publish failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("aws-iot not connected".to_string()))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
         Ok(())
     }
 }
@@ -599,11 +624,7 @@ impl AwsIotSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            ConnectorError::Connection(message),
-                        );
+                        return self.restore_err(rows, oldest, ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(bridge_backoff(attempt)).await;
@@ -670,7 +691,9 @@ impl AwsIotSink {
 /// a 2s ceiling plus wall-clock jitter (no config knobs per the
 /// bridge contract; batching depths stay user-configurable).
 fn bridge_backoff(attempt: usize) -> Duration {
-    let grown = 100u64.saturating_mul(2u64.saturating_pow(attempt.min(10) as u32)).min(2_000);
+    let grown = 100u64
+        .saturating_mul(2u64.saturating_pow(attempt.min(10) as u32))
+        .min(2_000);
     let jitter = (now_millis().max(0) as u64) % (grown / 2 + 1);
     Duration::from_millis(grown.saturating_add(jitter).min(4_000))
 }
@@ -782,8 +805,10 @@ mod tests {
         assert!(config.validate().is_err());
         config.auth = AwsIotAuth::Mtls {
             ca_cert_pem: "-----BEGIN CERTIFICATE-----\nxx\n-----END CERTIFICATE-----".to_string(),
-            client_cert_pem: "-----BEGIN CERTIFICATE-----\nxx\n-----END CERTIFICATE-----".to_string(),
-            client_key_pem: "-----BEGIN PRIVATE KEY-----\nxx\n-----END PRIVATE KEY-----".to_string(),
+            client_cert_pem: "-----BEGIN CERTIFICATE-----\nxx\n-----END CERTIFICATE-----"
+                .to_string(),
+            client_key_pem: "-----BEGIN PRIVATE KEY-----\nxx\n-----END PRIVATE KEY-----"
+                .to_string(),
         };
         assert!(config.validate().is_ok());
         config.auth = test_config().auth;
@@ -851,8 +876,14 @@ mod tests {
             mapping.resolve_local("edge-7").unwrap(),
             "devices/+/telemetry"
         );
-        assert!(topic_matches("devices/+/telemetry", "devices/edge-7/telemetry"));
-        assert!(!topic_matches("devices/+/telemetry", "devices/edge-7/state"));
+        assert!(topic_matches(
+            "devices/+/telemetry",
+            "devices/edge-7/telemetry"
+        ));
+        assert!(!topic_matches(
+            "devices/+/telemetry",
+            "devices/edge-7/state"
+        ));
         assert!(topic_matches("devices/#", "devices/edge-7/telemetry"));
         assert!(!topic_matches("other/#", "devices/edge-7/telemetry"));
 
@@ -883,10 +914,15 @@ mod tests {
             ShadowTopics::update_rejected("thing-1"),
             "$aws/things/thing-1/shadow/update/rejected"
         );
-        assert_eq!(ShadowTopics::get("thing-1"), "$aws/things/thing-1/shadow/get");
+        assert_eq!(
+            ShadowTopics::get("thing-1"),
+            "$aws/things/thing-1/shadow/get"
+        );
 
         // Accepted docs pass through; rejected docs fail with code.
-        let accepted = ShadowTopics::parse_response(br#"{"state":{"reported":{}},"clientToken":"x"}"#).unwrap();
+        let accepted =
+            ShadowTopics::parse_response(br#"{"state":{"reported":{}},"clientToken":"x"}"#)
+                .unwrap();
         assert_eq!(accepted["clientToken"], "x");
         let err = ShadowTopics::parse_response(
             br#"{"code":400,"message":"Missing required node: state","clientToken":"x"}"#,
@@ -913,14 +949,24 @@ mod tests {
         let captured = transport.captured();
         assert_eq!(captured.len(), 1);
         // Remote topic resolves with the gateway client id.
-        assert_eq!(captured[0].remote_topic, "$aws/things/edge-gateway-1/telemetry");
+        assert_eq!(
+            captured[0].remote_topic,
+            "$aws/things/edge-gateway-1/telemetry"
+        );
         assert_eq!(captured[0].payload, br#"{"temp":21.5}"#.to_vec());
-        assert_eq!(captured[0].content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            captured[0].content_type.as_deref(),
+            Some("application/json")
+        );
         assert_eq!(sink.sent_records(), 1);
 
         // Unmatched topics fail loudly (no silent blackhole).
         assert!(sink
-            .send(&Topic::new("other/thing").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
+            .send(
+                &Topic::new("other/thing").unwrap(),
+                &Bytes::from("{}"),
+                QoS::AtMostOnce
+            )
             .await
             .is_err());
     }
@@ -932,13 +978,14 @@ mod tests {
         config.batch_size = Some(10);
         config.max_retries = Some(3);
         let (sink, transport) = test_sink(config);
-        transport.script_outcomes(vec![
-            MockAwsIotOutcome::Throttled,
-            MockAwsIotOutcome::Ok,
-        ]);
-        sink.send(&Topic::new("devices/a/telemetry").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        transport.script_outcomes(vec![MockAwsIotOutcome::Throttled, MockAwsIotOutcome::Ok]);
+        sink.send(
+            &Topic::new("devices/a/telemetry").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -949,9 +996,13 @@ mod tests {
         transport.script_outcomes(vec![MockAwsIotOutcome::Rejected {
             message: "Forbidden: unauthorized".to_string(),
         }]);
-        sink.send(&Topic::new("devices/a/telemetry").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("devices/a/telemetry").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("rejection must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -983,9 +1034,7 @@ mod tests {
             assert_eq!(decoded.payload, b"{\"temp\":21.5}");
         });
 
-        let transport = Arc::new(
-            TcpAwsIotTransport::new(&format!("127.0.0.1:{port}")).unwrap(),
-        );
+        let transport = Arc::new(TcpAwsIotTransport::new(&format!("127.0.0.1:{port}")).unwrap());
         transport.connect().await.unwrap();
         transport
             .publish(&AwsIotFrame {

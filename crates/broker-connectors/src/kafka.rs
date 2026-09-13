@@ -300,7 +300,12 @@ impl KafkaTransport for MemoryKafkaTransport {
     }
 }
 
-pub(crate) fn encode_request_header(api_key: i16, api_version: i16, correlation: i32, client_id: &str) -> Vec<u8> {
+pub(crate) fn encode_request_header(
+    api_key: i16,
+    api_version: i16,
+    correlation: i32,
+    client_id: &str,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&api_key.to_be_bytes());
     out.extend_from_slice(&api_version.to_be_bytes());
@@ -425,7 +430,11 @@ struct TcpKafkaConn {
 }
 
 impl TcpKafkaTransport {
-    pub fn new(endpoint: impl Into<String>, client_id: impl Into<String>, acks: &str) -> Result<Self> {
+    pub fn new(
+        endpoint: impl Into<String>,
+        client_id: impl Into<String>,
+        acks: &str,
+    ) -> Result<Self> {
         Ok(Self {
             endpoint: endpoint.into(),
             client_id: client_id.into(),
@@ -444,7 +453,8 @@ impl TcpKafkaTransport {
             let conn = guard.as_mut().expect("connected");
             let correlation = conn.correlation;
             conn.correlation = conn.correlation.wrapping_add(1);
-            let mut frame = encode_request_header(api_key, api_version, correlation, &self.client_id);
+            let mut frame =
+                encode_request_header(api_key, api_version, correlation, &self.client_id);
             frame.extend_from_slice(&body);
             let exchange = async {
                 send_frame(&mut conn.stream, frame).await?;
@@ -461,7 +471,8 @@ impl TcpKafkaTransport {
                             "truncated kafka response".to_string(),
                         ));
                     }
-                    let echoed = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+                    let echoed =
+                        i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
                     if echoed != correlation {
                         *guard = None;
                         if attempt == 0 {
@@ -484,21 +495,24 @@ impl TcpKafkaTransport {
                 }
             }
         }
-        Err(ConnectorError::Connection("kafka exchange failed".to_string()))
+        Err(ConnectorError::Connection(
+            "kafka exchange failed".to_string(),
+        ))
     }
 
     async fn dial(&self) -> Result<TcpKafkaConn> {
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(&self.endpoint),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::Connection(format!("kafka connect timeout: {}", self.endpoint))
-        })?
-        .map_err(|e| {
-            ConnectorError::Connection(format!("kafka connect to {} failed: {e}", self.endpoint))
-        })?;
+        let stream =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.endpoint))
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!("kafka connect timeout: {}", self.endpoint))
+                })?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!(
+                        "kafka connect to {} failed: {e}",
+                        self.endpoint
+                    ))
+                })?;
         let mut conn = TcpKafkaConn {
             stream,
             correlation: 1,
@@ -652,9 +666,18 @@ impl KafkaSink {
             key,
             value: payload.clone(),
             headers: vec![
-                ("mqtt.topic".to_string(), Bytes::from(topic.as_str().to_string())),
-                ("mqtt.qos".to_string(), Bytes::from(u8::from(qos).to_string())),
-                ("mqtt.timestamp".to_string(), Bytes::from(now_millis().to_string())),
+                (
+                    "mqtt.topic".to_string(),
+                    Bytes::from(topic.as_str().to_string()),
+                ),
+                (
+                    "mqtt.qos".to_string(),
+                    Bytes::from(u8::from(qos).to_string()),
+                ),
+                (
+                    "mqtt.timestamp".to_string(),
+                    Bytes::from(now_millis().to_string()),
+                ),
             ],
             timestamp_ms: now_millis(),
         }
@@ -783,7 +806,10 @@ mod tests {
         // A sample of keys spreads across partitions (no single hotspot).
         let mut seen = std::collections::HashSet::new();
         for i in 0..50 {
-            seen.insert(partition_for_key(Some(format!("device-{i}").as_bytes()), 12));
+            seen.insert(partition_for_key(
+                Some(format!("device-{i}").as_bytes()),
+                12,
+            ));
         }
         assert!(seen.len() >= 6, "keys must spread, got {seen:?}");
 
@@ -796,10 +822,7 @@ mod tests {
             extract_json_field(br#"{ "device_id": 42 }"#, "device_id"),
             Some(b"42".to_vec())
         );
-        assert_eq!(
-            extract_json_field(br#"{ "v": 1 }"#, "device_id"),
-            None
-        );
+        assert_eq!(extract_json_field(br#"{ "v": 1 }"#, "device_id"), None);
         assert_eq!(extract_json_field(b"not json", "device_id"), None);
     }
 
@@ -850,10 +873,16 @@ mod tests {
         let batch_len = i32::from_be_bytes([batch[8], batch[9], batch[10], batch[11]]) as usize;
         assert_eq!(8 + 4 + batch_len, batch.len());
         assert_eq!(batch[8 + 4 + 4], 2u8, "magic must be 2");
-        assert!(batch.windows(b"d7".len()).any(|w| w == b"d7"), "key bytes embedded");
-        assert!(batch
-            .windows(b"mqtt.topic".len())
-            .any(|w| w == b"mqtt.topic"), "header key embedded");
+        assert!(
+            batch.windows(b"d7".len()).any(|w| w == b"d7"),
+            "key bytes embedded"
+        );
+        assert!(
+            batch
+                .windows(b"mqtt.topic".len())
+                .any(|w| w == b"mqtt.topic"),
+            "header key embedded"
+        );
         assert_eq!(sink.sent_batches(), 1);
     }
 
@@ -885,7 +914,9 @@ mod tests {
     /// exchange over raw TCP, capturing the produced bytes.
     #[tokio::test]
     async fn test_tcp_transport_produce_against_fake_broker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
         let captured_rx = captured.clone();
@@ -922,12 +953,8 @@ mod tests {
         let sink = KafkaSink::new(
             config,
             Arc::new(
-                TcpKafkaTransport::new(
-                    format!("127.0.0.1:{port}"),
-                    "indra-fake-test",
-                    "all",
-                )
-                .expect("valid transport"),
+                TcpKafkaTransport::new(format!("127.0.0.1:{port}"), "indra-fake-test", "all")
+                    .expect("valid transport"),
             ),
         )
         .expect("valid sink");
@@ -957,10 +984,15 @@ mod tests {
         let wire = captured.lock().clone();
         assert!(wire.windows(4).any(|w| w == b"test"), "topic on the wire");
         assert!(wire.windows(2).any(|w| w == b"d7"), "key on the wire");
-        assert!(wire.windows(10).any(|w| w == b"mqtt.topic"), "headers on the wire");
-        assert!(wire
-            .windows(br#"{ "device_id": "d7" }"#.len())
-            .any(|w| w == br#"{ "device_id": "d7" }"#), "payload on the wire");
+        assert!(
+            wire.windows(10).any(|w| w == b"mqtt.topic"),
+            "headers on the wire"
+        );
+        assert!(
+            wire.windows(br#"{ "device_id": "d7" }"#.len())
+                .any(|w| w == br#"{ "device_id": "d7" }"#),
+            "payload on the wire"
+        );
     }
 
     async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {

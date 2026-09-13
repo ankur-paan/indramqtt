@@ -74,7 +74,10 @@ mod tests {
         buf.resize(HEADER_LEN, 0);
 
         let result = codec.decode(&mut buf);
-        assert!(matches!(result, Err(BrokerLinkError::InvalidMagic(0x00, 0x00))));
+        assert!(matches!(
+            result,
+            Err(BrokerLinkError::InvalidMagic(0x00, 0x00))
+        ));
     }
 
     #[test]
@@ -86,7 +89,10 @@ mod tests {
         buf.resize(HEADER_LEN, 0);
 
         let result = codec.decode(&mut buf);
-        assert!(matches!(result, Err(BrokerLinkError::UnsupportedVersion(99))));
+        assert!(matches!(
+            result,
+            Err(BrokerLinkError::UnsupportedVersion(99))
+        ));
     }
 
     #[test]
@@ -99,7 +105,10 @@ mod tests {
         buf.resize(HEADER_LEN, 0);
 
         let result = codec.decode(&mut buf);
-        assert!(matches!(result, Err(BrokerLinkError::UnknownOpcode(0xFFFF))));
+        assert!(matches!(
+            result,
+            Err(BrokerLinkError::UnknownOpcode(0xFFFF))
+        ));
     }
 
     #[test]
@@ -141,7 +150,10 @@ mod tests {
         // Feed the final byte
         partial.extend_from_slice(&encoded[total_bytes - 1..total_bytes]);
         let res = codec.decode(&mut partial).unwrap();
-        assert!(res.is_some(), "Should successfully decode once final byte arrives");
+        assert!(
+            res.is_some(),
+            "Should successfully decode once final byte arrives"
+        );
         assert_eq!(res.unwrap(), frame);
         assert!(partial.is_empty());
     }

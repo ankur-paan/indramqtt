@@ -52,8 +52,8 @@ impl ElasticsearchAuth {
                         "elasticsearch basic auth needs a username".to_string(),
                     ));
                 }
-                let credentials =
-                    base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+                let credentials = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{username}:{password}"));
                 Ok(Some(format!("Basic {credentials}")))
             }
             Self::ApiKey { key } => {
@@ -150,7 +150,10 @@ impl ElasticsearchSinkConfig {
         let sanitized: String = raw
             .chars()
             .map(|c| {
-                if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '+' | '.') {
+                if c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, '-' | '_' | '+' | '.')
+                {
                     c
                 } else if c.is_ascii_uppercase() {
                     c.to_ascii_lowercase()
@@ -216,8 +219,7 @@ impl ElasticsearchSinkConfig {
         for (key, value) in &extra {
             vars.push((key.as_str(), value.clone()));
         }
-        let borrowed: Vec<(&str, String)> =
-            vars.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let borrowed: Vec<(&str, String)> = vars.iter().map(|(k, v)| (*k, v.clone())).collect();
         let id = render_template(template, &borrowed)?;
         if id.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -414,17 +416,23 @@ impl ElasticsearchSink {
         for row in rows {
             let action = match &self.config.doc_id_template {
                 Some(template) => {
-                    let id = self.config.resolve_doc_id(template, &row.topic, &row.payload, row.seq)?;
+                    let id =
+                        self.config
+                            .resolve_doc_id(template, &row.topic, &row.payload, row.seq)?;
                     serde_json::json!({"index": {"_index": index, "_id": id}})
                 }
                 None => serde_json::json!({"index": {"_index": index}}),
             };
-            body.extend_from_slice(serde_json::to_vec(&action).map_err(|e| {
-                ConnectorError::Dispatch(format!("elasticsearch action encode failed: {e}"))
-            })?.as_slice());
+            body.extend_from_slice(
+                serde_json::to_vec(&action)
+                    .map_err(|e| {
+                        ConnectorError::Dispatch(format!("elasticsearch action encode failed: {e}"))
+                    })?
+                    .as_slice(),
+            );
             body.push(b'\n');
-            let payload: serde_json::Value = serde_json::from_slice(&row.payload)
-                .unwrap_or_else(|_| {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&row.payload).unwrap_or_else(|_| {
                     serde_json::Value::String(String::from_utf8_lossy(&row.payload).into_owned())
                 });
             let doc = serde_json::json!({
@@ -433,9 +441,13 @@ impl ElasticsearchSink {
                 "payload": payload,
                 "timestamp": rfc3339_millis(now_millis()),
             });
-            body.extend_from_slice(serde_json::to_vec(&doc).map_err(|e| {
-                ConnectorError::Dispatch(format!("elasticsearch doc encode failed: {e}"))
-            })?.as_slice());
+            body.extend_from_slice(
+                serde_json::to_vec(&doc)
+                    .map_err(|e| {
+                        ConnectorError::Dispatch(format!("elasticsearch doc encode failed: {e}"))
+                    })?
+                    .as_slice(),
+            );
             body.push(b'\n');
         }
         Ok(body)
@@ -469,7 +481,8 @@ impl ElasticsearchSink {
                     attempt += 1;
                     self.backoff.lock().failure();
                     // Sleep the backoff window inline: rows stay in hand.
-                    let wait = Duration::from_secs(2u64.saturating_pow(attempt.min(5) as u32).min(30));
+                    let wait =
+                        Duration::from_secs(2u64.saturating_pow(attempt.min(5) as u32).min(30));
                     tokio::time::sleep(wait).await;
                     tracing::warn!(
                         status,
@@ -590,7 +603,9 @@ mod tests {
         assert!(config.validate().is_ok());
         // 2026-09-12T11:18:09.123Z.
         assert_eq!(
-            config.resolve_index("sensors/t1", 1_789_211_889_123).unwrap(),
+            config
+                .resolve_index("sensors/t1", 1_789_211_889_123)
+                .unwrap(),
             "iot-telemetry-2026.09.12"
         );
 
@@ -617,7 +632,9 @@ mod tests {
             password: "p".to_string(),
         };
         assert!(config.validate().is_err());
-        config.auth = ElasticsearchAuth::ApiKey { key: "  ".to_string() };
+        config.auth = ElasticsearchAuth::ApiKey {
+            key: "  ".to_string(),
+        };
         assert!(config.validate().is_err());
         config.auth = ElasticsearchAuth::None;
 
@@ -641,9 +658,11 @@ mod tests {
             Some("Basic ZWxhc3RpYzpjaGFuZ2VtZQ==".to_string())
         );
         assert_eq!(
-            ElasticsearchAuth::ApiKey { key: "abc123".to_string() }
-                .header_value()
-                .unwrap(),
+            ElasticsearchAuth::ApiKey {
+                key: "abc123".to_string()
+            }
+            .header_value()
+            .unwrap(),
             Some("ApiKey abc123".to_string())
         );
     }
@@ -652,12 +671,18 @@ mod tests {
     fn test_doc_id_templates() {
         let config = test_config();
         let payload = br#"{"client_id":"d7","n":3}"#;
-        let id = config.resolve_doc_id("${client_id}_${timestamp}", "t", payload, 9).unwrap();
+        let id = config
+            .resolve_doc_id("${client_id}_${timestamp}", "t", payload, 9)
+            .unwrap();
         assert!(id.starts_with("d7_"));
         assert_ne!(id, "d7_");
-        let id = config.resolve_doc_id("${field:n}-${seq}", "t", payload, 9).unwrap();
+        let id = config
+            .resolve_doc_id("${field:n}-${seq}", "t", payload, 9)
+            .unwrap();
         assert_eq!(id, "3-9");
-        let id = config.resolve_doc_id("auto-${seq}", "t", b"not json", 4).unwrap();
+        let id = config
+            .resolve_doc_id("auto-${seq}", "t", b"not json", 4)
+            .unwrap();
         assert_eq!(id, "auto-4");
     }
 
@@ -668,12 +693,20 @@ mod tests {
         config.doc_id_template = Some("evt-${seq}".to_string());
         let (sink, transport) = test_sink(config);
 
-        sink.send(&Topic::new("logs/a").unwrap(), &Bytes::from(r#"{"m":"x"}"#), QoS::AtMostOnce)
-            .await
-            .unwrap();
-        sink.send(&Topic::new("logs/b").unwrap(), &Bytes::from("plain"), QoS::AtLeastOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("logs/a").unwrap(),
+            &Bytes::from(r#"{"m":"x"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("logs/b").unwrap(),
+            &Bytes::from("plain"),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.sent_batches(), 1);
 
         let captured = transport.captured();
@@ -707,7 +740,9 @@ mod tests {
         transport.script_statuses(vec![429, 200]);
 
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let started = std::time::Instant::now();
         sink.flush().await.unwrap();
         assert!(started.elapsed() >= Duration::from_secs(2));
@@ -725,7 +760,9 @@ mod tests {
         transport.script_statuses(vec![503]);
 
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("503 must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
@@ -743,7 +780,9 @@ mod tests {
         transport.script_statuses(vec![400]);
 
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("400 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(sink.buffered_rows(), 1);

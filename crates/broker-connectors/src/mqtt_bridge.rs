@@ -22,9 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// MQTT protocol version for wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -196,7 +194,9 @@ impl MqttBridgeSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_inflight(&self) -> usize {
@@ -571,10 +571,13 @@ impl MqttBridgeTransport for TcpMqttBridgeTransport {
             ));
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("mqtt bridge connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("mqtt bridge connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connect failed: {e}")))?;
         let connect = encode_connect(
             &self.client_id,
             self.clean_start,
@@ -583,15 +586,13 @@ impl MqttBridgeTransport for TcpMqttBridgeTransport {
             self.password.as_deref(),
             self.v50,
         );
-        stream
-            .write_all(&connect)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connect write failed: {e}")))?;
+        stream.write_all(&connect).await.map_err(|e| {
+            ConnectorError::Connection(format!("mqtt bridge connect write failed: {e}"))
+        })?;
         let mut connack = [0u8; 4];
-        stream
-            .read_exact(&mut connack)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connack read failed: {e}")))?;
+        stream.read_exact(&mut connack).await.map_err(|e| {
+            ConnectorError::Connection(format!("mqtt bridge connack read failed: {e}"))
+        })?;
         if connack[0] != 0x20 || connack[1] != 0x02 {
             return Err(ConnectorError::Connection(
                 "mqtt bridge malformed CONNACK".to_string(),
@@ -609,9 +610,9 @@ impl MqttBridgeTransport for TcpMqttBridgeTransport {
 
     async fn publish(&self, packet: &SerializedMqttPacket) -> Result<()> {
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("mqtt bridge not connected".to_string())
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("mqtt bridge not connected".to_string()))?;
         stream
             .write_all(&packet.bytes)
             .await
@@ -696,7 +697,14 @@ impl MqttBridgeSink {
         let v50 = self.config.protocol == MqttBridgeProtocol::V50;
         let mut packets = Vec::with_capacity(rows.len());
         for row in &rows {
-            let bytes = encode_publish(&row.topic, row.qos, row.retain, row.packet_id, &row.payload, v50)?;
+            let bytes = encode_publish(
+                &row.topic,
+                row.qos,
+                row.retain,
+                row.packet_id,
+                &row.payload,
+                v50,
+            )?;
             packets.push(SerializedMqttPacket {
                 bytes,
                 topic: row.topic.clone(),
@@ -746,7 +754,11 @@ impl MqttBridgeSink {
         let mapped = self.config.remap_topic(topic.as_str(), qos, millis)?;
         let out_qos = self.config.qos_override.unwrap_or_else(|| u8::from(qos));
         let retain = self.config.retain_override.unwrap_or(false);
-        let packet_id = if out_qos > 0 { self.next_packet_id() } else { 0 };
+        let packet_id = if out_qos > 0 {
+            self.next_packet_id()
+        } else {
+            0
+        };
         Ok(self.buffer.lock().push(BridgeRow {
             topic: mapped,
             payload: payload.to_vec(),
@@ -820,7 +832,9 @@ mod tests {
         }
     }
 
-    fn test_sink(config: MqttBridgeSinkConfig) -> (Arc<MqttBridgeSink>, Arc<MemoryMqttBridgeTransport>) {
+    fn test_sink(
+        config: MqttBridgeSinkConfig,
+    ) -> (Arc<MqttBridgeSink>, Arc<MemoryMqttBridgeTransport>) {
         let transport = Arc::new(MemoryMqttBridgeTransport::new());
         let sink = Arc::new(MqttBridgeSink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -829,7 +843,9 @@ mod tests {
     #[test]
     fn test_config_validation() {
         assert!(test_config("mqtt://127.0.0.1:1883").validate().is_ok());
-        assert!(test_config("mqtts://iot.example.com:8883").validate().is_ok());
+        assert!(test_config("mqtts://iot.example.com:8883")
+            .validate()
+            .is_ok());
         assert!(test_config("127.0.0.1:1883").validate().is_ok());
         assert!(test_config("broker.local").validate().is_ok());
 
@@ -860,42 +876,62 @@ mod tests {
     fn test_address_parsing() {
         assert_eq!(
             parse_bridge_address("mqtt://h:1883").unwrap(),
-            BridgeEndpoint { host: "h".to_string(), port: 1883, tls: false }
+            BridgeEndpoint {
+                host: "h".to_string(),
+                port: 1883,
+                tls: false
+            }
         );
         assert_eq!(
             parse_bridge_address("mqtts://h").unwrap(),
-            BridgeEndpoint { host: "h".to_string(), port: 8883, tls: true }
+            BridgeEndpoint {
+                host: "h".to_string(),
+                port: 8883,
+                tls: true
+            }
         );
-        assert_eq!(
-            parse_bridge_address("h:9999").unwrap().port,
-            9999
-        );
+        assert_eq!(parse_bridge_address("h:9999").unwrap().port, 9999);
         assert_eq!(
             parse_bridge_address("h").unwrap(),
-            BridgeEndpoint { host: "h".to_string(), port: 1883, tls: false }
+            BridgeEndpoint {
+                host: "h".to_string(),
+                port: 1883,
+                tls: false
+            }
         );
     }
 
     #[test]
     fn test_topic_remapping() {
         let mut config = test_config("mqtt://h:1883");
-        assert_eq!(config.remap_topic("sensors/t1", QoS::AtMostOnce, 0).unwrap(), "sensors/t1");
+        assert_eq!(
+            config
+                .remap_topic("sensors/t1", QoS::AtMostOnce, 0)
+                .unwrap(),
+            "sensors/t1"
+        );
 
         config.topic_prefix = Some("edge/station1/".to_string());
         assert_eq!(
-            config.remap_topic("sensors/t1", QoS::AtMostOnce, 0).unwrap(),
+            config
+                .remap_topic("sensors/t1", QoS::AtMostOnce, 0)
+                .unwrap(),
             "edge/station1/sensors/t1"
         );
 
         config.topic_template = Some("upstream/${topic}".to_string());
         assert_eq!(
-            config.remap_topic("sensors/t1", QoS::AtMostOnce, 0).unwrap(),
+            config
+                .remap_topic("sensors/t1", QoS::AtMostOnce, 0)
+                .unwrap(),
             "edge/station1/upstream/sensors/t1"
         );
 
         // Wildcards in the mapped result are rejected.
         config.topic_template = Some("up/${topic}/#".to_string());
-        assert!(config.remap_topic("sensors/t1", QoS::AtMostOnce, 0).is_err());
+        assert!(config
+            .remap_topic("sensors/t1", QoS::AtMostOnce, 0)
+            .is_err());
     }
 
     #[test]
@@ -974,12 +1010,20 @@ mod tests {
         config.max_batch_size = Some(10);
         let (sink, transport) = test_sink(config);
 
-        sink.send(&Topic::new("sensors/t1").unwrap(), &Bytes::from("on"), QoS::AtMostOnce)
-            .await
-            .unwrap();
-        sink.send(&Topic::new("sensors/t2").unwrap(), &Bytes::from("off"), QoS::AtLeastOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from("on"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("sensors/t2").unwrap(),
+            &Bytes::from("off"),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
 
         assert_eq!(transport.connect_calls(), 1);
@@ -1011,7 +1055,9 @@ mod tests {
         config.max_batch_size = Some(100);
         let (sink, _) = test_sink(config);
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("a"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("a"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink
             .send(&topic, &Bytes::from("b"), QoS::AtMostOnce)
             .await
@@ -1036,7 +1082,10 @@ mod tests {
             let needle = b"indra-bridge-loop";
             assert!(body.windows(needle.len()).any(|w| w == needle));
             // CONNACK accepted.
-            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.expect("connack");
+            stream
+                .write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("connack");
             // One PUBLISH frame follows.
             let mut fixed = [0u8; 1];
             stream.read_exact(&mut fixed).await.expect("pub head");

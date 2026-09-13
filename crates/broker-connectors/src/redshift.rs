@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 pub const REDSHIFT_TARGET: &str = "RedshiftData.BatchExecuteStatement";
 pub const REDSHIFT_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
@@ -195,12 +193,20 @@ impl RedshiftSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Resolve + sanitize the table: template first, then anything
     /// outside `[A-Za-z0-9_.]` becomes `_`.
-    pub fn resolve_table(&self, topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Result<String> {
+    pub fn resolve_table(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<String> {
         let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
         let field = |name: &str| match doc.get(name) {
             Some(serde_json::Value::String(text)) => text.clone(),
@@ -213,8 +219,7 @@ impl RedshiftSinkConfig {
             ("qos", u8::from(qos).to_string()),
             ("timestamp", millis.to_string()),
         ];
-        let borrowed: Vec<(&str, String)> =
-            vars.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let borrowed: Vec<(&str, String)> = vars.iter().map(|(k, v)| (*k, v.clone())).collect();
         let rendered = render_template(&self.table_template, &borrowed)?;
         let sanitized: String = rendered
             .chars()
@@ -290,13 +295,13 @@ pub fn sign_batch_execute(
     let payload_hash = super::sha256_hex(body);
     let date = super::amz_date(millis);
     let mut headers = vec![
-        ("content-type".to_string(), REDSHIFT_CONTENT_TYPE.to_string()),
+        (
+            "content-type".to_string(),
+            REDSHIFT_CONTENT_TYPE.to_string(),
+        ),
         ("host".to_string(), host.to_string()),
         ("x-amz-date".to_string(), date.clone()),
-        (
-            "x-amz-target".to_string(),
-            REDSHIFT_TARGET.to_string(),
-        ),
+        ("x-amz-target".to_string(), REDSHIFT_TARGET.to_string()),
     ];
     if let Some(token) = session_token {
         headers.push(("x-amz-security-token".to_string(), token.to_string()));
@@ -370,9 +375,13 @@ pub fn render_batch_body(req: &RedshiftBatchRequest) -> Vec<u8> {
 /// Scripted outcome for the mock transport.
 #[derive(Debug, Clone)]
 pub enum MockRedshiftOutcome {
-    Accepted { id: String },
+    Accepted {
+        id: String,
+    },
     /// Query/terminal failure (no retry).
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
     /// 429 concurrency limit (retries the batch).
     Throttled,
     /// Transport failure (retries in-loop).
@@ -381,10 +390,7 @@ pub enum MockRedshiftOutcome {
 
 #[async_trait]
 pub trait RedshiftTransport: Send + Sync {
-    async fn execute_batch(
-        &self,
-        req: &RedshiftBatchRequest,
-    ) -> Result<RedshiftBatchResponse>;
+    async fn execute_batch(&self, req: &RedshiftBatchRequest) -> Result<RedshiftBatchResponse>;
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -416,10 +422,7 @@ impl MockRedshiftTransport {
 
 #[async_trait]
 impl RedshiftTransport for MockRedshiftTransport {
-    async fn execute_batch(
-        &self,
-        req: &RedshiftBatchRequest,
-    ) -> Result<RedshiftBatchResponse> {
+    async fn execute_batch(&self, req: &RedshiftBatchRequest) -> Result<RedshiftBatchResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(RedshiftBatchRequest {
             database: req.database.clone(),
@@ -429,11 +432,11 @@ impl RedshiftTransport for MockRedshiftTransport {
             statements: req.statements.clone(),
         });
         match self.scripted.lock().pop_front() {
-            None => Ok(RedshiftBatchResponse { id: "stmt-1".to_string() }),
+            None => Ok(RedshiftBatchResponse {
+                id: "stmt-1".to_string(),
+            }),
             Some(MockRedshiftOutcome::Accepted { id }) => Ok(RedshiftBatchResponse { id }),
-            Some(MockRedshiftOutcome::Failed { message }) => {
-                Err(ConnectorError::Dispatch(message))
-            }
+            Some(MockRedshiftOutcome::Failed { message }) => Err(ConnectorError::Dispatch(message)),
             Some(MockRedshiftOutcome::Throttled) => Err(ConnectorError::Connection(
                 "mock redshift throttled".to_string(),
             )),
@@ -480,10 +483,7 @@ impl HttpRedshiftTransport {
 
 #[async_trait]
 impl RedshiftTransport for HttpRedshiftTransport {
-    async fn execute_batch(
-        &self,
-        req: &RedshiftBatchRequest,
-    ) -> Result<RedshiftBatchResponse> {
+    async fn execute_batch(&self, req: &RedshiftBatchRequest) -> Result<RedshiftBatchResponse> {
         let body = render_batch_body(req);
         let millis = now_millis();
         let (auth, date) = sign_batch_execute(
@@ -525,12 +525,12 @@ impl RedshiftTransport for HttpRedshiftTransport {
             .bytes()
             .await
             .map_err(|e| ConnectorError::Connection(format!("redshift read failed: {e}")))?;
-        let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-            ConnectorError::Connection(format!("redshift bad response JSON: {e}"))
-        })?;
-        let id = doc.get("Id").and_then(|v| v.as_str()).ok_or_else(|| {
-            ConnectorError::Dispatch("redshift response lacks Id".to_string())
-        })?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ConnectorError::Connection(format!("redshift bad response JSON: {e}")))?;
+        let id = doc
+            .get("Id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ConnectorError::Dispatch("redshift response lacks Id".to_string()))?;
         Ok(RedshiftBatchResponse { id: id.to_string() })
     }
 }
@@ -613,12 +613,10 @@ impl RedshiftSink {
         qos: QoS,
         millis: i64,
     ) -> Result<String> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("redshift payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("redshift payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("redshift payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("redshift payload must be JSON".to_string()))?;
         let client_id = value
             .get("client_id")
             .and_then(|v| v.as_str())
@@ -715,7 +713,9 @@ impl RedshiftSink {
             ));
         }
         let millis = now_millis();
-        let table = self.config.resolve_table(topic.as_str(), payload, qos, millis)?;
+        let table = self
+            .config
+            .resolve_table(topic.as_str(), payload, qos, millis)?;
         let statement =
             Self::render_row_statement(&self.config, &table, topic, payload, qos, millis)?;
         let bytes = statement.len();
@@ -792,9 +792,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: RedshiftSinkConfig,
-    ) -> (Arc<RedshiftSink>, Arc<MockRedshiftTransport>) {
+    fn test_sink(config: RedshiftSinkConfig) -> (Arc<RedshiftSink>, Arc<MockRedshiftTransport>) {
         let transport = Arc::new(MockRedshiftTransport::new());
         let sink = Arc::new(RedshiftSink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -841,7 +839,9 @@ mod tests {
         let mut config = test_config();
         config.table_template = "${topic}".to_string();
         assert_eq!(
-            config.resolve_table("sensors/kitchen x", b"{}", QoS::AtMostOnce, 0).unwrap(),
+            config
+                .resolve_table("sensors/kitchen x", b"{}", QoS::AtMostOnce, 0)
+                .unwrap(),
             "sensors_kitchen_x"
         );
         assert!(config.resolve_table("", b"{}", QoS::AtMostOnce, 0).is_err());
@@ -869,15 +869,7 @@ mod tests {
 
         let default = default_insert("sensor_logs");
         assert!(default.contains("$1") && default.contains("$5"));
-        let rendered = render_statement(
-            &default,
-            "sensor_logs",
-            7,
-            "t",
-            "d",
-            0,
-            "{\"v\":1}",
-        );
+        let rendered = render_statement(&default, "sensor_logs", 7, "t", "d", 0, "{\"v\":1}");
         assert!(rendered.starts_with("INSERT INTO sensor_logs (time_ms, topic, client_id, qos, payload) VALUES (7, 't', 'd', 0, "));
     }
 
@@ -976,12 +968,18 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
             MockRedshiftOutcome::Throttled,
-            MockRedshiftOutcome::Accepted { id: "stmt-9".to_string() },
+            MockRedshiftOutcome::Accepted {
+                id: "stmt-9".to_string(),
+            },
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -995,13 +993,21 @@ mod tests {
         config.max_retries = Some(5);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockRedshiftOutcome::Failed { message: "syntax error".to_string() },
-            MockRedshiftOutcome::Accepted { id: "stmt-9".to_string() },
+            MockRedshiftOutcome::Failed {
+                message: "syntax error".to_string(),
+            },
+            MockRedshiftOutcome::Accepted {
+                id: "stmt-9".to_string(),
+            },
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("failure must abort");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    now_millis, render_template, ymd_from_millis, BackoffState, BatchQueue, ConnectorError,
-    Result, Sink,
+    now_millis, render_template, ymd_from_millis, BackoffState, BatchQueue, ConnectorError, Result,
+    Sink,
 };
 
 /// Object body compression.
@@ -259,7 +259,10 @@ pub fn sigv4_authorization(request: &SigV4Request<'_>) -> String {
         canonical_query: String::new(),
         headers: vec![
             ("host".to_string(), request.host.to_string()),
-            ("x-amz-content-sha256".to_string(), request.payload_sha256_hex.to_string()),
+            (
+                "x-amz-content-sha256".to_string(),
+                request.payload_sha256_hex.to_string(),
+            ),
             ("x-amz-date".to_string(), super::amz_date(request.millis)),
         ],
         payload_hash: request.payload_sha256_hex.to_string(),
@@ -588,8 +591,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key_id: String::new(),
             secret_access_key: String::new(),
-            key_template:
-                "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson".to_string(),
+            key_template: "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson"
+                .to_string(),
             compression: S3Compression::None,
             batch_size: 1_000,
             batch_bytes: 5 * 1024 * 1024,
@@ -606,7 +609,14 @@ mod tests {
         assert!(config.validate().is_err());
         config.endpoint = "http://127.0.0.1:9000".to_string();
 
-        for bad in ["UPPER", "ab", "no_underscores", "-lead", "trail-", "has space"] {
+        for bad in [
+            "UPPER",
+            "ab",
+            "no_underscores",
+            "-lead",
+            "trail-",
+            "has space",
+        ] {
             config.bucket = bad.to_string();
             assert!(config.validate().is_err(), "bucket {bad:?} must fail");
         }
@@ -635,7 +645,9 @@ mod tests {
     fn test_key_template_resolution() {
         let config = test_config();
         // 2026-09-12T11:18:09.123Z.
-        let key = config.resolve_key("sensors/t1", 7, 1_789_211_889_123).unwrap();
+        let key = config
+            .resolve_key("sensors/t1", 7, 1_789_211_889_123)
+            .unwrap();
         assert_eq!(
             key,
             "telemetry/year=2026/month=09/day=12/sensors/t1_7.ndjson"
@@ -643,7 +655,10 @@ mod tests {
 
         // Illegal path characters in topics are sanitized; hierarchy kept.
         let key = config.resolve_key("a/b+c d?e#f", 0, 0).unwrap();
-        assert_eq!(key, "telemetry/year=1970/month=01/day=01/a/b_c_d_e_f_0.ndjson");
+        assert_eq!(
+            key,
+            "telemetry/year=1970/month=01/day=01/a/b_c_d_e_f_0.ndjson"
+        );
 
         // `${uuid}` renders a unique v4 id per call.
         let mut uuid_config = test_config();
@@ -651,7 +666,11 @@ mod tests {
         let first = uuid_config.resolve_key("t", 0, 0).unwrap();
         let second = uuid_config.resolve_key("t", 0, 0).unwrap();
         assert_ne!(first, second);
-        let id = first.strip_prefix("telemetry/").unwrap().strip_suffix(".ndjson").unwrap();
+        let id = first
+            .strip_prefix("telemetry/")
+            .unwrap()
+            .strip_suffix(".ndjson")
+            .unwrap();
         assert_eq!(id.len(), 36);
         assert!(uuid::Uuid::parse_str(id).is_ok());
 
@@ -666,7 +685,9 @@ mod tests {
         let sink = S3Sink::new(config, transport.clone()).unwrap();
 
         let topic = Topic::new("sensors/t1").unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
         sink.flush().await.unwrap();
         let puts = transport.puts();
@@ -707,9 +728,13 @@ mod tests {
         config.batch_size = 2;
         let sink = S3Sink::new(config, transport.clone()).unwrap();
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.sent_objects(), 0);
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.sent_objects(), 1);
         assert_eq!(sink.sent_records(), 2);
 
@@ -719,7 +744,9 @@ mod tests {
         config.batch_size = 1_000_000;
         config.batch_bytes = 10;
         let sink = S3Sink::new(config, transport.clone()).unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.sent_objects(), 1);
         assert_eq!(sink.buffered_bytes(), 0);
     }
@@ -732,7 +759,9 @@ mod tests {
         config.batch_size = 10;
         let sink = S3Sink::new(config, transport.clone()).unwrap();
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let bytes = sink.buffered_bytes();
         assert!(bytes > 0);
         let err = sink.flush().await.expect_err("mock down must fail");

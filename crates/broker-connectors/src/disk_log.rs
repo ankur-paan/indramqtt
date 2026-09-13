@@ -111,7 +111,10 @@ impl DiskLogSinkConfig {
                 "disk log directory must not be empty".to_string(),
             ));
         }
-        if self.filename_prefix.trim().is_empty() || self.filename_prefix.contains('/') || self.filename_prefix.contains('\\') {
+        if self.filename_prefix.trim().is_empty()
+            || self.filename_prefix.contains('/')
+            || self.filename_prefix.contains('\\')
+        {
             return Err(ConnectorError::Dispatch(format!(
                 "disk log filename_prefix must be a bare name: {:?}",
                 self.filename_prefix
@@ -276,12 +279,12 @@ impl DiskLogWriter for MemoryDiskLogWriter {
             DiskLogCompression::None => raw,
             DiskLogCompression::Gzip => {
                 let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-                encoder.write_all(&raw).map_err(|e| {
-                    ConnectorError::Dispatch(format!("disk log gzip failed: {e}"))
-                })?;
-                encoder.finish().map_err(|e| {
-                    ConnectorError::Dispatch(format!("disk log gzip failed: {e}"))
-                })?
+                encoder
+                    .write_all(&raw)
+                    .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?;
+                encoder
+                    .finish()
+                    .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?
             }
         };
         let name = self.backup_name(state.next_index);
@@ -355,7 +358,9 @@ impl FileDiskLogWriter {
         if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(index) = backup_index(&config.filename_prefix, &config.filename_extension, &name) {
+                if let Some(index) =
+                    backup_index(&config.filename_prefix, &config.filename_extension, &name)
+                {
                     next_index = next_index.max(index + 1);
                 }
             }
@@ -442,16 +447,16 @@ impl DiskLogWriter for FileDiskLogWriter {
                 .await
                 .map_err(|e| ConnectorError::Connection(format!("disk log read failed: {e}")))?;
             let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-            encoder.write_all(&raw).map_err(|e| {
-                ConnectorError::Dispatch(format!("disk log gzip failed: {e}"))
-            })?;
-            let gzipped = encoder.finish().map_err(|e| {
-                ConnectorError::Dispatch(format!("disk log gzip failed: {e}"))
-            })?;
+            encoder
+                .write_all(&raw)
+                .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?;
+            let gzipped = encoder
+                .finish()
+                .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?;
             let dest = self.backup_path(index);
-            tokio::fs::write(&dest, gzipped)
-                .await
-                .map_err(|e| ConnectorError::Connection(format!("disk log gzip write failed: {e}")))?;
+            tokio::fs::write(&dest, gzipped).await.map_err(|e| {
+                ConnectorError::Connection(format!("disk log gzip write failed: {e}"))
+            })?;
             tokio::fs::remove_file(&staged)
                 .await
                 .map_err(|e| ConnectorError::Connection(format!("disk log cleanup failed: {e}")))?;
@@ -524,7 +529,13 @@ impl DiskLogWriter for FileDiskLogWriter {
 // ---------------------------------------------------------------------------
 
 /// Render one record (without timestamp injection for Raw).
-fn format_record(format: DiskLogFormat, topic: &Topic, payload: &[u8], qos: QoS, millis: i64) -> Result<Vec<u8>> {
+fn format_record(
+    format: DiskLogFormat,
+    topic: &Topic,
+    payload: &[u8],
+    qos: QoS,
+    millis: i64,
+) -> Result<Vec<u8>> {
     match format {
         DiskLogFormat::Raw => {
             let mut record = payload.to_vec();
@@ -624,7 +635,12 @@ impl DiskLogSink {
     }
 
     pub fn backup_names(&self) -> Vec<String> {
-        self.state.lock().backups.iter().map(|backup| backup.name.clone()).collect()
+        self.state
+            .lock()
+            .backups
+            .iter()
+            .map(|backup| backup.name.clone())
+            .collect()
     }
 
     /// Rotate when the size or age policy trips at `now_ms`, then
@@ -639,7 +655,9 @@ impl DiskLogSink {
             let age_trip = match self.config.max_file_age_secs.unwrap_or(0) {
                 0 => false,
                 max_secs => {
-                    let max_ms = i64::try_from(max_secs).unwrap_or(i64::MAX).saturating_mul(1_000);
+                    let max_ms = i64::try_from(max_secs)
+                        .unwrap_or(i64::MAX)
+                        .saturating_mul(1_000);
                     state
                         .current_created_ms
                         .is_some_and(|created| now_ms.saturating_sub(created) >= max_ms)
@@ -655,7 +673,10 @@ impl DiskLogSink {
         let created = self.state.lock().current_created_ms.unwrap_or(now_ms);
         if let Some(name) = self.writer.rotate().await? {
             let mut state = self.state.lock();
-            state.backups.push(BackupInfo { name, created_ms: created });
+            state.backups.push(BackupInfo {
+                name,
+                created_ms: created,
+            });
             state.current_bytes = 0;
             state.current_created_ms = None;
             self.rotations.fetch_add(1, Ordering::Relaxed);
@@ -693,7 +714,10 @@ impl DiskLogSink {
         prune.dedup();
         for name in prune {
             self.writer.delete_backup(&name).await?;
-            self.state.lock().backups.retain(|backup| backup.name != name);
+            self.state
+                .lock()
+                .backups
+                .retain(|backup| backup.name != name);
         }
         Ok(())
     }
@@ -726,7 +750,10 @@ impl DiskLogSink {
             let created = self.state.lock().current_created_ms.unwrap_or(millis);
             if let Some(name) = self.writer.rotate().await? {
                 let mut state = self.state.lock();
-                state.backups.push(BackupInfo { name, created_ms: created });
+                state.backups.push(BackupInfo {
+                    name,
+                    created_ms: created,
+                });
                 state.current_bytes = 0;
                 state.current_created_ms = None;
                 self.rotations.fetch_add(1, Ordering::Relaxed);
@@ -922,7 +949,12 @@ mod tests {
         // Ndjson rejects non-UTF8 (raw exists for binary).
         let (sink, _) = test_sink(test_config());
         assert!(sink
-            .append_at(&Topic::new("t").unwrap(), &Bytes::from(vec![0xFF]), QoS::AtMostOnce, 0)
+            .append_at(
+                &Topic::new("t").unwrap(),
+                &Bytes::from(vec![0xFF]),
+                QoS::AtMostOnce,
+                0
+            )
             .await
             .is_err());
     }
@@ -934,13 +966,21 @@ mod tests {
         let (sink, writer) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {
-            sink.append_at(&topic, &Bytes::from(format!("{{\"v\":{v}}}")), QoS::AtMostOnce, 1_000)
-                .await
-                .unwrap();
+            sink.append_at(
+                &topic,
+                &Bytes::from(format!("{{\"v\":{v}}}")),
+                QoS::AtMostOnce,
+                1_000,
+            )
+            .await
+            .unwrap();
         }
         // Each ~50-byte row overflows the 60-byte segment: 2 rotations.
         assert_eq!(sink.rotation_count(), 2);
-        assert_eq!(sink.backup_names(), vec!["telemetry.log.1", "telemetry.log.2"]);
+        assert_eq!(
+            sink.backup_names(),
+            vec!["telemetry.log.1", "telemetry.log.2"]
+        );
         assert_eq!(writer.backup_blobs().len(), 2);
         let current = String::from_utf8(writer.current_bytes()).unwrap();
         assert_eq!(current.lines().count(), 1);
@@ -953,8 +993,12 @@ mod tests {
         config.max_file_size_bytes = Some(10);
         let (sink, writer) = test_sink(config);
         let topic = Topic::new("t").unwrap();
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000).await.unwrap();
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000)
+            .await
+            .unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000)
+            .await
+            .unwrap();
         assert_eq!(sink.rotation_count(), 1);
         let blobs = writer.backup_blobs();
         assert_eq!(blobs.len(), 1);
@@ -974,13 +1018,19 @@ mod tests {
         let (sink, writer) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         // Segment born at t=0; a write at t=61s rotates by age.
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0)
+            .await
+            .unwrap();
         assert_eq!(sink.rotation_count(), 0);
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 61_000).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 61_000)
+            .await
+            .unwrap();
         assert_eq!(sink.rotation_count(), 1);
         assert_eq!(writer.backup_blobs().len(), 1);
         // A write at t=122s rotates again; both backups stay in retention.
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 122_000).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 122_000)
+            .await
+            .unwrap();
         assert_eq!(sink.rotation_count(), 2);
         assert_eq!(writer.backup_blobs().len(), 2);
         // A later write rotates once more and purges the two backups
@@ -1001,10 +1051,15 @@ mod tests {
         let (sink, writer) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for _ in 0..4 {
-            sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000).await.unwrap();
+            sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000)
+                .await
+                .unwrap();
         }
         assert_eq!(sink.rotation_count(), 3);
-        assert_eq!(sink.backup_names(), vec!["telemetry.log.2", "telemetry.log.3"]);
+        assert_eq!(
+            sink.backup_names(),
+            vec!["telemetry.log.2", "telemetry.log.3"]
+        );
         assert_eq!(writer.backup_blobs().len(), 2);
     }
 
@@ -1015,18 +1070,26 @@ mod tests {
         config.sync_mode = DiskSyncMode::Interval { ms: 1_000 };
         let (sink, writer) = test_sink(config);
         let topic = Topic::new("t").unwrap();
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0)
+            .await
+            .unwrap();
         assert_eq!(writer.flush_count(), 0);
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 500).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 500)
+            .await
+            .unwrap();
         assert_eq!(writer.flush_count(), 0);
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 1_000)
+            .await
+            .unwrap();
         assert_eq!(writer.flush_count(), 1);
 
         // OsDefault never syncs explicitly.
         let mut config = test_config();
         config.sync_mode = DiskSyncMode::OsDefault;
         let (sink, writer) = test_sink(config);
-        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0).await.unwrap();
+        sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0)
+            .await
+            .unwrap();
         assert_eq!(writer.flush_count(), 0);
     }
 }

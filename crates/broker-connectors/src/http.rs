@@ -24,9 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// HTTP method for webhook delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,7 +75,10 @@ impl HttpAuth {
                 }
                 let credentials = base64::engine::general_purpose::STANDARD
                     .encode(format!("{username}:{password}"));
-                Ok(vec![("Authorization".to_string(), format!("Basic {credentials}"))])
+                Ok(vec![(
+                    "Authorization".to_string(),
+                    format!("Basic {credentials}"),
+                )])
             }
             Self::Bearer { token } => {
                 if token.trim().is_empty() {
@@ -85,7 +86,10 @@ impl HttpAuth {
                         "webhook bearer token must not be empty".to_string(),
                     ));
                 }
-                Ok(vec![("Authorization".to_string(), format!("Bearer {token}"))])
+                Ok(vec![(
+                    "Authorization".to_string(),
+                    format!("Bearer {token}"),
+                )])
             }
             Self::ApiKey { header_name, key } => {
                 if header_name.trim().is_empty() || key.trim().is_empty() {
@@ -338,7 +342,9 @@ impl HttpSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_timeout(&self) -> Duration {
@@ -347,15 +353,14 @@ impl HttpSinkConfig {
 
     /// Template variables for one event. `${client_id}` resolves from
     /// the JSON `client_id` field when present, else empty.
-    fn event_vars(
-        topic: &str,
-        payload: &[u8],
-        qos: QoS,
-        millis: i64,
-    ) -> [(String, String); 4] {
+    fn event_vars(topic: &str, payload: &[u8], qos: QoS, millis: i64) -> [(String, String); 4] {
         let client_id = serde_json::from_slice::<serde_json::Value>(payload)
             .ok()
-            .and_then(|doc| doc.get("client_id").and_then(|v| v.as_str()).map(str::to_string))
+            .and_then(|doc| {
+                doc.get("client_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         [
             ("topic".to_string(), percent_encode_path(topic)),
@@ -505,7 +510,12 @@ impl HttpTransport for MockHttpTransport {
             headers: request.headers.clone(),
             body: request.body.clone(),
         });
-        match self.scripted.lock().pop_front().unwrap_or(MockHttpOutcome::Status(200)) {
+        match self
+            .scripted
+            .lock()
+            .pop_front()
+            .unwrap_or(MockHttpOutcome::Status(200))
+        {
             MockHttpOutcome::Status(status) => Ok(HttpResponse { status }),
             MockHttpOutcome::TransportError(message) => Err(ConnectorError::Connection(message)),
         }
@@ -536,7 +546,10 @@ impl HttpTransport for ReqwestHttpTransport {
             HttpMethod::Put => reqwest::Method::PUT,
             HttpMethod::Patch => reqwest::Method::PATCH,
         };
-        let mut builder = self.client.request(method, &request.url).timeout(self.timeout);
+        let mut builder = self
+            .client
+            .request(method, &request.url)
+            .timeout(self.timeout);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -617,7 +630,8 @@ impl HttpSink {
     fn event_document(row: &HttpRow) -> Result<serde_json::Value> {
         let text = std::str::from_utf8(&row.payload)
             .map_err(|_| ConnectorError::Dispatch("webhook payload must be UTF-8".to_string()))?;
-        Ok(serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string())))
+        Ok(serde_json::from_str(text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.to_string())))
     }
 
     /// Build the requests for taken rows: one per row for RawJson and
@@ -632,7 +646,11 @@ impl HttpSink {
                 let body = serde_json::to_vec(&documents).map_err(|e| {
                     ConnectorError::Dispatch(format!("webhook batch encode failed: {e}"))
                 })?;
-                Ok(vec![self.request_for(rows[0].clone(), body, "application/json")?])
+                Ok(vec![self.request_for(
+                    rows[0].clone(),
+                    body,
+                    "application/json",
+                )?])
             }
             HttpBodyFormat::RawJson => {
                 let mut requests = Vec::with_capacity(rows.len());
@@ -673,8 +691,14 @@ impl HttpSink {
 
     /// Assemble one request: method, templated URL/headers, auth,
     /// content type, and the HMAC signature over the exact body.
-    fn request_for(&self, row: HttpRow, body: Vec<u8>, content_type: &'static str) -> Result<HttpRequest> {
-        let vars = HttpSinkConfig::event_vars(&row.topic, &row.payload, qos_from(row.qos), row.millis);
+    fn request_for(
+        &self,
+        row: HttpRow,
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> Result<HttpRequest> {
+        let vars =
+            HttpSinkConfig::event_vars(&row.topic, &row.payload, qos_from(row.qos), row.millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         let url = render_template(&self.config.url, &borrowed)?;
@@ -791,9 +815,8 @@ impl HttpSink {
                 "webhook row requires a non-empty topic".to_string(),
             ));
         }
-        std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("webhook payload must be UTF-8".to_string())
-        })?;
+        std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("webhook payload must be UTF-8".to_string()))?;
         let row = HttpRow {
             topic: topic.as_str().to_string(),
             payload: payload.to_vec(),
@@ -928,8 +951,13 @@ mod tests {
     #[test]
     fn test_url_template_substitution() {
         let config = test_config("https://h.example.com/t/${topic}?q=${qos}&ts=${timestamp}");
-        let url = config.resolve_url("sensors/t1", QoS::AtLeastOnce, 1_789_211_889_123).unwrap();
-        assert_eq!(url, "https://h.example.com/t/sensors/t1?q=1&ts=1789211889123");
+        let url = config
+            .resolve_url("sensors/t1", QoS::AtLeastOnce, 1_789_211_889_123)
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://h.example.com/t/sensors/t1?q=1&ts=1789211889123"
+        );
 
         // Spaces and `?` in topics are percent-encoded; `/` stays.
         let url = config.resolve_url("a b?c/d", QoS::AtMostOnce, 0).unwrap();
@@ -941,11 +969,17 @@ mod tests {
         // RFC 4231 Test Case 1: key = 0x0b * 20, data = "Hi There".
         let key = vec![0x0bu8; 20];
         assert_eq!(
-            hmac_sha256(&key, b"Hi There").iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            hmac_sha256(&key, b"Hi There")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
         assert_eq!(
-            hmac_sha1(&key, b"Hi There").iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            hmac_sha1(&key, b"Hi There")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
             "b617318655057264e28bc0b6fb378c8ef146be00"
         );
 
@@ -983,22 +1017,36 @@ mod tests {
     fn test_auth_headers() {
         assert!(HttpAuth::None.headers().unwrap().is_empty());
         assert_eq!(
-            HttpAuth::Basic { username: "u".to_string(), password: "p".to_string() }
-                .headers()
-                .unwrap(),
+            HttpAuth::Basic {
+                username: "u".to_string(),
+                password: "p".to_string()
+            }
+            .headers()
+            .unwrap(),
             vec![("Authorization".to_string(), "Basic dTpw".to_string())]
         );
         assert_eq!(
-            HttpAuth::Bearer { token: "tok".to_string() }.headers().unwrap(),
+            HttpAuth::Bearer {
+                token: "tok".to_string()
+            }
+            .headers()
+            .unwrap(),
             vec![("Authorization".to_string(), "Bearer tok".to_string())]
         );
         assert_eq!(
-            HttpAuth::ApiKey { header_name: "X-Key".to_string(), key: "k".to_string() }
-                .headers()
-                .unwrap(),
+            HttpAuth::ApiKey {
+                header_name: "X-Key".to_string(),
+                key: "k".to_string()
+            }
+            .headers()
+            .unwrap(),
             vec![("X-Key".to_string(), "k".to_string())]
         );
-        assert!(HttpAuth::Bearer { token: "  ".to_string() }.headers().is_err());
+        assert!(HttpAuth::Bearer {
+            token: "  ".to_string()
+        }
+        .headers()
+        .is_err());
     }
 
     #[tokio::test]
@@ -1015,9 +1063,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {
-            sink.send(&topic, &Bytes::from(format!("{{\"v\":{v}}}")), QoS::AtMostOnce)
-                .await
-                .unwrap();
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{\"v\":{v}}}")),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
         }
         // Third row fills the batch: exactly one array request.
         assert_eq!(sink.sent_requests(), 1);
@@ -1063,7 +1115,10 @@ mod tests {
             .expect("content type");
         assert_eq!(content_type.1, "application/x-www-form-urlencoded");
         let body = String::from_utf8(captured[0].body.clone()).unwrap();
-        assert!(body.starts_with("topic=sensors%2Ft1"), "topic encoded: {body}");
+        assert!(
+            body.starts_with("topic=sensors%2Ft1"),
+            "topic encoded: {body}"
+        );
         assert!(body.contains("qos=1"), "qos: {body}");
         assert!(body.contains("payload=hello+world"), "payload: {body}");
     }
@@ -1077,9 +1132,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_statuses(vec![429, 429, 200]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 3);
         assert_eq!(sink.sent_requests(), 1);
@@ -1095,9 +1154,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_statuses(vec![401, 200]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("401 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         // No retry consumed the queued 200; buffer retained for inspection.
@@ -1112,9 +1175,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockHttpOutcome::TransportError("down".to_string())]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let bytes_before = sink.buffered_rows();
         let err = sink.flush().await.expect_err("transport down must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));

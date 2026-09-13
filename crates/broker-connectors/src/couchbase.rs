@@ -22,9 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// KV opcodes used here.
 mod opcode {
@@ -200,7 +198,9 @@ impl CouchbaseSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_expiry(&self) -> u32 {
@@ -308,9 +308,9 @@ pub fn parse_connection_string(uri: &str) -> Result<CouchbaseEndpoint> {
     let host_port = host_port.split('/').next().unwrap_or_default();
     let (host, port) = match host_port.rsplit_once(':') {
         Some((host, port)) => {
-            let port: u16 = port.parse().map_err(|_| {
-                ConnectorError::Dispatch(format!("couchbase bad port in {uri:?}"))
-            })?;
+            let port: u16 = port
+                .parse()
+                .map_err(|_| ConnectorError::Dispatch(format!("couchbase bad port in {uri:?}")))?;
             if port == 0 {
                 return Err(ConnectorError::Dispatch(format!(
                     "couchbase port must be 1..=65535 in {uri:?}"
@@ -337,13 +337,7 @@ pub fn parse_connection_string(uri: &str) -> Result<CouchbaseEndpoint> {
 // ---------------------------------------------------------------------------
 
 /// Encode a request packet (magic 0x80).
-pub fn encode_request(
-    opcode: u8,
-    key: &[u8],
-    extras: &[u8],
-    value: &[u8],
-    opaque: u32,
-) -> Vec<u8> {
+pub fn encode_request(opcode: u8, key: &[u8], extras: &[u8], value: &[u8], opaque: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(24 + extras.len() + key.len() + value.len());
     out.push(0x80);
     out.push(opcode);
@@ -437,9 +431,10 @@ async fn read_response(stream: &mut tokio::net::TcpStream) -> Result<KvResponse>
         ));
     }
     let mut body = vec![0u8; total];
-    stream.read_exact(&mut body).await.map_err(|e| {
-        ConnectorError::Connection(format!("couchbase read failed: {e}"))
-    })?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| ConnectorError::Connection(format!("couchbase read failed: {e}")))?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
     decode_response(&frame)
@@ -467,11 +462,9 @@ pub fn classify_status(operation: CouchbaseOperation, status: u16) -> Result<boo
         status::EXISTS if operation == CouchbaseOperation::Insert => Err(ConnectorError::Dispatch(
             "couchbase insert: document exists".to_string(),
         )),
-        status::NOT_FOUND if operation == CouchbaseOperation::Replace => {
-            Err(ConnectorError::Dispatch(
-                "couchbase replace: document missing".to_string(),
-            ))
-        }
+        status::NOT_FOUND if operation == CouchbaseOperation::Replace => Err(
+            ConnectorError::Dispatch("couchbase replace: document missing".to_string()),
+        ),
         other => Err(ConnectorError::Dispatch(format!(
             "couchbase error status 0x{other:04x}"
         ))),
@@ -508,7 +501,9 @@ pub enum MockCouchbaseOutcome {
     /// Transport failure (retries in-loop).
     ConnectionError(String),
     /// Server status for every item (backpressure retries; conflicts terminal).
-    StatusError { status: u16 },
+    StatusError {
+        status: u16,
+    },
 }
 
 /// One captured batch call.
@@ -633,19 +628,20 @@ impl NativeCouchbaseTransport {
             ));
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!("couchbase connect timeout: {addr}"))
-                })?
-                .map_err(|e| ConnectorError::Connection(format!("couchbase connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("couchbase connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("couchbase connect failed: {e}")))?;
         let token = encode_plain_token(&self.username, &self.password);
         let opaque = self.opaque.fetch_add(1, Ordering::SeqCst) as u32;
         let auth = encode_request(opcode::SASL_AUTH, b"PLAIN", &[], &token, opaque);
-        stream.write_all(&auth).await.map_err(|e| {
-            ConnectorError::Connection(format!("couchbase auth write failed: {e}"))
-        })?;
+        stream
+            .write_all(&auth)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("couchbase auth write failed: {e}")))?;
         let reply = read_response(&mut stream).await?;
         if reply.opaque != opaque || reply.status != status::SUCCESS {
             return Err(ConnectorError::Connection(format!(
@@ -687,9 +683,9 @@ impl CouchbaseTransport for NativeCouchbaseTransport {
             ));
         }
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("couchbase not connected".to_string())
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("couchbase not connected".to_string()))?;
         stream.write_all(&out).await.map_err(|e| {
             ConnectorError::Connection(format!("couchbase batch write failed: {e}"))
         })?;
@@ -739,7 +735,10 @@ pub struct CouchbaseSink {
 }
 
 impl CouchbaseSink {
-    pub fn new(config: CouchbaseSinkConfig, transport: Arc<dyn CouchbaseTransport>) -> Result<Self> {
+    pub fn new(
+        config: CouchbaseSinkConfig,
+        transport: Arc<dyn CouchbaseTransport>,
+    ) -> Result<Self> {
         config.validate()?;
         let linger = config.effective_linger();
         Ok(Self {
@@ -785,12 +784,10 @@ impl CouchbaseSink {
     /// Build the JSON body: payload object merged with `_mqtt`, or
     /// `{"value": ...}` for scalar payloads.
     fn build_body(topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<Vec<u8>> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("couchbase payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("couchbase payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("couchbase payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("couchbase payload must be JSON".to_string()))?;
         let client_id = value
             .get("client_id")
             .and_then(|v| v.as_str())
@@ -900,7 +897,9 @@ impl CouchbaseSink {
         }
         let millis = now_millis();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        let key = self.config.resolve_doc_id(topic.as_str(), payload, qos, millis, seq)?;
+        let key = self
+            .config
+            .resolve_doc_id(topic.as_str(), payload, qos, millis, seq)?;
         let body = Self::build_body(topic, payload, qos, millis)?;
         let added = key.len() + body.len();
         let mut buffer = self.buffer.lock();
@@ -976,9 +975,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: CouchbaseSinkConfig,
-    ) -> (Arc<CouchbaseSink>, Arc<MockCouchbaseTransport>) {
+    fn test_sink(config: CouchbaseSinkConfig) -> (Arc<CouchbaseSink>, Arc<MockCouchbaseTransport>) {
         let transport = Arc::new(MockCouchbaseTransport::new());
         // Scripted statuses assume the sink operation; mirror it here.
         transport.set_operation_tag(operation_tag(&config.operation));
@@ -1008,7 +1005,12 @@ mod tests {
         let endpoint = parse_connection_string("couchbases://cb.example.com:11207").unwrap();
         assert!(endpoint.tls);
         assert_eq!(endpoint.port, 11207);
-        assert_eq!(parse_connection_string("couchbase://127.0.0.1").unwrap().port, 11_210);
+        assert_eq!(
+            parse_connection_string("couchbase://127.0.0.1")
+                .unwrap()
+                .port,
+            11_210
+        );
         config.connection_string = test_config().connection_string;
 
         config.bucket = "has space".to_string();
@@ -1036,7 +1038,13 @@ mod tests {
     fn test_doc_id_and_body() {
         let config = test_config();
         let key = config
-            .resolve_doc_id("sensors/t1", br#"{"client_id":"edge-7"}"#, QoS::AtMostOnce, 1_789_211_889_123, 9)
+            .resolve_doc_id(
+                "sensors/t1",
+                br#"{"client_id":"edge-7"}"#,
+                QoS::AtMostOnce,
+                1_789_211_889_123,
+                9,
+            )
             .unwrap();
         assert_eq!(key, "edge-7::1789211889123");
         // Payload-field template variables work too.
@@ -1075,15 +1083,27 @@ mod tests {
         assert_eq!(frame[1], opcode::SET);
         assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), 2);
         assert_eq!(frame[4], 8);
-        assert_eq!(u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]), 41);
+        assert_eq!(
+            u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+            41
+        );
         // Extras: flags 0 + expiry 3600 BE.
-        assert_eq!(&frame[24..32], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x10]);
+        assert_eq!(
+            &frame[24..32],
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x10]
+        );
         assert_eq!(&frame[32..34], b"k1");
         assert_eq!(&frame[34..36], b"v1");
 
         // ADD and REPLACE opcodes differ; SASL PLAIN token shape holds.
-        assert_eq!(encode_mutation(CouchbaseOperation::Insert, "k", b"", 0, 0)[1], opcode::ADD);
-        assert_eq!(encode_mutation(CouchbaseOperation::Replace, "k", b"", 0, 0)[1], opcode::REPLACE);
+        assert_eq!(
+            encode_mutation(CouchbaseOperation::Insert, "k", b"", 0, 0)[1],
+            opcode::ADD
+        );
+        assert_eq!(
+            encode_mutation(CouchbaseOperation::Replace, "k", b"", 0, 0)[1],
+            opcode::REPLACE
+        );
         assert_eq!(encode_plain_token("u", "p"), b"\0u\0p".to_vec());
 
         // Success response decodes with its opaque.
@@ -1115,8 +1135,7 @@ mod tests {
         assert_eq!(captured[0].items.len(), 1);
         assert!(captured[0].items[0].key.starts_with("edge-7::"));
         assert_eq!(captured[0].items[0].expiry_secs, 3_600);
-        let doc: serde_json::Value =
-            serde_json::from_slice(&captured[0].items[0].body).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&captured[0].items[0].body).unwrap();
         assert_eq!(doc["_mqtt"]["topic"], "sensors/t1");
         assert_eq!(sink.sent_records(), 1);
     }
@@ -1133,9 +1152,13 @@ mod tests {
             status: status::EXISTS,
         }]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from_static(br#"{"client_id":"d7"}"#), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(br#"{"client_id":"d7"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("exists must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -1150,13 +1173,19 @@ mod tests {
         config.max_backoff_ms = Some(2);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockCouchbaseOutcome::StatusError { status: status::TEMPORARY_FAILURE },
+            MockCouchbaseOutcome::StatusError {
+                status: status::TEMPORARY_FAILURE,
+            },
             MockCouchbaseOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from_static(br#"{"client_id":"d7"}"#), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(br#"{"client_id":"d7"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1167,7 +1196,9 @@ mod tests {
     async fn test_tcp_loopback_sasl_and_pipelined_batch() {
         use tokio::net::TcpListener;
 
-        async fn read_request(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>, Vec<u8>, Vec<u8>, u32) {
+        async fn read_request(
+            stream: &mut tokio::net::TcpStream,
+        ) -> (u8, Vec<u8>, Vec<u8>, Vec<u8>, u32) {
             let mut header = [0u8; 24];
             stream.read_exact(&mut header).await.expect("head");
             assert_eq!(header[0], 0x80);
@@ -1195,7 +1226,10 @@ mod tests {
             assert_eq!(opcode, opcode::SASL_AUTH);
             assert_eq!(key, b"PLAIN");
             assert_eq!(value, b"\0Administrator\0secret");
-            stream.write_all(&encode_success_response(opcode::SASL_AUTH, opaque)).await.expect("auth ok");
+            stream
+                .write_all(&encode_success_response(opcode::SASL_AUTH, opaque))
+                .await
+                .expect("auth ok");
             // Two pipelined SETs arrive back to back with distinct opaques.
             let mut seen = Vec::new();
             for _ in 0..2 {
@@ -1207,7 +1241,10 @@ mod tests {
             assert_ne!(seen[0].2, seen[1].2);
             assert_eq!(seen[0].0, b"edge-7::1");
             for (_, _, opaque) in &seen {
-                stream.write_all(&encode_success_response(opcode::SET, *opaque)).await.expect("ok");
+                stream
+                    .write_all(&encode_success_response(opcode::SET, *opaque))
+                    .await
+                    .expect("ok");
             }
         });
 

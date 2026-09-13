@@ -20,16 +20,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Azure IoT Hub authentication credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
 pub enum AzureIotAuth {
     /// Shared access key (SAS minted + renewed automatically).
-    SharedAccessKey { key: String, key_name: Option<String> },
+    SharedAccessKey {
+        key: String,
+        key_name: Option<String>,
+    },
     /// Pre-minted SAS token (auto-regeneration needs the secret key,
     /// so bare tokens are used verbatim until rejected).
     SasToken { token: String },
@@ -173,7 +174,9 @@ impl AzureIotConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_buffer(&self) -> usize {
@@ -405,7 +408,11 @@ impl TwinTopics {
     }
 
     /// Direct-method response topic + JSON body.
-    pub fn method_response(status: u16, rid: &str, payload: &serde_json::Value) -> (String, Vec<u8>) {
+    pub fn method_response(
+        status: u16,
+        rid: &str,
+        payload: &serde_json::Value,
+    ) -> (String, Vec<u8>) {
         (
             format!("$iothub/methods/res/{status}/?$rid={rid}"),
             serde_json::to_vec(payload).unwrap_or_default(),
@@ -495,9 +502,9 @@ impl AzureIotTransport for MockAzureIotTransport {
             }
             Some(MockAzureIotOutcome::HttpStatus(status)) => Err(match status {
                 401 => ConnectorError::Connection("mock azure-iot expired token".to_string()),
-                429 => ConnectorError::Connection(format!(
-                    "mock azure-iot throttled with {status}"
-                )),
+                429 => {
+                    ConnectorError::Connection(format!("mock azure-iot throttled with {status}"))
+                }
                 404 => ConnectorError::Dispatch("mock azure-iot device not found".to_string()),
                 _ => ConnectorError::Dispatch(format!("mock azure-iot failed with {status}")),
             }),
@@ -542,14 +549,16 @@ impl TcpAzureIotTransport {
 impl AzureIotTransport for TcpAzureIotTransport {
     async fn publish(&self, publish: &AzureIotPublish, _sas_token: &str) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let bytes = super::mqtt_bridge::encode_publish(&publish.topic, 1, false, 1, &publish.body, false)?;
+        let bytes =
+            super::mqtt_bridge::encode_publish(&publish.topic, 1, false, 1, &publish.body, false)?;
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("azure-iot not connected".to_string())
-        })?;
-        stream.write_all(&bytes).await.map_err(|e| {
-            ConnectorError::Connection(format!("azure-iot publish failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("azure-iot not connected".to_string()))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("azure-iot publish failed: {e}")))?;
         Ok(())
     }
 }
@@ -560,11 +569,13 @@ impl TcpAzureIotTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("azure-iot connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("azure-iot connect failed: {e}")))?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("azure-iot connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("azure-iot connect failed: {e}")))?;
         *self.stream.lock().await = Some(stream);
         Ok(())
     }
@@ -617,12 +628,7 @@ impl AzureIotSink {
         let linger = config.effective_linger();
         let sas_cache = match &config.auth {
             AzureIotAuth::SharedAccessKey { key, key_name } => Some(Arc::new(
-                AzureIotSasCache::new(
-                    config.resource_uri(),
-                    key_name.clone(),
-                    key.clone(),
-                    3_600,
-                ),
+                AzureIotSasCache::new(config.resource_uri(), key_name.clone(), key.clone(), 3_600),
             )),
             _ => None,
         };
@@ -654,7 +660,9 @@ impl AzureIotSink {
     }
 
     fn backoff_delay(&self, attempt: usize) -> Duration {
-        let grown = 100u64.saturating_mul(2u64.saturating_pow(attempt.min(10) as u32)).min(2_000);
+        let grown = 100u64
+            .saturating_mul(2u64.saturating_pow(attempt.min(10) as u32))
+            .min(2_000);
         let jitter = (now_millis().max(0) as u64) % (grown / 2 + 1);
         Duration::from_millis(grown.saturating_add(jitter).min(4_000))
     }
@@ -722,11 +730,7 @@ impl AzureIotSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            ConnectorError::Connection(message),
-                        );
+                        return self.restore_err(rows, oldest, ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
@@ -763,7 +767,11 @@ impl AzureIotSink {
                 "azure-iot buffer limit reached".to_string(),
             ));
         }
-        let d2c = d2c_topic(&self.config.device_id, self.config.module_id.as_deref(), &[]);
+        let d2c = d2c_topic(
+            &self.config.device_id,
+            self.config.module_id.as_deref(),
+            &[],
+        );
         Ok(self.buffer.lock().push(AzureIotRow {
             topic: d2c,
             body: payload.to_vec(),
@@ -862,7 +870,9 @@ mod tests {
         );
         config.module_id = None;
 
-        config.auth = AzureIotAuth::SasToken { token: "nope".to_string() };
+        config.auth = AzureIotAuth::SasToken {
+            token: "nope".to_string(),
+        };
         assert!(config.validate().is_err());
         config.auth = AzureIotAuth::X509 {
             cert_pem: "not-pem".to_string(),
@@ -947,7 +957,10 @@ mod tests {
             TwinTopics::parse_method_invocation("$iothub/methods/POST/reboot/?$rid=rid-9"),
             Some(("reboot".to_string(), "rid-9".to_string()))
         );
-        assert_eq!(TwinTopics::parse_method_invocation("$iothub/methods/POST/reboot"), None);
+        assert_eq!(
+            TwinTopics::parse_method_invocation("$iothub/methods/POST/reboot"),
+            None
+        );
         let (topic, body) =
             TwinTopics::method_response(200, "rid-9", &serde_json::json!({"ok": true}));
         assert_eq!(topic, "$iothub/methods/res/200/?$rid=rid-9");
@@ -995,9 +1008,13 @@ mod tests {
 
         let captured = transport.captured();
         assert_eq!(captured.len(), 1);
-        assert!(captured[0].topic.starts_with("devices/edge-1/messages/events/"));
+        assert!(captured[0]
+            .topic
+            .starts_with("devices/edge-1/messages/events/"));
         assert_eq!(captured[0].body, br#"{"temp":21.5}"#.to_vec());
-        assert!(captured[0].sas_token.starts_with("SharedAccessSignature sr="));
+        assert!(captured[0]
+            .sas_token
+            .starts_with("SharedAccessSignature sr="));
         assert_eq!(sink.sent_records(), 1);
 
         // 401 expires the token: invalidate + retry to success.
@@ -1011,9 +1028,13 @@ mod tests {
         // Force the cached token stale so renewal mints a new expiry.
         let cache = sink.sas_cache.clone().expect("shared key cache");
         *cache.cached.lock() = Some(("SharedAccessSignature sr=x&se=1".to_string(), 1));
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1029,9 +1050,13 @@ mod tests {
             MockAzureIotOutcome::HttpStatus(429),
             MockAzureIotOutcome::Ok,
         ]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1039,9 +1064,13 @@ mod tests {
         // 404 DeviceNotFound: terminal, single attempt, retained.
         let (sink, transport) = test_sink(test_config());
         transport.script_outcomes(vec![MockAzureIotOutcome::HttpStatus(404)]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("404 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -1072,9 +1101,7 @@ mod tests {
             assert_eq!(decoded.payload, b"{}");
         });
 
-        let transport = Arc::new(
-            TcpAzureIotTransport::new(&format!("127.0.0.1:{port}")).unwrap(),
-        );
+        let transport = Arc::new(TcpAzureIotTransport::new(&format!("127.0.0.1:{port}")).unwrap());
         transport.connect_transport().await.unwrap();
         transport
             .publish(

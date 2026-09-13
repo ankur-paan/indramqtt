@@ -1,8 +1,8 @@
-use bytes::{Buf, BytesMut};
 use crate::error::{BrokerLinkError, Result};
 use crate::frame::{BrokerFrame, DEFAULT_MAX_FRAME_SIZE};
 use crate::header::{FrameHeader, HEADER_LEN, MAGIC, PROTOCOL_VERSION_1};
 use crate::opcode::OpCode;
+use bytes::{Buf, BytesMut};
 
 #[derive(Debug, Clone)]
 pub struct FrameCodec {
@@ -23,7 +23,10 @@ impl FrameCodec {
     pub fn encode(&self, frame: &BrokerFrame, dst: &mut BytesMut) -> Result<()> {
         let total_len = frame.total_frame_len();
         if total_len > self.max_frame_size {
-            return Err(BrokerLinkError::FrameTooLarge(total_len, self.max_frame_size));
+            return Err(BrokerLinkError::FrameTooLarge(
+                total_len,
+                self.max_frame_size,
+            ));
         }
         frame.encode(dst);
         Ok(())
@@ -63,7 +66,10 @@ impl FrameCodec {
         let total_frame_len = HEADER_LEN + total_body_len;
 
         if total_frame_len > self.max_frame_size {
-            return Err(BrokerLinkError::FrameTooLarge(total_frame_len, self.max_frame_size));
+            return Err(BrokerLinkError::FrameTooLarge(
+                total_frame_len,
+                self.max_frame_size,
+            ));
         }
 
         if src.len() < total_frame_len {

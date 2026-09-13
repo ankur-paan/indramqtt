@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    hms_milli_from_millis, hmac_sha256, now_millis, render_template, ymd_from_millis,
-    BackoffState, BatchQueue, ConnectorError, Result, Sink,
+    hmac_sha256, hms_milli_from_millis, now_millis, render_template, ymd_from_millis, BackoffState,
+    BatchQueue, ConnectorError, Result, Sink,
 };
 
 /// Object body compression.
@@ -255,9 +255,10 @@ fn validate_container_name(name: &str) -> Result<()> {
             "azure_blob container_name must start/end alphanumeric: {name:?}"
         )));
     }
-    if !bytes.iter().all(|b| {
-        b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-'
-    }) {
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
         return Err(ConnectorError::Dispatch(format!(
             "azure_blob container_name must match [a-z0-9-]: {name:?}"
         )));
@@ -306,13 +307,15 @@ fn decode_account_key(account_key: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(account_key.trim())
-        .map_err(|e| {
-            ConnectorError::Dispatch(format!("azure_blob account_key is not base64: {e}"))
-        })
+        .map_err(|e| ConnectorError::Dispatch(format!("azure_blob account_key is not base64: {e}")))
 }
 
 /// `Authorization: SharedKey {account}:{Base64(HMAC_SHA256(key, sts))}`.
-pub fn shared_key_authorization(account: &str, account_key_b64: &str, string_to_sign: &str) -> Result<String> {
+pub fn shared_key_authorization(
+    account: &str,
+    account_key_b64: &str,
+    string_to_sign: &str,
+) -> Result<String> {
     let key = decode_account_key(account_key_b64)?;
     use base64::Engine;
     let signature = base64::engine::general_purpose::STANDARD
@@ -415,7 +418,12 @@ pub fn classify_blob_status(status: u16, body: &[u8]) -> AzureBlobOutcome {
 
 #[async_trait]
 pub trait AzureBlobTransport: Send + Sync {
-    async fn put_blob(&self, put: &AzureBlobPut, date: &str, authorization: Option<&str>) -> Result<()>;
+    async fn put_blob(
+        &self,
+        put: &AzureBlobPut,
+        date: &str,
+        authorization: Option<&str>,
+    ) -> Result<()>;
 }
 
 /// In-memory transport recording every upload (tests, dry runs). The
@@ -561,7 +569,10 @@ pub struct AzureBlobSink {
 }
 
 impl AzureBlobSink {
-    pub fn new(config: AzureBlobSinkConfig, transport: Arc<dyn AzureBlobTransport>) -> Result<Self> {
+    pub fn new(
+        config: AzureBlobSinkConfig,
+        transport: Arc<dyn AzureBlobTransport>,
+    ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             buffer: parking_lot::Mutex::new(AzureBlobBuffer {
@@ -624,7 +635,11 @@ impl AzureBlobSink {
         }
         let (body, content_encoding, content_type) = match self.config.compression {
             AzureBlobCompression::None => (raw.into_bytes(), None, "application/x-ndjson"),
-            AzureBlobCompression::Gzip => (gzip_bytes(raw.as_bytes())?, Some("gzip"), "application/octet-stream"),
+            AzureBlobCompression::Gzip => (
+                gzip_bytes(raw.as_bytes())?,
+                Some("gzip"),
+                "application/octet-stream",
+            ),
         };
         let date = super::oci_streaming::rfc1123_date(millis);
         let authorization = match &self.config.auth {
@@ -775,11 +790,17 @@ mod tests {
         assert!(config.validate().is_err());
         config.container_name = "telemetry".to_string();
 
-        config.auth = AzureBlobAuth::SharedKey { account_key: "!!!not-base64!!!".to_string() };
+        config.auth = AzureBlobAuth::SharedKey {
+            account_key: "!!!not-base64!!!".to_string(),
+        };
         assert!(config.validate().is_err());
-        config.auth = AzureBlobAuth::SasToken { sas_token: "   ".to_string() };
+        config.auth = AzureBlobAuth::SasToken {
+            sas_token: "   ".to_string(),
+        };
         assert!(config.validate().is_err());
-        config.auth = AzureBlobAuth::BearerToken { token: String::new() };
+        config.auth = AzureBlobAuth::BearerToken {
+            token: String::new(),
+        };
         assert!(config.validate().is_err());
         config.auth = test_config().auth;
 
@@ -853,10 +874,7 @@ mod tests {
         let config = test_config();
         // 2026-09-12T11:18:09.123Z.
         let path = config.resolve_path(0, 1_789_211_889_123).unwrap();
-        assert_eq!(
-            path,
-            "telemetry/year=2026/month=09/day=12/hour=11/0.json"
-        );
+        assert_eq!(path, "telemetry/year=2026/month=09/day=12/hour=11/0.json");
         let next = config.resolve_path(41, 0).unwrap();
         assert_eq!(next, "telemetry/year=1970/month=01/day=01/hour=00/41.json");
 
@@ -878,8 +896,12 @@ mod tests {
              ?sv=2021-08-06&sr=c&sig=abc%2Fdef"
         );
         // Leading `?` is optional.
-        config.auth = AzureBlobAuth::SasToken { sas_token: "sv=2021-08-06".to_string() };
-        assert!(config.blob_url("telemetry/0.json").ends_with("?sv=2021-08-06"));
+        config.auth = AzureBlobAuth::SasToken {
+            sas_token: "sv=2021-08-06".to_string(),
+        };
+        assert!(config
+            .blob_url("telemetry/0.json")
+            .ends_with("?sv=2021-08-06"));
 
         // SharedKey/Bearer URLs carry no query string.
         assert_eq!(
@@ -889,9 +911,9 @@ mod tests {
 
         // Custom endpoint (Azurite) wins over the default.
         config.endpoint = Some("http://127.0.0.1:10000/devstoreaccount1".to_string());
-        assert!(config.blob_url("telemetry/0.json").starts_with(
-            "http://127.0.0.1:10000/devstoreaccount1/telemetry/telemetry/0.json"
-        ));
+        assert!(config
+            .blob_url("telemetry/0.json")
+            .starts_with("http://127.0.0.1:10000/devstoreaccount1/telemetry/telemetry/0.json"));
     }
 
     #[test]
@@ -930,10 +952,7 @@ mod tests {
             AzureBlobOutcome::Terminal
         );
         assert_eq!(
-            classify_blob_status(
-                404,
-                br#"<Error><Code>ContainerNotFound</Code></Error>"#
-            ),
+            classify_blob_status(404, br#"<Error><Code>ContainerNotFound</Code></Error>"#),
             AzureBlobOutcome::Terminal
         );
         assert_eq!(classify_blob_status(403, b""), AzureBlobOutcome::Terminal);
@@ -961,7 +980,9 @@ mod tests {
         let sink = AzureBlobSink::new(config, transport.clone()).unwrap();
 
         let topic = Topic::new("sensors/t1").unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
         sink.flush().await.unwrap();
         let puts = transport.puts();
@@ -972,7 +993,12 @@ mod tests {
         assert_eq!(sink.sent_blobs(), 1);
         assert_eq!(sink.sent_records(), 1);
         // SharedKey proof ran: mock saw date + SharedKey authorization.
-        assert!(transport.last_date.lock().as_deref().unwrap().ends_with("GMT"));
+        assert!(transport
+            .last_date
+            .lock()
+            .as_deref()
+            .unwrap()
+            .ends_with("GMT"));
         assert!(transport
             .last_authorization
             .lock()
@@ -982,7 +1008,9 @@ mod tests {
 
         // Scripted 503 retries in-loop... here: backoff engages.
         transport.fail_next(503, "<Error><Code>ServiceUnavailable</Code></Error>");
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("503 must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
@@ -995,7 +1023,9 @@ mod tests {
         let mut config = test_config();
         config.max_records_per_blob = Some(10);
         let sink = AzureBlobSink::new(config, transport.clone()).unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("403 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
     }
@@ -1042,7 +1072,9 @@ mod tests {
                 }
             }
         }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1051,9 +1083,8 @@ mod tests {
         let mut config = test_config();
         config.endpoint = Some(format!("http://127.0.0.1:{port}"));
         config.max_records_per_blob = Some(1);
-        let transport = Arc::new(
-            HttpAzureBlobTransport::new(&config, reqwest::Client::new()).unwrap(),
-        );
+        let transport =
+            Arc::new(HttpAzureBlobTransport::new(&config, reqwest::Client::new()).unwrap());
         let sink = AzureBlobSink::new(config, transport).unwrap();
         sink.send(
             &Topic::new("sensors/t1").unwrap(),
@@ -1069,16 +1100,17 @@ mod tests {
         assert!(puts[0].path.starts_with("/telemetry/telemetry/"));
         assert_eq!(puts[0].blob_type.as_deref(), Some("BlockBlob"));
         assert_eq!(puts[0].version.as_deref(), Some("2021-08-06"));
-        assert_eq!(puts[0].content_type.as_deref(), Some("application/x-ndjson"));
+        assert_eq!(
+            puts[0].content_type.as_deref(),
+            Some("application/x-ndjson")
+        );
         assert!(puts[0]
             .auth
             .as_deref()
             .unwrap()
             .starts_with("SharedKey mydeviceblobs:"));
-        let row: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&puts[0].body).unwrap().trim_end(),
-        )
-        .unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&puts[0].body).unwrap().trim_end()).unwrap();
         assert_eq!(row["payload"], serde_json::json!({"v": 9}));
         server.abort();
     }

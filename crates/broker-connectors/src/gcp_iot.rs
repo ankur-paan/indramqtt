@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// JWT signature algorithm for Cloud IoT device credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -152,7 +150,9 @@ impl GcpIotConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_buffer(&self) -> usize {
@@ -201,8 +201,12 @@ pub fn build_jwt(
         }
     }
     .map_err(|e| ConnectorError::Dispatch(format!("gcp-iot private key rejected: {e}")))?;
-    jsonwebtoken::encode(&jsonwebtoken::Header::new(algorithm.jsonwebtoken()), &claims, &key)
-        .map_err(|e| ConnectorError::Dispatch(format!("gcp-iot JWT signing failed: {e}")))
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(algorithm.jsonwebtoken()),
+        &claims,
+        &key,
+    )
+    .map_err(|e| ConnectorError::Dispatch(format!("gcp-iot JWT signing failed: {e}")))
 }
 
 /// Proactive JWT cache: refreshes 60s before expiry.
@@ -323,9 +327,8 @@ pub fn route_downlink(device_id: &str, topic: &str) -> DownlinkRoute {
 
 /// Validate a device state snapshot (must be a JSON object).
 pub fn validate_state_snapshot(payload: &[u8]) -> Result<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
-        ConnectorError::Dispatch("gcp-iot state must be JSON".to_string())
-    })?;
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| ConnectorError::Dispatch("gcp-iot state must be JSON".to_string()))?;
     if !value.is_object() {
         return Err(ConnectorError::Dispatch(
             "gcp-iot state must be a JSON object".to_string(),
@@ -346,7 +349,9 @@ pub enum MockGcpIotOutcome {
     ConnectionError(String),
     /// UNAUTHENTICATED (renews once), RESOURCE_EXHAUSTED (backs
     /// off), PERMISSION_DENIED (terminal).
-    GrpcStatus { code: String },
+    GrpcStatus {
+        code: String,
+    },
 }
 
 /// One captured telemetry publish.
@@ -452,12 +457,13 @@ impl GcpIotTransport for TcpGcpIotTransport {
         use tokio::io::AsyncWriteExt;
         let bytes = super::mqtt_bridge::encode_publish(topic, 0, false, 0, body, false)?;
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("gcp-iot not connected".to_string())
-        })?;
-        stream.write_all(&bytes).await.map_err(|e| {
-            ConnectorError::Connection(format!("gcp-iot publish failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("gcp-iot not connected".to_string()))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("gcp-iot publish failed: {e}")))?;
         Ok(())
     }
 }
@@ -469,11 +475,13 @@ impl TcpGcpIotTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("gcp-iot connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("gcp-iot connect failed: {e}")))?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("gcp-iot connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("gcp-iot connect failed: {e}")))?;
         *self.stream.lock().await = Some(stream);
         Ok(())
     }
@@ -535,7 +543,9 @@ impl GcpIotSink {
     }
 
     fn backoff_delay(&self, attempt: usize) -> Duration {
-        let grown = 100u64.saturating_mul(2u64.saturating_pow(attempt.min(10) as u32)).min(2_000);
+        let grown = 100u64
+            .saturating_mul(2u64.saturating_pow(attempt.min(10) as u32))
+            .min(2_000);
         let jitter = (now_millis().max(0) as u64) % (grown / 2 + 1);
         Duration::from_millis(grown.saturating_add(jitter).min(4_000))
     }
@@ -577,11 +587,7 @@ impl GcpIotSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            ConnectorError::Connection(message),
-                        );
+                        return self.restore_err(rows, oldest, ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
@@ -668,8 +674,8 @@ impl super::Connector for GcpIotConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Sink;
     use crate::test_rsa_keys::{PRIVATE_PEM as RSA_PEM, PUBLIC_PEM as RSA_PUB};
+    use crate::Sink;
 
     /// Test-only P-256 keypair, PKCS#8 form (openssl-generated, never deployed).
     const EC_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNtx6LMoE4Fs+KdnH\nKNSNbNtkzVHwlVXNYicddZ8NK12hRANCAASiFtHB/nPS7UK0kAIKxnr7AVBb/7MM\ngPYl7vJWoexONyDiBQN0yCt5BM+yDWnzinjmSpKSJPlfTejjsjAJYAFc\n-----END PRIVATE KEY-----\n";
@@ -698,15 +704,19 @@ mod tests {
         (sink, transport)
     }
 
-    fn decode_claims(token: &str, public_pem: &str, algorithm: jsonwebtoken::Algorithm) -> serde_json::Value {
+    fn decode_claims(
+        token: &str,
+        public_pem: &str,
+        algorithm: jsonwebtoken::Algorithm,
+    ) -> serde_json::Value {
         let key = jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes())
             .or_else(|_| jsonwebtoken::DecodingKey::from_ec_pem(public_pem.as_bytes()))
             .expect("public key parses");
         let mut validation = jsonwebtoken::Validation::new(algorithm);
         validation.validate_exp = false;
         validation.set_audience(&["my-iot-project"]);
-        let data = jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
-            .expect("verifies");
+        let data =
+            jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).expect("verifies");
         data.claims
     }
 
@@ -739,7 +749,14 @@ mod tests {
     #[test]
     fn test_rs256_jwt_signs_and_verifies() {
         let now = 1_726_000_000u64;
-        let token = build_jwt(RSA_PEM, GcpIotAlgorithm::Rs256, "my-iot-project", now, 3_600).unwrap();
+        let token = build_jwt(
+            RSA_PEM,
+            GcpIotAlgorithm::Rs256,
+            "my-iot-project",
+            now,
+            3_600,
+        )
+        .unwrap();
         assert_eq!(token.split('.').count(), 3);
         let claims = decode_claims(&token, RSA_PUB, jsonwebtoken::Algorithm::RS256);
         assert_eq!(claims["aud"], "my-iot-project");
@@ -752,7 +769,14 @@ mod tests {
     #[test]
     fn test_es256_jwt_signs_and_verifies() {
         let now = 1_726_000_000u64;
-        let token = build_jwt(EC_PRIVATE_PEM, GcpIotAlgorithm::Es256, "my-iot-project", now, 3_600).unwrap();
+        let token = build_jwt(
+            EC_PRIVATE_PEM,
+            GcpIotAlgorithm::Es256,
+            "my-iot-project",
+            now,
+            3_600,
+        )
+        .unwrap();
         assert_eq!(token.split('.').count(), 3);
         let claims = decode_claims(&token, EC_PUBLIC_PEM, jsonwebtoken::Algorithm::ES256);
         assert_eq!(claims["aud"], "my-iot-project");
@@ -789,13 +813,22 @@ mod tests {
         assert!(validate_state_snapshot(br#"{"temp":1}"#).is_ok());
         assert!(validate_state_snapshot(b"[1,2]").is_err());
         assert!(validate_state_snapshot(b"nope").is_err());
-        assert_eq!(route_downlink("edge-7", "/devices/edge-7/config"), DownlinkRoute::Config);
+        assert_eq!(
+            route_downlink("edge-7", "/devices/edge-7/config"),
+            DownlinkRoute::Config
+        );
         assert_eq!(
             route_downlink("edge-7", "/devices/edge-7/commands/reboot"),
             DownlinkRoute::Commands("reboot".to_string())
         );
-        assert_eq!(route_downlink("edge-7", "/devices/edge-7/commands/"), DownlinkRoute::Neither);
-        assert_eq!(route_downlink("edge-7", "/devices/other/config"), DownlinkRoute::Neither);
+        assert_eq!(
+            route_downlink("edge-7", "/devices/edge-7/commands/"),
+            DownlinkRoute::Neither
+        );
+        assert_eq!(
+            route_downlink("edge-7", "/devices/other/config"),
+            DownlinkRoute::Neither
+        );
     }
 
     #[test]
@@ -804,7 +837,12 @@ mod tests {
         assert_eq!(next_refresh_ms(1_000, 0), 940_000);
         assert_eq!(next_refresh_ms(100, 200_000), 200_000);
         // Cache honors the skew then renews.
-        let cache = GcpIotTokenCache::new(RSA_PEM.to_string(), GcpIotAlgorithm::Rs256, "p".to_string(), 3_600);
+        let cache = GcpIotTokenCache::new(
+            RSA_PEM.to_string(),
+            GcpIotAlgorithm::Rs256,
+            "p".to_string(),
+            3_600,
+        );
         let first = cache.token_at(1_000).unwrap();
         assert_eq!(cache.token_at(2_000).unwrap(), first);
         let second = cache.token_at(5_000).unwrap();
@@ -835,14 +873,20 @@ mod tests {
         // UNAUTHENTICATED renews the token and retries to success.
         let (sink, transport) = test_sink(test_config());
         transport.script_outcomes(vec![
-            MockGcpIotOutcome::GrpcStatus { code: "UNAUTHENTICATED".to_string() },
+            MockGcpIotOutcome::GrpcStatus {
+                code: "UNAUTHENTICATED".to_string(),
+            },
             MockGcpIotOutcome::Ok,
         ]);
         // Pin the cache so renewal visibly changes the token.
         *sink.token_cache.cached.lock() = Some(("old-token".to_string(), u64::MAX));
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(transport.captured()[0].password_token, "old-token");
@@ -860,9 +904,13 @@ mod tests {
         transport.script_outcomes(vec![MockGcpIotOutcome::GrpcStatus {
             code: "RESOURCE_EXHAUSTED".to_string(),
         }]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("exhausted must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(transport.calls(), 1);
@@ -873,9 +921,13 @@ mod tests {
         transport.script_outcomes(vec![MockGcpIotOutcome::GrpcStatus {
             code: "PERMISSION_DENIED".to_string(),
         }]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("denied must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

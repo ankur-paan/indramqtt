@@ -1,6 +1,6 @@
-use bytes::{Buf, BufMut, BytesMut};
 use crate::error::{BrokerLinkError, Result};
 use crate::opcode::OpCode;
+use bytes::{Buf, BufMut, BytesMut};
 
 pub const MAGIC: [u8; 2] = [0x42, 0x4C]; // 'B', 'L'
 pub const PROTOCOL_VERSION_1: u8 = 1;
@@ -18,7 +18,13 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    pub fn new(opcode: OpCode, conn_id: u64, sequence_no: u64, meta_len: u16, payload_len: u32) -> Self {
+    pub fn new(
+        opcode: OpCode,
+        conn_id: u64,
+        sequence_no: u64,
+        meta_len: u16,
+        payload_len: u32,
+    ) -> Self {
         Self {
             version: PROTOCOL_VERSION_1,
             flags: 0,

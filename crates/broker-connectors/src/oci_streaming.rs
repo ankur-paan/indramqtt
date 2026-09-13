@@ -25,9 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Headers covered by the OCI signature, in signing order.
 const SIGNED_HEADERS: &str =
@@ -148,7 +146,10 @@ impl OciStreamingSinkConfig {
                 self.stream_id
             )));
         }
-        for (label, ocid) in [("tenancy_ocid", &self.tenancy_ocid), ("user_ocid", &self.user_ocid)] {
+        for (label, ocid) in [
+            ("tenancy_ocid", &self.tenancy_ocid),
+            ("user_ocid", &self.user_ocid),
+        ] {
             if !ocid.starts_with("ocid1.") || ocid.contains([' ', '\0']) {
                 return Err(ConnectorError::Dispatch(format!(
                     "oci {label} must be an OCID: {ocid:?}"
@@ -162,9 +163,8 @@ impl OciStreamingSinkConfig {
             )));
         }
         // Key must parse now (PKCS#1 or PKCS#8).
-        parse_rsa_key(&self.private_key_pem).map_err(|e| {
-            ConnectorError::Dispatch(format!("oci private key rejected: {e}"))
-        })?;
+        parse_rsa_key(&self.private_key_pem)
+            .map_err(|e| ConnectorError::Dispatch(format!("oci private key rejected: {e}")))?;
         if self.partition_key_template.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "oci partition_key_template must not be empty".to_string(),
@@ -213,7 +213,10 @@ impl OciStreamingSinkConfig {
 
     /// `keyId` for the Authorization header.
     pub fn key_id(&self) -> String {
-        format!("{}/{}/{}", self.tenancy_ocid, self.user_ocid, self.fingerprint)
+        format!(
+            "{}/{}/{}",
+            self.tenancy_ocid, self.user_ocid, self.fingerprint
+        )
     }
 
     pub fn effective_batch_size(&self) -> usize {
@@ -225,7 +228,9 @@ impl OciStreamingSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     pub fn effective_buffer(&self) -> usize {
@@ -265,9 +270,7 @@ impl OciStreamingSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -417,11 +420,13 @@ pub fn render_put_messages(messages: &[OciMessage]) -> Vec<u8> {
 /// Split a PutMessagesResult into failed positions: entries carrying
 /// `error` fail, plain offset/partition entries succeed.
 pub fn failed_positions(body: &[u8]) -> Result<Vec<usize>> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("oci bad result JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("oci bad result JSON: {e}")))?;
     let empty = Vec::new();
-    let entries = doc.get("entries").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let entries = doc
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
     let mut failed = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.get("error").is_some() {
@@ -475,7 +480,11 @@ pub enum MockOciOutcome {
 
 #[async_trait]
 pub trait OciStreamingTransport: Send + Sync {
-    async fn put_messages(&self, messages: Vec<OciMessage>, auth: &OciAuthHeaders) -> Result<Vec<usize>>;
+    async fn put_messages(
+        &self,
+        messages: Vec<OciMessage>,
+        auth: &OciAuthHeaders,
+    ) -> Result<Vec<usize>>;
 }
 
 /// Request auth material: proof the signer ran (the header value).
@@ -536,9 +545,9 @@ impl OciStreamingTransport for MockOciStreamingTransport {
         match self.scripted.lock().pop_front() {
             None | Some(MockOciOutcome::Accepted) => Ok(Vec::new()),
             Some(MockOciOutcome::PartialFailed(positions)) => Ok(positions),
-            Some(MockOciOutcome::Throttled) => Err(ConnectorError::Connection(
-                "mock oci throttled".to_string(),
-            )),
+            Some(MockOciOutcome::Throttled) => {
+                Err(ConnectorError::Connection("mock oci throttled".to_string()))
+            }
             Some(MockOciOutcome::Terminal(message)) => Err(ConnectorError::Dispatch(message)),
             Some(MockOciOutcome::ConnectionError(message)) => {
                 Err(ConnectorError::Connection(message))
@@ -975,7 +984,10 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             config.messages_url(),
             "https://cell-1.streaming.us-east-1.oci.oraclecloud.com/20180418/streams/ocid1.stream.oc1.test.stream/messages"
         );
-        assert_eq!(config.host(), "cell-1.streaming.us-east-1.oci.oraclecloud.com");
+        assert_eq!(
+            config.host(),
+            "cell-1.streaming.us-east-1.oci.oraclecloud.com"
+        );
 
         config.endpoint = "http://insecure:8080".to_string();
         assert!(config.validate().is_err());
@@ -1033,7 +1045,10 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         );
         // RFC 1123 date math: epoch, a known Saturday, clamp negatives.
         assert_eq!(rfc1123_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-        assert_eq!(rfc1123_date(1_789_211_889_123), "Sat, 12 Sep 2026 11:18:09 GMT");
+        assert_eq!(
+            rfc1123_date(1_789_211_889_123),
+            "Sat, 12 Sep 2026 11:18:09 GMT"
+        );
         assert_eq!(rfc1123_date(-5), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
@@ -1075,23 +1090,33 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
     #[test]
     fn test_body_and_partial_isolation() {
         // Base64 key/value framing.
-        let body = render_put_messages(&[
-            OciMessage { key_b64: base64_encode(b"device-1"), value_b64: base64_encode(br#"{'temp':24.5}"#) },
-        ]);
-        let doc: serde_json::Value = serde_json::from_str(&String::from_utf8(body).unwrap()).unwrap();
+        let body = render_put_messages(&[OciMessage {
+            key_b64: base64_encode(b"device-1"),
+            value_b64: base64_encode(br#"{'temp':24.5}"#),
+        }]);
+        let doc: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(body).unwrap()).unwrap();
         assert_eq!(doc["messages"][0]["key"], "ZGV2aWNlLTE=");
         // Partial entries: error entries fail by position.
         assert_eq!(
             failed_positions(br#"{"failures":1,"entries":[{"offset":100,"partition":"0"},{"error":"TooManyRequests","errorMessage":"slow"}]}"#).unwrap(),
             vec![1]
         );
-        assert!(failed_positions(br#"{"failures":0,"entries":[{"offset":1,"partition":"0"}]}"#).unwrap().is_empty());
+        assert!(
+            failed_positions(br#"{"failures":0,"entries":[{"offset":1,"partition":"0"}]}"#)
+                .unwrap()
+                .is_empty()
+        );
         assert!(failed_positions(b"nope").is_err());
     }
 
     #[test]
     fn test_status_classification() {
-        assert!(classify_put_response(200, br#"{"failures":0,"entries":[]}"#).unwrap().is_empty());
+        assert!(
+            classify_put_response(200, br#"{"failures":0,"entries":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             classify_put_response(429, b"{}"),
             Err(ConnectorError::Connection(_))
@@ -1124,8 +1149,13 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         ]);
 
         let topic = Topic::new("sensors/t1").unwrap();
-        for payload in [br#"{"client_id":"device-1","v":1}"#.as_slice(), br#"{"client_id":"device-1","v":2}"#.as_slice()] {
-            sink.send(&topic, &Bytes::from(payload.to_vec()), QoS::AtMostOnce).await.unwrap();
+        for payload in [
+            br#"{"client_id":"device-1","v":1}"#.as_slice(),
+            br#"{"client_id":"device-1","v":2}"#.as_slice(),
+        ] {
+            sink.send(&topic, &Bytes::from(payload.to_vec()), QoS::AtMostOnce)
+                .await
+                .unwrap();
         }
         sink.flush().await.unwrap();
 
@@ -1155,7 +1185,8 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             key_b64: base64_encode(b"k"),
             value_b64: base64_encode(b"loopback-body"),
         };
-        let expected_hash = content_sha256_b64(&render_put_messages(std::slice::from_ref(&message)));
+        let expected_hash =
+            content_sha256_b64(&render_put_messages(std::slice::from_ref(&message)));
         let expected_state = StdArc::new(expected_hash);
 
         async fn handler(
@@ -1171,12 +1202,17 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             assert!(auth.starts_with("Signature version=\"1\",headers=\"(request-target) host date x-content-sha256 content-type content-length\",keyId=\"ocid1.tenancy.oc1..test/"));
             assert!(auth.contains(",algorithm=\"rsa-sha256\",signature=\""));
             assert_eq!(
-                headers.get("x-content-sha256").and_then(|v| v.to_str().ok()),
+                headers
+                    .get("x-content-sha256")
+                    .and_then(|v| v.to_str().ok()),
                 Some(state.as_str())
             );
             let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
             assert_eq!(parsed["messages"].as_array().expect("array").len(), 1);
-            (StatusCode::OK, "{\"failures\":0,\"entries\":[{\"offset\":1,\"partition\":\"0\"}]}".to_string())
+            (
+                StatusCode::OK,
+                "{\"failures\":0,\"entries\":[{\"offset\":1,\"partition\":\"0\"}]}".to_string(),
+            )
         }
         let app = Router::new().route(
             "/20180418/streams/ocid1.stream.oc1.test.stream/messages",
@@ -1188,7 +1224,9 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1196,7 +1234,8 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
 
         let mut config = test_config();
         config.endpoint = format!("http://127.0.0.1:{port}");
-        let transport = Arc::new(HttpOciStreamingTransport::new(&config, reqwest::Client::new()).unwrap());
+        let transport =
+            Arc::new(HttpOciStreamingTransport::new(&config, reqwest::Client::new()).unwrap());
         let result = transport
             .put_messages(
                 vec![message],

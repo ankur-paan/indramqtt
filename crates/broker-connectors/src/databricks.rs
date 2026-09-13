@@ -21,9 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 fn default_catalog() -> String {
     "main".to_string()
@@ -59,7 +57,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 
 fn is_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Databricks sink configuration. All depths are optional (`None` =
@@ -194,7 +194,9 @@ impl DatabricksSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -230,9 +232,7 @@ impl DatabricksSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -247,7 +247,13 @@ impl DatabricksSinkConfig {
     }
 
     /// Resolve + validate the table name.
-    pub fn resolve_table(&self, topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Result<String> {
+    pub fn resolve_table(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<String> {
         let vars = Self::template_vars(topic, payload, qos, millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -332,9 +338,8 @@ pub enum StatementState {
 
 /// Parse the `status.state` of a statement response body.
 pub fn parse_statement_state(body: &[u8]) -> Result<StatementState> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("databricks bad response JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("databricks bad response JSON: {e}")))?;
     let state = doc
         .get("status")
         .and_then(|status| status.get("state"))
@@ -363,7 +368,9 @@ pub fn parse_statement_state(body: &[u8]) -> Result<StatementState> {
 pub enum MockDatabricksOutcome {
     Succeeded,
     Pending,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
     /// Transport failure (retries in-loop).
     ConnectionError(String),
     /// HTTP failure (429/503 retry the batch).
@@ -442,9 +449,9 @@ impl DatabricksTransport for MockDatabricksTransport {
                 Err(ConnectorError::Connection(message))
             }
             Some(MockDatabricksOutcome::HttpStatus(status)) => Err(match status {
-                429 | 503 => ConnectorError::Connection(format!(
-                    "mock databricks throttled with {status}"
-                )),
+                429 | 503 => {
+                    ConnectorError::Connection(format!("mock databricks throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock databricks failed with {status}")),
             }),
         }
@@ -514,14 +521,12 @@ impl DatabricksTransport for HttpDatabricksTransport {
             .map_err(|e| ConnectorError::Connection(format!("databricks read failed: {e}")))?;
         match parse_statement_state(&bytes)? {
             StatementState::Succeeded => Ok(()),
-            StatementState::Pending | StatementState::Running => Err(
-                ConnectorError::Connection("databricks statement pending".to_string()),
+            StatementState::Pending | StatementState::Running => Err(ConnectorError::Connection(
+                "databricks statement pending".to_string(),
+            )),
+            StatementState::Failed | StatementState::Canceled | StatementState::Closed => Err(
+                ConnectorError::Dispatch("databricks statement failed".to_string()),
             ),
-            StatementState::Failed | StatementState::Canceled | StatementState::Closed => {
-                Err(ConnectorError::Dispatch(
-                    "databricks statement failed".to_string(),
-                ))
-            }
         }
     }
 }
@@ -633,10 +638,11 @@ impl DatabricksSink {
         let text = std::str::from_utf8(payload).map_err(|_| {
             ConnectorError::Dispatch("databricks payload must be UTF-8".to_string())
         })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("databricks payload must be JSON".to_string())
-        })?;
-        let table = self.config.resolve_table(topic.as_str(), payload, qos, millis)?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("databricks payload must be JSON".to_string()))?;
+        let table = self
+            .config
+            .resolve_table(topic.as_str(), payload, qos, millis)?;
         let mut columns: Vec<String> = Vec::new();
         let mut values: Vec<serde_json::Value> = Vec::new();
         if self.config.column_mappings.is_empty() {
@@ -660,7 +666,8 @@ impl DatabricksSink {
             for name in names {
                 let template = &self.config.column_mappings[name];
                 let rendered =
-                    self.config.event_vars(topic.as_str(), payload, qos, millis, template)?;
+                    self.config
+                        .event_vars(topic.as_str(), payload, qos, millis, template)?;
                 let field = serde_json::from_str::<serde_json::Value>(&rendered)
                     .ok()
                     .filter(|v| !v.is_string())
@@ -673,7 +680,8 @@ impl DatabricksSink {
         // explicit `_PARTITION` STRING column (fail loudly when empty).
         if let Some(template) = &self.config.partition_key_template {
             let partition =
-                self.config.event_vars(topic.as_str(), payload, qos, millis, template)?;
+                self.config
+                    .event_vars(topic.as_str(), payload, qos, millis, template)?;
             if partition.trim().is_empty() {
                 return Err(ConnectorError::Dispatch(
                     "databricks partition rendered empty".to_string(),
@@ -709,7 +717,12 @@ impl DatabricksSink {
 
     /// Merge one group (same table + columns) into a single
     /// multi-tuple INSERT with sequentially renumbered parameters.
-    fn merge_group(table: &str, columns: &[String], rows: &[DatabricksRow], config: &DatabricksSinkConfig) -> (String, Vec<DatabricksParam>) {
+    fn merge_group(
+        table: &str,
+        columns: &[String],
+        rows: &[DatabricksRow],
+        config: &DatabricksSinkConfig,
+    ) -> (String, Vec<DatabricksParam>) {
         let mut tuples = Vec::with_capacity(rows.len());
         let mut params = Vec::new();
         for row in rows {
@@ -764,8 +777,7 @@ impl DatabricksSink {
         loop {
             let mut outcome: Result<()> = Ok(());
             for (table, columns, grouped) in &groups {
-                let (statement, params) =
-                    Self::merge_group(table, columns, grouped, &self.config);
+                let (statement, params) = Self::merge_group(table, columns, grouped, &self.config);
                 if let Err(e) = self
                     .transport
                     .execute_statement(&statement, params, &self.config.token)
@@ -887,7 +899,10 @@ mod tests {
             partition_key_template: None,
             column_mappings: HashMap::from([
                 ("device_id".to_string(), "${client_id}".to_string()),
-                ("temperature".to_string(), "${payload.temperature}".to_string()),
+                (
+                    "temperature".to_string(),
+                    "${payload.temperature}".to_string(),
+                ),
             ]),
             batch_size: Some(200),
             batch_bytes: Some(2_097_152),
@@ -971,10 +986,22 @@ mod tests {
         );
 
         // Typing follows JSON shape.
-        assert_eq!(DatabricksSink::typed_param("1", &serde_json::json!("x")).param_type, "STRING");
-        assert_eq!(DatabricksSink::typed_param("1", &serde_json::json!(98.6)).param_type, "DOUBLE");
-        assert_eq!(DatabricksSink::typed_param("1", &serde_json::json!(7)).param_type, "BIGINT");
-        assert_eq!(DatabricksSink::typed_param("1", &serde_json::json!(true)).param_type, "BOOLEAN");
+        assert_eq!(
+            DatabricksSink::typed_param("1", &serde_json::json!("x")).param_type,
+            "STRING"
+        );
+        assert_eq!(
+            DatabricksSink::typed_param("1", &serde_json::json!(98.6)).param_type,
+            "DOUBLE"
+        );
+        assert_eq!(
+            DatabricksSink::typed_param("1", &serde_json::json!(7)).param_type,
+            "BIGINT"
+        );
+        assert_eq!(
+            DatabricksSink::typed_param("1", &serde_json::json!(true)).param_type,
+            "BOOLEAN"
+        );
         assert_eq!(
             DatabricksSink::typed_param("1", &serde_json::json!({"a": 1})).param_type,
             "STRING"
@@ -1024,8 +1051,16 @@ mod tests {
         assert_eq!(
             captured[0].params,
             vec![
-                DatabricksParam { name: "1".to_string(), value: "dev-42".to_string(), param_type: "STRING".to_string() },
-                DatabricksParam { name: "2".to_string(), value: "98.6".to_string(), param_type: "DOUBLE".to_string() },
+                DatabricksParam {
+                    name: "1".to_string(),
+                    value: "dev-42".to_string(),
+                    param_type: "STRING".to_string()
+                },
+                DatabricksParam {
+                    name: "2".to_string(),
+                    value: "98.6".to_string(),
+                    param_type: "DOUBLE".to_string()
+                },
             ]
         );
         assert_eq!(captured[0].token, "dapi-test-token");
@@ -1049,7 +1084,14 @@ mod tests {
         let captured = transport.captured();
         assert!(captured[0].statement.contains("_PARTITION"));
         let last = captured[0].params.last().expect("partition param");
-        assert_eq!((last.name.as_str(), last.value.as_str(), last.param_type.as_str()), ("3", "edge-d7", "STRING"));
+        assert_eq!(
+            (
+                last.name.as_str(),
+                last.value.as_str(),
+                last.param_type.as_str()
+            ),
+            ("3", "edge-d7", "STRING")
+        );
     }
 
     #[tokio::test]
@@ -1059,9 +1101,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for temp in [20.5, 21.5] {
-            sink.send(&topic, &Bytes::from(format!("{{\"client_id\":\"d\",\"temperature\":{temp}}}")), QoS::AtMostOnce)
-                .await
-                .unwrap();
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{\"client_id\":\"d\",\"temperature\":{temp}}}")),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
         }
         sink.flush().await.unwrap();
         // One statement call with two tuples and renumbered params.
@@ -1072,11 +1118,19 @@ mod tests {
             "INSERT INTO main.default.sensor_readings (device_id, temperature) VALUES (?, ?), (?, ?)"
         );
         assert_eq!(
-            captured[0].params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            captured[0]
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
             vec!["1", "2", "3", "4"]
         );
         assert_eq!(
-            captured[0].params.iter().map(|p| p.value.clone()).collect::<Vec<_>>(),
+            captured[0]
+                .params
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>(),
             vec!["d", "20.5", "d", "21.5"]
         );
         assert_eq!(sink.sent_records(), 2);
@@ -1094,9 +1148,13 @@ mod tests {
             MockDatabricksOutcome::Succeeded,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1110,13 +1168,19 @@ mod tests {
         config.max_retries = Some(5);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockDatabricksOutcome::Failed { message: "syntax error".to_string() },
+            MockDatabricksOutcome::Failed {
+                message: "syntax error".to_string(),
+            },
             MockDatabricksOutcome::Succeeded,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("failed must abort");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

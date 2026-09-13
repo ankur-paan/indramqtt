@@ -302,7 +302,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-        #[test]
+    #[test]
     fn test_insert_query_renders_whitelisted_formats() {
         let mut config = test_config("http://ch:8123");
         for format in ["JSONEachRow", "JSONStringsEachRow", "TabSeparated", "CSV"] {
@@ -316,10 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn test_row_validation() {        let sink = ClickHouseSink::new(test_config("http://ch:8123"), test_client()).unwrap();
-        let topic= Topic::new("sensors/t1").unwrap();
+    fn test_row_validation() {
+        let sink = ClickHouseSink::new(test_config("http://ch:8123"), test_client()).unwrap();
+        let topic = Topic::new("sensors/t1").unwrap();
 
-        assert!(!sink.buffer_row(&topic, &Bytes::from("{}"), QoS::AtLeastOnce).unwrap());
+        assert!(!sink
+            .buffer_row(&topic, &Bytes::from("{}"), QoS::AtLeastOnce)
+            .unwrap());
         assert_eq!(sink.buffered_rows(), 1);
 
         // Empty topics are rejected at construction, so they can never
@@ -349,12 +352,9 @@ mod tests {
         ) -> StatusCode {
             *captured.query.lock().unwrap() = uri.query().unwrap_or_default().to_string();
             *captured.body.lock().unwrap() = body;
-            StatusCode::from_u16(*captured.status.lock().unwrap())
-                .unwrap_or(StatusCode::OK)
+            StatusCode::from_u16(*captured.status.lock().unwrap()).unwrap_or(StatusCode::OK)
         }
-        let app = Router::new()
-            .route("/", post(handler))
-            .with_state(captured);
+        let app = Router::new().route("/", post(handler)).with_state(captured);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
@@ -371,18 +371,24 @@ mod tests {
         config.batch_size = 2;
         let sink = ClickHouseSink::new(config, test_client()).unwrap();
 
-        let t1= Topic::new("sensors/t1").unwrap();
-        let t2= Topic::new("sensors/t2").unwrap();
-        sink.send(&t1, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce).await.unwrap();
+        let t1 = Topic::new("sensors/t1").unwrap();
+        let t2 = Topic::new("sensors/t2").unwrap();
+        sink.send(&t1, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
-        sink.send(&t2, &Bytes::from(r#"{"v":2}"#), QoS::AtLeastOnce).await.unwrap();
+        sink.send(&t2, &Bytes::from(r#"{"v":2}"#), QoS::AtLeastOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.sent_batches(), 1);
         assert_eq!(sink.buffered_rows(), 0);
 
         let query = captured.query.lock().unwrap().clone();
-        assert!(query.contains("INSERT+INTO+indra.mqtt_events+FORMAT+JSONEachRow")
-            || query.contains("INSERT INTO indra.mqtt_events FORMAT JSONEachRow"),
-            "unexpected query: {query}");
+        assert!(
+            query.contains("INSERT+INTO+indra.mqtt_events+FORMAT+JSONEachRow")
+                || query.contains("INSERT INTO indra.mqtt_events FORMAT JSONEachRow"),
+            "unexpected query: {query}"
+        );
         let body = captured.body.lock().unwrap().clone();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -406,8 +412,10 @@ mod tests {
         config.batch_size = 10;
         let sink = ClickHouseSink::new(config, test_client()).unwrap();
 
-        let topic= Topic::new("sensors/t1").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        let topic = Topic::new("sensors/t1").unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
         let err = sink.flush().await.expect_err("500 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));

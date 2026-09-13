@@ -1,11 +1,11 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -143,8 +143,8 @@ impl TokenBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         self.last_update = now;
-        self.tokens = (self.tokens + elapsed * f64::from(self.rate_per_sec))
-            .min(f64::from(self.burst));
+        self.tokens =
+            (self.tokens + elapsed * f64::from(self.rate_per_sec)).min(f64::from(self.burst));
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -272,7 +272,8 @@ impl SessionManager {
         }
     }
 
-    pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {        let mut map = self.sessions.write();
+    pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {
+        let mut map = self.sessions.write();
 
         if clean_start {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
@@ -336,9 +337,7 @@ impl SessionManager {
     /// releases from racing teardowns can never underflow).
     pub fn release_connection_slot(&self, username: &str) {
         if let Some(count) = self.conn_counts.read().get(username) {
-            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                n.checked_sub(1)
-            });
+            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
     }
 
@@ -425,14 +424,21 @@ mod tests {
         assert!(!info.clean_start);
         assert!(info.connected);
         assert_eq!(info.queued, 0);
-        assert_eq!(info.subscriptions, vec!["alerts".to_string(), "sensors/+".to_string()]);
+        assert_eq!(
+            info.subscriptions,
+            vec!["alerts".to_string(), "sensors/+".to_string()]
+        );
 
         manager.remove_subscription("detail-9", &TopicFilter::new("alerts").unwrap());
         let info = manager.client_info("detail-9").expect("still known");
         assert_eq!(info.subscriptions, vec!["sensors/+".to_string()]);
 
         // Unknown clients are no-ops, never panics.
-        manager.add_subscription("ghost", TopicFilter::new("a").unwrap(), broker_protocol::QoS::AtMostOnce);
+        manager.add_subscription(
+            "ghost",
+            TopicFilter::new("a").unwrap(),
+            broker_protocol::QoS::AtMostOnce,
+        );
         manager.remove_subscription("ghost", &TopicFilter::new("a").unwrap());
     }
 

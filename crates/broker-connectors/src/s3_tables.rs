@@ -122,9 +122,8 @@ pub struct S3TablesSinkConfig {
 
 impl S3TablesSinkConfig {
     pub fn validate(&self) -> Result<()> {
-        parse_table_bucket_arn(&self.table_bucket_arn).map_err(|e| {
-            ConnectorError::Dispatch(format!("s3_tables table_bucket_arn: {e}"))
-        })?;
+        parse_table_bucket_arn(&self.table_bucket_arn)
+            .map_err(|e| ConnectorError::Dispatch(format!("s3_tables table_bucket_arn: {e}")))?;
         if self.namespace.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "s3_tables namespace must not be empty".to_string(),
@@ -235,7 +234,9 @@ pub fn parse_table_bucket_arn(arn: &str) -> std::result::Result<TableBucketArn, 
             account_id: parts[4].to_string(),
             bucket: bucket.to_string(),
         }),
-        _ => Err(format!("s3tables ARN needs resource bucket/<name>: {arn:?}")),
+        _ => Err(format!(
+            "s3tables ARN needs resource bucket/<name>: {arn:?}"
+        )),
     }
 }
 
@@ -660,10 +661,7 @@ pub struct S3TablesSink {
 }
 
 impl S3TablesSink {
-    pub fn new(
-        config: S3TablesSinkConfig,
-        transport: Arc<dyn S3TablesTransport>,
-    ) -> Result<Self> {
+    pub fn new(config: S3TablesSinkConfig, transport: Arc<dyn S3TablesTransport>) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             buffer: parking_lot::Mutex::new(S3TablesBuffer {
@@ -722,9 +720,11 @@ impl S3TablesSink {
             raw.push('\n');
         }
         let (body, content_encoding, content_type) = match self.config.target_format {
-            S3TablesFormat::NdjsonCompressed => {
-                (gzip_bytes(raw.as_bytes())?, Some("gzip"), "application/x-ndjson")
-            }
+            S3TablesFormat::NdjsonCompressed => (
+                gzip_bytes(raw.as_bytes())?,
+                Some("gzip"),
+                "application/x-ndjson",
+            ),
             S3TablesFormat::ParquetPlaceholder => {
                 (raw.into_bytes(), None, "application/octet-stream")
             }
@@ -947,12 +947,7 @@ mod tests {
             "date_year=2026"
         );
         assert_eq!(
-            apply_partition_transform(
-                IcebergTransform::Identity,
-                "device_id",
-                "sensor-42",
-                millis
-            ),
+            apply_partition_transform(IcebergTransform::Identity, "device_id", "sensor-42", millis),
             "device_id=sensor-42"
         );
         assert_eq!(
@@ -971,8 +966,14 @@ mod tests {
 
         // Full directory honours spec order; missing dims are null.
         let spec = vec![
-            IcebergPartitionField { source_name: "date".to_string(), transform: IcebergTransform::Day },
-            IcebergPartitionField { source_name: "device_id".to_string(), transform: IcebergTransform::Identity },
+            IcebergPartitionField {
+                source_name: "date".to_string(),
+                transform: IcebergTransform::Day,
+            },
+            IcebergPartitionField {
+                source_name: "device_id".to_string(),
+                transform: IcebergTransform::Identity,
+            },
         ];
         let dims = [("device_id", "sensor-42".to_string())];
         assert_eq!(
@@ -988,10 +989,18 @@ mod tests {
 
     #[test]
     fn test_data_file_path_and_snapshot() {
-        let key = data_file_path("date_day=2026-09-12/device_id=sensor-42", S3TablesFormat::NdjsonCompressed);
+        let key = data_file_path(
+            "date_day=2026-09-12/device_id=sensor-42",
+            S3TablesFormat::NdjsonCompressed,
+        );
         assert!(key.starts_with("data/date_day=2026-09-12/device_id=sensor-42/"));
         assert!(key.ends_with(".data.gz"));
-        let id = key.rsplit('/').next().unwrap().strip_suffix(".data.gz").unwrap();
+        let id = key
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_suffix(".data.gz")
+            .unwrap();
         assert!(uuid::Uuid::parse_str(id).is_ok());
         assert!(data_file_path("", S3TablesFormat::NdjsonCompressed).starts_with("data/"));
 
@@ -1013,7 +1022,10 @@ mod tests {
         assert_eq!(parsed["table"], "production_iot.device_events");
         assert_eq!(parsed["schema"]["fields"].as_array().unwrap().len(), 4);
         assert_eq!(parsed["manifest"]["path"], "metadata/snap-7.avro");
-        assert_eq!(parsed["manifest"]["partition_summary"]["date_day=2026-09-12"], 3);
+        assert_eq!(
+            parsed["manifest"]["partition_summary"]["date_day=2026-09-12"],
+            3
+        );
         assert_eq!(parsed["data_files"][0]["record_count"], 3);
     }
 
@@ -1061,14 +1073,30 @@ mod tests {
         let sink = S3TablesSink::new(config, transport.clone()).unwrap();
 
         let topic = Topic::new("sensors/t1").unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"device_id":"sensor-42","v":1}"#), QoS::AtMostOnce).await.unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"device_id":"sensor-42","v":2}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"device_id":"sensor-42","v":1}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"device_id":"sensor-42","v":2}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.sent_files(), 1);
         assert_eq!(sink.sent_records(), 2);
 
         let puts = transport.puts();
         assert_eq!(puts.len(), 1);
-        assert!(puts[0].key.contains("device_id=sensor-42/"), "got {:?}", puts[0].key);
+        assert!(
+            puts[0].key.contains("device_id=sensor-42/"),
+            "got {:?}",
+            puts[0].key
+        );
         assert!(puts[0].key.ends_with(".data.gz"));
         assert_eq!(puts[0].content_encoding, Some("gzip"));
         // Gzip body holds both ndjson rows.
@@ -1088,7 +1116,9 @@ mod tests {
 
         // Transport failures restore the buffer and engage backoff.
         transport.fail_next(10);
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("mock down must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
@@ -1134,7 +1164,9 @@ mod tests {
                 }
             }
         }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1143,9 +1175,8 @@ mod tests {
         let mut config = test_config();
         config.endpoint = Some(format!("http://127.0.0.1:{port}"));
         config.batch_size = Some(1);
-        let transport = Arc::new(
-            HttpS3TablesTransport::new(&config, reqwest::Client::new()).unwrap(),
-        );
+        let transport =
+            Arc::new(HttpS3TablesTransport::new(&config, reqwest::Client::new()).unwrap());
         let sink = S3TablesSink::new(config, transport).unwrap();
         sink.send(
             &Topic::new("sensors/t1").unwrap(),
@@ -1160,9 +1191,16 @@ mod tests {
         assert_eq!(puts.len(), 1);
         assert!(puts[0].path.starts_with("/data/date_day="));
         assert!(puts[0].path.ends_with(".data.gz"));
-        assert_eq!(puts[0].content_type.as_deref(), Some("application/x-ndjson"));
+        assert_eq!(
+            puts[0].content_type.as_deref(),
+            Some("application/x-ndjson")
+        );
         // Custom endpoint signs the `s3` service.
-        assert!(puts[0].auth.as_deref().unwrap().contains("/us-east-1/s3/aws4_request"));
+        assert!(puts[0]
+            .auth
+            .as_deref()
+            .unwrap()
+            .contains("/us-east-1/s3/aws4_request"));
         assert_eq!(puts[0].date.as_deref().unwrap().len(), 16);
         // The uploaded body gunzips to the single ndjson row.
         assert_eq!(&puts[0].body[..2], &[0x1f, 0x8b], "gzip magic");

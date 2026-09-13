@@ -23,9 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 fn default_token_ttl_secs() -> u64 {
     3_600
@@ -58,9 +56,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 fn is_namespace(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=63).contains(&bytes.len())
-        && bytes.iter().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-'
-        })
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
         && bytes[0] != b'-'
         && bytes[bytes.len() - 1] != b'-'
 }
@@ -68,9 +66,9 @@ fn is_namespace(value: &str) -> bool {
 fn is_hub_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=256).contains(&bytes.len())
-        && bytes.iter().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.' | b'~')
-        })
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.' | b'~'))
 }
 
 /// Azure Event Hubs sink configuration. All depths are optional
@@ -202,7 +200,9 @@ impl AzureEventHubsSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event (`${client_id}` from the JSON
@@ -263,12 +263,7 @@ fn sas_key_bytes(secret: &str) -> Vec<u8> {
 
 /// Build the `Authorization: SharedAccessSignature ...` value for
 /// `resource_uri` expiring at `expiry_secs` (Unix seconds).
-pub fn sas_token(
-    resource_uri: &str,
-    key_name: &str,
-    secret: &str,
-    expiry_secs: u64,
-) -> String {
+pub fn sas_token(resource_uri: &str, key_name: &str, secret: &str, expiry_secs: u64) -> String {
     let string_to_sign = format!("{resource_uri}\n{expiry_secs}");
     // HMAC-SHA256 inline (same shape as the shared signer).
     const BLOCK: usize = 64;
@@ -331,9 +326,7 @@ pub fn render_batch_body(events: &[AzureEventItem]) -> Vec<u8> {
             }
             body.push_str(&serde_json::to_string(key).unwrap_or_default());
             body.push(':');
-            body.push_str(
-                &serde_json::to_string(&event.user_properties[*key]).unwrap_or_default(),
-            );
+            body.push_str(&serde_json::to_string(&event.user_properties[*key]).unwrap_or_default());
         }
         body.push_str("},\"BrokerProperties\":{");
         match &event.partition_key {
@@ -424,9 +417,9 @@ impl AzureEventHubsTransport for MockAzureEventHubsTransport {
         match self.scripted.lock().pop_front() {
             None => Ok(()),
             Some(MockAzureOutcome::HttpStatus(status)) => Err(match status {
-                429 | 503 => ConnectorError::Connection(format!(
-                    "mock azure throttled with {status}"
-                )),
+                429 | 503 => {
+                    ConnectorError::Connection(format!("mock azure throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock azure failed with {status}")),
             }),
             Some(MockAzureOutcome::TransportError(message)) => {
@@ -618,8 +611,8 @@ impl AzureEventHubsSink {
         let mut attempt = 0usize;
         loop {
             // Fresh SAS per attempt: tokens may expire mid-backoff.
-            let expiry =
-                (now_millis().max(0) as u64 / 1_000).saturating_add(self.config.token_ttl_secs.max(1));
+            let expiry = (now_millis().max(0) as u64 / 1_000)
+                .saturating_add(self.config.token_ttl_secs.max(1));
             let token = sas_token(
                 &self.config.resource_uri(),
                 &self.config.shared_access_key_name,
@@ -825,9 +818,20 @@ mod tests {
         let token = sas_token("https://ns/hub", "k", "plain-secret-key", 1_789_211_889);
         assert!(token.starts_with("SharedAccessSignature sr=https%3A%2F%2Fns%2Fhub&sig="));
         // The embedded signature decodes to 32 HMAC bytes.
-        let sig_enc = token.split("&sig=").nth(1).unwrap().split('&').next().unwrap();
-        let sig_b64 = sig_enc.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=");
-        let sig = base64::engine::general_purpose::STANDARD.decode(&sig_b64).unwrap();
+        let sig_enc = token
+            .split("&sig=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        let sig_b64 = sig_enc
+            .replace("%2B", "+")
+            .replace("%2F", "/")
+            .replace("%3D", "=");
+        let sig = base64::engine::general_purpose::STANDARD
+            .decode(&sig_b64)
+            .unwrap();
         assert_eq!(sig.len(), 32);
     }
 
@@ -847,15 +851,28 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].hub, "telemetry-hub");
         // SAS token shape on the wire.
-        assert!(captured[0].sas_token.starts_with("SharedAccessSignature sr="));
+        assert!(captured[0]
+            .sas_token
+            .starts_with("SharedAccessSignature sr="));
         assert!(captured[0].sas_token.contains("&skn=SendPolicy"));
         assert_eq!(captured[0].events.len(), 1);
         let event = &captured[0].events[0];
         assert_eq!(event.partition_key.as_deref(), Some("edge-7"));
-        assert_eq!(event.user_properties.get("mqtt_topic").map(String::as_str), Some("sensors/t1"));
-        assert_eq!(event.user_properties.get("mqtt_qos").map(String::as_str), Some("1"));
-        assert_eq!(event.user_properties.get("source").map(String::as_str), Some("indramqtt"));
-        let payload = base64::engine::general_purpose::STANDARD.decode(&event.body_b64).unwrap();
+        assert_eq!(
+            event.user_properties.get("mqtt_topic").map(String::as_str),
+            Some("sensors/t1")
+        );
+        assert_eq!(
+            event.user_properties.get("mqtt_qos").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event.user_properties.get("source").map(String::as_str),
+            Some("indramqtt")
+        );
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&event.body_b64)
+            .unwrap();
         assert_eq!(payload, br#"{"client_id":"edge-7","v":1}"#);
 
         // Rendered body shape matches the batch contract.
@@ -871,9 +888,8 @@ mod tests {
         // partition template means a null BrokerProperties key.
         let mut config = test_config();
         config.partition_key_template = None;
-        config.user_properties = HashMap::from([
-            ("device".to_string(), "${client_id}@${topic}".to_string()),
-        ]);
+        config.user_properties =
+            HashMap::from([("device".to_string(), "${client_id}@${topic}".to_string())]);
         let (sink, transport) = test_sink(config);
         sink.send(
             &Topic::new("sensors/t1").unwrap(),
@@ -886,7 +902,10 @@ mod tests {
         let captured = transport.captured();
         assert_eq!(captured[0].events[0].partition_key, None);
         assert_eq!(
-            captured[0].events[0].user_properties.get("device").map(String::as_str),
+            captured[0].events[0]
+                .user_properties
+                .get("device")
+                .map(String::as_str),
             Some("edge-7@sensors/t1")
         );
         let body = String::from_utf8(render_batch_body(&captured[0].events)).unwrap();
@@ -905,9 +924,13 @@ mod tests {
             MockAzureOutcome::HttpStatus(503),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 3);
         assert_eq!(sink.sent_batches(), 1);
@@ -923,9 +946,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockAzureOutcome::HttpStatus(400)]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("400 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -938,10 +965,17 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockAzureOutcome::HttpStatus(503)]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        let err = sink
+            .flush()
             .await
-            .unwrap();
-        let err = sink.flush().await.expect_err("503 with no retries must fail");
+            .expect_err("503 with no retries must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);

@@ -231,7 +231,11 @@ pub fn build_system_properties(
     let tag = match &config.tag_template {
         Some(template) => {
             let rendered = resolve_system_field(template, topic, client_id, message_id)?;
-            if rendered.is_empty() { None } else { Some(rendered) }
+            if rendered.is_empty() {
+                None
+            } else {
+                Some(rendered)
+            }
         }
         None => None,
     };
@@ -249,7 +253,11 @@ pub fn build_system_properties(
     let message_group = match &config.message_group_template {
         Some(template) => {
             let rendered = resolve_system_field(template, topic, client_id, message_id)?;
-            if rendered.is_empty() { None } else { Some(rendered) }
+            if rendered.is_empty() {
+                None
+            } else {
+                Some(rendered)
+            }
         }
         None => None,
     };
@@ -341,9 +349,8 @@ pub fn decode_envelope(frame: &[u8]) -> Result<RocketMqEnvelope> {
             frame.len() - 5
         )));
     }
-    serde_json::from_slice(&frame[5..]).map_err(|e| {
-        ConnectorError::Dispatch(format!("rocketmq envelope body is not JSON: {e}"))
-    })
+    serde_json::from_slice(&frame[5..])
+        .map_err(|e| ConnectorError::Dispatch(format!("rocketmq envelope body is not JSON: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,13 +617,9 @@ impl RocketMqTransport for TcpRocketMqTransport {
         // Envelope frames carry their own 5-byte prefix; the ack
         // framing is a bare BE length + JSON `{"code":N}` body.
         let reply = self.roundtrip(frame).await?;
-        let ack: serde_json::Value = serde_json::from_slice(&reply).map_err(|e| {
-            ConnectorError::Connection(format!("rocketmq ack is not JSON: {e}"))
-        })?;
-        let code = ack
-            .get("code")
-            .and_then(|code| code.as_i64())
-            .unwrap_or(-1) as i32;
+        let ack: serde_json::Value = serde_json::from_slice(&reply)
+            .map_err(|e| ConnectorError::Connection(format!("rocketmq ack is not JSON: {e}")))?;
+        let code = ack.get("code").and_then(|code| code.as_i64()).unwrap_or(-1) as i32;
         match classify_status(RocketMqStatus::from_code(code)) {
             RocketMqOutcome::Success => Ok(()),
             RocketMqOutcome::Retryable => Err(ConnectorError::Connection(format!(
@@ -699,9 +702,11 @@ impl RocketMqSink {
     fn build_messages(&self, rows: &[RocketMqRow], millis: i64) -> Result<Vec<RocketMqMessage>> {
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows {
-            let text = std::str::from_utf8(&row.payload)
-                .map_err(|_| ConnectorError::Dispatch("rocketmq payload must be UTF-8".to_string()))?;
-            let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+            let text = std::str::from_utf8(&row.payload).map_err(|_| {
+                ConnectorError::Dispatch("rocketmq payload must be UTF-8".to_string())
+            })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
             let client_id = parsed
                 .get("client_id")
                 .and_then(|v| v.as_str())
@@ -740,7 +745,8 @@ impl RocketMqSink {
         let millis = now_millis();
         let datetime = rfc3339_millis(millis);
         let messages = self.build_messages(&pending, millis)?;
-        let body_md5 = md5_hex(&serde_json::to_vec(&messages_md5_input(&messages)).unwrap_or_default());
+        let body_md5 =
+            md5_hex(&serde_json::to_vec(&messages_md5_input(&messages)).unwrap_or_default());
         let authorization = match (&self.config.access_key, &self.config.secret_key) {
             (Some(ak), Some(sk)) => Some(authorization_header(
                 ak,
@@ -893,7 +899,10 @@ mod tests {
         config.secret_key = None;
         assert!(config.validate().is_err(), "half credentials must fail");
         config.access_key = None;
-        assert!(config.validate().is_ok(), "anonymous proxy testing is allowed");
+        assert!(
+            config.validate().is_ok(),
+            "anonymous proxy testing is allowed"
+        );
         config.access_key = Some("rocket-key".to_string());
         config.secret_key = Some(String::new());
         assert!(config.validate().is_err());
@@ -933,7 +942,9 @@ mod tests {
     #[test]
     fn test_system_properties_builder() {
         let config = test_config();
-        let props = build_system_properties(&config, "sensors/kitchen", "d7", 41, 1_789_211_889_123).unwrap();
+        let props =
+            build_system_properties(&config, "sensors/kitchen", "d7", 41, 1_789_211_889_123)
+                .unwrap();
         assert_eq!(
             props,
             RocketMqSystemProperties {
@@ -993,13 +1004,34 @@ mod tests {
 
     #[test]
     fn test_status_classification_and_fifo_hashing() {
-        assert_eq!(classify_status(RocketMqStatus::from_code(0)), RocketMqOutcome::Success);
-        assert_eq!(classify_status(RocketMqStatus::from_code(1)), RocketMqOutcome::Retryable);
-        assert_eq!(classify_status(RocketMqStatus::from_code(2)), RocketMqOutcome::Retryable);
-        assert_eq!(classify_status(RocketMqStatus::from_code(3)), RocketMqOutcome::Terminal);
-        assert_eq!(classify_status(RocketMqStatus::from_code(4)), RocketMqOutcome::Terminal);
-        assert_eq!(classify_status(RocketMqStatus::from_code(5)), RocketMqOutcome::Terminal);
-        assert_eq!(classify_status(RocketMqStatus::from_code(99)), RocketMqOutcome::Retryable);
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(0)),
+            RocketMqOutcome::Success
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(1)),
+            RocketMqOutcome::Retryable
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(2)),
+            RocketMqOutcome::Retryable
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(3)),
+            RocketMqOutcome::Terminal
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(4)),
+            RocketMqOutcome::Terminal
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(5)),
+            RocketMqOutcome::Terminal
+        );
+        assert_eq!(
+            classify_status(RocketMqStatus::from_code(99)),
+            RocketMqOutcome::Retryable
+        );
 
         // FNV-1a 32 reference values (independent Python check).
         assert_eq!(fnv1a_32(b""), 0x811c9dc5);
@@ -1020,8 +1052,20 @@ mod tests {
         let sink = RocketMqSink::new(config, transport.clone()).unwrap();
 
         let topic = Topic::new("sensors/kitchen").unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"client_id":"d7"}"#), QoS::AtMostOnce).await.unwrap();
-        sink.send(&topic, &Bytes::from(r#"{"client_id":"d8"}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"client_id":"d7"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"client_id":"d8"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.sent_batches(), 1);
         assert_eq!(sink.sent_records(), 2);
 
@@ -1038,7 +1082,10 @@ mod tests {
             vec!["d7-0".to_string()]
         );
         assert_eq!(
-            envelopes[0].messages[0].system_properties.message_group.as_deref(),
+            envelopes[0].messages[0]
+                .system_properties
+                .message_group
+                .as_deref(),
             Some("group-d7")
         );
         use base64::Engine;
@@ -1056,7 +1103,13 @@ mod tests {
 
         // Transport failures restore the buffer and engage backoff.
         transport.fail_next(10);
-        sink.send(&topic, &Bytes::from(r#"{"client_id":"dx"}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"client_id":"dx"}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("mock down must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
@@ -1071,7 +1124,9 @@ mod tests {
 
         let seen_auth = Arc::new(StdMutex::new(Vec::<String>::new()));
         let seen_auth_rx = seen_auth.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1089,9 +1144,10 @@ mod tests {
                 envelope.messages[0].system_properties.tag.as_deref(),
                 Some("kitchen")
             );
-            seen_auth_rx.lock().unwrap().push(
-                envelope.authorization.clone().expect("signed when keyed"),
-            );
+            seen_auth_rx
+                .lock()
+                .unwrap()
+                .push(envelope.authorization.clone().expect("signed when keyed"));
             // Ack frame: BE length + {"code":0}.
             let ack = br#"{"code":0}"#;
             let mut framed = (ack.len() as u32).to_be_bytes().to_vec();
@@ -1136,7 +1192,10 @@ mod tests {
         }
         assert!(finished, "fake proxy never consumed the envelope");
         server.await.expect("fake proxy task");
-        assert_eq!(*seen_auth.lock().unwrap(), vec!["MQ rocket-key:test".to_string()]);
+        assert_eq!(
+            *seen_auth.lock().unwrap(),
+            vec!["MQ rocket-key:test".to_string()]
+        );
     }
 
     fn test_config_with_port(port: u16) -> RocketMqSinkConfig {

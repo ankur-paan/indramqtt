@@ -271,10 +271,7 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, QoS, bool)> {
 // ---------------------------------------------------------------------------
 
 /// Upgrade `GET /ws/mqtt` to an MQTT-over-WebSocket session.
-pub async fn ws_mqtt_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<ApiState>,
-) -> Response {
+pub async fn ws_mqtt_handler(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
     ws.on_upgrade(|socket| handle_socket(state, socket))
 }
 
@@ -352,7 +349,19 @@ async fn drive_packets(
         }
         let packet: Vec<u8> = carry.drain(..total).collect();
         let payload = &packet[1 + header_len..];
-        handle_packet(state, socket, session, conn_id, tx, WsPacket { packet_type, flags, payload }).await?;
+        handle_packet(
+            state,
+            socket,
+            session,
+            conn_id,
+            tx,
+            WsPacket {
+                packet_type,
+                flags,
+                payload,
+            },
+        )
+        .await?;
     }
 }
 
@@ -375,7 +384,11 @@ async fn handle_packet(
     tx: &mpsc::UnboundedSender<BrokerFrame>,
     packet: WsPacket<'_>,
 ) -> Result<(), ()> {
-    let WsPacket { packet_type, flags, payload } = packet;
+    let WsPacket {
+        packet_type,
+        flags,
+        payload,
+    } = packet;
     match (session.is_none(), packet_type) {
         // First packet must be CONNECT.
         (true, 1) => {
@@ -491,7 +504,9 @@ async fn handle_subscribe(
                             group: None,
                         },
                     );
-                    state.sessions.add_subscription(&sess.client_id, filter.clone(), qos);
+                    state
+                        .sessions
+                        .add_subscription(&sess.client_id, filter.clone(), qos);
                     sess.subscriptions.push(filter);
                     sub.qos
                 }
@@ -519,7 +534,16 @@ async fn handle_publish(
         // Console boundary: delayed markers are dropped, never stored.
         tracing::warn!("WS console dropped $delayed publish (unsupported here)");
         if publish.qos == QoS::AtLeastOnce {
-            send_bin(socket, vec![0x40, 0x02, (publish.packet_id >> 8) as u8, (publish.packet_id & 0xFF) as u8]).await;
+            send_bin(
+                socket,
+                vec![
+                    0x40,
+                    0x02,
+                    (publish.packet_id >> 8) as u8,
+                    (publish.packet_id & 0xFF) as u8,
+                ],
+            )
+            .await;
         }
         return Ok(());
     }
@@ -626,7 +650,9 @@ mod tests {
 
     #[test]
     fn test_remaining_length_roundtrip() {
-        for n in [0usize, 1, 127, 128, 321, 16383, 16384, 2097151, 2097152, 268435455] {
+        for n in [
+            0usize, 1, 127, 128, 321, 16383, 16384, 2097151, 2097152, 268435455,
+        ] {
             let mut out = Vec::new();
             encode_remaining_length(n, &mut out);
             assert_eq!(decode_remaining_length(&out), Some((n, out.len())));
@@ -737,9 +763,13 @@ mod tests {
     fn test_encode_vectors() {
         assert_eq!(encode_connack(false, 0), vec![0x20, 0x02, 0x00, 0x00]);
         assert_eq!(encode_connack(true, 0), vec![0x20, 0x02, 0x01, 0x00]);
-        assert_eq!(encode_suback(9, &[0, 1]), vec![0x90, 0x04, 0x00, 0x09, 0x00, 0x01]);
-        assert_eq!(encode_publish("t", 0, QoS::AtMostOnce, b"hi"), vec![
-            0x30, 0x05, 0x00, 0x01, b't', b'h', b'i'
-        ]);
+        assert_eq!(
+            encode_suback(9, &[0, 1]),
+            vec![0x90, 0x04, 0x00, 0x09, 0x00, 0x01]
+        );
+        assert_eq!(
+            encode_publish("t", 0, QoS::AtMostOnce, b"hi"),
+            vec![0x30, 0x05, 0x00, 0x01, b't', b'h', b'i']
+        );
     }
 }

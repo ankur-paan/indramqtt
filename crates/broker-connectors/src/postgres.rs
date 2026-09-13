@@ -146,9 +146,16 @@ pub(crate) fn referenced_params(template: &str) -> Result<Vec<u32>> {
                     i += 1; // lone `$`: not a marker (e.g. dollar quoting edge)
                     continue;
                 }
-                let number: u32 = chars[i + 1..j].iter().collect::<String>().parse().map_err(
-                    |_| ConnectorError::Dispatch("postgres parameter number overflow".to_string()),
-                )?;
+                let number: u32 =
+                    chars[i + 1..j]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .map_err(|_| {
+                            ConnectorError::Dispatch(
+                                "postgres parameter number overflow".to_string(),
+                            )
+                        })?;
                 found.push(number);
                 i = j;
             }
@@ -217,7 +224,9 @@ impl PgTransport for MemoryPgTransport {
         let mut failures = self.failures_left.lock();
         if *failures > 0 {
             *failures -= 1;
-            return Err(ConnectorError::Connection("mock transport down".to_string()));
+            return Err(ConnectorError::Connection(
+                "mock transport down".to_string(),
+            ));
         }
         self.batches.lock().push(batch.clone());
         Ok(())
@@ -242,7 +251,9 @@ struct PgEndpoint {
 /// design (terminate TLS upstream instead of silently downgrading).
 fn parse_endpoint(url: &str) -> Result<PgEndpoint> {
     let rest = url.strip_prefix("postgresql://").ok_or_else(|| {
-        ConnectorError::Dispatch(format!("postgres url must start with postgresql://: {url:?}"))
+        ConnectorError::Dispatch(format!(
+            "postgres url must start with postgresql://: {url:?}"
+        ))
     })?;
     let (authority_path, query) = match rest.split_once('?') {
         Some((left, query)) => (left, query),
@@ -275,13 +286,16 @@ fn parse_endpoint(url: &str) -> Result<PgEndpoint> {
         Some((user, pass)) => (user.to_string(), pass.to_string()),
         None => (credentials.to_string(), String::new()),
     };
-    let user = if user.is_empty() { "postgres".to_string() } else { user };
+    let user = if user.is_empty() {
+        "postgres".to_string()
+    } else {
+        user
+    };
     let (host, port) = match hostport.rsplit_once(':') {
         Some((host, port)) => (
             host.to_string(),
-            port.parse::<u16>().map_err(|_| {
-                ConnectorError::Dispatch(format!("postgres bad port in {url:?}"))
-            })?,
+            port.parse::<u16>()
+                .map_err(|_| ConnectorError::Dispatch(format!("postgres bad port in {url:?}")))?,
         ),
         None => (hostport.to_string(), 5432),
     };
@@ -290,7 +304,11 @@ fn parse_endpoint(url: &str) -> Result<PgEndpoint> {
             "postgres url needs a host: {url:?}"
         )));
     }
-    let database = if dbname.is_empty() { user.clone() } else { dbname.to_string() };
+    let database = if dbname.is_empty() {
+        user.clone()
+    } else {
+        dbname.to_string()
+    };
     Ok(PgEndpoint {
         host,
         port,
@@ -522,7 +540,8 @@ async fn startup_handshake(endpoint: &PgEndpoint, stream: &mut TcpStream) -> Res
                                 "postgres offers no SCRAM-SHA-256".to_string(),
                             ));
                         }
-                        scram_exchange(&endpoint.user, endpoint.password.as_bytes(), stream).await?;
+                        scram_exchange(&endpoint.user, endpoint.password.as_bytes(), stream)
+                            .await?;
                     }
                     _ => {
                         return Err(ConnectorError::Connection(format!(
@@ -563,7 +582,9 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
 
     // AuthenticationSASLContinue: server-first-message.
     let (tag, body) = read_msg(stream).await?;
-    if tag != b'R' || body.len() < 4 || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 11
+    if tag != b'R'
+        || body.len() < 4
+        || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 11
     {
         return Err(ConnectorError::Connection(
             "expected SASL continue".to_string(),
@@ -575,9 +596,9 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
     let mut salt_b64 = String::new();
     let mut iterations = 0u32;
     for part in server_first.split(',') {
-        let (key, value) = part.split_once('=').ok_or_else(|| {
-            ConnectorError::Connection("malformed SASL server-first".to_string())
-        })?;
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| ConnectorError::Connection("malformed SASL server-first".to_string()))?;
         match key {
             "r" => combined_nonce = value.to_string(),
             "s" => salt_b64 = value.to_string(),
@@ -618,7 +639,9 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
 
     // AuthenticationSASLFinal: verify the server signature (no blind trust).
     let (tag, body) = read_msg(stream).await?;
-    if tag != b'R' || body.len() < 4 || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 12
+    if tag != b'R'
+        || body.len() < 4
+        || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 12
     {
         return Err(ConnectorError::Connection(
             "expected SASL final".to_string(),
@@ -666,9 +689,7 @@ impl TcpPgTransport {
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
         let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
             .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!("postgres connect timeout: {addr}"))
-            })?
+            .map_err(|_| ConnectorError::Connection(format!("postgres connect timeout: {addr}")))?
             .map_err(|e| ConnectorError::Connection(format!("postgres connect failed: {e}")))?;
         startup_handshake(&self.endpoint, &mut stream).await?;
         Ok(PgConn { stream })
@@ -937,9 +958,13 @@ mod tests {
 
         // Three sends stay buffered (batch_size 100)...
         for _ in 0..3 {
-            sink.send(&topic, &Bytes::from_static(br#"{ "v": 1 }"#), QoS::AtLeastOnce)
-                .await
-                .unwrap();
+            sink.send(
+                &topic,
+                &Bytes::from_static(br#"{ "v": 1 }"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(sink.buffered_rows(), 3);
         assert!(transport.batches().is_empty());
@@ -956,7 +981,10 @@ mod tests {
         assert_eq!(batches[0].rows[0][0], b"sensors/temp");
         assert_eq!(batches[0].rows[0][1], b"1");
         assert_eq!(batches[0].rows[0][2], br#"{ "v": 1 }"#);
-        assert!(!batches[0].sql.contains("sensors/temp"), "values stay bound");
+        assert!(
+            !batches[0].sql.contains("sensors/temp"),
+            "values stay bound"
+        );
     }
 
     #[tokio::test]
@@ -1050,7 +1078,9 @@ mod tests {
     /// extended-protocol batch whose bound parameters are captured.
     #[tokio::test]
     async fn test_tcp_md5_auth_and_batch_params() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let captured = Arc::new(parking_lot::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
         let captured_rx = captured.clone();
@@ -1074,7 +1104,10 @@ mod tests {
             assert_eq!(tag, b'p');
             let presented = std::str::from_utf8(&body[..body.len() - 1]).expect("utf8");
             let inner = md5_hex(b"pwdu");
-            let expected = format!("md5{}", md5_hex(format!("{inner}{}", hex(&salt)).as_bytes()));
+            let expected = format!(
+                "md5{}",
+                md5_hex(format!("{inner}{}", hex(&salt)).as_bytes())
+            );
             assert_eq!(presented, expected, "MD5 digest must verify");
             write_pg_msg(&mut stream, b'R', &0i32.to_be_bytes()).await;
             send_ready(&mut stream).await;
@@ -1100,7 +1133,8 @@ mod tests {
                         cursor = &cursor[2..];
                         let mut row = Vec::new();
                         for _ in 0..count {
-                            let len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+                            let len =
+                                i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
                             cursor = &cursor[4..];
                             row.push(cursor[..len as usize].to_vec());
                             cursor = &cursor[len as usize..];
@@ -1122,25 +1156,26 @@ mod tests {
             send_ready(&mut stream).await;
         });
 
-        let transport = TcpPgTransport::new(
-            &format!("postgresql://u:pwd@127.0.0.1:{port}/db"),
-            1,
-        )
-        .expect("valid transport");
+        let transport = TcpPgTransport::new(&format!("postgresql://u:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
         let mut config = test_config();
         config.batch_size = 2;
-        let sink = PostgreSqlSink::new(
-            config,
-            Arc::new(transport),
-        )
-        .expect("valid sink");
+        let sink = PostgreSqlSink::new(config, Arc::new(transport)).expect("valid sink");
         let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 1 }"#), QoS::AtLeastOnce)
-            .await
-            .expect("row one");
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 2 }"#), QoS::AtLeastOnce)
-            .await
-            .expect("row two triggers flush");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 1 }"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("row one");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 2 }"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("row two triggers flush");
         assert_eq!(sink.sent_batches(), 1);
 
         let mut done = false;
@@ -1166,7 +1201,9 @@ mod tests {
     async fn test_tcp_scram_auth_verifies_proof() {
         use base64::Engine;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1213,8 +1250,9 @@ mod tests {
             hasher.update(hmac_sha256(&salted, b"Client Key"));
             let stored: [u8; 32] = hasher.finalize().into();
             // proof XOR signature must recover the client key.
-            let presented =
-                base64::engine::general_purpose::STANDARD.decode(proof_b64).expect("b64 proof");
+            let presented = base64::engine::general_purpose::STANDARD
+                .decode(proof_b64)
+                .expect("b64 proof");
             assert_eq!(presented.len(), 32);
             let signature = hmac_sha256(&stored, auth_message.as_bytes());
             let mut derived_key = presented;
@@ -1254,16 +1292,18 @@ mod tests {
             send_ready(&mut stream).await;
         });
 
-        let transport = TcpPgTransport::new(
-            &format!("postgresql://user:pwd@127.0.0.1:{port}/db"),
-            1,
-        )
-        .expect("valid transport");
+        let transport =
+            TcpPgTransport::new(&format!("postgresql://user:pwd@127.0.0.1:{port}/db"), 1)
+                .expect("valid transport");
         let sink = PostgreSqlSink::new(test_config(), Arc::new(transport)).expect("valid sink");
         // A single row flush exercises the handshake plus one batch.
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from_static(b"{}"), QoS::AtMostOnce)
-            .await
-            .expect("buffered");
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("buffered");
         match sink.flush().await {
             Ok(()) => {}
             Err(e) => panic!("scram flush failed: {e}"),

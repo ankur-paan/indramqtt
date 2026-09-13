@@ -12,11 +12,15 @@ use bytes::Bytes;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "indramqtt", version, about = "IndraMQTT Distributed Broker Kernel")]
+#[command(
+    name = "indramqtt",
+    version,
+    about = "IndraMQTT Distributed Broker Kernel"
+)]
 struct Args {
     #[arg(short, long, default_value = "127.0.0.1:1883")]
     bind: String,
@@ -198,9 +202,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
 
 /// Decode the optional trailing credentials section: empty means
 /// anonymous; otherwise exactly `UserLen | Username | PassLen | Password`.
-fn decode_bind_credentials(
-    rest: &[u8],
-) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
+fn decode_bind_credentials(rest: &[u8]) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
     if rest.is_empty() {
         return Ok((None, None));
     }
@@ -211,8 +213,7 @@ fn decode_bind_credentials(
     if rest.len() < 2 + user_len + 2 {
         return Err("bind credentials truncated");
     }
-    let username =
-        std::str::from_utf8(&rest[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
+    let username = std::str::from_utf8(&rest[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
     let base = 2 + user_len;
     let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
     if rest.len() != base + 2 + pass_len {
@@ -360,11 +361,7 @@ async fn handle_connection(
 
 /// Detach a dead transport: forget its mailbox and mark its session
 /// detached (durable sessions keep subscriptions + offline queue).
-fn detach(
-    bound: &Option<(String, u64)>,
-    shared: &Shared,
-    tx: &UnboundedSender<BrokerFrame>,
-) {
+fn detach(bound: &Option<(String, u64)>, shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
     shared.conns.prune_sender(tx);
     if let Some((client_id, conn_id)) = bound {
         shared.sessions.unbind_connection(client_id, *conn_id);
@@ -471,9 +468,9 @@ async fn apply_subscribe(
             continue;
         }
         let parsed = TopicFilter::new(filter_str).ok().and_then(|filter| {
-            QoS::try_from(qos_raw)
-                .ok()
-                .and_then(|qos| split_shared_filter(&filter).map(|(group, inner)| (inner, qos, group)))
+            QoS::try_from(qos_raw).ok().and_then(|qos| {
+                split_shared_filter(&filter).map(|(group, inner)| (inner, qos, group))
+            })
         });
         let (filter, qos, group) = match parsed {
             Some(parts) => parts,
@@ -527,11 +524,7 @@ async fn apply_subscribe(
     if let Some(cluster) = &shared.cluster {
         for (filter, _) in &granted {
             if let Err(e) = cluster.announce_filter(filter).await {
-                warn!(
-                    "Cluster announce failed for {}: {}",
-                    filter.as_str(),
-                    e
-                );
+                warn!("Cluster announce failed for {}: {}", filter.as_str(), e);
             }
         }
     }
@@ -739,8 +732,7 @@ async fn apply_delayed_publish(
         None
     };
     if delay_secs == 0 {
-        let deliveries =
-            ingress_pipeline(shared, &inner_topic, qos, retain, &frame.payload).await;
+        let deliveries = ingress_pipeline(shared, &inner_topic, qos, retain, &frame.payload).await;
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
         return (ack, deliveries);
     }
@@ -748,8 +740,7 @@ async fn apply_delayed_publish(
     let payload = frame.payload.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let deliveries =
-            ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
+        let deliveries = ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
         shared
             .metrics
             .inc_messages_forwarded_by(deliveries.len() as u64);
@@ -797,7 +788,12 @@ async fn ingress_pipeline(
     shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
     build_downlink_frames(
-        &shared.router, &shared.sessions, topic, qos, retain, payload,
+        &shared.router,
+        &shared.sessions,
+        topic,
+        qos,
+        retain,
+        payload,
     )
 }
 
@@ -919,7 +915,9 @@ async fn check_publish_quota(frame: &BrokerFrame, shared: &Shared) -> bool {
         return true;
     };
     let burst = quotas.max_publish_burst.unwrap_or(rate);
-    shared.sessions.check_publish_budget(&client_id, rate, burst)
+    shared
+        .sessions
+        .check_publish_budget(&client_id, rate, burst)
 }
 
 /// Build one `PubAckOut` reply mirroring the request identity.
@@ -997,7 +995,8 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
 /// Detach one edge connection: mark its session disconnected (ownership
 /// verified against the bound conn_id) and forget its mailbox. Durable
 /// subscriptions survive; redelivery is a later sprint.
-fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {    if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
+fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
+    if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
         shared
             .sessions
             .unbind_connection(&client_id, frame.header.conn_id);
@@ -1078,7 +1077,7 @@ fn decode_unbind_meta(meta: &[u8]) -> Option<String> {
     std::str::from_utf8(&meta[2..2 + id_len])
         .ok()
         .map(str::to_string)
-    }
+}
 
 async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
@@ -1102,10 +1101,7 @@ async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std:
 }
 
 /// Serve the management REST API on an already-bound listener.
-async fn serve_api(
-    listener: tokio::net::TcpListener,
-    shared: Shared,
-) -> std::io::Result<()> {
+async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io::Result<()> {
     let state = broker_api::ApiState::new(
         shared.engine.clone(),
         shared.sessions.clone(),
@@ -1323,7 +1319,10 @@ mod tests {
 
         let (session_id, present, rc) = decode_session_binding_meta(&reply.metadata);
         assert_ne!(session_id, 0, "fresh session must have a nonzero id");
-        assert!(!present, "first clean-start bind must report session_present=false");
+        assert!(
+            !present,
+            "first clean-start bind must report session_present=false"
+        );
         assert_eq!(rc, 0, "accepted bind must carry return code 0");
     }
 
@@ -1337,10 +1336,19 @@ mod tests {
 
         let second = bind_frame(12, 1, encode_bind_meta("device-007", false, 60));
         let second_reply = reply_for_frame(&second, &sessions).expect("second bind replies");
-        assert_eq!(second_reply.header.conn_id, 12, "reply mirrors requesting conn");
+        assert_eq!(
+            second_reply.header.conn_id, 12,
+            "reply mirrors requesting conn"
+        );
         let (second_id, second_present, rc) = decode_session_binding_meta(&second_reply.metadata);
-        assert!(second_present, "resumed session must report session_present=true");
-        assert_eq!(second_id, first_id, "resumed bind must reuse the session id");
+        assert!(
+            second_present,
+            "resumed session must report session_present=true"
+        );
+        assert_eq!(
+            second_id, first_id,
+            "resumed bind must reuse the session id"
+        );
         assert_eq!(rc, 0);
     }
 
@@ -1354,7 +1362,10 @@ mod tests {
         let second = bind_frame(11, 2, encode_bind_meta("device-009", true, 60));
         let reply = reply_for_frame(&second, &sessions).expect("rebind replies");
         let (second_id, present, rc) = decode_session_binding_meta(&reply.metadata);
-        assert_ne!(second_id, first_id, "clean start must mint a fresh session id");
+        assert_ne!(
+            second_id, first_id,
+            "clean start must mint a fresh session id"
+        );
         assert!(!present);
         assert_eq!(rc, 0);
     }
@@ -1421,9 +1432,7 @@ mod tests {
                 .expect("handle");
         });
 
-        let stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect");
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let client = FramedTransport::new(stream);
         client
             .send(BrokerFrame::ping(99, 100))
@@ -1438,7 +1447,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_binds_session_end_to_end() {        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    async fn server_binds_session_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
         let server_task = tokio::spawn(async move {
@@ -1448,9 +1458,7 @@ mod tests {
                 .expect("handle");
         });
 
-        let stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect");
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let client = FramedTransport::new(stream);
         client
             .send(bind_frame(55, 9, encode_bind_meta("e2e-device", true, 30)))
@@ -1486,9 +1494,7 @@ mod tests {
         assert_eq!(&reply.metadata[0..2], &7u16.to_be_bytes());
         assert_eq!(&reply.metadata[2..], &[1u8, 0u8]);
 
-        let matches = shared
-            .router
-            .matches(&Topic::new("sport/tennis").unwrap());
+        let matches = shared.router.matches(&Topic::new("sport/tennis").unwrap());
         assert_eq!(matches.len(), 1);
         let sub = matches.iter().next().unwrap();
         assert_eq!(sub.client_id.as_ref(), "sub-1");
@@ -1533,7 +1539,8 @@ mod tests {
             (31u64, "fan-a", "sport/tennis", 1u8),
             (32u64, "fan-b", "sport/#", 0u8),
         ] {
-            let frame = subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[(filter, qos)]));
+            let frame =
+                subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[(filter, qos)]));
             let (reply, _) = apply_subscribe(&frame, &shared).await;
             reply.expect("subscribe replies");
             // Sessions must exist and be bound for live delivery.
@@ -1590,8 +1597,7 @@ mod tests {
     async fn publish_qos0_needs_no_ack() {
         let shared = test_shared();
         let (meta, payload) = encode_publish_meta("t", 0, 0, false, b"x");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(60, 1, meta, payload), &shared).await;
+        let (ack, deliveries) = apply_publish(&publish_frame(60, 1, meta, payload), &shared).await;
         assert!(ack.is_none(), "QoS 0 needs no PubAck");
         assert!(deliveries.is_empty(), "no subscribers, no deliveries");
     }
@@ -1629,14 +1635,14 @@ mod tests {
         .expect("valid unbind frame");
         apply_unbind(&unbind, &shared);
 
-        let session = shared.sessions.get("gone-1").expect("session survives unbind");
+        let session = shared
+            .sessions
+            .get("gone-1")
+            .expect("session survives unbind");
         assert!(!*session.connected.read());
         assert_eq!(*session.conn_id.read(), None);
         // Durable subscriptions survive the detach.
-        assert_eq!(
-            shared.router.matches(&Topic::new("t").unwrap()).len(),
-            1
-        );
+        assert_eq!(shared.router.matches(&Topic::new("t").unwrap()).len(), 1);
     }
 
     #[tokio::test]
@@ -1659,7 +1665,9 @@ mod tests {
         });
 
         // Subscriber: bind as conn 101, subscribe with a wildcard.
-        let sub_io = tokio::net::TcpStream::connect(addr).await.expect("connect sub");
+        let sub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect sub");
         let sub = FramedTransport::new(sub_io);
         sub.send(bind_frame(101, 1, encode_bind_meta("route-me", true, 60)))
             .await
@@ -1679,7 +1687,9 @@ mod tests {
         assert_eq!(&suback.metadata[2..], &[1u8]);
 
         // Publisher: bind as conn 102, publish QoS 1.
-        let pub_io = tokio::net::TcpStream::connect(addr).await.expect("connect pub");
+        let pub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect pub");
         let publ = FramedTransport::new(pub_io);
         publ.send(bind_frame(102, 1, encode_bind_meta("writer", true, 60)))
             .await
@@ -1716,17 +1726,19 @@ mod tests {
         // Ingress rule: anything under sensors/+ is republished to
         // alerts/critical. No MQTT loopback involved: delivery flows
         // engine -> in-memory sink -> subscriber mailbox.
-        shared.engine.create_rule(
-            "republish-temp".to_string(),
-            TopicFilter::new("sensors/+").unwrap(),
-            None,
-            true,
-            vec![RuleAction::Republish {
-                topic: Topic::new("alerts/critical").unwrap(),
-                qos: QoS::AtMostOnce,
-            }],
-        )
-        .expect("rule creates");
+        shared
+            .engine
+            .create_rule(
+                "republish-temp".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("alerts/critical").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -1742,11 +1754,17 @@ mod tests {
         });
 
         // Client A subscribes to alerts/critical as conn 301.
-        let sub_io = tokio::net::TcpStream::connect(addr).await.expect("connect sub");
-        let sub = FramedTransport::new(sub_io);
-        sub.send(bind_frame(301, 1, encode_bind_meta("alert-watcher", true, 60)))
+        let sub_io = tokio::net::TcpStream::connect(addr)
             .await
-            .expect("bind");
+            .expect("connect sub");
+        let sub = FramedTransport::new(sub_io);
+        sub.send(bind_frame(
+            301,
+            1,
+            encode_bind_meta("alert-watcher", true, 60),
+        ))
+        .await
+        .expect("bind");
         let _ = sub.recv().await.expect("recv binding");
         sub.send(subscribe_frame(
             301,
@@ -1759,11 +1777,17 @@ mod tests {
         assert_eq!(suback.header.opcode, OpCode::SubAckOut);
 
         // Client B publishes to sensors/temperature as conn 302.
-        let pub_io = tokio::net::TcpStream::connect(addr).await.expect("connect pub");
-        let publ = FramedTransport::new(pub_io);
-        publ.send(bind_frame(302, 1, encode_bind_meta("thermometer", true, 60)))
+        let pub_io = tokio::net::TcpStream::connect(addr)
             .await
-            .expect("bind");
+            .expect("connect pub");
+        let publ = FramedTransport::new(pub_io);
+        publ.send(bind_frame(
+            302,
+            1,
+            encode_bind_meta("thermometer", true, 60),
+        ))
+        .await
+        .expect("bind");
         let _ = publ.recv().await.expect("recv binding");
         let (meta, payload) = encode_publish_meta("sensors/temperature", 0, 0, false, b"21.5C");
         publ.send(publish_frame(302, 2, meta, payload))
@@ -1818,7 +1842,9 @@ mod tests {
         });
 
         // Client A subscribes to transformed/temp as conn 401.
-        let sub_io = tokio::net::TcpStream::connect(addr).await.expect("connect sub");
+        let sub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect sub");
         let sub = FramedTransport::new(sub_io);
         sub.send(bind_frame(401, 1, encode_bind_meta("dashboard", true, 60)))
             .await
@@ -1835,7 +1861,9 @@ mod tests {
         assert_eq!(suback.header.opcode, OpCode::SubAckOut);
 
         // Client B publishes a wide payload to raw/temp as conn 402.
-        let pub_io = tokio::net::TcpStream::connect(addr).await.expect("connect pub");
+        let pub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect pub");
         let publ = FramedTransport::new(pub_io);
         publ.send(bind_frame(402, 1, encode_bind_meta("sensor-9", true, 60)))
             .await
@@ -1923,7 +1951,10 @@ mod tests {
         let held = sub.recv().await.expect("recv retained");
         assert_eq!(held.header.opcode, OpCode::PublishOut);
         assert_eq!(held.header.conn_id, 502);
-        assert_eq!(held.payload, Bytes::from_static(b"{ \"status\": \"online\" }"));
+        assert_eq!(
+            held.payload,
+            Bytes::from_static(b"{ \"status\": \"online\" }")
+        );
         let (topic, _, qos, retain) = decode_publish_meta_parts(&held.metadata);
         assert_eq!(topic, "device/state");
         assert_eq!(qos, 0);
@@ -1937,17 +1968,17 @@ mod tests {
 
         // A later subscriber gets its SUBACK but no retained message.
         let late = bind_client(addr, 503, "watcher-c", true).await;
-        late
-            .send(subscribe_frame(
-                503,
-                2,
-                encode_subscribe_meta(8, "watcher-c", &[("device/+", 0)]),
-            ))
-            .await
-            .expect("subscribe");
+        late.send(subscribe_frame(
+            503,
+            2,
+            encode_subscribe_meta(8, "watcher-c", &[("device/+", 0)]),
+        ))
+        .await
+        .expect("subscribe");
         let suback = late.recv().await.expect("recv suback");
         assert_eq!(suback.header.opcode, OpCode::SubAckOut);
-        let nothing = tokio::time::timeout(std::time::Duration::from_millis(400), late.recv()).await;
+        let nothing =
+            tokio::time::timeout(std::time::Duration::from_millis(400), late.recv()).await;
         assert!(
             nothing.is_err(),
             "cleared retained state must not be delivered"
@@ -2043,10 +2074,7 @@ mod tests {
         // One BrokerLink listener + one inbox pump per node.
         async fn serve_one(
             shared: Shared,
-        ) -> (
-            std::net::SocketAddr,
-            Vec<tokio::task::JoinHandle<()>>,
-        ) {
+        ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let accept = tokio::spawn(async move {
@@ -2108,9 +2136,15 @@ mod tests {
             .await
             .expect("connect api");
         let req = format!("GET {path} HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await.expect("write api request");
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .expect("write api request");
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.expect("read api response");
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read api response");
         let text = String::from_utf8(buf).expect("api response is UTF-8");
         let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
         let status: u16 = head.lines().next().expect("status line")[9..12]
@@ -2341,16 +2375,14 @@ mod tests {
             assert_eq!(deliveries.len(), 1, "burst publishes must route");
         }
         let (meta, payload) = encode_publish_meta("t/rate", 4, 1, false, b"x");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(97, 4, meta, payload), &shared).await;
+        let (ack, deliveries) = apply_publish(&publish_frame(97, 4, meta, payload), &shared).await;
         let ack = ack.expect("QoS 1 over-rate still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x04, 0x97u8]);
         assert!(deliveries.is_empty(), "over-rate publish must not fan out");
 
         // QoS 0 over-rate drops silently but counts.
         let (meta, payload) = encode_publish_meta("t/rate", 0, 0, false, b"x");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(97, 5, meta, payload), &shared).await;
+        let (ack, deliveries) = apply_publish(&publish_frame(97, 5, meta, payload), &shared).await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
         // Both over-rate drops counted (QoS 1 above + this QoS 0).
@@ -2390,8 +2422,7 @@ mod tests {
             .add_rule(AclRule::new("muted", AclAction::Publish, "#", false));
 
         let (meta, payload) = encode_publish_meta("t", 5, 1, false, b"shh");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(92, 1, meta, payload), &shared).await;
+        let (ack, deliveries) = apply_publish(&publish_frame(92, 1, meta, payload), &shared).await;
         let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
         assert!(deliveries.is_empty(), "denied publish must not fan out");
@@ -2455,7 +2486,10 @@ mod tests {
             ))
             .await
             .expect("subscribe a");
-        assert_eq!(worker_a.recv().await.expect("suback a").header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            worker_a.recv().await.expect("suback a").header.opcode,
+            OpCode::SubAckOut
+        );
 
         let worker_b = bind_client(addr, 712, "worker-b", true).await;
         worker_b
@@ -2466,7 +2500,10 @@ mod tests {
             ))
             .await
             .expect("subscribe b");
-        assert_eq!(worker_b.recv().await.expect("suback b").header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            worker_b.recv().await.expect("suback b").header.opcode,
+            OpCode::SubAckOut
+        );
 
         let plain = bind_client(addr, 713, "plain-c", true).await;
         plain
@@ -2477,7 +2514,10 @@ mod tests {
             ))
             .await
             .expect("subscribe c");
-        assert_eq!(plain.recv().await.expect("suback c").header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            plain.recv().await.expect("suback c").header.opcode,
+            OpCode::SubAckOut
+        );
 
         // Publisher emits two jobs.
         let publ = bind_client(addr, 714, "producer", true).await;
@@ -2562,8 +2602,7 @@ mod tests {
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }
-            *captured_rx.lock() =
-                Some(buf[head_end..head_end + content_length].to_vec());
+            *captured_rx.lock() = Some(buf[head_end..head_end + content_length].to_vec());
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await
@@ -2584,9 +2623,7 @@ mod tests {
             .create_rule(
                 "telemetry-webhook".to_string(),
                 TopicFilter::new("sensors/+").unwrap(),
-                Some(
-                    r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string(),
-                ),
+                Some(r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string()),
                 true,
                 vec![broker_rules::RuleAction::ForwardConnector {
                     connector_id: "webhook-1".to_string(),
@@ -2614,8 +2651,7 @@ mod tests {
             .expect("webhook fired")
             .expect("hook task");
         let body = captured.lock().clone().expect("captured body");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("webhook body is JSON");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("webhook body is JSON");
         assert_eq!(json, serde_json::json!({ "temperature": 85.0 }));
 
         edge_task.abort();
@@ -2633,7 +2669,11 @@ mod tests {
         shared.conns.register(951, tx);
         let (session, _) = shared.sessions.get_or_create("delayed-sub", true);
         *session.conn_id.write() = Some(951);
-        let sub = subscribe_frame(951, 1, encode_subscribe_meta(1, "delayed-sub", &[("alerts", 0)]));
+        let sub = subscribe_frame(
+            951,
+            1,
+            encode_subscribe_meta(1, "delayed-sub", &[("alerts", 0)]),
+        );
         let (reply, _) = apply_subscribe(&sub, shared).await;
         reply.expect("subscribe replies");
         let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"later");
@@ -2669,16 +2709,13 @@ mod tests {
         // Non-numeric delay is not a delayed target at all: it publishes
         // literally (no subscribers exist for it here).
         let (meta, payload) = encode_publish_meta("$delayed/soon/t", 0, 0, false, b"x");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(953, 1, meta, payload), &shared).await;
+        let (ack, deliveries) = apply_publish(&publish_frame(953, 1, meta, payload), &shared).await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
 
         // Absurd delays are dropped, not scheduled.
-        let (meta, payload) =
-            encode_publish_meta("$delayed/99999999/t", 0, 0, false, b"x");
-        let (ack, deliveries) =
-            apply_publish(&publish_frame(953, 2, meta, payload), &shared).await;
+        let (meta, payload) = encode_publish_meta("$delayed/99999999/t", 0, 0, false, b"x");
+        let (ack, deliveries) = apply_publish(&publish_frame(953, 2, meta, payload), &shared).await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
 
@@ -2717,7 +2754,10 @@ mod tests {
         ))
         .await
         .expect("subscribe");
-        assert_eq!(sub.recv().await.expect("suback").header.opcode, OpCode::SubAckOut);
+        assert_eq!(
+            sub.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
 
         let publ = bind_client(addr, 962, "procrastinator", true).await;
         let start = std::time::Instant::now();

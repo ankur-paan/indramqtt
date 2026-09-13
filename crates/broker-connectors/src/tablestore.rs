@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    hmac_sha1, now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{hmac_sha1, now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// OTS API version pinned on every request.
 pub const OTS_API_VERSION: &str = "2015-12-31";
@@ -179,9 +177,9 @@ fn validate_mapping(name: &str, source: &str, what: &str) -> Result<()> {
             "tablestore {what} name must not be empty"
         )));
     }
-    parse_source(source).map(|_| ()).map_err(|e| {
-        ConnectorError::Dispatch(format!("tablestore {what} {name:?}: {e}"))
-    })
+    parse_source(source)
+        .map(|_| ())
+        .map_err(|e| ConnectorError::Dispatch(format!("tablestore {what} {name:?}: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,9 +284,7 @@ impl OtsValue {
             OtsValue::Boolean(b) => serde_json::Value::Bool(*b),
             OtsValue::Binary(bytes) => {
                 use base64::Engine;
-                serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(bytes),
-                )
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
             }
         }
     }
@@ -296,21 +292,29 @@ impl OtsValue {
 
 fn coerce_pk(value: &serde_json::Value, data_type: PrimaryKeyType, name: &str) -> Result<OtsValue> {
     match data_type {
-        PrimaryKeyType::String => value.as_str().map(|s| OtsValue::String(s.to_string())).ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "tablestore primary key {name:?} needs a JSON string"
-            ))
-        }),
+        PrimaryKeyType::String => value
+            .as_str()
+            .map(|s| OtsValue::String(s.to_string()))
+            .ok_or_else(|| {
+                ConnectorError::Dispatch(format!(
+                    "tablestore primary key {name:?} needs a JSON string"
+                ))
+            }),
         PrimaryKeyType::Integer => as_integer(value).map(OtsValue::Integer).ok_or_else(|| {
             ConnectorError::Dispatch(format!(
                 "tablestore primary key {name:?} needs a JSON integer"
             ))
         }),
-        PrimaryKeyType::Binary => value.as_str().map(decode_binary).transpose()?.ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "tablestore primary key {name:?} needs a base64 JSON string"
-            ))
-        }).map(OtsValue::Binary),
+        PrimaryKeyType::Binary => value
+            .as_str()
+            .map(decode_binary)
+            .transpose()?
+            .ok_or_else(|| {
+                ConnectorError::Dispatch(format!(
+                    "tablestore primary key {name:?} needs a base64 JSON string"
+                ))
+            })
+            .map(OtsValue::Binary),
     }
 }
 
@@ -320,31 +324,37 @@ fn coerce_attr(
     name: &str,
 ) -> Result<OtsValue> {
     match data_type {
-        AttributeColumnType::String => value.as_str().map(|s| OtsValue::String(s.to_string())).ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "tablestore attribute {name:?} needs a JSON string"
-            ))
-        }),
+        AttributeColumnType::String => value
+            .as_str()
+            .map(|s| OtsValue::String(s.to_string()))
+            .ok_or_else(|| {
+                ConnectorError::Dispatch(format!(
+                    "tablestore attribute {name:?} needs a JSON string"
+                ))
+            }),
         AttributeColumnType::Integer => as_integer(value).map(OtsValue::Integer).ok_or_else(|| {
             ConnectorError::Dispatch(format!(
                 "tablestore attribute {name:?} needs a JSON integer"
             ))
         }),
         AttributeColumnType::Double => value.as_f64().map(OtsValue::Double).ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "tablestore attribute {name:?} needs a JSON number"
-            ))
+            ConnectorError::Dispatch(format!("tablestore attribute {name:?} needs a JSON number"))
         }),
         AttributeColumnType::Boolean => value.as_bool().map(OtsValue::Boolean).ok_or_else(|| {
             ConnectorError::Dispatch(format!(
                 "tablestore attribute {name:?} needs a JSON boolean"
             ))
         }),
-        AttributeColumnType::Binary => value.as_str().map(decode_binary).transpose()?.ok_or_else(|| {
-            ConnectorError::Dispatch(format!(
-                "tablestore attribute {name:?} needs a base64 JSON string"
-            ))
-        }).map(OtsValue::Binary),
+        AttributeColumnType::Binary => value
+            .as_str()
+            .map(decode_binary)
+            .transpose()?
+            .ok_or_else(|| {
+                ConnectorError::Dispatch(format!(
+                    "tablestore attribute {name:?} needs a base64 JSON string"
+                ))
+            })
+            .map(OtsValue::Binary),
     }
 }
 
@@ -405,10 +415,16 @@ pub fn string_to_sign(content_md5: &str, date: &str, instance: &str) -> String {
 }
 
 /// `Authorization: OTS {access_key_id}:{Base64(HMAC_SHA1(secret, sts))}`.
-pub fn ots_authorization(access_key_id: &str, access_key_secret: &str, string_to_sign: &str) -> String {
+pub fn ots_authorization(
+    access_key_id: &str,
+    access_key_secret: &str,
+    string_to_sign: &str,
+) -> String {
     use base64::Engine;
-    let signature = base64::engine::general_purpose::STANDARD
-        .encode(hmac_sha1(access_key_secret.as_bytes(), string_to_sign.as_bytes()));
+    let signature = base64::engine::general_purpose::STANDARD.encode(hmac_sha1(
+        access_key_secret.as_bytes(),
+        string_to_sign.as_bytes(),
+    ));
     format!("OTS {access_key_id}:{signature}")
 }
 
@@ -465,9 +481,8 @@ pub struct OtsRowFailure {
 /// returning the indices of failed rows. Malformed bodies are a
 /// dispatch error (never silently committed).
 pub fn failed_positions(body: &[u8], row_count: usize) -> Result<Vec<OtsRowFailure>> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Dispatch(format!("tablestore response is not JSON: {e}"))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Dispatch(format!("tablestore response is not JSON: {e}")))?;
     let rows = parsed
         .get("tables")
         .and_then(|t| t.as_array())
@@ -475,9 +490,7 @@ pub fn failed_positions(body: &[u8], row_count: usize) -> Result<Vec<OtsRowFailu
         .and_then(|t| t.get("rows"))
         .and_then(|r| r.as_array())
         .ok_or_else(|| {
-            ConnectorError::Dispatch(
-                "tablestore response misses tables[0].rows".to_string(),
-            )
+            ConnectorError::Dispatch("tablestore response misses tables[0].rows".to_string())
         })?;
     if rows.len() != row_count {
         return Err(ConnectorError::Dispatch(format!(
@@ -551,7 +564,12 @@ pub enum MockTablestoreOutcome {
 #[async_trait]
 pub trait TablestoreTransport: Send + Sync {
     /// Write one batch; returns the positions of failed rows.
-    async fn batch_write(&self, table: &str, rows: Vec<OtsRow>, auth: &TablestoreAuth) -> Result<Vec<usize>>;
+    async fn batch_write(
+        &self,
+        table: &str,
+        rows: Vec<OtsRow>,
+        auth: &TablestoreAuth,
+    ) -> Result<Vec<usize>>;
 }
 
 /// Request auth material: proof the signer ran.
@@ -773,7 +791,10 @@ impl TablestoreSink {
         for mapping in &self.config.primary_keys {
             let source = parse_source(&mapping.source).map_err(ConnectorError::Dispatch)?;
             let value = resolve_source(&source, &event.topic, &event.payload, millis);
-            primary_keys.push((mapping.name.clone(), coerce_pk(&value, mapping.data_type, &mapping.name)?));
+            primary_keys.push((
+                mapping.name.clone(),
+                coerce_pk(&value, mapping.data_type, &mapping.name)?,
+            ));
         }
         let mut attributes = Vec::with_capacity(self.config.attribute_columns.len());
         for mapping in &self.config.attribute_columns {
@@ -840,13 +861,19 @@ impl TablestoreSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     let mut buffer = self.buffer.lock();
-                    buffer.restore(pending.into_iter().map(|(event, _)| event).collect(), oldest);
+                    buffer.restore(
+                        pending.into_iter().map(|(event, _)| event).collect(),
+                        oldest,
+                    );
                     self.backoff.lock().failure();
                     return Err(ConnectorError::Connection(message));
                 }
                 Err(e) => {
                     let mut buffer = self.buffer.lock();
-                    buffer.restore(pending.into_iter().map(|(event, _)| event).collect(), oldest);
+                    buffer.restore(
+                        pending.into_iter().map(|(event, _)| event).collect(),
+                        oldest,
+                    );
                     self.backoff.lock().failure();
                     return Err(e);
                 }
@@ -867,11 +894,11 @@ impl TablestoreSink {
                 "tablestore buffer limit reached".to_string(),
             ));
         }
-        let text = std::str::from_utf8(payload)
-            .map_err(|_| ConnectorError::Dispatch("tablestore payload must be UTF-8".to_string()))?;
-        let parsed: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("tablestore payload must be JSON".to_string())
+        let text = std::str::from_utf8(payload).map_err(|_| {
+            ConnectorError::Dispatch("tablestore payload must be UTF-8".to_string())
         })?;
+        let parsed: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("tablestore payload must be JSON".to_string()))?;
         let mut buffer = self.buffer.lock();
         Ok(buffer.push(TablestoreRow {
             topic: topic.as_str().to_string(),
@@ -1030,7 +1057,10 @@ mod tests {
     fn test_source_parsing_and_coercion() {
         assert_eq!(parse_source("${client_id}").unwrap(), FieldSource::ClientId);
         assert_eq!(parse_source("${topic}").unwrap(), FieldSource::Topic);
-        assert_eq!(parse_source("${timestamp}").unwrap(), FieldSource::Timestamp);
+        assert_eq!(
+            parse_source("${timestamp}").unwrap(),
+            FieldSource::Timestamp
+        );
         assert_eq!(
             parse_source("${payload.a.b}").unwrap(),
             FieldSource::Payload(vec!["a".to_string(), "b".to_string()])
@@ -1063,7 +1093,10 @@ mod tests {
     fn test_batch_body_encoding() {
         let rows = vec![OtsRow {
             primary_keys: vec![
-                ("device_id".to_string(), OtsValue::String("sensor-42".to_string())),
+                (
+                    "device_id".to_string(),
+                    OtsValue::String("sensor-42".to_string()),
+                ),
                 ("ts".to_string(), OtsValue::Integer(1_789_211_889_123)),
             ],
             attributes: vec![
@@ -1081,7 +1114,10 @@ mod tests {
         assert_eq!(encoded["operation"], "put");
         assert_eq!(encoded["primary_keys"][0]["value"], "sensor-42");
         assert_eq!(encoded["primary_keys"][1]["type"], "integer");
-        assert_eq!(encoded["attributes"][0]["timestamp_ms"], serde_json::json!(1_789_211_889_123i64));
+        assert_eq!(
+            encoded["attributes"][0]["timestamp_ms"],
+            serde_json::json!(1_789_211_889_123i64)
+        );
         assert_eq!(encoded["attributes"][2]["type"], "binary");
         assert_eq!(encoded["attributes"][2]["value"], "3q0=");
     }
@@ -1094,19 +1130,31 @@ mod tests {
         assert_eq!(
             failed_positions(partial, 3).unwrap(),
             vec![
-                OtsRowFailure { index: 1, error_code: "OTSRowOperationFailed".to_string() },
-                OtsRowFailure { index: 2, error_code: "OTSTimeout".to_string() },
+                OtsRowFailure {
+                    index: 1,
+                    error_code: "OTSRowOperationFailed".to_string()
+                },
+                OtsRowFailure {
+                    index: 2,
+                    error_code: "OTSTimeout".to_string()
+                },
             ]
         );
         assert!(failed_positions(ok, 3).is_err(), "count mismatch must fail");
         assert!(failed_positions(b"nope", 1).is_err());
 
-        assert_eq!(classify_error_code("OTSParameterInvalid"), OtsOutcome::Terminal);
+        assert_eq!(
+            classify_error_code("OTSParameterInvalid"),
+            OtsOutcome::Terminal
+        );
         assert_eq!(classify_error_code("OTSAuthFailed"), OtsOutcome::Terminal);
         assert_eq!(classify_error_code("OTSTooFrequent"), OtsOutcome::Retryable);
         assert_eq!(classify_error_code("OTSServerBusy"), OtsOutcome::Retryable);
         assert_eq!(classify_error_code("OTSTimeout"), OtsOutcome::Retryable);
-        assert_eq!(classify_error_code("OTSRowOperationFailed"), OtsOutcome::Retryable);
+        assert_eq!(
+            classify_error_code("OTSRowOperationFailed"),
+            OtsOutcome::Retryable
+        );
         assert_eq!(classify_http_status(200), OtsOutcome::Success);
         assert_eq!(classify_http_status(400), OtsOutcome::Terminal);
         assert_eq!(classify_http_status(403), OtsOutcome::Terminal);
@@ -1148,7 +1196,13 @@ mod tests {
 
         // Throttle restores the whole batch and backs off.
         transport.push_outcome(MockTablestoreOutcome::Throttled);
-        sink.send(&topic, &Bytes::from(r#"{"client_id":"dx","temperature":21.0,"online":false}"#), QoS::AtMostOnce).await.unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from(r#"{"client_id":"dx","temperature":21.0,"online":false}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("throttle must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
@@ -1200,22 +1254,19 @@ mod tests {
             )
         }
         let captured = Arc::new(Captured::default());
-        let app = Router::new()
-            .route(
-                "/api/BatchWriteRow",
-                post({
+        let app = Router::new().route(
+            "/api/BatchWriteRow",
+            post({
+                let captured = captured.clone();
+                move |headers: axum::http::HeaderMap, uri: axum::http::Uri, body: Bytes| {
                     let captured = captured.clone();
-                    move |headers: axum::http::HeaderMap,
-                          uri: axum::http::Uri,
-                          body: Bytes| {
-                        let captured = captured.clone();
-                        async move {
-                            handler(headers, uri, State(captured), body).await
-                        }
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                    async move { handler(headers, uri, State(captured), body).await }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1224,9 +1275,8 @@ mod tests {
         let mut config = test_config();
         config.endpoint = format!("http://127.0.0.1:{port}");
         config.batch_size = Some(1);
-        let transport = Arc::new(
-            HttpTablestoreTransport::new(&config, reqwest::Client::new()).unwrap(),
-        );
+        let transport =
+            Arc::new(HttpTablestoreTransport::new(&config, reqwest::Client::new()).unwrap());
         let sink = TablestoreSink::new(config, transport).unwrap();
         sink.send(
             &Topic::new("sensors/t1").unwrap(),
@@ -1249,7 +1299,10 @@ mod tests {
             .unwrap()
             .starts_with("OTS test-key-id:"));
         // Content-MD5 matches the received body.
-        assert_eq!(calls[0].md5.as_deref(), Some(content_md5_b64(&calls[0].body).as_str()));
+        assert_eq!(
+            calls[0].md5.as_deref(),
+            Some(content_md5_b64(&calls[0].body).as_str())
+        );
         let parsed: serde_json::Value = serde_json::from_slice(&calls[0].body).unwrap();
         let rows = parsed["tables"][0]["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);

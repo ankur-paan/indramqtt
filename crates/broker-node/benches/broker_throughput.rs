@@ -166,7 +166,12 @@ fn bench_sql_ingress_throughput() {
     runtime.block_on(async {
         for _ in 0..2_000 {
             engine
-                .dispatch_ingress(black_box(&topic), black_box(&payload), QoS::AtMostOnce, &sink)
+                .dispatch_ingress(
+                    black_box(&topic),
+                    black_box(&payload),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
                 .await;
         }
     });
@@ -183,7 +188,12 @@ fn bench_sql_ingress_throughput() {
         runtime.block_on(async {
             for _ in 0..sample_iters {
                 engine
-                    .dispatch_ingress(black_box(&topic), black_box(&payload), QoS::AtMostOnce, &sink)
+                    .dispatch_ingress(
+                        black_box(&topic),
+                        black_box(&payload),
+                        QoS::AtMostOnce,
+                        &sink,
+                    )
                     .await;
             }
         });

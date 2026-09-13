@@ -56,10 +56,14 @@ impl Topic {
 
     pub fn validate(topic: &str) -> Result<(), ProtocolError> {
         if topic.is_empty() {
-            return Err(ProtocolError::InvalidTopic("topic cannot be empty".to_string()));
+            return Err(ProtocolError::InvalidTopic(
+                "topic cannot be empty".to_string(),
+            ));
         }
         if topic.contains('+') || topic.contains('#') {
-            return Err(ProtocolError::InvalidTopic("concrete topic cannot contain wildcards".to_string()));
+            return Err(ProtocolError::InvalidTopic(
+                "concrete topic cannot contain wildcards".to_string(),
+            ));
         }
         Ok(())
     }
@@ -87,15 +91,21 @@ impl TopicFilter {
 
     pub fn validate(filter: &str) -> Result<(), ProtocolError> {
         if filter.is_empty() {
-            return Err(ProtocolError::InvalidTopic("filter cannot be empty".to_string()));
+            return Err(ProtocolError::InvalidTopic(
+                "filter cannot be empty".to_string(),
+            ));
         }
         // Multi-level wildcard '#' can only appear as the last character or preceded by '/'
         if let Some(pos) = filter.find('#') {
             if pos != filter.len() - 1 {
-                return Err(ProtocolError::InvalidTopic("'#' wildcard must be the final level".to_string()));
+                return Err(ProtocolError::InvalidTopic(
+                    "'#' wildcard must be the final level".to_string(),
+                ));
             }
             if pos > 0 && &filter[pos - 1..pos] != "/" {
-                return Err(ProtocolError::InvalidTopic("'#' wildcard must be prefixed with '/'".to_string()));
+                return Err(ProtocolError::InvalidTopic(
+                    "'#' wildcard must be prefixed with '/'".to_string(),
+                ));
             }
         }
         Ok(())

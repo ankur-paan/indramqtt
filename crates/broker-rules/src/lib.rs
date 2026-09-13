@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use broker_connectors::ConnectorManager;
-use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
+use bytes::Bytes;
 use parking_lot::RwLock;
 use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 
@@ -488,11 +488,10 @@ impl RuleEngine {
             Some(stmt) => stmt,
             None => return,
         };
-        let record: HashMap<String, serde_json::Value> =
-            match serde_json::from_slice(payload) {
-                Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-                _ => return,
-            };
+        let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
+            Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+            _ => return,
+        };
         let passes = match stmt.where_clause.as_ref() {
             Some(condition) => Evaluator::eval_bool(condition, &record),
             None => true,
@@ -562,9 +561,7 @@ impl RuleEngine {
                 window,
             )),
         };
-        self.window_workers
-            .write()
-            .insert(rule.id.clone(), worker);
+        self.window_workers.write().insert(rule.id.clone(), worker);
     }
 
     /// Execute every enabled rule whose filter matches `topic`.
@@ -599,7 +596,10 @@ impl RuleEngine {
         };
         for rule in &matched {
             if rule.tier == RuleTier::Enterprise
-                && rule.parsed_query.as_ref().is_some_and(|stmt| stmt.window.is_some())
+                && rule
+                    .parsed_query
+                    .as_ref()
+                    .is_some_and(|stmt| stmt.window.is_some())
             {
                 self.dispatch_windowed(rule, topic, payload);
                 continue;
@@ -800,7 +800,11 @@ async fn window_worker_loop(
                 let end = now_ms();
                 let cutoff = end.saturating_sub(span);
                 buffer.push_back(record);
-                while buffer.front().map(|r| r.arrived_ms < cutoff).unwrap_or(false) {
+                while buffer
+                    .front()
+                    .map(|r| r.arrived_ms < cutoff)
+                    .unwrap_or(false)
+                {
                     buffer.pop_front();
                 }
                 // Aggregate the trailing window on every arrival.
@@ -856,8 +860,7 @@ async fn flush_window(
     // The sink snapshot is shared across this flush's rows.
     let sink = flush_ctx.broker_sink.read().clone();
     for (topic, row) in aggregate_partitioned(stmt, records) {
-        let object: serde_json::Map<String, serde_json::Value> =
-            row.into_iter().collect();
+        let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
             Ok(bytes) => Bytes::from(bytes),
             Err(e) => {
@@ -924,10 +927,7 @@ fn aggregate_partitioned(
 
 /// Canonical group key: type-tagged so `1`, `"1"` and `true` never
 /// collide across JSON types.
-fn group_key(
-    exprs: &[rekuiper_sql::Expr],
-    record: &HashMap<String, serde_json::Value>,
-) -> String {
+fn group_key(exprs: &[rekuiper_sql::Expr], record: &HashMap<String, serde_json::Value>) -> String {
     exprs
         .iter()
         .map(|expr| match Evaluator::eval_val(expr, record) {
@@ -962,8 +962,7 @@ fn normalize_from_target(sql: &str) -> String {
             && sql.len() - b >= 4
             && sql[b..b + 4].eq_ignore_ascii_case("from")
             && (b == 0 || !is_word_char(sql[..b].chars().next_back().unwrap_or(' ')))
-            && (b + 4 >= sql.len()
-                || !is_word_char(sql[b + 4..].chars().next().unwrap_or(' ')));
+            && (b + 4 >= sql.len() || !is_word_char(sql[b + 4..].chars().next().unwrap_or(' ')));
         if !is_from {
             ci += 1;
             continue;
@@ -1051,10 +1050,9 @@ pub fn try_evaluate(
             let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = elements
                 .iter()
                 .filter_map(|element| match element {
-                    serde_json::Value::Object(map) => Some((
-                        probe.clone(),
-                        map.clone().into_iter().collect(),
-                    )),
+                    serde_json::Value::Object(map) => {
+                        Some((probe.clone(), map.clone().into_iter().collect()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1069,11 +1067,7 @@ pub fn try_evaluate(
                 Some(stmt) => {
                     let rows: Vec<serde_json::Value> = aggregate_partitioned(&stmt, records)
                         .into_iter()
-                        .map(|(_, row)| {
-                            serde_json::Value::Object(
-                                row.into_iter().collect(),
-                            )
-                        })
+                        .map(|(_, row)| serde_json::Value::Object(row.into_iter().collect()))
                         .collect();
                     if rows.is_empty() {
                         Ok((false, None))
@@ -1084,8 +1078,7 @@ pub fn try_evaluate(
             }
         }
         serde_json::Value::Object(map) => {
-            let record: HashMap<String, serde_json::Value> =
-                map.clone().into_iter().collect();
+            let record: HashMap<String, serde_json::Value> = map.clone().into_iter().collect();
             match stmt {
                 None => Ok((true, Some(payload.clone()))),
                 Some(stmt) => match Evaluator::eval_select(&stmt, &record) {
@@ -1148,8 +1141,7 @@ fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngin
                     && sql.len() - b >= 4
                     && sql[b..b + 4].eq_ignore_ascii_case("into")
                     && (b == 0 || !is_word(sql[..b].chars().next_back().unwrap_or(' ')))
-                    && (b + 4 >= sql.len()
-                        || !is_word(sql[b + 4..].chars().next().unwrap_or(' ')));
+                    && (b + 4 >= sql.len() || !is_word(sql[b + 4..].chars().next().unwrap_or(' ')));
                 if !is_into {
                     i += 1;
                     continue;
@@ -1219,11 +1211,7 @@ fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngin
 /// the projected JSON when evaluation succeeds, or `None` to skip the
 /// rule (WHERE false, non-JSON/non-object payload, serialization
 /// failure). Never panics on attacker-controlled bytes.
-fn apply_sql(
-    parsed: &Option<SelectStmt>,
-    payload: &Bytes,
-    rule_id: &str,
-) -> Option<Bytes> {
+fn apply_sql(parsed: &Option<SelectStmt>, payload: &Bytes, rule_id: &str) -> Option<Bytes> {
     let stmt = match parsed {
         None => return Some(payload.clone()),
         Some(stmt) => stmt,
@@ -1273,7 +1261,9 @@ mod tests {
     impl EventInput for MockInput {
         async fn push(&self, _event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
             match self.policy {
-                BackpressurePolicy::DropNewest => Ok(PushOutcome::Dropped(OverflowReason::DroppedNewest)),
+                BackpressurePolicy::DropNewest => {
+                    Ok(PushOutcome::Dropped(OverflowReason::DroppedNewest))
+                }
                 _ => Ok(PushOutcome::Enqueued),
             }
         }
@@ -1307,7 +1297,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_input_mock() {
-        let input = MockInput { policy: BackpressurePolicy::DropNewest };
+        let input = MockInput {
+            policy: BackpressurePolicy::DropNewest,
+        };
         let event = StreamEvent {
             topic: Topic::new("sensors/temp").unwrap(),
             payload: Bytes::from_static(b"{\"temp\": 23}"),
@@ -1322,17 +1314,18 @@ mod tests {
     #[tokio::test]
     async fn test_rule_republish_executes_on_match() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        engine.create_rule(
-            "republish-temp".to_string(),
-            TopicFilter::new("sensors/+").unwrap(),
-            None,
-            true,
-            vec![RuleAction::Republish {
-                topic: Topic::new("alerts/critical").unwrap(),
-                qos: QoS::AtLeastOnce,
-            }],
-        )
-        .expect("rule creates");
+        engine
+            .create_rule(
+                "republish-temp".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("alerts/critical").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                }],
+            )
+            .expect("rule creates");
         let sink = Arc::new(RecordingSink::default());
         let sink_obj: Arc<dyn BrokerSink> = sink.clone();
 
@@ -1355,32 +1348,39 @@ mod tests {
         // Effective QoS is min(ingress 0, action 1) = 0; retain stays false.
         assert_eq!(
             published,
-            vec![("alerts/critical".to_string(), Bytes::from_static(b"21.5C"), QoS::AtMostOnce, false)]
+            vec![(
+                "alerts/critical".to_string(),
+                Bytes::from_static(b"21.5C"),
+                QoS::AtMostOnce,
+                false
+            )]
         );
     }
 
     #[tokio::test]
     async fn test_rule_skips_disabled_and_non_matching() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        engine.create_rule(
-            "disabled".to_string(),
-            TopicFilter::new("sensors/+").unwrap(),
-            None,
-            false,
-            vec![RuleAction::Log],
-        )
-        .expect("rule creates");
-        engine.create_rule(
-            "other-branch".to_string(),
-            TopicFilter::new("factory/#").unwrap(),
-            None,
-            true,
-            vec![RuleAction::Republish {
-                topic: Topic::new("alerts/other").unwrap(),
-                qos: QoS::AtMostOnce,
-            }],
-        )
-        .expect("rule creates");
+        engine
+            .create_rule(
+                "disabled".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                false,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
+        engine
+            .create_rule(
+                "other-branch".to_string(),
+                TopicFilter::new("factory/#").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("alerts/other").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
         let sink = Arc::new(RecordingSink::default());
         let sink_obj: Arc<dyn BrokerSink> = sink.clone();
 
@@ -1399,14 +1399,15 @@ mod tests {
     #[tokio::test]
     async fn test_rule_crud_lifecycle() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        let rule = engine.create_rule(
-            "r1".to_string(),
-            TopicFilter::new("a/#").unwrap(),
-            Some("SELECT * FROM a/#".to_string()),
-            true,
-            vec![RuleAction::Log],
-        )
-        .expect("rule creates");
+        let rule = engine
+            .create_rule(
+                "r1".to_string(),
+                TopicFilter::new("a/#").unwrap(),
+                Some("SELECT * FROM a/#".to_string()),
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
         assert_eq!(rule.id, "rule-1");
         assert!(engine.get_rule("rule-1").is_some());
         assert!(engine.get_rule("rule-999").is_none());
@@ -1420,37 +1421,64 @@ mod tests {
     async fn test_drop_oldest_under_saturation() {
         let engine = RuleEngine::new(2, BackpressurePolicy::DropOldest);
         let input = engine.input();
-        assert_eq!(input.try_push(test_event("t", b"one")).unwrap(), PushOutcome::Enqueued);
-        assert_eq!(input.try_push(test_event("t", b"two")).unwrap(), PushOutcome::Enqueued);
+        assert_eq!(
+            input.try_push(test_event("t", b"one")).unwrap(),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            input.try_push(test_event("t", b"two")).unwrap(),
+            PushOutcome::Enqueued
+        );
         assert_eq!(
             input.try_push(test_event("t", b"three")).unwrap(),
             PushOutcome::Dropped(OverflowReason::DroppedOldest)
         );
 
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"two"));
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"three"));
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"two")
+        );
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"three")
+        );
     }
 
     #[tokio::test]
     async fn test_drop_newest_under_saturation() {
         let engine = RuleEngine::new(2, BackpressurePolicy::DropNewest);
         let input = engine.input();
-        assert_eq!(input.try_push(test_event("t", b"one")).unwrap(), PushOutcome::Enqueued);
-        assert_eq!(input.try_push(test_event("t", b"two")).unwrap(), PushOutcome::Enqueued);
+        assert_eq!(
+            input.try_push(test_event("t", b"one")).unwrap(),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            input.try_push(test_event("t", b"two")).unwrap(),
+            PushOutcome::Enqueued
+        );
         assert_eq!(
             input.try_push(test_event("t", b"three")).unwrap(),
             PushOutcome::Dropped(OverflowReason::DroppedNewest)
         );
 
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"one"));
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"two"));
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"one")
+        );
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"two")
+        );
     }
 
     #[tokio::test]
     async fn test_block_waits_for_capacity() {
         let engine = RuleEngine::new(1, BackpressurePolicy::Block);
         let input = engine.input();
-        assert_eq!(input.try_push(test_event("t", b"one")).unwrap(), PushOutcome::Enqueued);
+        assert_eq!(
+            input.try_push(test_event("t", b"one")).unwrap(),
+            PushOutcome::Enqueued
+        );
         // Synchronous callers cannot block: a full buffer reports overflow.
         assert_eq!(
             input.try_push(test_event("t", b"two")).unwrap(),
@@ -1466,17 +1494,26 @@ mod tests {
                 .is_err(),
             "blocked push must pend while full"
         );
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"one"));
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"one")
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), slow)
             .await
             .expect("push completes after drain")
             .unwrap();
-        assert_eq!(input.next_event().await.unwrap().payload, Bytes::from_static(b"three"));
+        assert_eq!(
+            input.next_event().await.unwrap().payload,
+            Bytes::from_static(b"three")
+        );
     }
 
     #[tokio::test]
     async fn test_reject_and_spill_report_overflow_when_full() {
-        for policy in [BackpressurePolicy::RejectPublisher, BackpressurePolicy::SpillToDisk] {
+        for policy in [
+            BackpressurePolicy::RejectPublisher,
+            BackpressurePolicy::SpillToDisk,
+        ] {
             let engine = RuleEngine::new(1, policy);
             let input = engine.input();
             assert!(input.try_push(test_event("t", b"one")).is_ok());
@@ -1629,10 +1666,7 @@ mod tests {
 
     /// Run one stateless SELECT through the real ingress path and return
     /// the projected row.
-    async fn project_one(
-        sql: &str,
-        payload: &'static [u8],
-    ) -> serde_json::Value {
+    async fn project_one(sql: &str, payload: &'static [u8]) -> serde_json::Value {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let rule = engine
             .create_rule(
@@ -1935,9 +1969,7 @@ mod tests {
     async fn test_forward_connector_receives_projected_payload() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let recorder: Arc<RecordingConnector> = Arc::new(RecordingConnector::default());
-        engine
-            .connectors()
-            .register("webhook", recorder.clone());
+        engine.connectors().register("webhook", recorder.clone());
 
         engine
             .create_rule(
@@ -1956,9 +1988,7 @@ mod tests {
         engine
             .dispatch_ingress(
                 &Topic::new("sensors/temperature").unwrap(),
-                &Bytes::from_static(
-                    br#"{ "temperature": 72.5, "secret": "hide_me" }"#,
-                ),
+                &Bytes::from_static(br#"{ "temperature": 72.5, "secret": "hide_me" }"#),
                 QoS::AtMostOnce,
                 &sink,
             )
@@ -2052,9 +2082,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, payload, _, _)| {
-                serde_json::from_slice(payload).expect("row is JSON")
-            })
+            .map(|(_, payload, _, _)| serde_json::from_slice(payload).expect("row is JSON"))
             .collect()
     }
 
@@ -2247,9 +2275,24 @@ mod tests {
             republish_action(),
         );
 
-        ingress(&engine, &sink_obj, br#"{ "sensor_id": "a", "temperature": 10.0 }"#).await;
-        ingress(&engine, &sink_obj, br#"{ "sensor_id": "b", "temperature": 30.0 }"#).await;
-        ingress(&engine, &sink_obj, br#"{ "sensor_id": "a", "temperature": 20.0 }"#).await;
+        ingress(
+            &engine,
+            &sink_obj,
+            br#"{ "sensor_id": "a", "temperature": 10.0 }"#,
+        )
+        .await;
+        ingress(
+            &engine,
+            &sink_obj,
+            br#"{ "sensor_id": "b", "temperature": 30.0 }"#,
+        )
+        .await;
+        ingress(
+            &engine,
+            &sink_obj,
+            br#"{ "sensor_id": "a", "temperature": 20.0 }"#,
+        )
+        .await;
         wait_rows(&sink, 2).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let rows = published_rows(&sink);
@@ -2304,9 +2347,7 @@ mod tests {
     #[tokio::test]
     async fn test_sliding_window_aggregates_per_arrival() {
         let (engine, sink, sink_obj, _) = window_rule(
-            Some(
-                r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY SLIDINGWINDOW(ss, 60)"#,
-            ),
+            Some(r#"SELECT avg(temperature) AS a FROM "sensors/+" GROUP BY SLIDINGWINDOW(ss, 60)"#),
             republish_action(),
         );
 
@@ -2415,7 +2456,8 @@ mod tests {
     async fn test_window_channel_depth_reaches_worker() {
         // The spawned worker's channel bound equals the configured depth.
         async fn worker_capacity(depth: usize) -> usize {
-            let engine = RuleEngine::new_with_window_depth(16, BackpressurePolicy::DropOldest, depth);
+            let engine =
+                RuleEngine::new_with_window_depth(16, BackpressurePolicy::DropOldest, depth);
             let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
             engine
                 .create_rule(
@@ -2522,7 +2564,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_evaluate_vectors() {        let payload = serde_json::json!({ "temperature": 72.5, "secret": "x" });
+    fn test_try_evaluate_vectors() {
+        let payload = serde_json::json!({ "temperature": 72.5, "secret": "x" });
 
         // SQL match with projection.
         let (matched, projected) = try_evaluate(
@@ -2559,8 +2602,7 @@ mod tests {
 
         // No SQL: raw passthrough on match.
         let (matched, projected) =
-            try_evaluate(None, Some("sensors/+"), "sensors/kitchen", &payload)
-                .expect("evaluates");
+            try_evaluate(None, Some("sensors/+"), "sensors/kitchen", &payload).expect("evaluates");
         assert!(matched);
         assert_eq!(projected, Some(payload.clone()));
 
@@ -2587,7 +2629,10 @@ mod tests {
         let (stripped, bound) =
             split_into_connector(r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#)
                 .expect("parses");
-        assert_eq!(stripped, r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#);
+        assert_eq!(
+            stripped,
+            r#"SELECT * FROM "sensors/+" WHERE temperature > 0"#
+        );
         assert_eq!(bound, None);
 
         // Trailing INTO binds the connector and strips cleanly.
@@ -2602,10 +2647,9 @@ mod tests {
         assert_eq!(bound, Some("kafka-sink-1".to_string()));
 
         // Single quotes, extra whitespace, trailing semicolon tolerated.
-        let (stripped, bound) = split_into_connector(
-            "SELECT a FROM s WHERE v > 1   INTO   connector( 'r1' ) ;",
-        )
-        .expect("parses");
+        let (stripped, bound) =
+            split_into_connector("SELECT a FROM s WHERE v > 1   INTO   connector( 'r1' ) ;")
+                .expect("parses");
         assert_eq!(stripped, "SELECT a FROM s WHERE v > 1");
         assert_eq!(bound, Some("r1".to_string()));
 
@@ -2624,10 +2668,7 @@ mod tests {
             r#"SELECT * FROM s INTO topic("x")"#,
             r#"SELECT * FROM s INTO connector("x") TRAILING"#,
         ] {
-            assert!(
-                split_into_connector(bad).is_err(),
-                "must reject: {bad}"
-            );
+            assert!(split_into_connector(bad).is_err(), "must reject: {bad}");
         }
     }
 
@@ -2671,7 +2712,9 @@ mod tests {
             .expect("rule creates");
         assert_eq!(
             rule.sql_query.as_deref(),
-            Some(r#"SELECT temperature, device_id FROM "sensors/+" WHERE temperature > 0 INTO connector("kafka-sink-1")"#)
+            Some(
+                r#"SELECT temperature, device_id FROM "sensors/+" WHERE temperature > 0 INTO connector("kafka-sink-1")"#
+            )
         );
         assert!(rule.actions.iter().any(|action| matches!(
             action,
@@ -2735,10 +2778,9 @@ mod tests {
     async fn test_rule_fans_out_to_five_analytical_sinks() {
         use axum::{extract::State, routing::post, Router};
         use broker_connectors::{
-            ClickHouseSink, ClickHouseSinkConfig, InfluxDbSink, InfluxDbSinkConfig,
-            KafkaSink, KafkaSinkConfig, MemoryKafkaTransport, MemoryMySqlTransport,
-            MemoryRedisTransport, MySqlSink, MySqlSinkConfig, RedisCommandKind,
-            RedisSink, RedisSinkConfig,
+            ClickHouseSink, ClickHouseSinkConfig, InfluxDbSink, InfluxDbSinkConfig, KafkaSink,
+            KafkaSinkConfig, MemoryKafkaTransport, MemoryMySqlTransport, MemoryRedisTransport,
+            MySqlSink, MySqlSinkConfig, RedisCommandKind, RedisSink, RedisSinkConfig,
         };
         use tokio::net::TcpListener;
 
@@ -2750,7 +2792,9 @@ mod tests {
                 *captured.lock() = body;
                 axum::http::StatusCode::OK
             }
-            let app = Router::new().route(route, post(handler)).with_state(captured);
+            let app = Router::new()
+                .route(route, post(handler))
+                .with_state(captured);
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let port = listener.local_addr().expect("addr").port();
             tokio::spawn(async move {
@@ -2803,9 +2847,8 @@ mod tests {
             MySqlSink::new(
                 MySqlSinkConfig {
                     connection_url: "mysql://u:p@unused:3306/db".to_string(),
-                    sql_template:
-                        "INSERT INTO mqtt_events (topic, qos, payload) VALUES (?, ?, ?)"
-                            .to_string(),
+                    sql_template: "INSERT INTO mqtt_events (topic, qos, payload) VALUES (?, ?, ?)"
+                        .to_string(),
                     pool_size: 1,
                     batch_size: 100,
                     batch_timeout_ms: 50,
@@ -2916,21 +2959,13 @@ mod tests {
             projected
         );
 
-        let ch_lines: Vec<String> = ch_body
-            .lock()
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let ch_lines: Vec<String> = ch_body.lock().lines().map(str::to_string).collect();
         assert_eq!(ch_lines.len(), 1);
         let ch_row: serde_json::Value = serde_json::from_str(&ch_lines[0]).unwrap();
         assert_eq!(ch_row["topic"], "sensors/kitchen");
         assert_eq!(ch_row["payload"], projected.to_string());
 
-        let influx_lines: Vec<String> = influx_body
-            .lock()
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let influx_lines: Vec<String> = influx_body.lock().lines().map(str::to_string).collect();
         assert_eq!(influx_lines.len(), 1);
         assert!(
             influx_lines[0].starts_with("mqtt_events,topic=sensors/kitchen "),
@@ -2968,8 +3003,8 @@ mod tests {
     async fn test_into_fans_out_to_s3_elasticsearch_timescaledb() {
         use broker_connectors::{
             ElasticsearchSink, ElasticsearchSinkConfig, MockElasticsearchTransport,
-            MockS3Transport, MockTimescaleTransport, S3Sink, S3SinkConfig,
-            TimescaleDbSink, TimescaleDbSinkConfig,
+            MockS3Transport, MockTimescaleTransport, S3Sink, S3SinkConfig, TimescaleDbSink,
+            TimescaleDbSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -2996,7 +3031,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("s3-telemetry-archive", s3.clone());
+        engine
+            .connectors()
+            .register("s3-telemetry-archive", s3.clone());
 
         // Elasticsearch log search (auto-flush every row).
         let es_transport = Arc::new(MockElasticsearchTransport::new());
@@ -3025,11 +3062,10 @@ mod tests {
                     connection_url: "postgresql://u:p@unused:5432/timeseries".to_string(),
                     hypertable: "sensor_metrics".to_string(),
                     time_column: "time".to_string(),
-                    sql_template:
-                        "INSERT INTO sensor_metrics (time, device_id, topic, metrics) \
+                    sql_template: "INSERT INTO sensor_metrics (time, device_id, topic, metrics) \
                          VALUES ($1, $2, $3, $4::jsonb) \
                          ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics"
-                            .to_string(),
+                        .to_string(),
                     pool_size: 1,
                     batch_size: 1,
                     batch_timeout_ms: 50,
@@ -3038,7 +3074,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("timescale-metrics", ts.clone());
+        engine
+            .connectors()
+            .register("timescale-metrics", ts.clone());
 
         // One INTO rule per sink, mirroring the directive's SQL shapes
         // (count windows keep the test fast; tumbling time windows use
@@ -3060,8 +3098,12 @@ mod tests {
             engine
                 .create_rule(
                     id.to_string(),
-                    TopicFilter::new(if id == "log-search" { "logs/+" } else { "sensors/+" })
-                        .unwrap(),
+                    TopicFilter::new(if id == "log-search" {
+                        "logs/+"
+                    } else {
+                        "sensors/+"
+                    })
+                    .unwrap(),
                     Some(sql.to_string()),
                     true,
                     vec![],
@@ -3120,14 +3162,12 @@ mod tests {
         let body = String::from_utf8(captured[0].body.clone()).unwrap();
         assert!(body.ends_with('\n'));
         let mut body_lines = body.lines();
-        let action: serde_json::Value =
-            serde_json::from_str(body_lines.next().unwrap()).unwrap();
+        let action: serde_json::Value = serde_json::from_str(body_lines.next().unwrap()).unwrap();
         assert!(action["index"]["_index"]
             .as_str()
             .unwrap()
             .starts_with("iot-telemetry-"));
-        let doc: serde_json::Value =
-            serde_json::from_str(body_lines.next().unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(body_lines.next().unwrap()).unwrap();
         assert!(body_lines.next().is_none());
         assert_eq!(doc["topic"], "logs/app");
         assert_eq!(doc["payload"]["message"], "ok");
@@ -3140,8 +3180,7 @@ mod tests {
         assert_eq!(batches[0].rows.len(), 1);
         assert_eq!(batches[0].rows[0][1], b"sensors/kitchen".to_vec());
         assert_eq!(batches[0].rows[0][2], b"sensors/kitchen".to_vec());
-        let metrics: serde_json::Value =
-            serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
+        let metrics: serde_json::Value = serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
         assert_eq!(metrics, serde_json::json!({"avg_temp": 21.0}));
     }
 
@@ -3153,8 +3192,8 @@ mod tests {
     async fn test_into_fans_out_to_industrial_sinks() {
         use broker_connectors::{
             DiskLogSink, DiskLogSinkConfig, HttpSink, HttpSinkConfig, MemoryDiskLogWriter,
-            MemoryMqttBridgeTransport, MemorySparkplugTransport, MqttBridgeSink,
-            MqttBridgeSinkConfig, MockHttpTransport, SparkplugBSink, SparkplugSinkConfig,
+            MemoryMqttBridgeTransport, MemorySparkplugTransport, MockHttpTransport, MqttBridgeSink,
+            MqttBridgeSinkConfig, SparkplugBSink, SparkplugSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -3182,7 +3221,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("hook-industrial", hook.clone());
+        engine
+            .connectors()
+            .register("hook-industrial", hook.clone());
 
         // MQTT bridge (auto-flush every row).
         let bridge_transport = Arc::new(MemoryMqttBridgeTransport::new());
@@ -3208,7 +3249,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("bridge-upstream", bridge.clone());
+        engine
+            .connectors()
+            .register("bridge-upstream", bridge.clone());
 
         // Disk audit log (write-through, in-memory segments).
         let disk_writer = Arc::new(
@@ -3310,8 +3353,7 @@ mod tests {
         let packets = bridge_transport.packets();
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].topic, "upstream/spBv1.0/plant1/DDATA/edge7/plc3");
-        let decoded =
-            broker_connectors::decode_publish(&packets[0].bytes, false).unwrap();
+        let decoded = broker_connectors::decode_publish(&packets[0].bytes, false).unwrap();
         assert_eq!(decoded.qos, 0);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&decoded.payload).unwrap(),
@@ -3444,7 +3486,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("azure-eventhubs", azure.clone());
+        engine
+            .connectors()
+            .register("azure-eventhubs", azure.clone());
 
         // Pulsar (auto-flush every row).
         let pulsar_transport = Arc::new(MemoryPulsarTransport::new());
@@ -3520,11 +3564,14 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].project, "my-iot-project");
         assert_eq!(captured[0].messages.len(), 1);
-        assert_eq!(captured[0].messages[0].ordering_key.as_deref(), Some("device-42"));
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(
-                &base64_decode(&captured[0].messages[0].data_b64)
-            )
+            captured[0].messages[0].ordering_key.as_deref(),
+            Some("device-42")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&base64_decode(
+                &captured[0].messages[0].data_b64
+            ))
             .unwrap(),
             projected
         );
@@ -3534,8 +3581,13 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].hub, "telemetry-hub");
         assert_eq!(captured[0].events.len(), 1);
-        assert_eq!(captured[0].events[0].partition_key.as_deref(), Some("device-42"));
-        assert!(captured[0].sas_token.starts_with("SharedAccessSignature sr="));
+        assert_eq!(
+            captured[0].events[0].partition_key.as_deref(),
+            Some("device-42")
+        );
+        assert!(captured[0]
+            .sas_token
+            .starts_with("SharedAccessSignature sr="));
         let payload = base64_decode(&captured[0].events[0].body_b64);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
@@ -3545,7 +3597,10 @@ mod tests {
         // Pulsar: one message on the canonical topic path.
         let captured = pulsar_transport.captured();
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].topic_path, "persistent://public/default/sensors.kitchen");
+        assert_eq!(
+            captured[0].topic_path,
+            "persistent://public/default/sensors.kitchen"
+        );
         assert_eq!(captured[0].messages.len(), 1);
         assert_eq!(captured[0].messages[0].sequence_id, 0);
         assert_eq!(
@@ -3606,8 +3661,7 @@ mod tests {
         let oci = Arc::new(
             OciStreamingSink::new(
                 OciStreamingSinkConfig {
-                    endpoint:
-                        "https://cell-1.streaming.us-east-1.oci.oraclecloud.com".to_string(),
+                    endpoint: "https://cell-1.streaming.us-east-1.oci.oraclecloud.com".to_string(),
                     stream_pool_id: "ocid1.streampool.oc1..testpool".to_string(),
                     stream_id: "ocid1.stream.oc1..teststream".to_string(),
                     tenancy_ocid: "ocid1.tenancy.oc1..test".to_string(),
@@ -3683,7 +3737,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("azure-iot-sink", azure.clone());
+        engine
+            .connectors()
+            .register("azure-iot-sink", azure.clone());
 
         // GCP IoT Core (RS256 JWT minted with the test key).
         let gcp_transport = Arc::new(MockGcpIotTransport::new());
@@ -3862,7 +3918,9 @@ mod tests {
 
     fn base64_decode(input: &str) -> Vec<u8> {
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.decode(input).unwrap()
+        base64::engine::general_purpose::STANDARD
+            .decode(input)
+            .unwrap()
     }
 
     /// Multi-store e2e (INDRA-220): one ingress event routes through
@@ -3950,7 +4008,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("cassandra-sink", cassandra.clone());
+        engine
+            .connectors()
+            .register("cassandra-sink", cassandra.clone());
 
         // Couchbase documents (auto-flush every row).
         let couchbase_transport = Arc::new(MockCouchbaseTransport::new());
@@ -3980,7 +4040,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("couchbase-sink", couchbase.clone());
+        engine
+            .connectors()
+            .register("couchbase-sink", couchbase.clone());
 
         // One INTO rule per store.
         for (id, connector) in [
@@ -4037,7 +4099,9 @@ mod tests {
                 broker_connectors::BsonValue::Document(meta) => meta.get("topic").cloned(),
                 _ => None,
             }),
-            Some(broker_connectors::BsonValue::String("sensors/kitchen".to_string()))
+            Some(broker_connectors::BsonValue::String(
+                "sensors/kitchen".to_string()
+            ))
         );
 
         // MSSQL: one typed row in dbo.SensorEvents.
@@ -4072,7 +4136,8 @@ mod tests {
         assert_eq!(captured[0].items.len(), 1);
         assert!(captured[0].items[0].key.starts_with("device-42::"));
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&captured[0].items[0].body).unwrap()["temp"],
+            serde_json::from_slice::<serde_json::Value>(&captured[0].items[0].body).unwrap()
+                ["temp"],
             serde_json::json!(22.5)
         );
 
@@ -4121,7 +4186,10 @@ mod tests {
                     },
                     tags_template: HashMap::new(),
                     metrics_template: HashMap::from([
-                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                        (
+                            "temperature".to_string(),
+                            "${payload.temperature}".to_string(),
+                        ),
                         ("humidity".to_string(), "${payload.humidity}".to_string()),
                     ]),
                     batch_size: Some(1),
@@ -4135,7 +4203,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("tdengine-sink", tdengine.clone());
+        engine
+            .connectors()
+            .register("tdengine-sink", tdengine.clone());
 
         // IoTDB tablet rows (auto-flush every row).
         let iotdb_transport = Arc::new(MockIotDbTransport::new());
@@ -4201,7 +4271,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("timestream-sink", timestream.clone());
+        engine
+            .connectors()
+            .register("timestream-sink", timestream.clone());
 
         // DynamoDB items (auto-flush every row).
         let dynamodb_transport = Arc::new(MockDynamoDbTransport::new());
@@ -4237,7 +4309,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("dynamodb-sink", dynamodb.clone());
+        engine
+            .connectors()
+            .register("dynamodb-sink", dynamodb.clone());
 
         // One INTO rule per store over the same telemetry stream.
         for (id, connector) in [
@@ -4275,7 +4349,9 @@ mod tests {
         let captured = tdengine_transport.captured();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].database, "power");
-        assert!(captured[0].sql.starts_with("INSERT INTO d_sensor101 USING meters TAGS ()"));
+        assert!(captured[0]
+            .sql
+            .starts_with("INSERT INTO d_sensor101 USING meters TAGS ()"));
         assert!(captured[0].sql.contains("61.2, 24.5"));
 
         // IoTDB: one tablet on the hierarchical device path.
@@ -4296,19 +4372,19 @@ mod tests {
             .dimensions
             .iter()
             .any(|(name, value)| name == "device_id" && value == "sensor101"));
-        assert!(captured[0].records[0].measures.iter().any(
-            |(name, value, measure_type)| name == "temperature"
+        assert!(captured[0].records[0]
+            .measures
+            .iter()
+            .any(|(name, value, measure_type)| name == "temperature"
                 && value == "24.5"
-                && measure_type == "DOUBLE"
-        ));
+                && measure_type == "DOUBLE"));
 
         // DynamoDB: one item keyed by client_id with the unpacked doc.
         let captured = dynamodb_transport.captured();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].table, "telemetry_table");
         assert_eq!(captured[0].items.len(), 1);
-        let item: serde_json::Value =
-            serde_json::from_str(&captured[0].items[0].body).unwrap();
+        let item: serde_json::Value = serde_json::from_str(&captured[0].items[0].body).unwrap();
         assert_eq!(item["device_id"], serde_json::json!({"S": "sensor101"}));
         assert_eq!(item["temperature"], serde_json::json!({"N": "24.5"}));
 
@@ -4334,10 +4410,10 @@ mod tests {
     #[tokio::test]
     async fn test_into_fans_out_to_lakehouse_sinks() {
         use broker_connectors::{
-            BigQuerySink, BigQuerySinkConfig, DatabricksSink, DatabricksSinkConfig,
-            DorisSink, DorisSinkConfig, MockBigQueryTransport, MockDatabricksTransport,
-            MockDorisTransport, MockRedshiftTransport, MockSnowflakeTransport, RedshiftSink,
-            RedshiftSinkConfig, SnowflakeSink, SnowflakeSinkConfig,
+            BigQuerySink, BigQuerySinkConfig, DatabricksSink, DatabricksSinkConfig, DorisSink,
+            DorisSinkConfig, MockBigQueryTransport, MockDatabricksTransport, MockDorisTransport,
+            MockRedshiftTransport, MockSnowflakeTransport, RedshiftSink, RedshiftSinkConfig,
+            SnowflakeSink, SnowflakeSinkConfig,
         };
         use std::collections::HashMap;
 
@@ -4362,7 +4438,10 @@ mod tests {
                     channel: "INDRA_CHANNEL".to_string(),
                     column_mappings: HashMap::from([
                         ("device_id".to_string(), "${client_id}".to_string()),
-                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                        (
+                            "temperature".to_string(),
+                            "${payload.temperature}".to_string(),
+                        ),
                     ]),
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -4375,7 +4454,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("snowflake-sink", snowflake.clone());
+        engine
+            .connectors()
+            .register("snowflake-sink", snowflake.clone());
 
         // Databricks lakehouse rows (auto-flush every row).
         let databricks_transport = Arc::new(MockDatabricksTransport::new());
@@ -4391,7 +4472,10 @@ mod tests {
                     partition_key_template: None,
                     column_mappings: HashMap::from([
                         ("device_id".to_string(), "${client_id}".to_string()),
-                        ("temperature".to_string(), "${payload.temperature}".to_string()),
+                        (
+                            "temperature".to_string(),
+                            "${payload.temperature}".to_string(),
+                        ),
                     ]),
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -4404,7 +4488,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("databricks-sink", databricks.clone());
+        engine
+            .connectors()
+            .register("databricks-sink", databricks.clone());
 
         // Doris stream load (auto-flush every row).
         let doris_transport = Arc::new(MockDorisTransport::new());
@@ -4460,7 +4546,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("bigquery-sink", bigquery.clone());
+        engine
+            .connectors()
+            .register("bigquery-sink", bigquery.clone());
 
         // Redshift statements (auto-flush every row).
         let redshift_transport = Arc::new(MockRedshiftTransport::new());
@@ -4489,7 +4577,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("redshift-sink", redshift.clone());
+        engine
+            .connectors()
+            .register("redshift-sink", redshift.clone());
 
         // One INTO rule per lakehouse over the same telemetry stream.
         for (id, connector) in [
@@ -4542,8 +4632,13 @@ mod tests {
         // Databricks: qualified INSERT with typed params.
         let captured = databricks_transport.captured();
         assert_eq!(captured.len(), 1);
-        assert!(captured[0].statement.starts_with("INSERT INTO main.default.sensor_readings"));
-        assert!(captured[0].params.iter().any(|param| param.value == "sensor-101"));
+        assert!(captured[0]
+            .statement
+            .starts_with("INSERT INTO main.default.sensor_readings"));
+        assert!(captured[0]
+            .params
+            .iter()
+            .any(|param| param.value == "sensor-101"));
 
         // Doris: one JSON array load with the projected row.
         let captured = doris_transport.captured();
@@ -4591,7 +4686,10 @@ mod tests {
             .create_rule(
                 "broken-into".to_string(),
                 TopicFilter::new("sensors/+").unwrap(),
-                Some(r#"SELECT * FROM "sensors/+" WHERE temperature > 0 INTO connector()"#.to_string()),
+                Some(
+                    r#"SELECT * FROM "sensors/+" WHERE temperature > 0 INTO connector()"#
+                        .to_string(),
+                ),
                 true,
                 vec![],
             )
@@ -4606,8 +4704,8 @@ mod tests {
     #[tokio::test]
     async fn test_sql_fans_out_to_postgres_and_redis() {
         use broker_connectors::{
-            MemoryPgTransport, MemoryRedisTransport, PostgreSqlSink,
-            PostgreSqlSinkConfig, RedisCommandKind, RedisSink, RedisSinkConfig,
+            MemoryPgTransport, MemoryRedisTransport, PostgreSqlSink, PostgreSqlSinkConfig,
+            RedisCommandKind, RedisSink, RedisSinkConfig,
         };
 
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
@@ -4617,7 +4715,9 @@ mod tests {
             PostgreSqlSink::new(
                 PostgreSqlSinkConfig {
                     connection_url: "postgresql://u:p@db/db".to_string(),
-                    sql_template: "INSERT INTO device_status (topic, qos, payload) VALUES ($1, $2, $3::jsonb)".to_string(),
+                    sql_template:
+                        "INSERT INTO device_status (topic, qos, payload) VALUES ($1, $2, $3::jsonb)"
+                            .to_string(),
                     pool_size: 1,
                     batch_size: 100,
                     batch_timeout_ms: 50,
@@ -4701,9 +4801,15 @@ mod tests {
         let commands = redis_transport.commands();
         assert_eq!(commands.len(), 1);
         let encoded = String::from_utf8_lossy(&commands[0].encode_resp()).to_string();
-        assert!(encoded.contains("stream:devices/thermostat/status"), "stream key");
+        assert!(
+            encoded.contains("stream:devices/thermostat/status"),
+            "stream key"
+        );
         assert!(encoded.contains("MAXLEN"), "trim directive");
-        assert!(encoded.contains(r#""status":"online""#), "projected payload");
+        assert!(
+            encoded.contains(r#""status":"online""#),
+            "projected payload"
+        );
         assert!(!encoded.contains("hide_me"), "secrets never leave the rule");
     }
 
@@ -4715,12 +4821,11 @@ mod tests {
     async fn test_into_fans_out_to_storage_messaging_sinks() {
         use broker_connectors::{
             AttributeColumnMapping, AttributeColumnType, AzureBlobAuth, AzureBlobSink,
-            AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink,
-            IcebergPartitionField, IcebergTransform, MemoryConfluentTransport,
-            MockAzureBlobTransport, MockRocketMqTransport, MockS3TablesTransport,
-            MockTablestoreTransport, PrimaryKeyMapping, PrimaryKeyType, RocketMqSink,
-            RocketMqSinkConfig, S3TablesSink, S3TablesSinkConfig, SaslMechanism,
-            TablestoreSink, TablestoreSinkConfig,
+            AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink, IcebergPartitionField,
+            IcebergTransform, MemoryConfluentTransport, MockAzureBlobTransport,
+            MockRocketMqTransport, MockS3TablesTransport, MockTablestoreTransport,
+            PrimaryKeyMapping, PrimaryKeyType, RocketMqSink, RocketMqSinkConfig, S3TablesSink,
+            S3TablesSinkConfig, SaslMechanism, TablestoreSink, TablestoreSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -4816,15 +4921,18 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("iceberg_table", tables.clone());
+        engine
+            .connectors()
+            .register("iceberg_table", tables.clone());
 
         // Confluent Cloud (auto-flush every row, SASL dummies).
         let confluent_transport = Arc::new(MemoryConfluentTransport::new());
         let confluent = Arc::new(
             ConfluentKafkaSink::new(
                 ConfluentKafkaConfig {
-                    bootstrap_servers:
-                        vec!["pkc-test.us-east-1.aws.confluent.cloud:9092".to_string()],
+                    bootstrap_servers: vec![
+                        "pkc-test.us-east-1.aws.confluent.cloud:9092".to_string()
+                    ],
                     api_key: "confluent-key".to_string(),
                     api_secret: "confluent-secret".to_string(),
                     auth_mechanism: SaslMechanism::Plain,
@@ -4839,7 +4947,9 @@ mod tests {
             )
             .expect("valid sink"),
         );
-        engine.connectors().register("cloud_kafka", confluent.clone());
+        engine
+            .connectors()
+            .register("cloud_kafka", confluent.clone());
 
         // RocketMQ (auto-flush every row, anonymous proxy).
         let rmq_transport = Arc::new(MockRocketMqTransport::new());
@@ -4921,7 +5031,11 @@ mod tests {
         // S3 Tables: one gzip data file on the day/device partition.
         let files = tables_transport.puts();
         assert_eq!(files.len(), 1);
-        assert!(files[0].key.contains("device_id=__null__/"), "got {:?}", files[0].key);
+        assert!(
+            files[0].key.contains("device_id=__null__/"),
+            "got {:?}",
+            files[0].key
+        );
         assert!(files[0].key.ends_with(".data.gz"));
 
         // Confluent: one record on the templated topic, keyed by client.

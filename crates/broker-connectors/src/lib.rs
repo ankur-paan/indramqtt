@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use broker_protocol::{QoS, Topic};
+use bytes::Bytes;
 use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,89 +9,275 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-pub mod kafka;
-pub mod rabbitmq;
-pub mod postgres;
-pub mod redis;
-pub mod mysql;
-pub mod clickhouse;
-pub mod influxdb;
-pub mod s3;
-pub mod elasticsearch;
-pub mod timescaledb;
-pub mod http;
-pub mod mqtt_bridge;
-pub mod disk_log;
-pub mod sparkplug_b;
-pub mod kinesis;
-pub mod gcp_pubsub;
-pub mod azure_eventhubs;
-pub mod pulsar;
-pub mod mongodb;
-pub mod mssql;
-pub mod cassandra;
-pub mod couchbase;
-pub mod tdengine;
-pub mod iotdb;
-pub mod timestream;
-pub mod dynamodb;
-pub mod snowflake;
-pub mod databricks;
-pub mod doris;
-pub mod bigquery;
-pub mod redshift;
-pub mod opc_ua;
 pub mod aws_iot;
-pub mod azure_iot;
-pub mod gcp_iot;
-pub mod oci_streaming;
 pub mod azure_blob;
-pub mod tablestore;
-pub mod s3_tables;
+pub mod azure_eventhubs;
+pub mod azure_iot;
+pub mod bigquery;
+pub mod cassandra;
+pub mod clickhouse;
 pub mod confluent;
+pub mod couchbase;
+pub mod databricks;
+pub mod disk_log;
+pub mod doris;
+pub mod dynamodb;
+pub mod elasticsearch;
+pub mod gcp_iot;
+pub mod gcp_pubsub;
+pub mod http;
+pub mod influxdb;
+pub mod iotdb;
+pub mod kafka;
+pub mod kinesis;
+pub mod mongodb;
+pub mod mqtt_bridge;
+pub mod mssql;
+pub mod mysql;
+pub mod oci_streaming;
+pub mod opc_ua;
+pub mod postgres;
+pub mod pulsar;
+pub mod rabbitmq;
+pub mod redis;
+pub mod redshift;
 pub mod rocketmq;
+pub mod s3;
+pub mod s3_tables;
+pub mod snowflake;
+pub mod sparkplug_b;
+pub mod tablestore;
+pub mod tdengine;
+pub mod timescaledb;
+pub mod timestream;
 
-pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
-pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
-pub use postgres::{MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport};
-pub use redis::{MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply, RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport};
-pub use mysql::{MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig, MySqlTransport, TcpMySqlTransport};
+pub use aws_iot::{
+    shadow_update_document, sign_websocket_url, AwsIotAuth, AwsIotConfig, AwsIotConnector,
+    AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping,
+    MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TcpAwsIotTransport,
+};
+pub use azure_blob::{
+    azure_error_code, canonicalized_resource, classify_blob_status, shared_key_authorization,
+    string_to_sign as azure_blob_string_to_sign, AzureBlobAuth, AzureBlobCompression,
+    AzureBlobConnector, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
+    AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
+};
+pub use azure_eventhubs::{
+    render_batch_body as render_azure_batch_body, sas_token, AzureEventHubsConnector,
+    AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem,
+    CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome,
+};
+pub use azure_iot::{
+    d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token, AzureIotAuth,
+    AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink,
+    AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport,
+    TcpAzureIotTransport, TwinTopics,
+};
+pub use bigquery::{
+    classify_insert_errors, render_insert_body as render_bigquery_body, BigQueryConnector,
+    BigQueryInsertResponse, BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport,
+    CapturedBigQueryInsert, HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport,
+};
+pub use cassandra::{
+    decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token,
+    parse_contact_point, CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink,
+    CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError,
+    CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport,
+};
 pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
+pub use confluent::{
+    classify_kafka_error, frame_schema_registry, parse_scram_server_first,
+    resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template,
+    resolve_topic as resolve_confluent_topic, sasl_plain_payload, schema_registry_basic_auth,
+    scram_client_first_message, scram_client_proof as scram_confluent_client_proof, scram_hi,
+    scram_nonce, scram_server_signature, split_schema_registry, ConfluentKafkaConfig,
+    ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord,
+    ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport, SaslMechanism,
+    ScramHash, ScramServerFirst, TcpConfluentTransport,
+};
+pub use couchbase::{
+    decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,
+    parse_connection_string as parse_couchbase_connection_string, CapturedCouchbaseBatch,
+    CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation,
+    CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, KvResponse, MockCouchbaseOutcome,
+    MockCouchbaseTransport, NativeCouchbaseTransport,
+};
+pub use databricks::{
+    parse_statement_state, render_statement_body, CapturedDatabricksStatement, DatabricksConnector,
+    DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport,
+    HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState,
+};
+pub use disk_log::{
+    BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink,
+    DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter,
+};
+pub use doris::{
+    classify_status as classify_doris_status, parse_load_result, render_body as render_doris_body,
+    CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat, DorisHeaders, DorisLoadResult,
+    DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport, MockDorisOutcome,
+    MockDorisTransport,
+};
+pub use dynamodb::{
+    build_item_body, dynamodb_attribute, parse_unprocessed,
+    render_batch_body as render_dynamodb_batch_body, DynamoDbBatchWriteRequest, DynamoDbConnector,
+    DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig, DynamoDbTransport, DynamoKeyConfig,
+    HttpDynamoDbTransport, MockDynamoDbOutcome, MockDynamoDbTransport, DYNAMODB_CONTENT_TYPE,
+    DYNAMODB_TARGET,
+};
+pub use elasticsearch::{
+    BulkOutcome, CapturedBulk, ElasticsearchAuth, ElasticsearchConnector, ElasticsearchSink,
+    ElasticsearchSinkConfig, ElasticsearchTransport, HttpElasticsearchTransport,
+    MockElasticsearchTransport,
+};
+pub use gcp_iot::{
+    build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
+    state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
+    GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
+    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport,
+};
+pub use gcp_pubsub::{
+    build_jwt_assertion, parse_publish_response, render_publish_body, CapturedGcpPublish, GcpAuth,
+    GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport,
+    GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport,
+    GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
+};
+pub use http::{
+    CapturedHttpRequest, HmacAlgorithm, HmacEncoding, HttpAuth, HttpBodyFormat, HttpConnector,
+    HttpHmacSignature, HttpMethod, HttpRequest, HttpResponse, HttpSink, HttpSinkConfig,
+    HttpTransport, MockHttpOutcome, MockHttpTransport, ReqwestHttpTransport,
+};
 pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
-pub use s3::{HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig, S3Transport, SigV4Request};
-pub use elasticsearch::{BulkOutcome, CapturedBulk, ElasticsearchAuth, ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport, HttpElasticsearchTransport, MockElasticsearchTransport};
-pub use timescaledb::{MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch, TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport};
-pub use http::{CapturedHttpRequest, HmacAlgorithm, HmacEncoding, HttpAuth, HttpBodyFormat, HttpConnector, HttpHmacSignature, HttpMethod, HttpRequest, HttpResponse, HttpSink, HttpSinkConfig, HttpTransport, MockHttpOutcome, MockHttpTransport, ReqwestHttpTransport};
-pub use mqtt_bridge::{BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport, MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig, MqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport, decode_publish, decode_remaining_length, encode_publish, encode_remaining_length, parse_bridge_address};
-pub use disk_log::{BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink, DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter};
-pub use sparkplug_b::{MemorySparkplugTransport, SpbAnomaly, SpbDataType, SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SparkplugBConnector, SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig, SparkplugStateMachine, SparkplugTopic, SparkplugTransport, decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint, payload_from_json, payload_to_json, tier, SPARKPLUG_TIER};
-pub use kinesis::{HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse, KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport, MockKinesisOutcome, MockKinesisTransport, KINESIS_TARGET, KINESIS_CONTENT_TYPE};
-pub use gcp_pubsub::{CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport, build_jwt_assertion, parse_publish_response, render_publish_body, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL};
-pub use azure_eventhubs::{AzureEventHubsConnector, AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem, CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome, render_batch_body as render_azure_batch_body, sas_token};
-pub use pulsar::{CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport, TcpPulsarTransport, crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url};
-pub use mongodb::{BsonDocument, BsonValue, CapturedMongoBulk, MockMongoDbTransport, MockMongoOutcome, MongoDbConnector, MongoDbDocumentItem, MongoDbSink, MongoDbSinkConfig, MongoDbTransport, MongoEndpoint, MongoOperation, NativeMongoDbTransport, decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string, scram_client_proof};
-pub use mssql::{CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth, MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport, NativeMssqlTransport, TdsReply, days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password, parse_reply_tokens};
-pub use cassandra::{CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink, CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError, CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport, decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token, parse_contact_point};
-pub use couchbase::{CapturedCouchbaseBatch, CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation, CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, KvResponse, MockCouchbaseOutcome, MockCouchbaseTransport, NativeCouchbaseTransport, decode_response as decode_kv_response, encode_mutation as encode_kv_mutation, parse_connection_string as parse_couchbase_connection_string};
-pub use tdengine::{CapturedTdengineSql, MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse, TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport, HttpTdengineTransport, parse_rest_response, render_insert};
-pub use iotdb::{CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector, IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport, MockIotDbOutcome, MockIotDbTransport, render_tablet_body};
-pub use timestream::{HttpTimestreamTransport, MockTimestreamOutcome, MockTimestreamTransport, TimestreamConnector, TimestreamRecord, TimestreamSink, TimestreamSinkConfig, TimestreamTimeUnit, TimestreamTransport, TimestreamWriteRequest, TimestreamWriteResponse, render_write_records_body, TIMESTREAM_TARGET, TIMESTREAM_CONTENT_TYPE};
-pub use dynamodb::{DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig, DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome, MockDynamoDbTransport, build_item_body, dynamodb_attribute, parse_unprocessed, render_batch_body as render_dynamodb_batch_body, DYNAMODB_TARGET, DYNAMODB_CONTENT_TYPE};
-pub use snowflake::{CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport, SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport, build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows};
-pub use databricks::{CapturedDatabricksStatement, DatabricksConnector, DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport, HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState, parse_statement_state, render_statement_body};
-pub use doris::{CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat, DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport, MockDorisOutcome, MockDorisTransport, classify_status as classify_doris_status, parse_load_result, render_body as render_doris_body};
-pub use bigquery::{BigQueryConnector, BigQueryInsertResponse, BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert, HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, classify_insert_errors, render_insert_body as render_bigquery_body};
-pub use redshift::{HttpRedshiftTransport, MockRedshiftOutcome, MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector, RedshiftSink, RedshiftSinkConfig, RedshiftTransport, default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body, render_statement as render_redshift_statement};
-pub use opc_ua::{MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector, OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport, datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant, encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json};
-pub use aws_iot::{AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping, MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TcpAwsIotTransport, shadow_update_document, sign_websocket_url};
-pub use azure_iot::{AzureIotAuth, AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink, AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TcpAzureIotTransport, TwinTopics, d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token};
-pub use gcp_iot::{CapturedGcpIotPublish, DownlinkRoute, GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport, MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink, state_topic, telemetry_topic, validate_state_snapshot};
-pub use oci_streaming::{HttpOciStreamingTransport, MockOciOutcome, MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage, OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport, authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages, rfc1123_date, rsa_sign, signing_string};
-pub use azure_blob::{AzureBlobAuth, AzureBlobCompression, AzureBlobConnector, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig, AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, azure_error_code, canonicalized_resource, classify_blob_status, shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AZURE_STORAGE_VERSION};
-pub use tablestore::{AttributeColumnMapping, AttributeColumnType, MockTablestoreOutcome, OtsOutcome, OtsRow, OtsRowFailure, OtsValue, PrimaryKeyMapping, PrimaryKeyType, TablestoreAuth, TablestoreConnector, TablestoreSink, TablestoreSinkConfig, TablestoreTransport, HttpTablestoreTransport, MockTablestoreTransport, classify_error_code as classify_ots_error_code, classify_http_status as classify_ots_http_status, content_md5_b64, failed_positions as tablestore_failed_positions, ots_authorization, render_batch_body as render_ots_batch_body, string_to_sign as ots_string_to_sign, BATCH_WRITE_ROW_PATH, OTS_API_VERSION};
-pub use s3_tables::{HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport, S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSink, S3TablesSinkConfig, S3TablesSigning, S3TablesTransport, SnapshotFile, TableBucketArn, apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path, parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization};
-pub use confluent::{ConfluentKafkaConfig, ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord, ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport, SaslMechanism, ScramHash, ScramServerFirst, TcpConfluentTransport, classify_kafka_error, frame_schema_registry, parse_scram_server_first, resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template, resolve_topic as resolve_confluent_topic, sasl_plain_payload, schema_registry_basic_auth, scram_client_first_message, scram_client_proof as scram_confluent_client_proof, scram_hi, scram_nonce, scram_server_signature, split_schema_registry};
-pub use rocketmq::{RocketMqConnector, RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink, RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport, MockRocketMqTransport, TcpRocketMqTransport, authorization_header as rocketmq_authorization, build_system_properties as build_rocketmq_properties, classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope, encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32, md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field, signing_string as rocketmq_signing_string, ENVELOPE_VERSION};
+pub use iotdb::{
+    render_tablet_body, CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector,
+    IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport,
+    MockIotDbOutcome, MockIotDbTransport,
+};
+pub use kafka::{
+    KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport,
+    TcpKafkaTransport,
+};
+pub use kinesis::{
+    HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
+    KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
+    MockKinesisOutcome, MockKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
+};
+pub use mongodb::{
+    decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
+    scram_client_proof, BsonDocument, BsonValue, CapturedMongoBulk, MockMongoDbTransport,
+    MockMongoOutcome, MongoDbConnector, MongoDbDocumentItem, MongoDbSink, MongoDbSinkConfig,
+    MongoDbTransport, MongoEndpoint, MongoOperation, NativeMongoDbTransport,
+};
+pub use mqtt_bridge::{
+    decode_publish, decode_remaining_length, encode_publish, encode_remaining_length,
+    parse_bridge_address, BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport,
+    MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig,
+    MqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport,
+};
+pub use mssql::{
+    days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password,
+    parse_reply_tokens, CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth,
+    MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport,
+    NativeMssqlTransport, TdsReply,
+};
+pub use mysql::{
+    MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig, MySqlTransport, TcpMySqlTransport,
+};
+pub use oci_streaming::{
+    authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages,
+    rfc1123_date, rsa_sign, signing_string, HttpOciStreamingTransport, MockOciOutcome,
+    MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage,
+    OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport,
+};
+pub use opc_ua::{
+    datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant,
+    encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json,
+    MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector,
+    OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode,
+    OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport,
+    OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
+};
+pub use postgres::{
+    MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport,
+};
+pub use pulsar::{
+    crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
+    CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector,
+    PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
+    TcpPulsarTransport,
+};
+pub use rabbitmq::{
+    AmqpFrame, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport,
+    TcpRabbitTransport,
+};
+pub use redis::{
+    MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply, RedisSink, RedisSinkConfig,
+    RedisTransport, TcpRedisTransport,
+};
+pub use redshift::{
+    default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
+    render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
+    MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
+    RedshiftSink, RedshiftSinkConfig, RedshiftTransport,
+};
+pub use rocketmq::{
+    authorization_header as rocketmq_authorization,
+    build_system_properties as build_rocketmq_properties,
+    classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope,
+    encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32,
+    md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field,
+    signing_string as rocketmq_signing_string, MockRocketMqTransport, RocketMqConnector,
+    RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink,
+    RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
+    TcpRocketMqTransport, ENVELOPE_VERSION,
+};
+pub use s3::{
+    HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
+    S3Transport, SigV4Request,
+};
+pub use s3_tables::{
+    apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path,
+    parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization,
+    HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport,
+    S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSigning, S3TablesSink,
+    S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
+};
+pub use snowflake::{
+    build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows,
+    CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport,
+    SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport,
+};
+pub use sparkplug_b::{
+    decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint,
+    payload_from_json, payload_to_json, tier, MemorySparkplugTransport, SparkplugBConnector,
+    SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
+    SparkplugStateMachine, SparkplugTopic, SparkplugTransport, SpbAnomaly, SpbDataType,
+    SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SPARKPLUG_TIER,
+};
+pub use tablestore::{
+    classify_error_code as classify_ots_error_code,
+    classify_http_status as classify_ots_http_status, content_md5_b64,
+    failed_positions as tablestore_failed_positions, ots_authorization,
+    render_batch_body as render_ots_batch_body, string_to_sign as ots_string_to_sign,
+    AttributeColumnMapping, AttributeColumnType, HttpTablestoreTransport, MockTablestoreOutcome,
+    MockTablestoreTransport, OtsOutcome, OtsRow, OtsRowFailure, OtsValue, PrimaryKeyMapping,
+    PrimaryKeyType, TablestoreAuth, TablestoreConnector, TablestoreSink, TablestoreSinkConfig,
+    TablestoreTransport, BATCH_WRITE_ROW_PATH, OTS_API_VERSION,
+};
+pub use tdengine::{
+    parse_rest_response, render_insert, CapturedTdengineSql, HttpTdengineTransport,
+    MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse,
+    TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport,
+};
+pub use timescaledb::{
+    MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch, TimescaleDbConnector,
+    TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
+};
+pub use timestream::{
+    render_write_records_body, HttpTimestreamTransport, MockTimestreamOutcome,
+    MockTimestreamTransport, TimestreamConnector, TimestreamRecord, TimestreamSink,
+    TimestreamSinkConfig, TimestreamTimeUnit, TimestreamTransport, TimestreamWriteRequest,
+    TimestreamWriteResponse, TIMESTREAM_CONTENT_TYPE, TIMESTREAM_TARGET,
+};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -136,12 +322,11 @@ pub struct ConnectorInfo {
 /// Enterprise; everything else is Community.
 pub fn connector_tier(kind: &str) -> &'static str {
     match kind {
-        "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b"
-        | "mongodb" | "mssql" | "cassandra" | "couchbase"
-        | "tdengine" | "iotdb" | "timestream" | "dynamodb"
-        | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
-        | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua"
-        | "azure_blob" | "tablestore" | "s3_tables" | "confluent" | "rocketmq" => "enterprise",
+        "kinesis" | "gcp_pubsub" | "azure_eventhubs" | "pulsar" | "sparkplug_b" | "mongodb"
+        | "mssql" | "cassandra" | "couchbase" | "tdengine" | "iotdb" | "timestream"
+        | "dynamodb" | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
+        | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua" | "azure_blob"
+        | "tablestore" | "s3_tables" | "confluent" | "rocketmq" => "enterprise",
         _ => "community",
     }
 }
@@ -271,7 +456,11 @@ impl Sink for ConsoleLoggerSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
         let preview = match std::str::from_utf8(payload) {
             Ok(text) if text.len() <= self.max_preview_bytes => text.into(),
-            Ok(text) => format!("{}…<{} bytes total>", &text[..self.max_preview_bytes], payload.len()),
+            Ok(text) => format!(
+                "{}…<{} bytes total>",
+                &text[..self.max_preview_bytes],
+                payload.len()
+            ),
             Err(_) => format!("<{} non-UTF8 bytes>", payload.len()),
         };
         tracing::info!(
@@ -313,7 +502,10 @@ impl ConnectorManager {
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn Sink>> {
-        self.connectors.read().get(id).map(|entry| entry.sink.clone())
+        self.connectors
+            .read()
+            .get(id)
+            .map(|entry| entry.sink.clone())
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -338,13 +530,7 @@ impl ConnectorManager {
     }
 
     /// Deliver one event through the named connector.
-    pub async fn send(
-        &self,
-        id: &str,
-        topic: &Topic,
-        payload: &Bytes,
-        qos: QoS,
-    ) -> Result<()> {
+    pub async fn send(&self, id: &str, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
         match self.get(id) {
             Some(sink) => sink.send(topic, payload, qos).await,
             None => Err(ConnectorError::UnknownConnector(id.to_string())),
@@ -443,9 +629,7 @@ impl BackoffState {
 
     pub(crate) fn failure(&mut self) {
         self.consecutive_errors += 1;
-        let secs = 2u64
-            .saturating_pow(self.consecutive_errors.min(5))
-            .min(30);
+        let secs = 2u64.saturating_pow(self.consecutive_errors.min(5)).min(30);
         self.retry_after = Some(Instant::now() + Duration::from_secs(secs));
     }
 }
@@ -579,7 +763,10 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
 /// Lowercase hex SHA-256 of `data`.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    sha2::Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// HMAC-SHA1 (sha1 only, no extra dependency). Shared by the
@@ -672,7 +859,10 @@ pub(crate) fn sigv4_authorization(signing: &SigV4Signing<'_>) -> String {
         signed_headers,
         signing.payload_hash
     );
-    let scope = format!("{short_date}/{}/{}/aws4_request", signing.region, signing.service);
+    let scope = format!(
+        "{short_date}/{}/{}/aws4_request",
+        signing.region, signing.service
+    );
     let canonical_hash = sha256_hex(canonical_request.as_bytes());
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{canonical_hash}");
     let mut key = hmac_sha256(
@@ -752,7 +942,12 @@ mod tests {
             .await
             .unwrap();
         let err = manager
-            .send("missing", &topic, &Bytes::from_static(b"hi"), QoS::AtMostOnce)
+            .send(
+                "missing",
+                &topic,
+                &Bytes::from_static(b"hi"),
+                QoS::AtMostOnce,
+            )
             .await
             .expect_err("unknown connector must fail");
         assert!(matches!(err, ConnectorError::UnknownConnector(_)));
@@ -795,11 +990,19 @@ mod tests {
             "confluent",
             "rocketmq",
         ] {
-            assert_eq!(connector_tier(kind), "enterprise", "{kind} must be enterprise");
+            assert_eq!(
+                connector_tier(kind),
+                "enterprise",
+                "{kind} must be enterprise"
+            );
         }
         // Everything else is community (including unknown kinds).
         for kind in ["kafka", "postgres", "redis", "webhook", "logger", "nope"] {
-            assert_eq!(connector_tier(kind), "community", "{kind} must be community");
+            assert_eq!(
+                connector_tier(kind),
+                "community",
+                "{kind} must be community"
+            );
         }
     }
 
@@ -855,11 +1058,7 @@ mod tests {
             .expect("webhook client");
         let mut headers = HeaderMap::new();
         headers.insert("X-Tenant", "acme".parse().unwrap());
-        let sink = HttpWebhookSink::new(
-            format!("http://127.0.0.1:{port}/hook"),
-            headers,
-            client,
-        );
+        let sink = HttpWebhookSink::new(format!("http://127.0.0.1:{port}/hook"), headers, client);
         assert_eq!(sink.sent_count(), 0);
 
         let payload = Bytes::from_static(br#"{ "temperature": 85.0 }"#);
@@ -897,7 +1096,11 @@ mod tests {
             reqwest::Client::new(),
         );
         let err = sink
-            .send(&Topic::new("a").unwrap(), &Bytes::from_static(b"{}"), QoS::AtMostOnce)
+            .send(
+                &Topic::new("a").unwrap(),
+                &Bytes::from_static(b"{}"),
+                QoS::AtMostOnce,
+            )
             .await
             .expect_err("5xx must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
@@ -911,7 +1114,11 @@ mod tests {
         )
         .with_timeout(Duration::from_millis(500));
         let err = dead
-            .send(&Topic::new("a").unwrap(), &Bytes::from_static(b"{}"), QoS::AtMostOnce)
+            .send(
+                &Topic::new("a").unwrap(),
+                &Bytes::from_static(b"{}"),
+                QoS::AtMostOnce,
+            )
             .await
             .expect_err("refused port must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));

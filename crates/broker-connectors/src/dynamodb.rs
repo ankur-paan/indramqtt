@@ -21,9 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 pub const DYNAMODB_TARGET: &str = "DynamoDB_20120810.BatchWriteItem";
 pub const DYNAMODB_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
@@ -125,8 +123,7 @@ fn event_variables(
 
 /// Render a template over owned event variables.
 fn render_key_template(template: &str, vars: &[(String, String)]) -> Result<String> {
-    let borrowed: Vec<(&str, String)> =
-        vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let borrowed: Vec<(&str, String)> = vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     render_template(template, &borrowed)
 }
 
@@ -247,7 +244,13 @@ impl DynamoDbSinkConfig {
             0,
         )?;
         if let Some(sort_key) = &self.sort_key {
-            sort_key.render("sort", "dummy", br#"{"client_id":"dummy"}"#, QoS::AtMostOnce, 0)?;
+            sort_key.render(
+                "sort",
+                "dummy",
+                br#"{"client_id":"dummy"}"#,
+                QoS::AtMostOnce,
+                0,
+            )?;
         }
         for (name, template) in &self.attributes_mapping {
             if name.trim().is_empty() {
@@ -256,7 +259,13 @@ impl DynamoDbSinkConfig {
                 ));
             }
             if template != "${payload}" {
-                self.render_text(template, "dummy", br#"{"client_id":"dummy"}"#, QoS::AtMostOnce, 0)?;
+                self.render_text(
+                    template,
+                    "dummy",
+                    br#"{"client_id":"dummy"}"#,
+                    QoS::AtMostOnce,
+                    0,
+                )?;
             }
         }
         if self.batch_size == Some(0) {
@@ -288,7 +297,9 @@ impl DynamoDbSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Build the owned variable set, then render (two-phase so the
@@ -358,13 +369,13 @@ pub fn build_item_body(
     qos: QoS,
     millis: i64,
 ) -> Result<String> {
-    let text = std::str::from_utf8(payload).map_err(|_| {
-        ConnectorError::Dispatch("dynamodb payload must be UTF-8".to_string())
-    })?;
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-        ConnectorError::Dispatch("dynamodb payload must be JSON".to_string())
-    })?;
-    let partition = config.partition_key.render("partition", topic, payload, qos, millis)?;
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| ConnectorError::Dispatch("dynamodb payload must be UTF-8".to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| ConnectorError::Dispatch("dynamodb payload must be JSON".to_string()))?;
+    let partition = config
+        .partition_key
+        .render("partition", topic, payload, qos, millis)?;
     let mut item = String::from("{");
     item.push_str(&serde_json::to_string(&config.partition_key.name).unwrap_or_default());
     item.push(':');
@@ -401,7 +412,11 @@ pub fn build_item_body(
     let mut names: Vec<&String> = config.attributes_mapping.keys().collect();
     names.sort();
     let mut unpacked: Vec<(String, serde_json::Value)> = Vec::new();
-    if config.attributes_mapping.values().any(|t| t == "${payload}") {
+    if config
+        .attributes_mapping
+        .values()
+        .any(|t| t == "${payload}")
+    {
         match &value {
             serde_json::Value::Object(map) => {
                 for (key, field) in map {
@@ -442,7 +457,10 @@ pub fn build_item_body(
     for (key, field) in &merged {
         // Keys already present (partition/sort/ttl) are not overwritten.
         if key == &config.partition_key.name
-            || config.sort_key.as_ref().is_some_and(|sort| key == &sort.name)
+            || config
+                .sort_key
+                .as_ref()
+                .is_some_and(|sort| key == &sort.name)
             || config.ttl_attribute.as_ref().is_some_and(|ttl| key == ttl)
         {
             continue;
@@ -476,9 +494,8 @@ pub fn render_batch_body(table: &str, items: &[String]) -> Vec<u8> {
 /// Parse a `BatchWriteItem` response into unprocessed item bodies
 /// (empty when everything was written).
 pub fn parse_unprocessed(table: &str, body: &[u8]) -> Result<Vec<String>> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("dynamodb bad response JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("dynamodb bad response JSON: {e}")))?;
     let empty = Vec::new();
     let pending = doc
         .get("UnprocessedItems")
@@ -508,13 +525,13 @@ pub fn sign_batch_write(
     let payload_hash = super::sha256_hex(body);
     let date = super::amz_date(millis);
     let mut headers = vec![
-        ("content-type".to_string(), DYNAMODB_CONTENT_TYPE.to_string()),
+        (
+            "content-type".to_string(),
+            DYNAMODB_CONTENT_TYPE.to_string(),
+        ),
         ("host".to_string(), host.to_string()),
         ("x-amz-date".to_string(), date.clone()),
-        (
-            "x-amz-target".to_string(),
-            DYNAMODB_TARGET.to_string(),
-        ),
+        ("x-amz-target".to_string(), DYNAMODB_TARGET.to_string()),
     ];
     if let Some(token) = session_token {
         headers.push(("x-amz-security-token".to_string(), token.to_string()));
@@ -568,10 +585,7 @@ pub enum MockDynamoDbOutcome {
 
 #[async_trait]
 pub trait DynamoDbTransport: Send + Sync {
-    async fn batch_write_item(
-        &self,
-        req: &DynamoDbBatchWriteRequest,
-    ) -> Result<Vec<usize>>;
+    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>>;
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -604,10 +618,7 @@ impl MockDynamoDbTransport {
 
 #[async_trait]
 impl DynamoDbTransport for MockDynamoDbTransport {
-    async fn batch_write_item(
-        &self,
-        req: &DynamoDbBatchWriteRequest,
-    ) -> Result<Vec<usize>> {
+    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(DynamoDbBatchWriteRequest {
             table: req.table.clone(),
@@ -619,9 +630,7 @@ impl DynamoDbTransport for MockDynamoDbTransport {
             Some(MockDynamoDbOutcome::Throttled) => Err(ConnectorError::Connection(
                 "mock dynamodb throttled".to_string(),
             )),
-            Some(MockDynamoDbOutcome::Terminal(message)) => {
-                Err(ConnectorError::Dispatch(message))
-            }
+            Some(MockDynamoDbOutcome::Terminal(message)) => Err(ConnectorError::Dispatch(message)),
         }
     }
 }
@@ -664,10 +673,7 @@ impl HttpDynamoDbTransport {
 
 #[async_trait]
 impl DynamoDbTransport for HttpDynamoDbTransport {
-    async fn batch_write_item(
-        &self,
-        req: &DynamoDbBatchWriteRequest,
-    ) -> Result<Vec<usize>> {
+    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>> {
         let bodies: Vec<String> = req.items.iter().map(|item| item.body.clone()).collect();
         let body = render_batch_body(&req.table, &bodies);
         let millis = now_millis();
@@ -971,9 +977,10 @@ mod tests {
             }),
             ttl_attribute: Some("expire_at".to_string()),
             ttl_secs: Some(86_400),
-            attributes_mapping: HashMap::from([
-                ("temperature".to_string(), "${payload.temperature}".to_string()),
-            ]),
+            attributes_mapping: HashMap::from([(
+                "temperature".to_string(),
+                "${payload.temperature}".to_string(),
+            )]),
             batch_size: Some(25),
             batch_bytes: Some(1_048_576),
             linger_ms: Some(10),
@@ -983,9 +990,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: DynamoDbSinkConfig,
-    ) -> (Arc<DynamoDbSink>, Arc<MockDynamoDbTransport>) {
+    fn test_sink(config: DynamoDbSinkConfig) -> (Arc<DynamoDbSink>, Arc<MockDynamoDbTransport>) {
         let transport = Arc::new(MockDynamoDbTransport::new());
         let sink = Arc::new(DynamoDbSink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -1012,7 +1017,9 @@ mod tests {
         assert!(config.validate().is_err());
         config.partition_key.template = "${client_id}".to_string();
 
-        config.attributes_mapping.insert("".to_string(), "x".to_string());
+        config
+            .attributes_mapping
+            .insert("".to_string(), "x".to_string());
         assert!(config.validate().is_err());
         config.attributes_mapping.remove("");
 
@@ -1052,14 +1059,9 @@ mod tests {
             template: "${client_id}".to_string(),
             key_type: "N".to_string(),
         });
-        assert!(build_item_body(
-            &numeric,
-            "t",
-            br#"{"client_id":"abc"}"#,
-            QoS::AtMostOnce,
-            0
-        )
-        .is_err());
+        assert!(
+            build_item_body(&numeric, "t", br#"{"client_id":"abc"}"#, QoS::AtMostOnce, 0).is_err()
+        );
     }
 
     #[test]
@@ -1082,14 +1084,8 @@ mod tests {
         assert_eq!(item["client_id"], serde_json::json!({"S": "d"}));
         assert_eq!(item["temperature"], serde_json::json!({"N": "84.2"}));
         assert_eq!(item["ok"], serde_json::json!({"BOOL": true}));
-        assert_eq!(
-            item["meta"],
-            serde_json::json!({"M": {"line": {"N": "1"}}})
-        );
-        assert_eq!(
-            item["tags"],
-            serde_json::json!({"L": [{"S": "a"}]})
-        );
+        assert_eq!(item["meta"], serde_json::json!({"M": {"line": {"N": "1"}}}));
+        assert_eq!(item["tags"], serde_json::json!({"L": [{"S": "a"}]}));
         assert_eq!(item["nothing"], serde_json::json!({"NULL": true}));
         assert!(item.get("expire_at").is_none());
 
@@ -1138,12 +1134,16 @@ mod tests {
             .unwrap(),
             vec!["{\"b\":2}".to_string()]
         );
-        assert!(parse_unprocessed("telemetry_table", br#"{"UnprocessedItems":{}}"#)
-            .unwrap()
-            .is_empty());
-        assert!(parse_unprocessed("other", br#"{"UnprocessedItems":{"telemetry_table":[]}}"#)
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_unprocessed("telemetry_table", br#"{"UnprocessedItems":{}}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_unprocessed("other", br#"{"UnprocessedItems":{"telemetry_table":[]}}"#)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1228,7 +1228,9 @@ mod tests {
 
         // Terminal failure: no retry, buffer retained.
         let (sink, transport) = test_sink(test_config());
-        transport.script_outcomes(vec![MockDynamoDbOutcome::Terminal("ValidationException".to_string())]);
+        transport.script_outcomes(vec![MockDynamoDbOutcome::Terminal(
+            "ValidationException".to_string(),
+        )]);
         sink.send(
             &Topic::new("t").unwrap(),
             &Bytes::from("{\"client_id\":\"d\"}"),

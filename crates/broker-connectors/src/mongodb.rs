@@ -22,9 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 // ---------------------------------------------------------------------------
 // BSON model + codec (subset: the types the sink emits and reads).
@@ -231,8 +229,7 @@ fn decode_value(element: u8, cursor: &[u8]) -> Result<(BsonValue, usize)> {
                     "mongo truncated BSON document".to_string(),
                 ));
             }
-            let total =
-                i32::from_le_bytes(cursor[..4].try_into().expect("4 bytes")) as usize;
+            let total = i32::from_le_bytes(cursor[..4].try_into().expect("4 bytes")) as usize;
             if total < 5 || cursor.len() < total {
                 return Err(ConnectorError::Connection(
                     "mongo bad nested BSON length".to_string(),
@@ -256,7 +253,8 @@ fn decode_value(element: u8, cursor: &[u8]) -> Result<(BsonValue, usize)> {
             }
         }
         0x05 => {
-            let len = i32::from_le_bytes(read_exact(&mut rest, 4)?.try_into().expect("4 bytes")) as usize;
+            let len =
+                i32::from_le_bytes(read_exact(&mut rest, 4)?.try_into().expect("4 bytes")) as usize;
             let _subtype = read_exact(&mut rest, 1)?[0];
             BsonValue::Binary(read_exact(&mut rest, len)?.to_vec())
         }
@@ -336,7 +334,10 @@ pub fn json_to_bson(value: &serde_json::Value) -> BsonValue {
             BsonValue::Array(items.iter().map(json_to_bson).collect())
         }
         serde_json::Value::Object(map) => BsonValue::Document(BsonDocument {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_bson(v))).collect(),
+            fields: map
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_bson(v)))
+                .collect(),
         }),
     }
 }
@@ -425,17 +426,20 @@ pub fn scram_client_proof(
     }
     let full_nonce = parts.get("r").copied().unwrap_or_default();
     let salt_b64 = parts.get("s").copied().unwrap_or_default();
-    let iterations: u32 = parts.get("i").copied().unwrap_or("4096").parse().map_err(|_| {
-        ConnectorError::Connection("mongo bad SCRAM iteration count".to_string())
-    })?;
+    let iterations: u32 = parts
+        .get("i")
+        .copied()
+        .unwrap_or("4096")
+        .parse()
+        .map_err(|_| ConnectorError::Connection("mongo bad SCRAM iteration count".to_string()))?;
     if !full_nonce.starts_with(client_nonce) {
         return Err(ConnectorError::Connection(
             "mongo SCRAM nonce mismatch".to_string(),
         ));
     }
-    let salt = base64::engine::general_purpose::STANDARD.decode(salt_b64).map_err(|_| {
-        ConnectorError::Connection("mongo bad SCRAM salt".to_string())
-    })?;
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(salt_b64)
+        .map_err(|_| ConnectorError::Connection("mongo bad SCRAM salt".to_string()))?;
     let client_first_bare = format!("n={username},r={client_nonce}");
     let client_final_wo_proof = format!("c=biws,r={full_nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{client_final_wo_proof}");
@@ -473,10 +477,16 @@ pub enum MongoOperation {
     InsertOne,
     /// Parametrized filter with `$set` payload.
     #[serde(alias = "update_one")]
-    UpdateOne { filter_template: String, upsert: bool },
+    UpdateOne {
+        filter_template: String,
+        upsert: bool,
+    },
     /// Parametrized filter with replacement payload.
     #[serde(alias = "replace_one")]
-    ReplaceOne { filter_template: String, upsert: bool },
+    ReplaceOne {
+        filter_template: String,
+        upsert: bool,
+    },
 }
 
 fn default_batch_size() -> Option<usize> {
@@ -554,11 +564,18 @@ impl MongoDbSinkConfig {
         self.resolve_collection("dummy/topic", b"{}", QoS::AtMostOnce, 0)?;
         match &self.operation {
             MongoOperation::InsertOne => {}
-            MongoOperation::UpdateOne { filter_template, .. }
-            | MongoOperation::ReplaceOne { filter_template, .. } => {
-                let rendered = self.event_vars("dummy", b"{}", QoS::AtMostOnce, 0, filter_template)?;
+            MongoOperation::UpdateOne {
+                filter_template, ..
+            }
+            | MongoOperation::ReplaceOne {
+                filter_template, ..
+            } => {
+                let rendered =
+                    self.event_vars("dummy", b"{}", QoS::AtMostOnce, 0, filter_template)?;
                 serde_json::from_str::<serde_json::Value>(&rendered).map_err(|e| {
-                    ConnectorError::Dispatch(format!("mongodb filter_template must render JSON: {e}"))
+                    ConnectorError::Dispatch(format!(
+                        "mongodb filter_template must render JSON: {e}"
+                    ))
                 })?;
             }
         }
@@ -584,7 +601,9 @@ impl MongoDbSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -621,9 +640,7 @@ impl MongoDbSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -702,9 +719,9 @@ pub fn parse_connection_string(uri: &str) -> Result<MongoEndpoint> {
     let first_host = hosts.split(',').next().unwrap_or_default();
     let (host, port) = match first_host.rsplit_once(':') {
         Some((host, port)) => {
-            let port: u16 = port.parse().map_err(|_| {
-                ConnectorError::Dispatch(format!("mongodb bad port in {uri:?}"))
-            })?;
+            let port: u16 = port
+                .parse()
+                .map_err(|_| ConnectorError::Dispatch(format!("mongodb bad port in {uri:?}")))?;
             (host, port)
         }
         None => (first_host, 27017),
@@ -830,7 +847,9 @@ impl MongoDbTransport for MockMongoDbTransport {
                 11_000 | 11_001 | 12_582 | 121 => {
                     ConnectorError::Dispatch(format!("mock mongo write error {code}: {message}"))
                 }
-                _ => ConnectorError::Connection(format!("mock mongo write error {code}: {message}")),
+                _ => {
+                    ConnectorError::Connection(format!("mock mongo write error {code}: {message}"))
+                }
             }),
         }
     }
@@ -857,12 +876,13 @@ impl NativeMongoDbTransport {
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst) as i32;
         let frame = encode_op_msg(body, request_id);
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("mongodb not connected".to_string())
-        })?;
-        stream.write_all(&frame).await.map_err(|e| {
-            ConnectorError::Connection(format!("mongodb write failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("mongodb not connected".to_string()))?;
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("mongodb write failed: {e}")))?;
         let mut head = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut head))
             .await
@@ -875,9 +895,10 @@ impl NativeMongoDbTransport {
             ));
         }
         let mut rest = vec![0u8; total - 4];
-        stream.read_exact(&mut rest).await.map_err(|e| {
-            ConnectorError::Connection(format!("mongodb read failed: {e}"))
-        })?;
+        stream
+            .read_exact(&mut rest)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("mongodb read failed: {e}")))?;
         let mut full = head.to_vec();
         full.extend_from_slice(&rest);
         let (_, reply) = decode_op_msg(&full)?;
@@ -891,27 +912,31 @@ impl NativeMongoDbTransport {
         }
         if self.endpoint.srv {
             return Err(ConnectorError::Dispatch(
-                "mongodb+srv needs DNS SRV resolution; use mongodb:// with explicit hosts".to_string(),
+                "mongodb+srv needs DNS SRV resolution; use mongodb:// with explicit hosts"
+                    .to_string(),
             ));
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!("mongodb connect timeout: {addr}"))
-                })?
-                .map_err(|e| ConnectorError::Connection(format!("mongodb connect failed: {e}")))?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("mongodb connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("mongodb connect failed: {e}")))?;
         *self.stream.lock().await = Some(stream);
         // Hello (maxWireVersion selects the command surface).
         let mut hello = BsonDocument::new();
-        hello.fields.push(("hello".to_string(), BsonValue::Int32(1)));
+        hello
+            .fields
+            .push(("hello".to_string(), BsonValue::Int32(1)));
         let reply = self.roundtrip(&hello).await?;
         check_ok(&reply, "hello")?;
         // SCRAM-SHA-256 when credentials are configured.
-        if let (Some(username), Some(password)) =
-            (self.endpoint.username.clone(), self.endpoint.password.clone())
-        {
+        if let (Some(username), Some(password)) = (
+            self.endpoint.username.clone(),
+            self.endpoint.password.clone(),
+        ) {
             self.scram_auth(&username, password.as_bytes()).await?;
         }
         Ok(())
@@ -926,8 +951,13 @@ impl NativeMongoDbTransport {
         );
         let first_bare = format!("n={username},r={client_nonce}");
         let mut start = BsonDocument::new();
-        start.fields.push(("saslStart".to_string(), BsonValue::Int32(1)));
-        start.fields.push(("mechanism".to_string(), BsonValue::String("SCRAM-SHA-256".to_string())));
+        start
+            .fields
+            .push(("saslStart".to_string(), BsonValue::Int32(1)));
+        start.fields.push((
+            "mechanism".to_string(),
+            BsonValue::String("SCRAM-SHA-256".to_string()),
+        ));
         start.fields.push((
             "payload".to_string(),
             BsonValue::Binary(format!("n,,{first_bare}").into_bytes()),
@@ -960,8 +990,10 @@ impl NativeMongoDbTransport {
         let (proof_b64, expected_server_sig) =
             scram_client_proof(username, password, &client_nonce, &server_first)?;
         let mut cont = BsonDocument::new();
-        cont.fields.push(("saslContinue".to_string(), BsonValue::Int32(1)));
-        cont.fields.push(("conversationId".to_string(), BsonValue::Int32(conversation)));
+        cont.fields
+            .push(("saslContinue".to_string(), BsonValue::Int32(1)));
+        cont.fields
+            .push(("conversationId".to_string(), BsonValue::Int32(conversation)));
         cont.fields.push((
             "payload".to_string(),
             BsonValue::Binary(
@@ -1007,7 +1039,9 @@ impl NativeMongoDbTransport {
 fn check_ok(reply: &BsonDocument, command: &str) -> Result<()> {
     match reply.get("ok") {
         Some(BsonValue::Double(v)) if *v == 1.0 => Ok(()),
-        Some(BsonValue::Int32(1)) | Some(BsonValue::Int64(1)) | Some(BsonValue::Bool(true)) => Ok(()),
+        Some(BsonValue::Int32(1)) | Some(BsonValue::Int64(1)) | Some(BsonValue::Bool(true)) => {
+            Ok(())
+        }
         _ => Err(ConnectorError::Connection(format!(
             "mongodb {command} not ok: {reply:?}"
         ))),
@@ -1038,16 +1072,24 @@ impl MongoDbTransport for NativeMongoDbTransport {
         let mut body = BsonDocument::new();
         match operation {
             MongoOperation::InsertOne => {
-                body.fields.push(("insert".to_string(), BsonValue::String(collection.to_string())));
+                body.fields.push((
+                    "insert".to_string(),
+                    BsonValue::String(collection.to_string()),
+                ));
                 let documents: Vec<BsonValue> = docs
                     .iter()
                     .map(|item| BsonValue::Document(item.document.clone()))
                     .collect();
-                body.fields.push(("documents".to_string(), BsonValue::Array(documents)));
-                body.fields.push(("ordered".to_string(), BsonValue::Bool(true)));
+                body.fields
+                    .push(("documents".to_string(), BsonValue::Array(documents)));
+                body.fields
+                    .push(("ordered".to_string(), BsonValue::Bool(true)));
             }
             MongoOperation::UpdateOne { .. } | MongoOperation::ReplaceOne { .. } => {
-                body.fields.push(("update".to_string(), BsonValue::String(collection.to_string())));
+                body.fields.push((
+                    "update".to_string(),
+                    BsonValue::String(collection.to_string()),
+                ));
                 let updates: Vec<BsonValue> = docs
                     .iter()
                     .map(|item| {
@@ -1070,33 +1112,36 @@ impl MongoDbTransport for NativeMongoDbTransport {
                         })
                     })
                     .collect();
-                body.fields.push(("updates".to_string(), BsonValue::Array(updates)));
-                body.fields.push(("ordered".to_string(), BsonValue::Bool(true)));
+                body.fields
+                    .push(("updates".to_string(), BsonValue::Array(updates)));
+                body.fields
+                    .push(("ordered".to_string(), BsonValue::Bool(true)));
             }
         }
-        body.fields.push(("$db".to_string(), BsonValue::String(db.to_string())));
+        body.fields
+            .push(("$db".to_string(), BsonValue::String(db.to_string())));
         let reply = self.roundtrip(&body).await?;
         check_ok(&reply, "bulk write")?;
         if let Some(BsonValue::Array(errors)) = reply.get("writeErrors") {
-        if let Some(BsonValue::Document(detail)) = errors.first() {
-            let code = match detail.get("code") {
-                Some(BsonValue::Int32(v)) => *v,
-                Some(BsonValue::Int64(v)) => *v as i32,
-                _ => -1,
-            };
-            let message = match detail.get("errmsg") {
-                Some(BsonValue::String(text)) => text.clone(),
-                _ => "bulk write error".to_string(),
-            };
-            if classify_write_error(code) {
-                return Err(ConnectorError::Dispatch(format!(
+            if let Some(BsonValue::Document(detail)) = errors.first() {
+                let code = match detail.get("code") {
+                    Some(BsonValue::Int32(v)) => *v,
+                    Some(BsonValue::Int64(v)) => *v as i32,
+                    _ => -1,
+                };
+                let message = match detail.get("errmsg") {
+                    Some(BsonValue::String(text)) => text.clone(),
+                    _ => "bulk write error".to_string(),
+                };
+                if classify_write_error(code) {
+                    return Err(ConnectorError::Dispatch(format!(
+                        "mongodb write error {code}: {message}"
+                    )));
+                }
+                return Err(ConnectorError::Connection(format!(
                     "mongodb write error {code}: {message}"
                 )));
             }
-            return Err(ConnectorError::Connection(format!(
-                "mongodb write error {code}: {message}"
-            )));
-        }
         }
         Ok(())
     }
@@ -1171,31 +1216,42 @@ impl MongoDbSink {
         qos: QoS,
         millis: i64,
     ) -> Result<(Option<BsonDocument>, BsonDocument, bool)> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("mongodb payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("mongodb payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("mongodb payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("mongodb payload must be JSON".to_string()))?;
         let client_id = value
             .get("client_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
         let mut meta = BsonDocument::new();
-        meta.fields.push(("topic".to_string(), BsonValue::String(topic.as_str().to_string())));
-        meta.fields.push(("client_id".to_string(), BsonValue::String(client_id.clone())));
-        meta.fields.push(("qos".to_string(), BsonValue::Int32(u8::from(qos) as i32)));
-        meta.fields.push(("timestamp".to_string(), BsonValue::Int64(millis)));
+        meta.fields.push((
+            "topic".to_string(),
+            BsonValue::String(topic.as_str().to_string()),
+        ));
+        meta.fields.push((
+            "client_id".to_string(),
+            BsonValue::String(client_id.clone()),
+        ));
+        meta.fields
+            .push(("qos".to_string(), BsonValue::Int32(u8::from(qos) as i32)));
+        meta.fields
+            .push(("timestamp".to_string(), BsonValue::Int64(millis)));
         let mut document = match &value {
             serde_json::Value::Object(map) => BsonDocument {
-                fields: map.iter().map(|(k, v)| (k.clone(), json_to_bson(v))).collect(),
+                fields: map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json_to_bson(v)))
+                    .collect(),
             },
             other => BsonDocument {
                 fields: vec![("value".to_string(), json_to_bson(other))],
             },
         };
-        document.fields.push(("_mqtt".to_string(), BsonValue::Document(meta)));
+        document
+            .fields
+            .push(("_mqtt".to_string(), BsonValue::Document(meta)));
         let has_id = document.get("_id").is_some();
         match operation {
             MongoOperation::InsertOne => {
@@ -1207,8 +1263,14 @@ impl MongoDbSink {
                 }
                 Ok((None, document, false))
             }
-            MongoOperation::UpdateOne { filter_template, upsert }
-            | MongoOperation::ReplaceOne { filter_template, upsert } => {
+            MongoOperation::UpdateOne {
+                filter_template,
+                upsert,
+            }
+            | MongoOperation::ReplaceOne {
+                filter_template,
+                upsert,
+            } => {
                 // Filter templates render over the raw payload text.
                 let rendered = render_template(
                     filter_template,
@@ -1256,7 +1318,10 @@ impl MongoDbSink {
         // Group by collection, preserving first-seen order.
         let mut groups: Vec<(String, Vec<MongoDbDocumentItem>)> = Vec::new();
         for row in &rows {
-            match groups.iter_mut().find(|(collection, _)| collection == &row.collection) {
+            match groups
+                .iter_mut()
+                .find(|(collection, _)| collection == &row.collection)
+            {
                 Some((_, items)) => items.push(row.item.clone()),
                 None => groups.push((row.collection.clone(), vec![row.item.clone()])),
             }
@@ -1279,7 +1344,8 @@ impl MongoDbSink {
             match outcome {
                 Ok(()) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1335,7 +1401,9 @@ impl MongoDbSink {
             ));
         }
         let millis = now_millis();
-        let collection = self.config.resolve_collection(topic.as_str(), payload, qos, millis)?;
+        let collection = self
+            .config
+            .resolve_collection(topic.as_str(), payload, qos, millis)?;
         let (filter, document, upsert) =
             Self::build_document(&self.config.operation, topic, payload, qos, millis)?;
         let encoded_bytes = document.encode().len();
@@ -1461,7 +1529,8 @@ mod tests {
     #[test]
     fn test_connection_string_parsing() {
         let endpoint =
-            parse_connection_string("mongodb://user:pass@127.0.0.1:27017/admin?authSource=ops").unwrap();
+            parse_connection_string("mongodb://user:pass@127.0.0.1:27017/admin?authSource=ops")
+                .unwrap();
         assert_eq!(endpoint.host, "127.0.0.1");
         assert_eq!(endpoint.port, 27017);
         assert_eq!(endpoint.username.as_deref(), Some("user"));
@@ -1488,8 +1557,10 @@ mod tests {
     #[test]
     fn test_bson_roundtrip_and_layout() {
         let mut doc = BsonDocument::new();
-        doc.fields.push(("n".to_string(), BsonValue::Int32(0x01020304)));
-        doc.fields.push(("s".to_string(), BsonValue::String("hi".to_string())));
+        doc.fields
+            .push(("n".to_string(), BsonValue::Int32(0x01020304)));
+        doc.fields
+            .push(("s".to_string(), BsonValue::String("hi".to_string())));
         doc.fields.push(("b".to_string(), BsonValue::Bool(true)));
         doc.fields.push(("d".to_string(), BsonValue::Double(1.5)));
         doc.fields.push(("nil".to_string(), BsonValue::Null));
@@ -1501,7 +1572,10 @@ mod tests {
         ));
         let bytes = doc.encode();
         // Length prefix covers the whole document; NUL trailer ends it.
-        assert_eq!(i32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize, bytes.len());
+        assert_eq!(
+            i32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
+            bytes.len()
+        );
         assert_eq!(bytes[bytes.len() - 1], 0x00);
         // First element: Int32 tag + "n" cstring + LE value bytes.
         assert_eq!(&bytes[4..7], &[0x10, b'n', 0x00]);
@@ -1520,7 +1594,10 @@ mod tests {
         let second = generate_object_id();
         assert_ne!(first, second);
         // Big-endian epoch seconds prefix, non-decreasing.
-        assert!(u32::from_be_bytes(first[..4].try_into().unwrap()) <= u32::from_be_bytes(second[..4].try_into().unwrap()));
+        assert!(
+            u32::from_be_bytes(first[..4].try_into().unwrap())
+                <= u32::from_be_bytes(second[..4].try_into().unwrap())
+        );
     }
 
     #[test]
@@ -1539,18 +1616,24 @@ mod tests {
         assert!(!upsert);
         // Auto _id first, payload merged, _mqtt injected.
         assert!(matches!(document.get("_id"), Some(BsonValue::ObjectId(_))));
-        assert_eq!(
-            document.get("temperature"),
-            Some(&BsonValue::Double(78.4))
-        );
+        assert_eq!(document.get("temperature"), Some(&BsonValue::Double(78.4)));
         let meta = match document.get("_mqtt") {
             Some(BsonValue::Document(meta)) => meta,
             other => panic!("_mqtt missing: {other:?}"),
         };
-        assert_eq!(meta.get("topic"), Some(&BsonValue::String("factory/line1/temp".to_string())));
-        assert_eq!(meta.get("client_id"), Some(&BsonValue::String("sensor-101".to_string())));
+        assert_eq!(
+            meta.get("topic"),
+            Some(&BsonValue::String("factory/line1/temp".to_string()))
+        );
+        assert_eq!(
+            meta.get("client_id"),
+            Some(&BsonValue::String("sensor-101".to_string()))
+        );
         assert_eq!(meta.get("qos"), Some(&BsonValue::Int32(1)));
-        assert_eq!(meta.get("timestamp"), Some(&BsonValue::Int64(1_726_160_000_000)));
+        assert_eq!(
+            meta.get("timestamp"),
+            Some(&BsonValue::Int64(1_726_160_000_000))
+        );
 
         // Non-object payloads ride under "value".
         let (_, document, _) = MongoDbSink::build_document(
@@ -1615,7 +1698,13 @@ mod tests {
         assert_eq!(server_sig, "FpANZr9jy3MU4R1Lli8Wu/fOH6w6mXz9BTpOnQU4GQQ=");
         // Nonce mismatch and bad iteration counts fail loudly.
         assert!(scram_client_proof("indra", b"s3cret-pass", "other", server_first).is_err());
-        assert!(scram_client_proof("indra", b"s3cret-pass", "rOprNGfwEbeRWgbNEkqO", "r=x,s=!!,i=1").is_err());
+        assert!(scram_client_proof(
+            "indra",
+            b"s3cret-pass",
+            "rOprNGfwEbeRWgbNEkqO",
+            "r=x,s=!!,i=1"
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1626,12 +1715,20 @@ mod tests {
         let (sink, transport) = test_sink(config);
         // Slashes ride into collection names verbatim here (template
         // has no sanitizer by design: operators own the template).
-        sink.send(&Topic::new("a").unwrap(), &Bytes::from("{\"v\":1}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
-        sink.send(&Topic::new("b").unwrap(), &Bytes::from("{\"v\":2}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("a").unwrap(),
+            &Bytes::from("{\"v\":1}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("b").unwrap(),
+            &Bytes::from("{\"v\":2}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         let captured = transport.captured();
         assert_eq!(captured.len(), 2);
@@ -1662,9 +1759,13 @@ mod tests {
             MockMongoOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1678,13 +1779,20 @@ mod tests {
         config.max_retries = Some(5);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockMongoOutcome::WriteError { code: 11_000, message: "dup key".to_string() },
+            MockMongoOutcome::WriteError {
+                code: 11_000,
+                message: "dup key".to_string(),
+            },
             MockMongoOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("duplicate key must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         // No retry consumed the queued success; buffer retained.

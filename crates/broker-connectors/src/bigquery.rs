@@ -23,9 +23,7 @@ use std::time::Duration;
 
 use super::{
     gcp_pubsub::{GcpAuth, GcpTokenCache},
-    now_millis,
-    render_template,
-    BackoffState, BatchQueue, ConnectorError, Result, Sink,
+    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
 };
 
 fn default_endpoint() -> Option<String> {
@@ -59,9 +57,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 fn is_resource_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=1024).contains(&bytes.len())
-        && bytes.iter().all(|b| {
-            b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-'
-        })
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// BigQuery sink configuration. All depths are optional (`None` =
@@ -149,7 +147,10 @@ impl BigQuerySinkConfig {
                     ));
                 }
             }
-            GcpAuth::ServiceAccountKey { client_email, private_key_pem } => {
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            } => {
                 if client_email.trim().is_empty() || private_key_pem.trim().is_empty() {
                     return Err(ConnectorError::Dispatch(
                         "bigquery service account needs email + private key".to_string(),
@@ -202,7 +203,9 @@ impl BigQuerySinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event (plus `${YYYYMMDD}`).
@@ -219,7 +222,10 @@ impl BigQuerySinkConfig {
             ("client_id".to_string(), field("client_id")),
             ("qos".to_string(), u8::from(qos).to_string()),
             ("timestamp".to_string(), millis.to_string()),
-            ("YYYYMMDD".to_string(), format!("{year:04}{month:02}{day:02}")),
+            (
+                "YYYYMMDD".to_string(),
+                format!("{year:04}{month:02}{day:02}"),
+            ),
         ]
     }
 
@@ -240,9 +246,7 @@ impl BigQuerySinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -258,7 +262,13 @@ impl BigQuerySinkConfig {
 
     /// Resolve + sanitize the table (illegal characters become `_`,
     /// optional `$suffix` decorator appended).
-    pub fn resolve_table(&self, topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Result<String> {
+    pub fn resolve_table(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<String> {
         let vars = Self::template_vars(topic, payload, qos, millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -280,7 +290,10 @@ impl BigQuerySinkConfig {
         }
         if let Some(suffix) = &self.template_suffix {
             let rendered = self.event_vars(topic, payload, qos, millis, suffix)?;
-            if !rendered.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            if !rendered
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
                 return Err(ConnectorError::Dispatch(format!(
                     "bigquery suffix resolved invalid: {rendered:?}"
                 )));
@@ -333,9 +346,8 @@ pub fn render_insert_body(
 /// Transient reasons (`backendError`, `rateLimitExceeded`) return
 /// their indices for selective requeue; anything else is terminal.
 pub fn classify_insert_errors(body: &[u8]) -> Result<Vec<usize>> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("bigquery bad response JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("bigquery bad response JSON: {e}")))?;
     let empty = Vec::new();
     let errors = doc
         .get("insertErrors")
@@ -343,7 +355,10 @@ pub fn classify_insert_errors(body: &[u8]) -> Result<Vec<usize>> {
         .unwrap_or(&empty);
     let mut transient = Vec::new();
     for entry in errors {
-        let index = entry.get("index").and_then(|v| v.as_u64()).unwrap_or(usize::MAX as u64) as usize;
+        let index = entry
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(usize::MAX as u64) as usize;
         let reasons: Vec<&str> = entry
             .get("errors")
             .and_then(|v| v.as_array())
@@ -353,7 +368,10 @@ pub fn classify_insert_errors(body: &[u8]) -> Result<Vec<usize>> {
                     .collect()
             })
             .unwrap_or_default();
-        if reasons.iter().all(|reason| matches!(*reason, "backendError" | "rateLimitExceeded")) {
+        if reasons
+            .iter()
+            .all(|reason| matches!(*reason, "backendError" | "rateLimitExceeded"))
+        {
             transient.push(index);
         } else {
             return Err(ConnectorError::Dispatch(format!(
@@ -453,7 +471,11 @@ impl BigQueryTransport for MockBigQueryTransport {
             dataset: dataset.to_string(),
             table: table.to_string(),
             rows: rows.clone(),
-            token: if token.is_empty() { None } else { Some(token.to_string()) },
+            token: if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            },
         });
         match self.scripted.lock().pop_front() {
             None | Some(MockBigQueryOutcome::Accepted) => Ok(BigQueryInsertResponse {
@@ -465,9 +487,7 @@ impl BigQueryTransport for MockBigQueryTransport {
             Some(MockBigQueryOutcome::Throttled) => Err(ConnectorError::Connection(
                 "mock bigquery throttled".to_string(),
             )),
-            Some(MockBigQueryOutcome::Terminal(message)) => {
-                Err(ConnectorError::Dispatch(message))
-            }
+            Some(MockBigQueryOutcome::Terminal(message)) => Err(ConnectorError::Dispatch(message)),
             Some(MockBigQueryOutcome::ConnectionError(message)) => {
                 Err(ConnectorError::Connection(message))
             }
@@ -490,7 +510,10 @@ impl HttpBigQueryTransport {
         let (token_cache, static_bearer) = match &config.auth {
             GcpAuth::None => (None, None),
             GcpAuth::AccessToken { token } => (None, Some(format!("Bearer {token}"))),
-            GcpAuth::ServiceAccountKey { client_email, private_key_pem } => (
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            } => (
                 Some(Arc::new(GcpTokenCache::new(
                     client_email.clone(),
                     private_key_pem.clone(),
@@ -588,10 +611,7 @@ pub struct BigQuerySink {
 }
 
 impl BigQuerySink {
-    pub fn new(
-        config: BigQuerySinkConfig,
-        transport: Arc<dyn BigQueryTransport>,
-    ) -> Result<Self> {
+    pub fn new(config: BigQuerySinkConfig, transport: Arc<dyn BigQueryTransport>) -> Result<Self> {
         config.validate()?;
         let linger = config.effective_linger();
         Ok(Self {
@@ -767,14 +787,14 @@ impl BigQuerySink {
                 "bigquery row requires a non-empty topic".to_string(),
             ));
         }
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("bigquery payload must be UTF-8".to_string())
-        })?;
-        let document: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("bigquery payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("bigquery payload must be UTF-8".to_string()))?;
+        let document: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("bigquery payload must be JSON".to_string()))?;
         let millis = now_millis();
-        let table = self.config.resolve_table(topic.as_str(), payload, _qos, millis)?;
+        let table = self
+            .config
+            .resolve_table(topic.as_str(), payload, _qos, millis)?;
         let bytes = document.to_string().len() + table.len();
         let mut buffer = self.buffer.lock();
         let full = buffer.queue.push(BigQueryRow { table, document });
@@ -846,9 +866,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: BigQuerySinkConfig,
-    ) -> (Arc<BigQuerySink>, Arc<MockBigQueryTransport>) {
+    fn test_sink(config: BigQuerySinkConfig) -> (Arc<BigQuerySink>, Arc<MockBigQueryTransport>) {
         let transport = Arc::new(MockBigQueryTransport::new());
         let sink = Arc::new(BigQuerySink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -876,7 +894,9 @@ mod tests {
         config.table_template = test_config().table_template;
 
         config.template_suffix = Some("2026.09.12".to_string());
-        assert!(config.resolve_table("t", b"{}", QoS::AtMostOnce, 0).is_err());
+        assert!(config
+            .resolve_table("t", b"{}", QoS::AtMostOnce, 0)
+            .is_err());
         config.template_suffix = Some("${YYYYMMDD}".to_string());
         assert!(config
             .resolve_table("t", b"{}", QoS::AtMostOnce, 1_789_211_889_123)
@@ -897,7 +917,9 @@ mod tests {
         let (none_sink, _) = test_sink(test_config());
         assert_eq!(none_sink.bearer_token().unwrap(), "");
         let mut token_config = test_config();
-        token_config.auth = GcpAuth::AccessToken { token: "ya29.test".to_string() };
+        token_config.auth = GcpAuth::AccessToken {
+            token: "ya29.test".to_string(),
+        };
         let (token_sink, _) = test_sink(token_config);
         assert_eq!(token_sink.bearer_token().unwrap(), "Bearer ya29.test");
     }
@@ -908,7 +930,9 @@ mod tests {
         config.template_suffix = Some("${YYYYMMDD}".to_string());
         // 2026-09-12T11:18:09.123Z.
         assert_eq!(
-            config.resolve_table("t", b"{}", QoS::AtMostOnce, 1_789_211_889_123).unwrap(),
+            config
+                .resolve_table("t", b"{}", QoS::AtMostOnce, 1_789_211_889_123)
+                .unwrap(),
             "telemetry_t$20260912"
         );
     }
@@ -948,7 +972,10 @@ mod tests {
             br#"{"insertErrors":[{"index":0,"errors":[{"reason":"invalid"}]}]}"#
         )
         .is_err());
-        assert_eq!(classify_insert_errors(br#"{}"#).unwrap(), Vec::<usize>::new());
+        assert_eq!(
+            classify_insert_errors(br#"{}"#).unwrap(),
+            Vec::<usize>::new()
+        );
     }
 
     #[tokio::test]
@@ -994,9 +1021,13 @@ mod tests {
 
         let topic = Topic::new("t").unwrap();
         for temp in [20.5, 21.5] {
-            sink.send(&topic, &Bytes::from(format!("{{\"temp\":{temp}}}")), QoS::AtMostOnce)
-                .await
-                .unwrap();
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{\"temp\":{temp}}}")),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
         }
         sink.flush().await.unwrap();
 
@@ -1022,9 +1053,13 @@ mod tests {
             "invalid schema".to_string(),
         )]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("terminal must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -1039,9 +1074,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockBigQueryOutcome::Throttled]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("throttle must exhaust");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(transport.calls(), 1);

@@ -11,9 +11,7 @@ pub const INDRA_LICENSE_MAGIC: &[u8] = b"indra-enterprise-licensing-v1-idacs-lab
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LicenseStatus {
     /// Permissive Community Evaluation Mode (Non-Production trial).
-    CommunityEvaluation {
-        max_eval_nodes: usize,
-    },
+    CommunityEvaluation { max_eval_nodes: usize },
     /// Valid active Enterprise Commercial License.
     EnterpriseValid {
         customer: String,
@@ -22,10 +20,7 @@ pub enum LicenseStatus {
         features: Vec<String>,
     },
     /// Expired Enterprise License.
-    Expired {
-        customer: String,
-        expired_at: u64,
-    },
+    Expired { customer: String, expired_at: u64 },
     /// Cluster size exceeds the purchased node quota.
     QuotaExceeded {
         customer: String,
@@ -127,7 +122,9 @@ impl ClusterLicense {
 
         let payload_bytes = match hex::decode(parts[1]) {
             Ok(b) => b,
-            Err(_) => return LicenseStatus::InvalidSignature("Invalid hex in license payload".into()),
+            Err(_) => {
+                return LicenseStatus::InvalidSignature("Invalid hex in license payload".into())
+            }
         };
 
         let expected_sig = Self::compute_signature(&payload_bytes);
@@ -189,8 +186,13 @@ impl ClusterLicense {
         match status {
             LicenseStatus::CommunityEvaluation { max_eval_nodes } => {
                 warn!("================================================================================");
-                warn!(" [LICENSE NOTICE] IndraMQTT Clustering running in COMMUNITY EVALUATION MODE");
-                warn!(" Non-production use only. Max evaluation cluster limit: {} nodes.", max_eval_nodes);
+                warn!(
+                    " [LICENSE NOTICE] IndraMQTT Clustering running in COMMUNITY EVALUATION MODE"
+                );
+                warn!(
+                    " Non-production use only. Max evaluation cluster limit: {} nodes.",
+                    max_eval_nodes
+                );
                 warn!(" For commercial production clustering licenses: sales@i-dacs.com");
                 warn!("================================================================================");
             }
@@ -212,7 +214,10 @@ impl ClusterLicense {
                 expired_at,
             } => {
                 error!("================================================================================");
-                error!(" [LICENSE EXPIRED] Enterprise clustering license for '{}' expired at {}", customer, expired_at);
+                error!(
+                    " [LICENSE EXPIRED] Enterprise clustering license for '{}' expired at {}",
+                    customer, expired_at
+                );
                 error!(" Please renew your commercial license: sales@i-dacs.com");
                 error!("================================================================================");
             }
@@ -228,7 +233,10 @@ impl ClusterLicense {
             }
             LicenseStatus::InvalidSignature(reason) => {
                 error!("================================================================================");
-                error!(" [LICENSE ERROR] Enterprise license validation failed: {}", reason);
+                error!(
+                    " [LICENSE ERROR] Enterprise license validation failed: {}",
+                    reason
+                );
                 error!("================================================================================");
             }
         }

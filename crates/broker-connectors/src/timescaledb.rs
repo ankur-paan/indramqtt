@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    now_millis, rfc3339_millis, BackoffState, BatchQueue, ConnectorError, PgBatch,
-    PgTransport, Result, Sink, TcpPgTransport,
+    now_millis, rfc3339_millis, BackoffState, BatchQueue, ConnectorError, PgBatch, PgTransport,
+    Result, Sink, TcpPgTransport,
 };
 
 fn default_time_column() -> String {
@@ -444,7 +444,10 @@ mod tests {
         assert_eq!(row[1], b"d7".to_vec());
         assert_eq!(row[2], b"sensors/kitchen".to_vec());
         let metrics: serde_json::Value = serde_json::from_slice(&row[3]).unwrap();
-        assert_eq!(metrics, serde_json::json!({"device_id": "d7", "temp": 21.5}));
+        assert_eq!(
+            metrics,
+            serde_json::json!({"device_id": "d7", "temp": 21.5})
+        );
     }
 
     #[tokio::test]
@@ -476,8 +479,7 @@ mod tests {
         let batches = transport.batches();
         assert_eq!(batches[0].rows.len(), 2);
         assert_eq!(batches[0].rows[0][1], b"sensors/door".to_vec());
-        let metrics: serde_json::Value =
-            serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
+        let metrics: serde_json::Value = serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
         assert_eq!(metrics, serde_json::Value::String("open".to_string()));
         assert_eq!(batches[0].rows[1][1], b"42".to_vec());
     }
@@ -490,7 +492,9 @@ mod tests {
         let sink = TimescaleDbSink::new(config, transport.clone()).unwrap();
         let topic = Topic::new("t").unwrap();
         for v in ["1", "2", "3"] {
-            sink.send(&topic, &Bytes::from(v), QoS::AtMostOnce).await.unwrap();
+            sink.send(&topic, &Bytes::from(v), QoS::AtMostOnce)
+                .await
+                .unwrap();
         }
         // Two rows flushed on count, one still buffered.
         assert_eq!(sink.sent_batches(), 1);
@@ -511,7 +515,9 @@ mod tests {
         config.batch_size = 10;
         let sink = TimescaleDbSink::new(config, transport.clone()).unwrap();
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         let err = sink.flush().await.expect_err("mock down must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);

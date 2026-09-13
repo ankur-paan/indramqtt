@@ -24,8 +24,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
-    hms_milli_from_millis, now_millis, render_template, ymd_from_millis, BackoffState,
-    BatchQueue, ConnectorError, Result, Sink,
+    hms_milli_from_millis, now_millis, render_template, ymd_from_millis, BackoffState, BatchQueue,
+    ConnectorError, Result, Sink,
 };
 
 /// CQL consistency levels (subset with wire codes).
@@ -56,7 +56,10 @@ impl CqlConsistency {
 pub enum CassandraAuth {
     #[default]
     None,
-    Password { username: String, password: String },
+    Password {
+        username: String,
+        password: String,
+    },
 }
 
 fn default_linger_ms() -> Option<u64> {
@@ -85,9 +88,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 
 fn is_cql_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || b == b'_'
-        })
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Cassandra sink configuration. All depths are optional (`None` =
@@ -168,7 +171,13 @@ impl CassandraSinkConfig {
             }
         }
         // Strict template checks with dummy values.
-        self.event_vars("dummy", b"{}", QoS::AtMostOnce, 0, &self.partition_key_template)?;
+        self.event_vars(
+            "dummy",
+            b"{}",
+            QoS::AtMostOnce,
+            0,
+            &self.partition_key_template,
+        )?;
         let markers = count_markers(&self.cql_statement_template)?;
         match (markers, self.ttl_secs) {
             (4, None) => {}
@@ -211,7 +220,9 @@ impl CassandraSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Resolve + sanitize the table: template first, then anything
@@ -359,8 +370,16 @@ pub fn murmur3_token(data: &[u8]) -> i64 {
     let mut h2 = 0u64;
     let blocks = data.len() / 16;
     for block in 0..blocks {
-        let mut k1 = u64::from_le_bytes(data[block * 16..block * 16 + 8].try_into().expect("8 bytes"));
-        let mut k2 = u64::from_le_bytes(data[block * 16 + 8..block * 16 + 16].try_into().expect("8 bytes"));
+        let mut k1 = u64::from_le_bytes(
+            data[block * 16..block * 16 + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        let mut k2 = u64::from_le_bytes(
+            data[block * 16 + 8..block * 16 + 16]
+                .try_into()
+                .expect("8 bytes"),
+        );
         k1 = k1.wrapping_mul(C1);
         k1 = k1.rotate_left(31);
         k1 = k1.wrapping_mul(C2);
@@ -381,12 +400,24 @@ pub fn murmur3_token(data: &[u8]) -> i64 {
     let mut k2 = 0u64;
     // Intentional fallthrough (long tail first), mirroring the
     // reference switch.
-    if tail.len() >= 15 { k2 ^= (tail[14] as u64) << 48; }
-    if tail.len() >= 14 { k2 ^= (tail[13] as u64) << 40; }
-    if tail.len() >= 13 { k2 ^= (tail[12] as u64) << 32; }
-    if tail.len() >= 12 { k2 ^= (tail[11] as u64) << 24; }
-    if tail.len() >= 11 { k2 ^= (tail[10] as u64) << 16; }
-    if tail.len() >= 10 { k2 ^= (tail[9] as u64) << 8; }
+    if tail.len() >= 15 {
+        k2 ^= (tail[14] as u64) << 48;
+    }
+    if tail.len() >= 14 {
+        k2 ^= (tail[13] as u64) << 40;
+    }
+    if tail.len() >= 13 {
+        k2 ^= (tail[12] as u64) << 32;
+    }
+    if tail.len() >= 12 {
+        k2 ^= (tail[11] as u64) << 24;
+    }
+    if tail.len() >= 11 {
+        k2 ^= (tail[10] as u64) << 16;
+    }
+    if tail.len() >= 10 {
+        k2 ^= (tail[9] as u64) << 8;
+    }
     if tail.len() >= 9 {
         k2 ^= tail[8] as u64;
         k2 = k2.wrapping_mul(C2);
@@ -394,13 +425,27 @@ pub fn murmur3_token(data: &[u8]) -> i64 {
         k2 = k2.wrapping_mul(C1);
         h2 ^= k2;
     }
-    if tail.len() >= 8 { k1 ^= (tail[7] as u64) << 56; }
-    if tail.len() >= 7 { k1 ^= (tail[6] as u64) << 48; }
-    if tail.len() >= 6 { k1 ^= (tail[5] as u64) << 40; }
-    if tail.len() >= 5 { k1 ^= (tail[4] as u64) << 32; }
-    if tail.len() >= 4 { k1 ^= (tail[3] as u64) << 24; }
-    if tail.len() >= 3 { k1 ^= (tail[2] as u64) << 16; }
-    if tail.len() >= 2 { k1 ^= (tail[1] as u64) << 8; }
+    if tail.len() >= 8 {
+        k1 ^= (tail[7] as u64) << 56;
+    }
+    if tail.len() >= 7 {
+        k1 ^= (tail[6] as u64) << 48;
+    }
+    if tail.len() >= 6 {
+        k1 ^= (tail[5] as u64) << 40;
+    }
+    if tail.len() >= 5 {
+        k1 ^= (tail[4] as u64) << 32;
+    }
+    if tail.len() >= 4 {
+        k1 ^= (tail[3] as u64) << 24;
+    }
+    if tail.len() >= 3 {
+        k1 ^= (tail[2] as u64) << 16;
+    }
+    if tail.len() >= 2 {
+        k1 ^= (tail[1] as u64) << 8;
+    }
     if !tail.is_empty() {
         k1 ^= tail[0] as u64;
         k1 = k1.wrapping_mul(C1);
@@ -416,7 +461,11 @@ pub fn murmur3_token(data: &[u8]) -> i64 {
     h2 = fmix64(h2);
     h1 = h1.wrapping_add(h2);
     let token = h1 as i64;
-    if token == i64::MIN { token.wrapping_add(1) } else { token }
+    if token == i64::MIN {
+        token.wrapping_add(1)
+    } else {
+        token
+    }
 }
 
 fn fmix64(mut value: u64) -> u64 {
@@ -501,10 +550,7 @@ pub fn encode_query(query: &str, consistency: CqlConsistency) -> Vec<u8> {
 }
 
 /// UNLOGGED BATCH body for simple statements with values.
-pub fn encode_batch(
-    statements: &[(String, Vec<Vec<u8>>)],
-    consistency: CqlConsistency,
-) -> Vec<u8> {
+pub fn encode_batch(statements: &[(String, Vec<Vec<u8>>)], consistency: CqlConsistency) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(0x01); // UNLOGGED
     body.extend_from_slice(&(statements.len() as u16).to_be_bytes());
@@ -559,9 +605,10 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<(u8, u16, Vec<
         ));
     }
     let mut body = vec![0u8; length];
-    stream.read_exact(&mut body).await.map_err(|e| {
-        ConnectorError::Connection(format!("cql read failed: {e}"))
-    })?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| ConnectorError::Connection(format!("cql read failed: {e}")))?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
     decode_frame(&frame)
@@ -642,11 +689,7 @@ pub struct CqlBoundStatement {
 
 #[async_trait]
 pub trait CassandraTransport: Send + Sync {
-    async fn execute_cql_batch(
-        &self,
-        keyspace: &str,
-        batch: Vec<CqlBoundStatement>,
-    ) -> Result<()>;
+    async fn execute_cql_batch(&self, keyspace: &str, batch: Vec<CqlBoundStatement>) -> Result<()>;
 }
 
 /// Scripted outcome for the mock transport.
@@ -656,7 +699,10 @@ pub enum MockCassandraOutcome {
     /// Transport failure (reconnects + retries in-loop).
     ConnectionError(String),
     /// Server error code (transient codes retry; rest terminal).
-    CqlError { code: i32, message: String },
+    CqlError {
+        code: i32,
+        message: String,
+    },
 }
 
 /// One captured batch call.
@@ -695,11 +741,7 @@ impl MockCassandraTransport {
 
 #[async_trait]
 impl CassandraTransport for MockCassandraTransport {
-    async fn execute_cql_batch(
-        &self,
-        keyspace: &str,
-        batch: Vec<CqlBoundStatement>,
-    ) -> Result<()> {
+    async fn execute_cql_batch(&self, keyspace: &str, batch: Vec<CqlBoundStatement>) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(CapturedCqlBatch {
             keyspace: keyspace.to_string(),
@@ -710,13 +752,13 @@ impl CassandraTransport for MockCassandraTransport {
             Some(MockCassandraOutcome::ConnectionError(message)) => {
                 Err(ConnectorError::Connection(message))
             }
-            Some(MockCassandraOutcome::CqlError { code, message }) => Err(
-                if is_transient_cql_error(code) {
+            Some(MockCassandraOutcome::CqlError { code, message }) => {
+                Err(if is_transient_cql_error(code) {
                     ConnectorError::Connection(format!("mock cql error 0x{code:08x}: {message}"))
                 } else {
                     ConnectorError::Dispatch(format!("mock cql error 0x{code:08x}: {message}"))
-                },
-            ),
+                })
+            }
         }
     }
 }
@@ -785,9 +827,10 @@ impl NativeCassandraTransport {
         body: &[u8],
         stream_id: u16,
     ) -> Result<(u8, Vec<u8>)> {
-        stream.write_all(&encode_frame(opcode, stream_id, 0, body)).await.map_err(|e| {
-            ConnectorError::Connection(format!("cql write failed: {e}"))
-        })?;
+        stream
+            .write_all(&encode_frame(opcode, stream_id, 0, body))
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("cql write failed: {e}")))?;
         let (reply_opcode, _, reply) = read_frame(stream).await?;
         Ok((reply_opcode, reply))
     }
@@ -799,9 +842,13 @@ impl NativeCassandraTransport {
                 .map_err(|_| ConnectorError::Connection(format!("cql connect timeout: {addr}")))?
                 .map_err(|e| ConnectorError::Connection(format!("cql connect failed: {e}")))?;
         // STARTUP.
-        let (opcode, _reply) =
-            Self::exchange(&mut stream, opcode::STARTUP, &encode_startup(), self.next_stream())
-                .await?;
+        let (opcode, _reply) = Self::exchange(
+            &mut stream,
+            opcode::STARTUP,
+            &encode_startup(),
+            self.next_stream(),
+        )
+        .await?;
         match opcode {
             opcode::READY => {}
             opcode::AUTHENTICATE => {
@@ -860,11 +907,7 @@ impl NativeCassandraTransport {
 
 #[async_trait]
 impl CassandraTransport for NativeCassandraTransport {
-    async fn execute_cql_batch(
-        &self,
-        keyspace: &str,
-        batch: Vec<CqlBoundStatement>,
-    ) -> Result<()> {
+    async fn execute_cql_batch(&self, keyspace: &str, batch: Vec<CqlBoundStatement>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -890,12 +933,13 @@ impl CassandraTransport for NativeCassandraTransport {
             ),
         );
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("cql not connected".to_string())
-        })?;
-        stream.write_all(&frame).await.map_err(|e| {
-            ConnectorError::Connection(format!("cql batch write failed: {e}"))
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("cql not connected".to_string()))?;
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("cql batch write failed: {e}")))?;
         let (opcode, _, reply) = read_frame(stream).await?;
         match opcode {
             opcode::RESULT => match parse_result_kind(&reply)? {
@@ -1009,12 +1053,10 @@ impl CassandraSink {
         payload: &Bytes,
         millis: i64,
     ) -> Result<(CqlBoundStatement, usize)> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("cassandra payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("cassandra payload must be JSON".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("cassandra payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("cassandra payload must be JSON".to_string()))?;
         let device_id = value
             .get("device_id")
             .and_then(|v| v.as_str())
@@ -1092,7 +1134,8 @@ impl CassandraSink {
             match outcome {
                 Ok(()) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1271,7 +1314,10 @@ mod tests {
         // Independent Python implementation of the Cassandra variant
         // (signed 64-bit tokens; negatives expected past 2^63).
         assert_eq!(murmur3_token(b"device-42"), -8_012_886_696_246_203_888);
-        assert_eq!(murmur3_token(b"sensors/kitchen"), -4_228_720_401_761_039_502);
+        assert_eq!(
+            murmur3_token(b"sensors/kitchen"),
+            -4_228_720_401_761_039_502
+        );
         assert_eq!(murmur3_token(b""), 0);
         assert_eq!(murmur3_token(&[b'a'; 100]), 2_508_270_112_733_394_994);
     }
@@ -1299,16 +1345,24 @@ mod tests {
             86_400i32.to_be_bytes().to_vec(),
         ];
         let batch = encode_batch(
-            &[("INSERT INTO t VALUES (?, ?, ?, ?) USING TTL ?".to_string(), values.clone())],
+            &[(
+                "INSERT INTO t VALUES (?, ?, ?, ?) USING TTL ?".to_string(),
+                values.clone(),
+            )],
             CqlConsistency::LocalQuorum,
         );
         assert_eq!(batch[0], 0x01); // UNLOGGED
-        assert_eq!(u16::from_be_bytes([batch.len() - 6, batch.len() - 5].map(|i| batch[i])), 0x000A);
+        assert_eq!(
+            u16::from_be_bytes([batch.len() - 6, batch.len() - 5].map(|i| batch[i])),
+            0x000A
+        );
         let mut frame = encode_frame(opcode::BATCH, 1, 0, &batch);
         frame[0] = 0x84;
         let (parsed_opcode, _, body) = decode_frame(&frame).unwrap();
         assert_eq!(parsed_opcode, opcode::BATCH);
-        assert!(body.windows(values[0].len()).any(|w| w == values[0].as_slice()));
+        assert!(body
+            .windows(values[0].len())
+            .any(|w| w == values[0].as_slice()));
     }
 
     #[tokio::test]
@@ -1316,7 +1370,9 @@ mod tests {
         let (sink, transport) = test_sink(test_config());
         sink.send(
             &Topic::new("sensors/kitchen").unwrap(),
-            &Bytes::from_static(br#"{"client_id":"device-42","device_id":"device-42","temp":22.5}"#),
+            &Bytes::from_static(
+                br#"{"client_id":"device-42","device_id":"device-42","temp":22.5}"#,
+            ),
             QoS::AtLeastOnce,
         )
         .await
@@ -1362,13 +1418,20 @@ mod tests {
         config.max_backoff_ms = Some(2);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockCassandraOutcome::CqlError { code: 0x1000, message: "unavailable".to_string() },
+            MockCassandraOutcome::CqlError {
+                code: 0x1000,
+                message: "unavailable".to_string(),
+            },
             MockCassandraOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1382,13 +1445,20 @@ mod tests {
         config.max_retries = Some(5);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockCassandraOutcome::CqlError { code: 0x2200, message: "invalid".to_string() },
+            MockCassandraOutcome::CqlError {
+                code: 0x2200,
+                message: "invalid".to_string(),
+            },
             MockCassandraOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("invalid must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -1432,24 +1502,39 @@ mod tests {
             assert_eq!(opcode, opcode::STARTUP);
             let mut body = Vec::new();
             encode_string(&mut body, "org.apache.cassandra.auth.PasswordAuthenticator");
-            stream.write_all(&reply(opcode::AUTHENTICATE, 1, &body)).await.expect("auth");
+            stream
+                .write_all(&reply(opcode::AUTHENTICATE, 1, &body))
+                .await
+                .expect("auth");
             // AUTH_RESPONSE carries the PLAIN token [NUL user NUL pass].
             let (opcode, body) = read_frame(&mut stream).await;
             assert_eq!(opcode, opcode::AUTH_RESPONSE);
             let len = i32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
             assert_eq!(&body[4..4 + len], b"\0cassandra\0secret");
-            stream.write_all(&reply(opcode::AUTH_SUCCESS, 1, &[])).await.expect("success");
+            stream
+                .write_all(&reply(opcode::AUTH_SUCCESS, 1, &[]))
+                .await
+                .expect("success");
             // USE keyspace -> SetKeyspace.
             let (opcode, body) = read_frame(&mut stream).await;
             assert_eq!(opcode, opcode::QUERY);
             assert!(body.windows(3).any(|w| w == b"USE"));
-            stream.write_all(&result_frame(3, 0x0003)).await.expect("use");
+            stream
+                .write_all(&result_frame(3, 0x0003))
+                .await
+                .expect("use");
             // BATCH: UNLOGGED type, one statement, LocalQuorum tail.
             let (opcode, body) = read_frame(&mut stream).await;
             assert_eq!(opcode, opcode::BATCH);
             assert_eq!(body[0], 0x01);
-            assert_eq!(&body[body.len() - 6..body.len() - 4], &0x000Au16.to_be_bytes());
-            stream.write_all(&result_frame(4, 0x0002)).await.expect("void");
+            assert_eq!(
+                &body[body.len() - 6..body.len() - 4],
+                &0x000Au16.to_be_bytes()
+            );
+            stream
+                .write_all(&result_frame(4, 0x0002))
+                .await
+                .expect("void");
         });
 
         let mut config = test_config();

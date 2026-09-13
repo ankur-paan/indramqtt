@@ -132,7 +132,12 @@ impl ConfluentKafkaConfig {
         // Strict template check with dummy values (segments 1..=4).
         resolve_topic(&self.topic_template, "dummy/seg2/seg3")?;
         if let Some(template) = &self.partition_key_template {
-            resolve_key(template, "dummy/seg2", "dummy-client", &serde_json::json!({}))?;
+            resolve_key(
+                template,
+                "dummy/seg2",
+                "dummy-client",
+                &serde_json::json!({}),
+            )?;
         }
         if let Some(registry) = &self.schema_registry {
             if !registry.endpoint.starts_with("http://")
@@ -237,7 +242,9 @@ pub fn resolve_template(
             let value = if let Some(leaf) = name.strip_prefix("payload.") {
                 payload_leaf(payload, leaf)
             } else {
-                vars.iter().find(|(key, _)| key == name).map(|(_, v)| v.clone())
+                vars.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, v)| v.clone())
             };
             match value {
                 Some(value) => out.push_str(&value),
@@ -447,9 +454,11 @@ pub fn parse_scram_server_first(message: &str) -> Result<ScramServerFirst> {
         }
     }
     match (nonce, salt_b64, iterations) {
-        (Some(nonce), Some(salt_b64), Some(iterations)) => {
-            Ok(ScramServerFirst { nonce, salt_b64, iterations })
-        }
+        (Some(nonce), Some(salt_b64), Some(iterations)) => Ok(ScramServerFirst {
+            nonce,
+            salt_b64,
+            iterations,
+        }),
         _ => Err(ConnectorError::Dispatch(format!(
             "confluent scram server-first is malformed: {message:?}"
         ))),
@@ -468,7 +477,9 @@ pub fn scram_client_proof(
     use base64::Engine;
     let salt = base64::engine::general_purpose::STANDARD
         .decode(salt_b64)
-        .map_err(|e| ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}")))?;
+        .map_err(|e| {
+            ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}"))
+        })?;
     let salted = scram_hi(hash, password, &salt, iterations)?;
     let client_key = hmac_with(hash, &salted, b"Client Key");
     let stored_key = hash_with(hash, &client_key);
@@ -493,11 +504,18 @@ pub fn scram_server_signature(
     use base64::Engine;
     let salt = base64::engine::general_purpose::STANDARD
         .decode(salt_b64)
-        .map_err(|e| ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}")))?;
+        .map_err(|e| {
+            ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}"))
+        })?;
     let salted = scram_hi(hash, password, &salt, iterations)?;
     let server_key = hmac_with(hash, &salted, b"Server Key");
-    Ok(base64::engine::general_purpose::STANDARD
-        .encode(hmac_with(hash, &server_key, auth_message)))
+    Ok(
+        base64::engine::general_purpose::STANDARD.encode(hmac_with(
+            hash,
+            &server_key,
+            auth_message,
+        )),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +600,9 @@ impl ConfluentTransport for MemoryConfluentTransport {
         let mut failures = self.failures_left.lock();
         if *failures > 0 {
             *failures -= 1;
-            return Err(ConnectorError::Connection("mock confluent down".to_string()));
+            return Err(ConnectorError::Connection(
+                "mock confluent down".to_string(),
+            ));
         }
         self.batches.lock().push(records.to_vec());
         Ok(())
@@ -630,7 +650,8 @@ impl TcpConfluentTransport {
             let conn = guard.as_mut().expect("connected");
             let correlation = conn.correlation;
             conn.correlation = conn.correlation.wrapping_add(1);
-            let mut frame = encode_request_header(api_key, api_version, correlation, &self.client_id);
+            let mut frame =
+                encode_request_header(api_key, api_version, correlation, &self.client_id);
             frame.extend_from_slice(&body);
             let exchange = async {
                 send_frame(&mut conn.stream, frame).await?;
@@ -677,15 +698,25 @@ impl TcpConfluentTransport {
     }
 
     async fn dial(&self) -> Result<TcpConfluentConn> {
-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.endpoint))
-            .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!("confluent connect timeout: {}", self.endpoint))
-            })?
-            .map_err(|e| {
-                ConnectorError::Connection(format!("confluent connect to {} failed: {e}", self.endpoint))
-            })?;
-        let mut conn = TcpConfluentConn { stream, correlation: 1 };
+        let stream =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.endpoint))
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "confluent connect timeout: {}",
+                        self.endpoint
+                    ))
+                })?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!(
+                        "confluent connect to {} failed: {e}",
+                        self.endpoint
+                    ))
+                })?;
+        let mut conn = TcpConfluentConn {
+            stream,
+            correlation: 1,
+        };
         // Prove framing before authenticating.
         let frame = encode_api_versions_request(0, &self.client_id);
         send_frame(&mut conn.stream, frame).await?;
@@ -714,20 +745,12 @@ impl TcpConfluentTransport {
             )));
         }
         match self.mechanism {
-            SaslMechanism::Plain => {
-                self.sasl_authenticate_bytes(
-                    conn,
-                    &sasl_plain_payload(&self.username, &self.password),
-                )
+            SaslMechanism::Plain => self
+                .sasl_authenticate_bytes(conn, &sasl_plain_payload(&self.username, &self.password))
                 .await
-                .map(|_| ())
-            }
-            SaslMechanism::ScramSha256 => {
-                self.scram_conversation(conn, ScramHash::Sha256).await
-            }
-            SaslMechanism::ScramSha512 => {
-                self.scram_conversation(conn, ScramHash::Sha512).await
-            }
+                .map(|_| ()),
+            SaslMechanism::ScramSha256 => self.scram_conversation(conn, ScramHash::Sha256).await,
+            SaslMechanism::ScramSha512 => self.scram_conversation(conn, ScramHash::Sha512).await,
         }
     }
 
@@ -748,7 +771,11 @@ impl TcpConfluentTransport {
         let response = read_response(&mut conn.stream).await?;
         let error = read_response_error(&response, correlation)?;
         if error != 0 {
-            let code = if error == 58 { "SASL_AUTHENTICATION_FAILED" } else { "sasl" };
+            let code = if error == 58 {
+                "SASL_AUTHENTICATION_FAILED"
+            } else {
+                "sasl"
+            };
             return Err(ConnectorError::Dispatch(format!(
                 "confluent sasl authenticate failed ({code}) with error {error}"
             )));
@@ -792,9 +819,12 @@ impl TcpConfluentTransport {
         let client_first_bare = format!("n={},r={}", self.username, nonce);
         let client_first = format!("n,,{client_first_bare}");
         let server_first = String::from_utf8(
-            self.sasl_authenticate_bytes(conn, client_first.as_bytes()).await?,
+            self.sasl_authenticate_bytes(conn, client_first.as_bytes())
+                .await?,
         )
-        .map_err(|_| ConnectorError::Connection("confluent scram server-first is not UTF-8".to_string()))?;
+        .map_err(|_| {
+            ConnectorError::Connection("confluent scram server-first is not UTF-8".to_string())
+        })?;
         let parsed = parse_scram_server_first(&server_first)?;
         if !parsed.nonce.starts_with(&nonce) {
             return Err(ConnectorError::Dispatch(
@@ -812,9 +842,12 @@ impl TcpConfluentTransport {
         )?;
         let client_final = format!("{client_final_wo},p={proof}");
         let server_final = String::from_utf8(
-            self.sasl_authenticate_bytes(conn, client_final.as_bytes()).await?,
+            self.sasl_authenticate_bytes(conn, client_final.as_bytes())
+                .await?,
         )
-        .map_err(|_| ConnectorError::Connection("confluent scram server-final is not UTF-8".to_string()))?;
+        .map_err(|_| {
+            ConnectorError::Connection("confluent scram server-final is not UTF-8".to_string())
+        })?;
         let signature = server_final.strip_prefix("v=").ok_or_else(|| {
             ConnectorError::Dispatch(format!(
                 "confluent scram server-final is malformed: {server_final:?}"
@@ -1010,15 +1043,17 @@ impl ConfluentKafkaSink {
     }
 
     fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<ConfluentRecord> {
-        let parsed: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
         let client_id = parsed
             .get("client_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let rendered_topic = resolve_topic(&self.config.topic_template, topic.as_str())?;
         let key = match &self.config.partition_key_template {
-            Some(template) => resolve_key(template, topic.as_str(), client_id, &parsed)?
-                .map(Bytes::from),
+            Some(template) => {
+                resolve_key(template, topic.as_str(), client_id, &parsed)?.map(Bytes::from)
+            }
             None => None,
         };
         let mut value = payload.clone();
@@ -1032,9 +1067,18 @@ impl ConfluentKafkaSink {
             key,
             value,
             headers: vec![
-                ("mqtt.topic".to_string(), Bytes::from(topic.as_str().to_string())),
-                ("mqtt.qos".to_string(), Bytes::from(u8::from(qos).to_string())),
-                ("mqtt.timestamp".to_string(), Bytes::from(now_millis().to_string())),
+                (
+                    "mqtt.topic".to_string(),
+                    Bytes::from(topic.as_str().to_string()),
+                ),
+                (
+                    "mqtt.qos".to_string(),
+                    Bytes::from(u8::from(qos).to_string()),
+                ),
+                (
+                    "mqtt.timestamp".to_string(),
+                    Bytes::from(now_millis().to_string()),
+                ),
             ],
         })
     }
@@ -1227,15 +1271,12 @@ mod tests {
         // (hashlib.pbkdf2_hmac/hmac) values for password "pencil".
         let client_first = scram_client_first_message("user", "fyko+d2lbbFgONRv9qkxdawU");
         assert_eq!(client_first, "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawU");
-        let server_first =
-            "r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
+        let server_first = "r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
         let parsed = parse_scram_server_first(server_first).unwrap();
         assert_eq!(parsed.iterations, 4096);
-        let client_final_wo =
-            "c=biws,r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j";
-        let auth_message = format!(
-            "n=user,r=fyko+d2lbbFgONRv9qkxdawU,{server_first},{client_final_wo}"
-        );
+        let client_final_wo = "c=biws,r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j";
+        let auth_message =
+            format!("n=user,r=fyko+d2lbbFgONRv9qkxdawU,{server_first},{client_final_wo}");
         let proof = scram_client_proof(
             ScramHash::Sha256,
             b"pencil",
@@ -1262,8 +1303,7 @@ mod tests {
     #[test]
     fn test_scram_sha512_proof_vector() {
         // Same exchange shape under SHA-512 (independent Python vector).
-        let auth_message =
-            "n=user,r=fyko+d2lbbFgONRv9qkxdawU,\
+        let auth_message = "n=user,r=fyko+d2lbbFgONRv9qkxdawU,\
              r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j,\
              s=QSXCR+Q6sek8bf92,i=4096,\
              c=biws,r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j";
@@ -1287,12 +1327,15 @@ mod tests {
             resolve_topic("telemetry-${topic_segment_1}", "sensors/kitchen").unwrap(),
             "telemetry-sensors"
         );
+        assert_eq!(resolve_topic("all-${topic}", "a/b/c").unwrap(), "all-a/b/c");
         assert_eq!(
-            resolve_topic("all-${topic}", "a/b/c").unwrap(),
-            "all-a/b/c"
-        );
-        assert_eq!(
-            resolve_template("k-${topic_segment_3}", "a/b/c", "", &serde_json::Value::Null).unwrap(),
+            resolve_template(
+                "k-${topic_segment_3}",
+                "a/b/c",
+                "",
+                &serde_json::Value::Null
+            )
+            .unwrap(),
             "k-c"
         );
         let payload = serde_json::json!({"client_id": "d7", "device": {"id": "x1"}});
@@ -1315,7 +1358,9 @@ mod tests {
         let header = schema_registry_basic_auth("registry-key", "registry-secret");
         let encoded = header.strip_prefix("Basic ").unwrap();
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
             b"registry-key:registry-secret"
         );
     }
@@ -1363,9 +1408,12 @@ mod tests {
                 key: r.key.clone(),
                 value: r.value.clone(),
                 headers: r.headers.clone(),
-                timestamp_ms: r.headers.iter().find(|(k, _)| k == "mqtt.timestamp").map(|(_, v)| {
-                    String::from_utf8_lossy(v).parse::<i64>().unwrap_or(0)
-                }).unwrap_or(0),
+                timestamp_ms: r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "mqtt.timestamp")
+                    .map(|(_, v)| String::from_utf8_lossy(v).parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0),
             })
             .collect();
         let batch = encode_record_batch_v2(&kafka_records);
@@ -1384,7 +1432,9 @@ mod tests {
     /// authenticate + Produce v3 over raw TCP, capturing the produce.
     #[tokio::test]
     async fn test_tcp_plain_produce_against_fake_broker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
         let captured_rx = captured.clone();
@@ -1397,8 +1447,7 @@ mod tests {
             // 2) SaslHandshake v1 PLAIN -> success, no mechanisms listed.
             let frame = read_tcp_frame(&mut stream).await;
             assert_eq!(&frame[..4], &[0, 17, 0, 1]);
-            let client_len =
-                i16::from_be_bytes([frame[8], frame[9]]) as usize;
+            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
             let mechanism = read_kafka_string(&frame[8 + 2 + client_len..]);
             assert_eq!(mechanism, "PLAIN");
             let mut response = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1407,14 +1456,10 @@ mod tests {
             // 3) SaslAuthenticate v1 -> check the PLAIN payload, success.
             let frame = read_tcp_frame(&mut stream).await;
             assert_eq!(&frame[..4], &[0, 36, 0, 1]);
-            let client_len =
-                i16::from_be_bytes([frame[8], frame[9]]) as usize;
+            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
             let body = &frame[8 + 2 + client_len..];
             let auth_len = i32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-            assert_eq!(
-                &body[4..4 + auth_len],
-                b"\0confluent-key\0confluent-secret"
-            );
+            assert_eq!(&body[4..4 + auth_len], b"\0confluent-key\0confluent-secret");
             let mut response = vec![0u8; 4 + 2 + 2 + 8 + 4];
             response[0..4].copy_from_slice(&frame[4..8]);
             write_tcp_frame(&mut stream, &response).await;
@@ -1466,10 +1511,17 @@ mod tests {
         server.await.expect("fake broker task");
         let wire = captured.lock().clone();
         let topic_bytes = b"telemetry-sensors";
-        assert!(wire.windows(topic_bytes.len()).any(|w| w == topic_bytes), "topic on the wire");
+        assert!(
+            wire.windows(topic_bytes.len()).any(|w| w == topic_bytes),
+            "topic on the wire"
+        );
         assert!(wire.windows(2).any(|w| w == b"d7"), "key on the wire");
         // Schema-registry magic + id ride inside the record value.
-        assert!(wire.windows(5).any(|w| *w == [0x00, 0x00, 0x00, 0x03, 0xE9]), "registry prefix on the wire");
+        assert!(
+            wire.windows(5)
+                .any(|w| *w == [0x00, 0x00, 0x00, 0x03, 0xE9]),
+            "registry prefix on the wire"
+        );
     }
 
     fn test_config_with_port(port: u16) -> ConfluentKafkaConfig {

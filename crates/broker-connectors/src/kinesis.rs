@@ -24,9 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 pub const KINESIS_TARGET: &str = "Kinesis_20131202.PutRecords";
 pub const KINESIS_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
@@ -178,7 +176,9 @@ impl KinesisSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Derive the partition key: template substitution over
@@ -221,8 +221,7 @@ impl KinesisSinkConfig {
         for (key, value) in &extra {
             vars.push((key.as_str(), value.clone()));
         }
-        let borrowed: Vec<(&str, String)> =
-            vars.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let borrowed: Vec<(&str, String)> = vars.iter().map(|(k, v)| (*k, v.clone())).collect();
         let key = render_template(template, &borrowed)?;
         if key.trim().is_empty() {
             return Ok(md5_hex(topic.as_bytes()));
@@ -245,7 +244,11 @@ impl KinesisSinkConfig {
 fn md5_hex(data: &[u8]) -> String {
     let mut digest = Md5::new();
     digest.update(data);
-    digest.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -328,9 +331,8 @@ pub fn render_put_records_body(stream: &str, records: &[KinesisRecordEntry]) -> 
 
 /// Parse a `PutRecords` JSON response body.
 pub fn parse_put_records_response(body: &[u8]) -> Result<KinesisPutRecordsResponse> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("kinesis bad response JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("kinesis bad response JSON: {e}")))?;
     let failed_count = doc
         .get("FailedRecordCount")
         .and_then(|v| v.as_u64())
@@ -352,7 +354,10 @@ pub fn parse_put_records_response(body: &[u8]) -> Result<KinesisPutRecordsRespon
             });
         }
     }
-    Ok(KinesisPutRecordsResponse { failed_count, results })
+    Ok(KinesisPutRecordsResponse {
+        failed_count,
+        results,
+    })
 }
 
 /// Sign a `PutRecords` POST with SigV4 (service `kinesis`), returning
@@ -465,9 +470,9 @@ impl KinesisTransport for MockKinesisTransport {
                     .collect(),
             }),
             Some(MockKinesisOutcome::HttpStatus(status)) => Err(match status {
-                429 | 500..=504 => ConnectorError::Connection(format!(
-                    "mock kinesis throttled with {status}"
-                )),
+                429 | 500..=504 => {
+                    ConnectorError::Connection(format!("mock kinesis throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock kinesis failed with {status}")),
             }),
             Some(MockKinesisOutcome::Records(errors)) => {
@@ -490,7 +495,10 @@ impl KinesisTransport for MockKinesisTransport {
                         }
                     }
                 }
-                Ok(KinesisPutRecordsResponse { failed_count, results })
+                Ok(KinesisPutRecordsResponse {
+                    failed_count,
+                    results,
+                })
             }
         }
     }
@@ -693,7 +701,10 @@ impl KinesisSink {
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
-                    pending = failed.into_iter().map(|index| pending[index].clone()).collect();
+                    pending = failed
+                        .into_iter()
+                        .map(|index| pending[index].clone())
+                        .collect();
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
@@ -734,7 +745,11 @@ impl KinesisSink {
             .map(|row| {
                 Ok(KinesisRecordEntry {
                     data_b64: base64::engine::general_purpose::STANDARD.encode(&row.payload),
-                    partition_key: self.config.partition_key_for(&row.topic, &row.payload, row.seq)?,
+                    partition_key: self.config.partition_key_for(
+                        &row.topic,
+                        &row.payload,
+                        row.seq,
+                    )?,
                     explicit_hash_key: self.config.explicit_hash_key.clone(),
                 })
             })
@@ -987,8 +1002,12 @@ mod tests {
         ]);
 
         let topic = Topic::new("t").unwrap();
-        sink.send(&topic, &Bytes::from("a"), QoS::AtMostOnce).await.unwrap();
-        sink.send(&topic, &Bytes::from("b"), QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &Bytes::from("a"), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        sink.send(&topic, &Bytes::from("b"), QoS::AtMostOnce)
+            .await
+            .unwrap();
         sink.flush().await.unwrap();
 
         assert_eq!(transport.calls(), 2);
@@ -1020,9 +1039,13 @@ mod tests {
             MockKinesisOutcome::Records(vec![Some("InternalFailure".to_string())]),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("a"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("a"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("failures must exhaust");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(transport.calls(), 2);
@@ -1077,9 +1100,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockKinesisOutcome::HttpStatus(400)]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("a"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("a"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("400 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

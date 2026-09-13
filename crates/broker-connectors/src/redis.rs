@@ -60,7 +60,9 @@ impl RedisSinkConfig {
             RedisCommandKind::Set { key_template, .. } => key_template,
             RedisCommandKind::HSet { key_template, .. } => key_template,
             RedisCommandKind::Publish { channel_template } => channel_template,
-            RedisCommandKind::XAdd { stream_template, .. } => stream_template,
+            RedisCommandKind::XAdd {
+                stream_template, ..
+            } => stream_template,
         };
         if template.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -119,31 +121,34 @@ impl RedisCommand {
 }
 
 /// Build the wire command for one MQTT event under `config`.
-pub fn build_command(
-    config: &RedisSinkConfig,
-    topic: &Topic,
-    payload: &Bytes,
-) -> RedisCommand {
+pub fn build_command(config: &RedisSinkConfig, topic: &Topic, payload: &Bytes) -> RedisCommand {
     match &config.command {
-        RedisCommandKind::Set { key_template, ttl_seconds } => {
+        RedisCommandKind::Set {
+            key_template,
+            ttl_seconds,
+        } => {
             let mut command = RedisCommand::new("SET")
                 .arg(render_template(key_template, topic.as_str()).as_bytes())
                 .arg(payload);
             if let Some(ttl) = ttl_seconds {
-                command = command
-                    .arg(b"EX")
-                    .arg(ttl.to_string().as_bytes());
+                command = command.arg(b"EX").arg(ttl.to_string().as_bytes());
             }
             command
         }
-        RedisCommandKind::HSet { key_template, field_template } => RedisCommand::new("HSET")
+        RedisCommandKind::HSet {
+            key_template,
+            field_template,
+        } => RedisCommand::new("HSET")
             .arg(render_template(key_template, topic.as_str()).as_bytes())
             .arg(render_template(field_template, topic.as_str()).as_bytes())
             .arg(payload),
         RedisCommandKind::Publish { channel_template } => RedisCommand::new("PUBLISH")
             .arg(render_template(channel_template, topic.as_str()).as_bytes())
             .arg(payload),
-        RedisCommandKind::XAdd { stream_template, maxlen } => {
+        RedisCommandKind::XAdd {
+            stream_template,
+            maxlen,
+        } => {
             let mut command = RedisCommand::new("XADD")
                 .arg(render_template(stream_template, topic.as_str()).as_bytes());
             if let Some(maxlen) = maxlen {
@@ -178,8 +183,14 @@ pub fn parse_reply(buf: &[u8]) -> Option<(RedisReply, usize)> {
     cursor = &cursor[line_end..];
     let text = std::str::from_utf8(line).ok()?;
     match kind {
-        b'+' => Some((RedisReply::Simple(text.to_string()), buf.len() - cursor.len())),
-        b'-' => Some((RedisReply::Error(text.to_string()), buf.len() - cursor.len())),
+        b'+' => Some((
+            RedisReply::Simple(text.to_string()),
+            buf.len() - cursor.len(),
+        )),
+        b'-' => Some((
+            RedisReply::Error(text.to_string()),
+            buf.len() - cursor.len(),
+        )),
         b':' => Some((
             RedisReply::Integer(text.parse().ok()?),
             buf.len() - cursor.len(),
@@ -257,7 +268,9 @@ struct RedisEndpoint {
 /// Parse `redis://[:password@]host[:port][/db]`.
 fn parse_endpoint(endpoint: &str) -> Result<RedisEndpoint> {
     let rest = endpoint.strip_prefix("redis://").ok_or_else(|| {
-        ConnectorError::Dispatch(format!("redis endpoint must start with redis://: {endpoint:?}"))
+        ConnectorError::Dispatch(format!(
+            "redis endpoint must start with redis://: {endpoint:?}"
+        ))
     })?;
     let (authority, db) = match rest.split_once('/') {
         Some((authority, db)) => (authority, db),
@@ -281,9 +294,8 @@ fn parse_endpoint(endpoint: &str) -> Result<RedisEndpoint> {
     let (host, port) = match hostport.rsplit_once(':') {
         Some((host, port)) => (
             host.to_string(),
-            port.parse::<u16>().map_err(|_| {
-                ConnectorError::Dispatch(format!("redis bad port in {endpoint:?}"))
-            })?,
+            port.parse::<u16>()
+                .map_err(|_| ConnectorError::Dispatch(format!("redis bad port in {endpoint:?}")))?,
         ),
         None => (hostport.to_string(), 6379),
     };
@@ -319,9 +331,7 @@ impl TcpRedisTransport {
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
         let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
             .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!("redis connect timeout: {addr}"))
-            })?
+            .map_err(|_| ConnectorError::Connection(format!("redis connect timeout: {addr}")))?
             .map_err(|e| ConnectorError::Connection(format!("redis connect failed: {e}")))?;
         if let Some(password) = &self.endpoint.password {
             let reply = self
@@ -625,7 +635,11 @@ mod tests {
                 field_template: "temp:${topic}".to_string(),
             },
         };
-        let command = build_command(&config, &Topic::new("s").unwrap(), &Bytes::from_static(b"1"));
+        let command = build_command(
+            &config,
+            &Topic::new("s").unwrap(),
+            &Bytes::from_static(b"1"),
+        );
         assert_eq!(
             command.encode_resp(),
             b"*4\r\n$4\r\nHSET\r\n$6\r\ndevice\r\n$6\r\ntemp:s\r\n$1\r\n1\r\n".to_vec()
@@ -638,7 +652,11 @@ mod tests {
                 channel_template: "alerts".to_string(),
             },
         };
-        let command = build_command(&config, &Topic::new("t").unwrap(), &Bytes::from_static(b"m"));
+        let command = build_command(
+            &config,
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"m"),
+        );
         assert_eq!(
             command.encode_resp(),
             b"*3\r\n$7\r\nPUBLISH\r\n$6\r\nalerts\r\n$1\r\nm\r\n".to_vec()
@@ -652,7 +670,11 @@ mod tests {
                 maxlen: Some(1000),
             },
         };
-        let command = build_command(&config, &Topic::new("t").unwrap(), &Bytes::from_static(b"v"));
+        let command = build_command(
+            &config,
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"v"),
+        );
         assert_eq!(
             command.encode_resp(),
             b"*8\r\n$4\r\nXADD\r\n$6\r\nevents\r\n$6\r\nMAXLEN\r\n$1\r\n~\r\n$4\r\n1000\r\n$1\r\n*\r\n$7\r\npayload\r\n$1\r\nv\r\n".to_vec()
@@ -666,7 +688,11 @@ mod tests {
                 maxlen: None,
             },
         };
-        let command = build_command(&config, &Topic::new("t").unwrap(), &Bytes::from_static(b"v"));
+        let command = build_command(
+            &config,
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"v"),
+        );
         assert_eq!(
             command.encode_resp(),
             b"*5\r\n$4\r\nXADD\r\n$6\r\nevents\r\n$1\r\n*\r\n$7\r\npayload\r\n$1\r\nv\r\n".to_vec()
@@ -679,14 +705,8 @@ mod tests {
             parse_reply(b"+OK\r\n"),
             Some((RedisReply::Simple("OK".to_string()), 5))
         );
-        assert_eq!(
-            parse_reply(b":42\r\n"),
-            Some((RedisReply::Integer(42), 5))
-        );
-        assert_eq!(
-            parse_reply(b"$-1\r\n"),
-            Some((RedisReply::Bulk(None), 5))
-        );
+        assert_eq!(parse_reply(b":42\r\n"), Some((RedisReply::Integer(42), 5)));
+        assert_eq!(parse_reply(b"$-1\r\n"), Some((RedisReply::Bulk(None), 5)));
         assert_eq!(
             parse_reply(b"$2\r\nhi\r\n"),
             Some((RedisReply::Bulk(Some(b"hi".to_vec())), 8))
@@ -720,7 +740,9 @@ mod tests {
     /// command shape, and answers canned replies (AUTH/SELECT +OK).
     #[tokio::test]
     async fn test_tcp_auth_select_and_pipelining() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::<Vec<String>>::new()));
         let seen_rx = seen.clone();
@@ -785,10 +807,7 @@ mod tests {
             .expect("pipelined");
         assert_eq!(
             replies,
-            vec![
-                RedisReply::Simple("OK".to_string()),
-                RedisReply::Integer(1)
-            ]
+            vec![RedisReply::Simple("OK".to_string()), RedisReply::Integer(1)]
         );
 
         let mut done = false;
@@ -815,7 +834,10 @@ mod tests {
             return None;
         }
         let header_end = buf.windows(2).position(|w| w == b"\r\n")? + 2;
-        let count: usize = std::str::from_utf8(&buf[1..header_end - 2]).ok()?.parse().ok()?;
+        let count: usize = std::str::from_utf8(&buf[1..header_end - 2])
+            .ok()?
+            .parse()
+            .ok()?;
         let mut argv = Vec::with_capacity(count);
         let mut cursor = &buf[header_end..];
         for _ in 0..count {
@@ -823,7 +845,10 @@ mod tests {
                 return None;
             }
             let end = cursor.windows(2).position(|w| w == b"\r\n")? + 2;
-            let len: usize = std::str::from_utf8(&cursor[1..end - 2]).ok()?.parse().ok()?;
+            let len: usize = std::str::from_utf8(&cursor[1..end - 2])
+                .ok()?
+                .parse()
+                .ok()?;
             cursor = &cursor[end..];
             if cursor.len() < len + 2 {
                 return None;

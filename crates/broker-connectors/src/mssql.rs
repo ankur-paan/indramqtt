@@ -22,9 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Days since 0001-01-01 (proleptic Gregorian) for a civil date
 /// (Howard Hinnant's days-from-civil).
@@ -81,7 +79,9 @@ pub enum MssqlAuth {
 pub enum MssqlQueryMode {
     #[default]
     InsertJson,
-    CustomUpsert { sql_template: String },
+    CustomUpsert {
+        sql_template: String,
+    },
 }
 
 fn default_port() -> Option<u16> {
@@ -230,7 +230,9 @@ impl MssqlSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Resolve + sanitize the destination table: template variables
@@ -347,9 +349,8 @@ fn decode_prelogin_encryption(payload: &[u8]) -> Result<u8> {
         }
         index += 4;
     }
-    let offset = encryption_offset.ok_or_else(|| {
-        ConnectorError::Connection("mssql prelogin lacks ENCRYPTION".to_string())
-    })?;
+    let offset = encryption_offset
+        .ok_or_else(|| ConnectorError::Connection("mssql prelogin lacks ENCRYPTION".to_string()))?;
     if encryption_len != 1 || payload.len() <= offset {
         return Err(ConnectorError::Connection(
             "mssql bad prelogin ENCRYPTION".to_string(),
@@ -382,7 +383,7 @@ fn encode_login(
     body.push(0x00); // option flags 3
     body.extend_from_slice(&[0x00; 4]); // client timezone
     body.extend_from_slice(&[0x00; 4]); // LCID
-    // Slots: hostname, username, password, app, server, ext, int, lang, db.
+                                        // Slots: hostname, username, password, app, server, ext, int, lang, db.
     let text = |value: &str| {
         let mut bytes = Vec::new();
         encode_ucs2(value, &mut bytes);
@@ -517,12 +518,12 @@ pub fn encode_executesql(
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_le_bytes()); // total length (patched)
     body.extend_from_slice(&0u32.to_le_bytes()); // headers length = 0
-    // RPC by name: length-prefixed UCS-2 "sp_executesql".
+                                                 // RPC by name: length-prefixed UCS-2 "sp_executesql".
     let proc_name = "sp_executesql";
     body.extend_from_slice(&(proc_name.encode_utf16().count() as u16).to_le_bytes());
     encode_ucs2(proc_name, &mut body);
     body.extend_from_slice(&0u16.to_le_bytes()); // options
-    // @stmt + @params + row params.
+                                                 // @stmt + @params + row params.
     let mut all: Vec<(&str, RpcParam)> = vec![
         ("stmt", RpcParam::NVarChar(sql.clone())),
         ("params", RpcParam::NVarChar(declarations)),
@@ -642,9 +643,10 @@ async fn read_packet(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
         )));
     }
     let mut body = vec![0u8; length - 8];
-    stream.read_exact(&mut body).await.map_err(|e| {
-        ConnectorError::Connection(format!("mssql read failed: {e}"))
-    })?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| ConnectorError::Connection(format!("mssql read failed: {e}")))?;
     Ok(body)
 }
 
@@ -674,7 +676,10 @@ pub enum MockMssqlOutcome {
     /// Transport failure (reconnects + retries in-loop).
     ConnectionError(String),
     /// Server error number (1205 retries; others terminal).
-    TdsError { number: i32, message: String },
+    TdsError {
+        number: i32,
+        message: String,
+    },
 }
 
 /// One captured batch call.
@@ -725,7 +730,9 @@ impl MssqlTransport for MockMssqlTransport {
                 Err(ConnectorError::Connection(message))
             }
             Some(MockMssqlOutcome::TdsError { number, message }) => Err(match number {
-                1205 => ConnectorError::Connection(format!("mock mssql deadlock {number}: {message}")),
+                1205 => {
+                    ConnectorError::Connection(format!("mock mssql deadlock {number}: {message}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock mssql error {number}: {message}")),
             }),
         }
@@ -772,11 +779,13 @@ impl NativeMssqlTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("mssql connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("mssql connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("mssql connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("mssql connect failed: {e}")))?;
         // PRELOGIN.
         stream
             .write_all(&tds_packet(packet::PRELOGIN, 0, &encode_prelogin()))
@@ -824,9 +833,9 @@ impl MssqlTransport for NativeMssqlTransport {
         }
         self.connect().await?;
         let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or_else(|| {
-            ConnectorError::Connection("mssql not connected".to_string())
-        })?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("mssql not connected".to_string()))?;
         for row in &rows {
             let statement = match &self.query_mode {
                 MssqlQueryMode::InsertJson => format!(
@@ -971,7 +980,8 @@ impl MssqlSink {
             match outcome {
                 Ok(()) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1016,13 +1026,11 @@ impl MssqlSink {
                 "mssql row requires a non-empty topic".to_string(),
             ));
         }
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("mssql payload must be UTF-8".to_string())
-        })?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("mssql payload must be UTF-8".to_string()))?;
         // Payload JSON is stored verbatim as NVARCHAR text.
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("mssql payload must be JSON".to_string())
-        })?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("mssql payload must be JSON".to_string()))?;
         let client_id = value
             .get("client_id")
             .and_then(|v| v.as_str())
@@ -1226,10 +1234,18 @@ mod tests {
         assert_eq!(length, packet.len());
         // sp_executesql by name rides the RPC name slot.
         let body = &packet[8..];
-        let proc_needle: Vec<u8> = "sp_executesql".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        assert!(body.windows(proc_needle.len()).any(|w| w == proc_needle.as_slice()));
+        let proc_needle: Vec<u8> = "sp_executesql"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert!(body
+            .windows(proc_needle.len())
+            .any(|w| w == proc_needle.as_slice()));
         // Payload text rides UCS-2 inside the packet.
-        let needle: Vec<u8> = "{\"v\":1}".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let needle: Vec<u8> = "{\"v\":1}"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
         assert!(body.windows(needle.len()).any(|w| w == needle.as_slice()));
         // DATETIMEOFFSET marker + 10 payload bytes present.
         assert!(body.windows(2).any(|w| w == [0x6F, 0x07]));
@@ -1293,13 +1309,20 @@ mod tests {
         config.max_backoff_ms = Some(2);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockMssqlOutcome::TdsError { number: 1205, message: "deadlock victim".to_string() },
+            MockMssqlOutcome::TdsError {
+                number: 1205,
+                message: "deadlock victim".to_string(),
+            },
             MockMssqlOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -1313,13 +1336,20 @@ mod tests {
         config.max_retries = Some(5);
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![
-            MockMssqlOutcome::TdsError { number: 208, message: "invalid object".to_string() },
+            MockMssqlOutcome::TdsError {
+                number: 208,
+                message: "invalid object".to_string(),
+            },
             MockMssqlOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("208 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

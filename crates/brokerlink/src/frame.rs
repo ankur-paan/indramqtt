@@ -1,7 +1,7 @@
-use bytes::{Bytes, BytesMut};
 use crate::error::{BrokerLinkError, Result};
 use crate::header::{FrameHeader, HEADER_LEN};
 use crate::opcode::OpCode;
+use bytes::{Bytes, BytesMut};
 
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
@@ -24,10 +24,16 @@ impl BrokerFrame {
         let payload_bytes = payload.into();
 
         if meta_bytes.len() > u16::MAX as usize {
-            return Err(BrokerLinkError::FrameTooLarge(meta_bytes.len(), u16::MAX as usize));
+            return Err(BrokerLinkError::FrameTooLarge(
+                meta_bytes.len(),
+                u16::MAX as usize,
+            ));
         }
         if payload_bytes.len() > u32::MAX as usize {
-            return Err(BrokerLinkError::FrameTooLarge(payload_bytes.len(), u32::MAX as usize));
+            return Err(BrokerLinkError::FrameTooLarge(
+                payload_bytes.len(),
+                u32::MAX as usize,
+            ));
         }
 
         let header = FrameHeader::new(
@@ -46,13 +52,25 @@ impl BrokerFrame {
     }
 
     pub fn ping(conn_id: u64, sequence_no: u64) -> Self {
-        Self::new(OpCode::Ping, conn_id, sequence_no, Bytes::new(), Bytes::new())
-            .expect("Ping frame within size bounds")
+        Self::new(
+            OpCode::Ping,
+            conn_id,
+            sequence_no,
+            Bytes::new(),
+            Bytes::new(),
+        )
+        .expect("Ping frame within size bounds")
     }
 
     pub fn pong(conn_id: u64, sequence_no: u64) -> Self {
-        Self::new(OpCode::Pong, conn_id, sequence_no, Bytes::new(), Bytes::new())
-            .expect("Pong frame within size bounds")
+        Self::new(
+            OpCode::Pong,
+            conn_id,
+            sequence_no,
+            Bytes::new(),
+            Bytes::new(),
+        )
+        .expect("Pong frame within size bounds")
     }
 
     pub fn total_frame_len(&self) -> usize {

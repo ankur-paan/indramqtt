@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// TDengine authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +95,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 
 fn is_td_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// TDengine sink configuration. All depths are optional (`None` =
@@ -168,7 +168,11 @@ impl TdengineSinkConfig {
         }
         // Strict template checks with dummy values.
         self.resolve_subtable("dummy", b"{}", QoS::AtMostOnce, 0)?;
-        for (column, template) in self.tags_template.iter().chain(self.metrics_template.iter()) {
+        for (column, template) in self
+            .tags_template
+            .iter()
+            .chain(self.metrics_template.iter())
+        {
             if !is_td_identifier(column) {
                 return Err(ConnectorError::Dispatch(format!(
                     "tdengine column must match [A-Za-z0-9_]+: {column:?}"
@@ -204,7 +208,9 @@ impl TdengineSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event (`${client_id}` from the JSON
@@ -341,12 +347,12 @@ pub struct TdengineResponse {
 }
 
 pub fn parse_rest_response(body: &[u8]) -> Result<TdengineResponse> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("tdengine bad response JSON: {e}"))
-    })?;
-    let code = doc.get("code").and_then(|v| v.as_i64()).ok_or_else(|| {
-        ConnectorError::Connection("tdengine response lacks code".to_string())
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("tdengine bad response JSON: {e}")))?;
+    let code = doc
+        .get("code")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ConnectorError::Connection("tdengine response lacks code".to_string()))?;
     let rows = doc.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
     Ok(TdengineResponse { code, rows })
 }
@@ -376,12 +382,7 @@ pub struct CapturedTdengineSql {
 
 #[async_trait]
 pub trait TdengineTransport: Send + Sync {
-    async fn execute_sql(
-        &self,
-        database: &str,
-        sql: &str,
-        auth: &TdengineAuth,
-    ) -> Result<usize>;
+    async fn execute_sql(&self, database: &str, sql: &str, auth: &TdengineAuth) -> Result<usize>;
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -413,12 +414,7 @@ impl MockTdengineTransport {
 
 #[async_trait]
 impl TdengineTransport for MockTdengineTransport {
-    async fn execute_sql(
-        &self,
-        database: &str,
-        sql: &str,
-        auth: &TdengineAuth,
-    ) -> Result<usize> {
+    async fn execute_sql(&self, database: &str, sql: &str, auth: &TdengineAuth) -> Result<usize> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(CapturedTdengineSql {
             database: database.to_string(),
@@ -456,12 +452,7 @@ impl HttpTdengineTransport {
 
 #[async_trait]
 impl TdengineTransport for HttpTdengineTransport {
-    async fn execute_sql(
-        &self,
-        _database: &str,
-        sql: &str,
-        auth: &TdengineAuth,
-    ) -> Result<usize> {
+    async fn execute_sql(&self, _database: &str, sql: &str, auth: &TdengineAuth) -> Result<usize> {
         let response = self
             .client
             .post(&self.url)
@@ -566,24 +557,25 @@ impl TdengineSink {
 
     /// Build one row: sub-table, sorted tag/metric literals, timestamp.
     /// Payloads must be JSON objects (metric columns read fields).
-    fn build_row(&self, topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<(TdengineRow, usize)> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("tdengine payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("tdengine payload must be JSON".to_string())
-        })?;
+    fn build_row(
+        &self,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+        millis: i64,
+    ) -> Result<(TdengineRow, usize)> {
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("tdengine payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("tdengine payload must be JSON".to_string()))?;
         if !value.is_object() {
             return Err(ConnectorError::Dispatch(
                 "tdengine payload must be a JSON object".to_string(),
             ));
         }
-        let subtable = self.config.resolve_subtable(
-            topic.as_str(),
-            payload,
-            qos,
-            millis,
-        )?;
+        let subtable = self
+            .config
+            .resolve_subtable(topic.as_str(), payload, qos, millis)?;
         // NOTE: QoS does not shape rows; AtMostOnce renders no variables.
         let mut tags = Vec::new();
         let mut tag_columns: Vec<&String> = self.config.tags_template.keys().collect();
@@ -804,14 +796,21 @@ mod tests {
         config.stable_name = "meters".to_string();
 
         config.subtable_template = "d-${topic}".to_string();
-        assert!(config.validate().is_err(), "slash must fail identifier check");
+        assert!(
+            config.validate().is_err(),
+            "slash must fail identifier check"
+        );
         config.subtable_template = test_config().subtable_template;
 
-        config.tags_template.insert("bad col".to_string(), "x".to_string());
+        config
+            .tags_template
+            .insert("bad col".to_string(), "x".to_string());
         assert!(config.validate().is_err());
         config.tags_template.remove("bad col");
 
-        config.auth = TdengineAuth::Token { token: "  ".to_string() };
+        config.auth = TdengineAuth::Token {
+            token: "  ".to_string(),
+        };
         assert!(config.validate().is_err());
         config.auth = test_config().auth;
 
@@ -827,18 +826,28 @@ mod tests {
     #[test]
     fn test_auth_headers() {
         assert_eq!(
-            TdengineAuth::Basic { username: "root".to_string(), password: "taosdata".to_string() }
-                .header_value()
-                .unwrap(),
+            TdengineAuth::Basic {
+                username: "root".to_string(),
+                password: "taosdata".to_string()
+            }
+            .header_value()
+            .unwrap(),
             "Basic cm9vdDp0YW9zZGF0YQ=="
         );
         assert_eq!(
-            TdengineAuth::Token { token: "abc".to_string() }.header_value().unwrap(),
+            TdengineAuth::Token {
+                token: "abc".to_string()
+            }
+            .header_value()
+            .unwrap(),
             "Taosd abc"
         );
-        assert!(TdengineAuth::Basic { username: String::new(), password: "x".to_string() }
-            .header_value()
-            .is_err());
+        assert!(TdengineAuth::Basic {
+            username: String::new(),
+            password: "x".to_string()
+        }
+        .header_value()
+        .is_err());
     }
 
     #[tokio::test]
@@ -907,11 +916,17 @@ mod tests {
         let mut config = test_config();
         config.subtable_template = "d_${topic}".to_string();
         // Slashes and spaces fail the identifier check loudly.
-        assert!(config.resolve_subtable("a/b", b"{}", QoS::AtMostOnce, 0).is_err());
-        assert!(config.resolve_subtable("a b", b"{}", QoS::AtMostOnce, 0).is_err());
+        assert!(config
+            .resolve_subtable("a/b", b"{}", QoS::AtMostOnce, 0)
+            .is_err());
+        assert!(config
+            .resolve_subtable("a b", b"{}", QoS::AtMostOnce, 0)
+            .is_err());
         // Underscores, digits and dots-free names pass.
         assert_eq!(
-            config.resolve_subtable("line_1", b"{}", QoS::AtMostOnce, 0).unwrap(),
+            config
+                .resolve_subtable("line_1", b"{}", QoS::AtMostOnce, 0)
+                .unwrap(),
             "d_line_1"
         );
     }
@@ -932,7 +947,10 @@ mod tests {
                 timestamp_ms: 7,
             }],
         );
-        assert_eq!(sql, "INSERT INTO d1 USING meters TAGS ('a''b') VALUES (7, 1);");
+        assert_eq!(
+            sql,
+            "INSERT INTO d1 USING meters TAGS ('a''b') VALUES (7, 1);"
+        );
     }
 
     #[test]
@@ -946,7 +964,9 @@ mod tests {
             TdengineResponse { code: 0, rows: 0 }
         );
         assert_eq!(
-            parse_rest_response(br#"{"code":533,"desc":"syntax error"}"#).unwrap().code,
+            parse_rest_response(br#"{"code":533,"desc":"syntax error"}"#)
+                .unwrap()
+                .code,
             533
         );
         assert!(parse_rest_response(b"nope").is_err());
@@ -965,9 +985,13 @@ mod tests {
             MockTdengineOutcome::Ok(2),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_records(), 1);
@@ -985,9 +1009,13 @@ mod tests {
             MockTdengineOutcome::Ok(1),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("SQL error must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);

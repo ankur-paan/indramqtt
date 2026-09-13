@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// IoTDB authentication (HTTP Basic).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,24 +77,19 @@ impl IotDbDataType {
                 .ok_or_else(|| {
                     ConnectorError::Dispatch("iotdb INT32 value out of range".to_string())
                 }),
-            (Self::Int64, serde_json::Value::Number(n)) => n
-                .as_i64()
-                .map(|v| serde_json::json!(v))
-                .ok_or_else(|| {
+            (Self::Int64, serde_json::Value::Number(n)) => {
+                n.as_i64().map(|v| serde_json::json!(v)).ok_or_else(|| {
                     ConnectorError::Dispatch("iotdb INT64 needs an integer".to_string())
-                }),
+                })
+            }
             (Self::Float, serde_json::Value::Number(n)) => n
                 .as_f64()
                 .map(|v| serde_json::json!(v as f32 as f64))
-                .ok_or_else(|| {
-                    ConnectorError::Dispatch("iotdb FLOAT needs a number".to_string())
-                }),
+                .ok_or_else(|| ConnectorError::Dispatch("iotdb FLOAT needs a number".to_string())),
             (Self::Double, serde_json::Value::Number(n)) => n
                 .as_f64()
                 .map(|v| serde_json::json!(v))
-                .ok_or_else(|| {
-                    ConnectorError::Dispatch("iotdb DOUBLE needs a number".to_string())
-                }),
+                .ok_or_else(|| ConnectorError::Dispatch("iotdb DOUBLE needs a number".to_string())),
             (Self::Text, serde_json::Value::String(text)) => Ok(serde_json::json!(text)),
             (Self::Text, other) if other.is_number() || other.is_boolean() => {
                 Ok(serde_json::json!(other.to_string()))
@@ -239,7 +232,9 @@ impl IotDbSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -275,9 +270,7 @@ impl IotDbSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -314,7 +307,9 @@ impl IotDbSinkConfig {
 
 fn is_node_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Check `${...}` syntax without rendering: every variable closes,
@@ -425,11 +420,7 @@ pub struct CapturedIotDbTablet {
 
 #[async_trait]
 pub trait IotDbTransport: Send + Sync {
-    async fn insert_tablet(
-        &self,
-        req: IotDbTabletRequest,
-        auth: &IotDbAuth,
-    ) -> Result<()>;
+    async fn insert_tablet(&self, req: IotDbTabletRequest, auth: &IotDbAuth) -> Result<()>;
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -461,11 +452,7 @@ impl MockIotDbTransport {
 
 #[async_trait]
 impl IotDbTransport for MockIotDbTransport {
-    async fn insert_tablet(
-        &self,
-        req: IotDbTabletRequest,
-        auth: &IotDbAuth,
-    ) -> Result<()> {
+    async fn insert_tablet(&self, req: IotDbTabletRequest, auth: &IotDbAuth) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(CapturedIotDbTablet {
             tablet: req,
@@ -477,9 +464,9 @@ impl IotDbTransport for MockIotDbTransport {
                 Err(ConnectorError::Connection(message))
             }
             Some(MockIotDbOutcome::HttpStatus(status)) => Err(match status {
-                305 | 500..=504 => ConnectorError::Connection(format!(
-                    "mock iotdb throttled with {status}"
-                )),
+                305 | 500..=504 => {
+                    ConnectorError::Connection(format!("mock iotdb throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock iotdb failed with {status}")),
             }),
         }
@@ -504,11 +491,7 @@ impl HttpIotDbTransport {
 
 #[async_trait]
 impl IotDbTransport for HttpIotDbTransport {
-    async fn insert_tablet(
-        &self,
-        req: IotDbTabletRequest,
-        auth: &IotDbAuth,
-    ) -> Result<()> {
+    async fn insert_tablet(&self, req: IotDbTabletRequest, auth: &IotDbAuth) -> Result<()> {
         let response = self
             .client
             .post(&self.url)
@@ -605,19 +588,20 @@ impl IotDbSink {
 
     /// Build one row: device path plus one coerced value per
     /// measurement (missing fields fail loudly).
-    fn build_row(&self, topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<(IotDbRow, usize)> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("iotdb payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("iotdb payload must be JSON".to_string())
-        })?;
-        let device = self.config.resolve_device_path(
-            topic.as_str(),
-            payload,
-            qos,
-            millis,
-        )?;
+    fn build_row(
+        &self,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+        millis: i64,
+    ) -> Result<(IotDbRow, usize)> {
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("iotdb payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("iotdb payload must be JSON".to_string()))?;
+        let device = self
+            .config
+            .resolve_device_path(topic.as_str(), payload, qos, millis)?;
         let mut values = Vec::with_capacity(self.config.measurements.len());
         for (measurement, data_type) in self
             .config
@@ -626,9 +610,7 @@ impl IotDbSink {
             .zip(self.config.data_types.iter())
         {
             let field = value.get(measurement).ok_or_else(|| {
-                ConnectorError::Dispatch(format!(
-                    "iotdb payload lacks measurement {measurement:?}"
-                ))
+                ConnectorError::Dispatch(format!("iotdb payload lacks measurement {measurement:?}"))
             })?;
             values.push(data_type.coerce(field)?);
         }
@@ -678,7 +660,11 @@ impl IotDbSink {
                     data_types: self.config.data_types.clone(),
                     values: grouped.iter().map(|row| row.values.clone()).collect(),
                 };
-                if let Err(e) = self.transport.insert_tablet(tablet, &self.config.auth).await {
+                if let Err(e) = self
+                    .transport
+                    .insert_tablet(tablet, &self.config.auth)
+                    .await
+                {
                     outcome = Err(e);
                     break;
                 }
@@ -686,7 +672,8 @@ impl IotDbSink {
             match outcome {
                 Ok(()) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -853,11 +840,17 @@ mod tests {
     #[test]
     fn test_tablet_url_and_auth_header() {
         let config = test_config();
-        assert_eq!(config.tablet_url(), "http://127.0.0.1:18080/rest/v2/insertTablet");
+        assert_eq!(
+            config.tablet_url(),
+            "http://127.0.0.1:18080/rest/v2/insertTablet"
+        );
         assert_eq!(config.auth.header_value().unwrap(), "Basic cm9vdDpyb290");
         let mut slashed = test_config();
         slashed.endpoint = "http://127.0.0.1:18080/rest/v2/".to_string();
-        assert_eq!(slashed.tablet_url(), "http://127.0.0.1:18080/rest/v2/insertTablet");
+        assert_eq!(
+            slashed.tablet_url(),
+            "http://127.0.0.1:18080/rest/v2/insertTablet"
+        );
     }
 
     #[test]
@@ -866,13 +859,17 @@ mod tests {
         let mut templated = test_config();
         templated.device_path_template = "root.${topic}".to_string();
         assert_eq!(
-            templated.resolve_device_path("a/b c", b"{}", QoS::AtMostOnce, 0).unwrap(),
+            templated
+                .resolve_device_path("a/b c", b"{}", QoS::AtMostOnce, 0)
+                .unwrap(),
             "root.a_b_c"
         );
         // Leading digits gain a `_` prefix; MQTT slashes flatten
         // (dots in the template itself create levels).
         assert_eq!(
-            templated.resolve_device_path("9lives/x", b"{}", QoS::AtMostOnce, 0).unwrap(),
+            templated
+                .resolve_device_path("9lives/x", b"{}", QoS::AtMostOnce, 0)
+                .unwrap(),
             "root._9lives_x"
         );
         assert_eq!(sanitize_node("ok_1"), "ok_1");
@@ -925,13 +922,19 @@ mod tests {
         assert_eq!(captured[0].auth, "Basic cm9vdDpyb290");
         assert!(!captured[0].tablet.is_aligned);
         assert_eq!(captured[0].tablet.timestamps.len(), 2);
-        assert_eq!(captured[0].tablet.measurements, vec!["temperature", "humidity"]);
+        assert_eq!(
+            captured[0].tablet.measurements,
+            vec!["temperature", "humidity"]
+        );
         assert_eq!(
             captured[0].tablet.data_types,
             vec![IotDbDataType::Float, IotDbDataType::Double]
         );
         assert_eq!(captured[0].tablet.values.len(), 2);
-        assert_eq!(captured[0].tablet.values[0][0], serde_json::json!(24.5f32 as f64));
+        assert_eq!(
+            captured[0].tablet.values[0][0],
+            serde_json::json!(24.5f32 as f64)
+        );
         assert_eq!(captured[0].tablet.values[1][1], serde_json::json!(60.0));
 
         // Rendered body matches the tablet contract.
@@ -973,7 +976,9 @@ mod tests {
 
         sink.send(
             &Topic::new("t").unwrap(),
-            &Bytes::from_static(br#"{"plant_id":"plant1","client_id":"sensor42","temperature":1.0,"humidity":2.0}"#),
+            &Bytes::from_static(
+                br#"{"plant_id":"plant1","client_id":"sensor42","temperature":1.0,"humidity":2.0}"#,
+            ),
             QoS::AtMostOnce,
         )
         .await
@@ -994,7 +999,9 @@ mod tests {
 
         sink.send(
             &Topic::new("t").unwrap(),
-            &Bytes::from_static(br#"{"plant_id":"plant1","client_id":"sensor42","temperature":1.0,"humidity":2.0}"#),
+            &Bytes::from_static(
+                br#"{"plant_id":"plant1","client_id":"sensor42","temperature":1.0,"humidity":2.0}"#,
+            ),
             QoS::AtMostOnce,
         )
         .await

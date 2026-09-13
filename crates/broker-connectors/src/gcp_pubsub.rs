@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 pub const GCP_PUBSUB_SCOPE: &str = "https://www.googleapis.com/auth/pubsub";
 pub const GCP_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -40,7 +38,10 @@ pub enum GcpAuth {
     AccessToken { token: String },
     /// Service-account key: RS256 JWT assertions exchanged for access
     /// tokens (cached to 60s before expiry).
-    ServiceAccountKey { client_email: String, private_key_pem: String },
+    ServiceAccountKey {
+        client_email: String,
+        private_key_pem: String,
+    },
 }
 
 impl GcpAuth {
@@ -91,9 +92,8 @@ pub fn build_jwt_assertion(
         exp: now_secs.saturating_add(3_600),
         iat: now_secs,
     };
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|e| {
-        ConnectorError::Dispatch(format!("gcp private key rejected: {e}"))
-    })?;
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+        .map_err(|e| ConnectorError::Dispatch(format!("gcp private key rejected: {e}")))?;
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
@@ -112,11 +112,7 @@ pub struct GcpTokenCache {
 }
 
 impl GcpTokenCache {
-    pub fn new(
-        client_email: String,
-        private_key_pem: String,
-        client: reqwest::Client,
-    ) -> Self {
+    pub fn new(client_email: String, private_key_pem: String, client: reqwest::Client) -> Self {
         Self {
             client_email,
             private_key_pem,
@@ -145,10 +141,7 @@ impl GcpTokenCache {
             .client
             .post(&self.token_url)
             .form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
             ])
             .send()
@@ -170,7 +163,10 @@ impl GcpTokenCache {
                 ConnectorError::Connection("gcp token response lacks access_token".to_string())
             })?
             .to_string();
-        let expires_in = doc.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3_600);
+        let expires_in = doc
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3_600);
         *self.cached.lock() = Some((token.clone(), now.saturating_add(expires_in)));
         Ok(token)
     }
@@ -282,7 +278,10 @@ impl GcpPubSubSinkConfig {
                     ));
                 }
             }
-            GcpAuth::ServiceAccountKey { client_email, private_key_pem } => {
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            } => {
                 if client_email.trim().is_empty() || private_key_pem.trim().is_empty() {
                     return Err(ConnectorError::Dispatch(
                         "gcp service account needs email + private key".to_string(),
@@ -340,7 +339,9 @@ impl GcpPubSubSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event. `${client_id}` resolves from
@@ -380,9 +381,7 @@ impl GcpPubSubSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -431,9 +430,7 @@ pub fn render_publish_body(messages: &[GcpPubSubMessage]) -> Vec<u8> {
             }
             body.push_str(&serde_json::to_string(key).unwrap_or_default());
             body.push(':');
-            body.push_str(
-                &serde_json::to_string(&message.attributes[*key]).unwrap_or_default(),
-            );
+            body.push_str(&serde_json::to_string(&message.attributes[*key]).unwrap_or_default());
         }
         body.push_str("}}");
     }
@@ -443,9 +440,8 @@ pub fn render_publish_body(messages: &[GcpPubSubMessage]) -> Vec<u8> {
 
 /// Parse a `:publish` response body into message ids.
 pub fn parse_publish_response(body: &[u8]) -> Result<Vec<String>> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("gcp bad publish response: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("gcp bad publish response: {e}")))?;
     doc.get("messageIds")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
@@ -453,9 +449,9 @@ pub fn parse_publish_response(body: &[u8]) -> Result<Vec<String>> {
         })?
         .iter()
         .map(|id| {
-            id.as_str().map(str::to_string).ok_or_else(|| {
-                ConnectorError::Connection("gcp messageId not a string".to_string())
-            })
+            id.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ConnectorError::Connection("gcp messageId not a string".to_string()))
         })
         .collect()
 }
@@ -550,7 +546,9 @@ impl GcpPubSubTransport for MockGcpPubSubTransport {
                 }
                 _ => ConnectorError::Dispatch(format!("mock gcp failed with {status}")),
             }),
-            Some(MockGcpOutcome::TransportError(message)) => Err(ConnectorError::Connection(message)),
+            Some(MockGcpOutcome::TransportError(message)) => {
+                Err(ConnectorError::Connection(message))
+            }
         }
     }
 }
@@ -569,7 +567,10 @@ impl HttpGcpPubSubTransport {
         let (token_cache, static_bearer) = match &config.auth {
             GcpAuth::None => (None, None),
             GcpAuth::AccessToken { token } => (None, Some(format!("Bearer {token}"))),
-            GcpAuth::ServiceAccountKey { client_email, private_key_pem } => (
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            } => (
                 Some(Arc::new(GcpTokenCache::new(
                     client_email.clone(),
                     private_key_pem.clone(),
@@ -765,7 +766,12 @@ impl GcpPubSubSink {
         loop {
             match self
                 .transport
-                .publish(&self.config.project_id, &self.config.topic_id, messages.clone(), auth.clone())
+                .publish(
+                    &self.config.project_id,
+                    &self.config.topic_id,
+                    messages.clone(),
+                    auth.clone(),
+                )
                 .await
             {
                 Ok(_) => {
@@ -876,9 +882,8 @@ impl super::Connector for GcpPubSubConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Sink;
     use crate::test_rsa_keys::{PRIVATE_PEM as TEST_PRIVATE_PEM, PUBLIC_PEM as TEST_PUBLIC_PEM};
-
+    use crate::Sink;
 
     fn test_config() -> GcpPubSubSinkConfig {
         GcpPubSubSinkConfig {
@@ -900,9 +905,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: GcpPubSubSinkConfig,
-    ) -> (Arc<GcpPubSubSink>, Arc<MockGcpPubSubTransport>) {
+    fn test_sink(config: GcpPubSubSinkConfig) -> (Arc<GcpPubSubSink>, Arc<MockGcpPubSubTransport>) {
         let transport = Arc::new(MockGcpPubSubTransport::new());
         let sink = Arc::new(GcpPubSubSink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -931,10 +934,14 @@ mod tests {
         assert!(config.validate().is_err());
         config.endpoint = Some("http://127.0.0.1:8085".to_string());
         assert!(config.validate().is_ok());
-        assert!(config.publish_url().starts_with("http://127.0.0.1:8085/v1/"));
+        assert!(config
+            .publish_url()
+            .starts_with("http://127.0.0.1:8085/v1/"));
         config.endpoint = None;
 
-        config.auth = GcpAuth::AccessToken { token: "  ".to_string() };
+        config.auth = GcpAuth::AccessToken {
+            token: "  ".to_string(),
+        };
         assert!(config.validate().is_err());
         config.auth = GcpAuth::ServiceAccountKey {
             client_email: "a@b.iam.gserviceaccount.com".to_string(),
@@ -959,8 +966,9 @@ mod tests {
     #[test]
     fn test_jwt_assertion_signs_and_verifies() {
         let now = now_millis().max(0) as u64 / 1_000;
-        let token = build_jwt_assertion("bot@example.iam.gserviceaccount.com", TEST_PRIVATE_PEM, now)
-            .expect("signs");
+        let token =
+            build_jwt_assertion("bot@example.iam.gserviceaccount.com", TEST_PRIVATE_PEM, now)
+                .expect("signs");
         assert_eq!(token.split('.').count(), 3);
         // Independent verification with the public half (jsonwebtoken).
         let key = jsonwebtoken::DecodingKey::from_rsa_pem(TEST_PUBLIC_PEM.as_bytes()).unwrap();
@@ -1000,7 +1008,9 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1045,19 +1055,37 @@ mod tests {
         let payload = base64::engine::general_purpose::STANDARD
             .decode(&message.data_b64)
             .unwrap();
-        assert_eq!(payload, br#"{"client_id":"device-001","device_id":"device-001","v":21.5}"#);
+        assert_eq!(
+            payload,
+            br#"{"client_id":"device-001","device_id":"device-001","v":21.5}"#
+        );
         assert_eq!(message.ordering_key.as_deref(), Some("device-001"));
-        assert_eq!(message.attributes.get("mqtt_topic").map(String::as_str), Some("factory/line1/temp"));
-        assert_eq!(message.attributes.get("mqtt_qos").map(String::as_str), Some("1"));
-        assert_eq!(message.attributes.get("source").map(String::as_str), Some("indramqtt"));
-        assert_eq!(message.attributes.get("device").map(String::as_str), Some("device-001"));
+        assert_eq!(
+            message.attributes.get("mqtt_topic").map(String::as_str),
+            Some("factory/line1/temp")
+        );
+        assert_eq!(
+            message.attributes.get("mqtt_qos").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            message.attributes.get("source").map(String::as_str),
+            Some("indramqtt")
+        );
+        assert_eq!(
+            message.attributes.get("device").map(String::as_str),
+            Some("device-001")
+        );
         assert_eq!(sink.sent_records(), 1);
 
         // Rendered body shape matches the Pub/Sub contract.
         let body = String::from_utf8(render_publish_body(&captured[0].messages)).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(doc["messages"][0]["orderingKey"], "device-001");
-        assert_eq!(doc["messages"][0]["attributes"]["mqtt_topic"], "factory/line1/temp");
+        assert_eq!(
+            doc["messages"][0]["attributes"]["mqtt_topic"],
+            "factory/line1/temp"
+        );
     }
 
     #[tokio::test]
@@ -1065,9 +1093,13 @@ mod tests {
         let mut config = test_config();
         config.ordering_key_template = None;
         let (sink, transport) = test_sink(config);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         let captured = transport.captured();
         assert_eq!(captured[0].messages[0].ordering_key, None);
@@ -1087,9 +1119,13 @@ mod tests {
             MockGcpOutcome::Ids(vec!["msg-1".to_string()]),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_batches(), 1);
@@ -1107,9 +1143,13 @@ mod tests {
             MockGcpOutcome::HttpStatus(403),
             MockGcpOutcome::Ids(vec!["msg-1".to_string()]),
         ]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("403 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -1124,9 +1164,13 @@ mod tests {
             MockGcpOutcome::TransportError("down".to_string()),
             MockGcpOutcome::TransportError("down".to_string()),
         ]);
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("transport down must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(transport.calls(), 4);

@@ -151,8 +151,7 @@ impl AclRule {
                 _ => return false,
             }
         }
-        pi == pattern_levels.len()
-            || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+        pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
     }
 }
 
@@ -198,7 +197,10 @@ impl MemoryAuth {
     pub fn add_user(&self, username: impl Into<String>, password: &[u8]) {
         let username = username.into();
         let mut users = self.users.write();
-        let quotas = users.get(&username).map(|entry| entry.quotas.clone()).unwrap_or_default();
+        let quotas = users
+            .get(&username)
+            .map(|entry| entry.quotas.clone())
+            .unwrap_or_default();
         users.insert(
             username,
             UserEntry {
@@ -229,7 +231,10 @@ impl MemoryAuth {
 
     /// Quota bounds for a user (`None` when unknown).
     pub fn get_quotas(&self, username: &str) -> Option<UserQuotas> {
-        self.users.read().get(username).map(|entry| entry.quotas.clone())
+        self.users
+            .read()
+            .get(username)
+            .map(|entry| entry.quotas.clone())
     }
 
     /// Sorted usernames (passwords are write-only, never listed).
@@ -264,10 +269,7 @@ impl MemoryAuth {
             return true;
         }
         for rule in rules.iter() {
-            if rule.client_matches(client_id)
-                && rule.action.covers(action)
-                && matches_rule(rule)
-            {
+            if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
                 return rule.allow;
             }
         }
@@ -425,7 +427,9 @@ mod tests {
             .await
             .is_ok());
         assert_eq!(
-            auth.get_quotas("alice").expect("quotas survive").max_connections,
+            auth.get_quotas("alice")
+                .expect("quotas survive")
+                .max_connections,
             Some(100)
         );
 
@@ -438,13 +442,21 @@ mod tests {
     async fn test_acl_open_mode_without_rules() {
         let auth = MemoryAuth::new();
         assert!(auth.authorize_publish("any", &topic("a/b")).await.is_ok());
-        assert!(auth.authorize_subscribe("any", &filter("a/#")).await.is_ok());
+        assert!(auth
+            .authorize_subscribe("any", &filter("a/#"))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn test_acl_allow_and_deny_with_first_match_wins() {
         let auth = MemoryAuth::new();
-        auth.add_rule(AclRule::new("sensor-1", AclAction::Publish, "sensors/#", true));
+        auth.add_rule(AclRule::new(
+            "sensor-1",
+            AclAction::Publish,
+            "sensors/#",
+            true,
+        ));
         auth.add_rule(AclRule::new("sensor-9", AclAction::All, "#", false));
         auth.add_rule(AclRule::new("*", AclAction::Subscribe, "#", true));
 
@@ -477,7 +489,12 @@ mod tests {
     #[tokio::test]
     async fn test_acl_subscribe_needs_covering_pattern() {
         let auth = MemoryAuth::new();
-        auth.add_rule(AclRule::new("*", AclAction::Subscribe, "sensors/temp", true));
+        auth.add_rule(AclRule::new(
+            "*",
+            AclAction::Subscribe,
+            "sensors/temp",
+            true,
+        ));
 
         // Exact grant covers the exact request.
         assert!(auth
@@ -497,9 +514,15 @@ mod tests {
         let auth = MemoryAuth::new();
         auth.add_rule(AclRule::new("pub-only", AclAction::Publish, "#", true));
 
-        assert!(auth.authorize_publish("pub-only", &topic("x")).await.is_ok());
+        assert!(auth
+            .authorize_publish("pub-only", &topic("x"))
+            .await
+            .is_ok());
         // Publish-only grant does not cover subscribes.
-        assert!(auth.authorize_subscribe("pub-only", &filter("x")).await.is_err());
+        assert!(auth
+            .authorize_subscribe("pub-only", &filter("x"))
+            .await
+            .is_err());
     }
     #[test]
     fn test_acl_action_parse() {

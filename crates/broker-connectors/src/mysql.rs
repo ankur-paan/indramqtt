@@ -76,7 +76,8 @@ impl MySqlSinkConfig {
         // payload), so the template must carry exactly three markers.
         if count_placeholders(&self.sql_template) != 3 {
             return Err(ConnectorError::Dispatch(
-                "mysql sql_template must carry exactly 3 ? markers (topic, qos, payload)".to_string(),
+                "mysql sql_template must carry exactly 3 ? markers (topic, qos, payload)"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -202,7 +203,9 @@ impl MySqlTransport for MemoryMySqlTransport {
         let mut failures = self.failures_left.lock();
         if *failures > 0 {
             *failures -= 1;
-            return Err(ConnectorError::Connection("mock transport down".to_string()));
+            return Err(ConnectorError::Connection(
+                "mock transport down".to_string(),
+            ));
         }
         self.batches.lock().push(batch.clone());
         Ok(())
@@ -257,13 +260,16 @@ fn parse_endpoint(url: &str) -> Result<MySqlEndpoint> {
         Some((user, pass)) => (user.to_string(), pass.to_string()),
         None => (credentials.to_string(), String::new()),
     };
-    let user = if user.is_empty() { "root".to_string() } else { user };
+    let user = if user.is_empty() {
+        "root".to_string()
+    } else {
+        user
+    };
     let (host, port) = match hostport.rsplit_once(':') {
         Some((host, port)) => (
             host.to_string(),
-            port.parse::<u16>().map_err(|_| {
-                ConnectorError::Dispatch(format!("mysql bad port in {url:?}"))
-            })?,
+            port.parse::<u16>()
+                .map_err(|_| ConnectorError::Dispatch(format!("mysql bad port in {url:?}")))?,
         ),
         None => (hostport.to_string(), 3306),
     };
@@ -324,8 +330,7 @@ fn decode_lenenc(cursor: &mut &[u8]) -> Result<u64> {
             if cursor.len() < 3 {
                 return Err(underflow());
             }
-            let value =
-                u32::from_le_bytes([cursor[0], cursor[1], cursor[2], 0]) as u64;
+            let value = u32::from_le_bytes([cursor[0], cursor[1], cursor[2], 0]) as u64;
             *cursor = &cursor[3..];
             Ok(value)
         }
@@ -394,8 +399,7 @@ async fn read_packet(stream: &mut TcpStream) -> Result<MySqlPacket> {
         .await
         .map_err(|_| ConnectorError::Connection("mysql read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("mysql read failed: {e}")))?;
-    let len =
-        u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+    let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     if len > 16 * 1024 * 1024 {
         return Err(ConnectorError::Connection(format!(
             "mysql packet too large: {len}"
@@ -484,17 +488,14 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
     cursor = &cursor[8 + 1..]; // seed part 1 + filler
     cursor = &cursor[2 + 1 + 2 + 2 + 1..]; // caps, charset, status, caps, auth len
     cursor = &cursor[10..]; // reserved
-    // Remainder: seed part 2 (NUL-terminated) + plugin name.
+                            // Remainder: seed part 2 (NUL-terminated) + plugin name.
     let mut salt = seed_part1;
     let seed_part2 = read_cstring(&mut cursor).unwrap_or_default();
     salt.extend_from_slice(&seed_part2[..seed_part2.len().min(12)]);
     let salt: Vec<u8> = salt.into_iter().take(20).collect();
 
     // HandshakeResponse41.
-    let token = native_password_token(
-        endpoint.password.as_bytes(),
-        &salt[..salt.len().min(20)],
-    );
+    let token = native_password_token(endpoint.password.as_bytes(), &salt[..salt.len().min(20)]);
     let mut body = Vec::new();
     body.extend_from_slice(&CLIENT_CAPABILITIES.to_le_bytes());
     body.extend_from_slice(&0x01000000u32.to_le_bytes()); // max packet 16MB
@@ -576,13 +577,10 @@ impl TcpMySqlTransport {
 
     async fn dial(&self) -> Result<MysqlConn> {
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!("mysql connect timeout: {addr}"))
-                })?
-                .map_err(|e| ConnectorError::Connection(format!("mysql connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("mysql connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("mysql connect failed: {e}")))?;
         let mut seq = 0u8;
         // Greeting sequence number starts at 0 server-side; our first
         // client packet uses 1.
@@ -855,8 +853,9 @@ mod tests {
     fn test_config() -> MySqlSinkConfig {
         MySqlSinkConfig {
             connection_url: "mysql://user:pass@127.0.0.1:3306/db".to_string(),
-            sql_template: "INSERT INTO sensor_data (topic, qos, payload, recorded_at) VALUES (?, ?, ?, NOW())"
-                .to_string(),
+            sql_template:
+                "INSERT INTO sensor_data (topic, qos, payload, recorded_at) VALUES (?, ?, ?, NOW())"
+                    .to_string(),
             pool_size: 2,
             batch_size: 100,
             batch_timeout_ms: 50,
@@ -897,7 +896,8 @@ mod tests {
 
     #[test]
     fn test_endpoint_parsing() {
-        let endpoint = parse_endpoint("mysql://user:pass@db.internal:3307/telemetry").expect("parses");
+        let endpoint =
+            parse_endpoint("mysql://user:pass@db.internal:3307/telemetry").expect("parses");
         assert_eq!(endpoint.host, "db.internal");
         assert_eq!(endpoint.port, 3307);
         assert_eq!(endpoint.user, "user");
@@ -921,9 +921,18 @@ mod tests {
         // Deterministic 20-byte XOR token otherwise.
         let token = native_password_token(b"pass", b"12345678901234567890");
         assert_eq!(token.len(), 20);
-        assert_eq!(token, native_password_token(b"pass", b"12345678901234567890"));
-        assert_ne!(token, native_password_token(b"pass", b"AAAAAAAAAAAAAAAAAAAA"));
-        assert_ne!(token, native_password_token(b"word", b"12345678901234567890"));
+        assert_eq!(
+            token,
+            native_password_token(b"pass", b"12345678901234567890")
+        );
+        assert_ne!(
+            token,
+            native_password_token(b"pass", b"AAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_ne!(
+            token,
+            native_password_token(b"word", b"12345678901234567890")
+        );
     }
 
     #[test]
@@ -937,7 +946,7 @@ mod tests {
         assert_eq!(frame[10], 0); // null bitmap (3 params -> 1 byte)
         assert_eq!(frame[11], 1); // new-params-bind
         assert_eq!(&frame[12..18], &[0xFD, 0, 0xFD, 0, 0xFD, 0]); // 3x VAR_STRING
-        // Values are length-prefixed blobs.
+                                                                  // Values are length-prefixed blobs.
         assert!(frame.windows(3).any(|w| w == b"a/b"));
     }
 
@@ -946,7 +955,9 @@ mod tests {
     /// then per-row Execute capture with independent param decoding.
     #[tokio::test]
     async fn test_tcp_handshake_prepare_and_batch_params() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let captured_sql = Arc::new(parking_lot::Mutex::new(String::new()));
         let captured_rows = Arc::new(parking_lot::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
@@ -975,7 +986,10 @@ mod tests {
             // Handshake response: verify plugin + native-password digest.
             // (Index 0 is the packet sequence number.)
             let request = read_server_packet(&mut stream).await;
-            assert_eq!(u32::from_le_bytes([request[1], request[2], request[3], request[4]]) & 0x00080000, 0x00080000);
+            assert_eq!(
+                u32::from_le_bytes([request[1], request[2], request[3], request[4]]) & 0x00080000,
+                0x00080000
+            );
             let mut cursor = &request[1 + 4 + 4 + 1 + 23..];
             let user = read_cstring(&mut cursor);
             assert_eq!(user, b"u");
@@ -1000,14 +1014,24 @@ mod tests {
             let mut h3 = Sha1::new();
             h3.update(&salted);
             let stage3 = h3.finalize().to_vec();
-            let expected: Vec<u8> = stage1.iter().zip(stage3.iter()).map(|(a, b)| a ^ b).collect();
-            assert_eq!(presented, expected.as_slice(), "native password must verify");
+            let expected: Vec<u8> = stage1
+                .iter()
+                .zip(stage3.iter())
+                .map(|(a, b)| a ^ b)
+                .collect();
+            assert_eq!(
+                presented,
+                expected.as_slice(),
+                "native password must verify"
+            );
             write_server_packet(&mut stream, 1, &[0x00, 0, 0, 0, 0, 0, 0]).await;
             // Prepare: capture SQL, report stmt 7 with 3 params, then the
             // parameter definitions plus EOF the client drains.
             let request = read_server_packet(&mut stream).await;
             assert_eq!(request[1], 0x16);
-            captured_sql_rx.lock().push_str(std::str::from_utf8(&request[2..]).expect("sql"));
+            captured_sql_rx
+                .lock()
+                .push_str(std::str::from_utf8(&request[2..]).expect("sql"));
             let mut prepare_ok = vec![0x00];
             prepare_ok.extend_from_slice(&7u32.to_le_bytes());
             prepare_ok.extend_from_slice(&0u16.to_le_bytes());
@@ -1052,21 +1076,26 @@ mod tests {
             captured_rows_rx.lock().extend(rows);
         });
 
-        let transport = TcpMySqlTransport::new(
-            &format!("mysql://u:pwd@127.0.0.1:{port}/db"),
-            1,
-        )
-        .expect("valid transport");
+        let transport = TcpMySqlTransport::new(&format!("mysql://u:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
         let mut config = test_config();
         config.batch_size = 2;
         let sink = MySqlSink::new(config, Arc::new(transport)).expect("valid sink");
         let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 1 }"#), QoS::AtLeastOnce)
-            .await
-            .expect("row one");
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 2 }"#), QoS::AtLeastOnce)
-            .await
-            .expect("row two triggers flush");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 1 }"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("row one");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 2 }"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("row two triggers flush");
         assert_eq!(sink.sent_batches(), 1);
 
         let mut done = false;
@@ -1079,9 +1108,7 @@ mod tests {
         }
         assert!(done, "fake server never finished");
         server.await.expect("fake server task");
-        assert!(captured_sql
-            .lock()
-            .contains("INSERT INTO sensor_data"));
+        assert!(captured_sql.lock().contains("INSERT INTO sensor_data"));
         let rows = captured_rows.lock().clone();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], b"sensors/temp");
@@ -1101,14 +1128,22 @@ mod tests {
         config.batch_timeout_ms = 20;
         let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
         let topic = Topic::new("sensors/temp").unwrap();
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 1 }"#), QoS::AtMostOnce)
-            .await
-            .expect("row one buffers");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 1 }"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("row one buffers");
         assert_eq!(sink.buffered_rows(), 1);
         tokio::time::sleep(Duration::from_millis(60)).await;
-        sink.send(&topic, &Bytes::from_static(br#"{ "v": 2 }"#), QoS::AtMostOnce)
-            .await
-            .expect("stale batch flushes");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "v": 2 }"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("stale batch flushes");
         assert_eq!(sink.sent_batches(), 1);
         assert_eq!(sink.buffered_rows(), 0);
         let batches = transport.batches();
@@ -1116,10 +1151,10 @@ mod tests {
         assert_eq!(batches[0].rows.len(), 2);
     }
 
-    async fn read_server_packet(stream: &mut TcpStream) -> Vec<u8> {        let mut header = [0u8; 4];
+    async fn read_server_packet(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 4];
         stream.read_exact(&mut header).await.expect("pkt head");
-        let len =
-            u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
         let mut body = vec![0u8; 1 + len];
         body[0] = header[3];
         stream.read_exact(&mut body[1..]).await.expect("pkt body");

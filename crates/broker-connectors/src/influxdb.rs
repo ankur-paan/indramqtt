@@ -298,7 +298,9 @@ mod tests {
     }
 
     fn test_client() -> reqwest::Client {
-        reqwest::Client::builder().build().expect("test http client")
+        reqwest::Client::builder()
+            .build()
+            .expect("test http client")
     }
 
     #[test]
@@ -379,7 +381,9 @@ mod tests {
         let sink = InfluxDbSink::new(test_config("http://influx:8086"), test_client()).unwrap();
         let topic = Topic::new("sensors/t1").unwrap();
 
-        assert!(!sink.buffer_row(&topic, &Bytes::from("{}"), QoS::AtLeastOnce).unwrap());
+        assert!(!sink
+            .buffer_row(&topic, &Bytes::from("{}"), QoS::AtLeastOnce)
+            .unwrap());
         assert_eq!(sink.buffered_rows(), 1);
 
         // Empty topics are rejected at construction; the buffer_row
@@ -434,13 +438,21 @@ mod tests {
         config.batch_size = 2;
         let sink = InfluxDbSink::new(config, test_client()).unwrap();
 
-        sink.send(&Topic::new("sensors/t1").unwrap(), &Bytes::from("on"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from("on"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
-        sink.send(&Topic::new("sensors/t2").unwrap(), &Bytes::from("off"), QoS::AtLeastOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("sensors/t2").unwrap(),
+            &Bytes::from("off"),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.sent_batches(), 1);
         assert_eq!(sink.buffered_rows(), 0);
 
@@ -473,9 +485,13 @@ mod tests {
         config.batch_size = 10;
         let sink = InfluxDbSink::new(config, test_client()).unwrap();
 
-        sink.send(&Topic::new("sensors/t1").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.buffered_rows(), 1);
         let err = sink.flush().await.expect_err("500 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));

@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Doris authentication (HTTP Basic).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +81,9 @@ fn default_max_backoff_ms() -> Option<u64> {
 
 fn is_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Doris sink configuration. All depths are optional (`None` =
@@ -200,7 +200,9 @@ impl DorisSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -220,7 +222,13 @@ impl DorisSinkConfig {
     }
 
     /// Resolve + validate the table for one event.
-    pub fn resolve_table(&self, topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Result<String> {
+    pub fn resolve_table(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<String> {
         let vars = Self::template_vars(topic, payload, qos, millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -257,21 +265,21 @@ pub struct DorisLoadResult {
 
 /// Parse the `{"Status": ..., ...}` reply envelope.
 pub fn parse_load_result(body: &[u8]) -> Result<DorisLoadResult> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        ConnectorError::Connection(format!("doris bad reply JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("doris bad reply JSON: {e}")))?;
     let status = doc
         .get("Status")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            ConnectorError::Connection("doris reply lacks Status".to_string())
-        })?
+        .ok_or_else(|| ConnectorError::Connection("doris reply lacks Status".to_string()))?
         .to_string();
     let rows_loaded = doc
         .get("NumberLoadedRows")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    Ok(DorisLoadResult { status, rows_loaded })
+    Ok(DorisLoadResult {
+        status,
+        rows_loaded,
+    })
 }
 
 /// Classify a load status: success, retryable (timeouts, label
@@ -346,7 +354,9 @@ fn csv_row(record: &serde_json::Value) -> String {
 /// Scripted outcome for the mock transport.
 #[derive(Debug, Clone)]
 pub enum MockDorisOutcome {
-    Success { rows: u64 },
+    Success {
+        rows: u64,
+    },
     /// Reply envelope status (transient statuses retry).
     Status(String),
     /// HTTP failure (429/503 retry the batch).
@@ -427,16 +437,16 @@ impl DorisTransport for MockDorisTransport {
                 status: "Success".to_string(),
                 rows_loaded: 0,
             }),
-            Some(MockDorisOutcome::Status(status)) => classify_status(&status).map(|_| {
-                DorisLoadResult {
+            Some(MockDorisOutcome::Status(status)) => {
+                classify_status(&status).map(|_| DorisLoadResult {
                     status,
                     rows_loaded: 0,
-                }
-            }),
+                })
+            }
             Some(MockDorisOutcome::HttpStatus(status)) => Err(match status {
-                429 | 503 => ConnectorError::Connection(format!(
-                    "mock doris throttled with {status}"
-                )),
+                429 | 503 => {
+                    ConnectorError::Connection(format!("mock doris throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock doris failed with {status}")),
             }),
             Some(MockDorisOutcome::ConnectionError(message)) => {
@@ -483,7 +493,11 @@ impl DorisTransport for HttpDorisTransport {
             .header("format", headers.format.as_str())
             .header(
                 "strip_outer_array",
-                if headers.strip_outer_array { "true" } else { "false" },
+                if headers.strip_outer_array {
+                    "true"
+                } else {
+                    "false"
+                },
             )
             .header("label", headers.label.as_str())
             .header("Expect", "100-continue")
@@ -590,13 +604,17 @@ impl DorisSink {
     }
 
     /// Build one record document: payload merged with topic/qos/timestamp.
-    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<serde_json::Value> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("doris payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("doris payload must be JSON".to_string())
-        })?;
+    fn build_record(
+        &self,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+        millis: i64,
+    ) -> Result<serde_json::Value> {
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("doris payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("doris payload must be JSON".to_string()))?;
         let mut document = match value {
             serde_json::Value::Object(map) => serde_json::Value::Object(map),
             other => serde_json::json!({"value": other}),
@@ -650,17 +668,20 @@ impl DorisSink {
                 // Fresh label per attempt: conflicts never recycle one.
                 label: self.fresh_label(),
                 jsonpaths: self.config.jsonpaths.clone(),
-                max_filter_ratio: self
-                    .config
-                    .max_filter_ratio
-                    .map(|ratio| ratio.to_string()),
+                max_filter_ratio: self.config.max_filter_ratio.map(|ratio| ratio.to_string()),
             };
             let mut outcome: Result<()> = Ok(());
             for (table, documents) in &groups {
                 let body = render_body(self.config.format, documents);
                 if let Err(e) = self
                     .transport
-                    .stream_load(&self.config.database, table, &body, &headers, &self.config.auth)
+                    .stream_load(
+                        &self.config.database,
+                        table,
+                        &body,
+                        &headers,
+                        &self.config.auth,
+                    )
                     .await
                 {
                     outcome = Err(e);
@@ -670,7 +691,8 @@ impl DorisSink {
             match outcome {
                 Ok(_) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -718,7 +740,9 @@ impl DorisSink {
         let millis = now_millis();
         // Table must resolve at buffer time: bad templates fail loudly
         // instead of poisoning the batch at flush.
-        let table = self.config.resolve_table(topic.as_str(), payload, qos, millis)?;
+        let table = self
+            .config
+            .resolve_table(topic.as_str(), payload, qos, millis)?;
         let document = self.build_record(topic, payload, qos, millis)?;
         let bytes = document.to_string().len();
         let mut buffer = self.buffer.lock();
@@ -805,7 +829,10 @@ mod tests {
     fn test_config_validation() {
         let mut config = test_config();
         assert!(config.validate().is_ok());
-        assert_eq!(config.load_url("events"), "http://127.0.0.1:8030/api/telemetry/events/_stream_load");
+        assert_eq!(
+            config.load_url("events"),
+            "http://127.0.0.1:8030/api/telemetry/events/_stream_load"
+        );
 
         config.fe_host.clear();
         assert!(config.validate().is_err());
@@ -843,9 +870,12 @@ mod tests {
     #[test]
     fn test_auth_and_body_framing() {
         assert_eq!(
-            DorisAuth { username: "root".to_string(), password: "secret".to_string() }
-                .header_value()
-                .unwrap(),
+            DorisAuth {
+                username: "root".to_string(),
+                password: "secret".to_string()
+            }
+            .header_value()
+            .unwrap(),
             "Basic cm9vdDpzZWNyZXQ="
         );
         // JSON array framing with strip_outer_array semantics.
@@ -869,7 +899,10 @@ mod tests {
     fn test_status_classification_and_parsing() {
         assert_eq!(
             parse_load_result(br#"{"Status":"Success","NumberLoadedRows":2}"#).unwrap(),
-            DorisLoadResult { status: "Success".to_string(), rows_loaded: 2 }
+            DorisLoadResult {
+                status: "Success".to_string(),
+                rows_loaded: 2
+            }
         );
         assert!(classify_status("Success").is_ok());
         assert!(matches!(
@@ -913,12 +946,20 @@ mod tests {
     #[tokio::test]
     async fn test_stream_load_headers_and_labels() {
         let (sink, transport) = test_sink(test_config());
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{\"v\":1}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{\"v\":2}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{\"v\":1}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{\"v\":2}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
 
         let captured = transport.captured();
@@ -930,8 +971,7 @@ mod tests {
         assert!(captured[0].headers.strip_outer_array);
         assert!(captured[0].headers.label.starts_with("indra-"));
         // Body is one JSON array with both records.
-        let body: serde_json::Value =
-            serde_json::from_slice(&captured[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
         assert_eq!(body.as_array().expect("array").len(), 2);
         assert_eq!(sink.sent_records(), 2);
     }
@@ -948,13 +988,20 @@ mod tests {
             MockDorisOutcome::Success { rows: 1 },
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         // Fresh label per attempt: no two calls share one.
-        assert_ne!(transport.captured()[0].headers.label, transport.captured()[1].headers.label);
+        assert_ne!(
+            transport.captured()[0].headers.label,
+            transport.captured()[1].headers.label
+        );
         assert_eq!(sink.sent_records(), 1);
         assert_eq!(sink.buffered_rows(), 0);
     }
@@ -967,9 +1014,13 @@ mod tests {
         let (sink, transport) = test_sink(config);
         transport.script_outcomes(vec![MockDorisOutcome::Status("Failed".to_string())]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("Failed must abort");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -980,17 +1031,17 @@ mod tests {
     async fn test_307_redirect_loopback() {
         use axum::{http::StatusCode, routing::put, Router};
 
-        async fn be_route(
-            headers: axum::http::HeaderMap,
-            body: String,
-        ) -> (StatusCode, String) {
+        async fn be_route(headers: axum::http::HeaderMap, body: String) -> (StatusCode, String) {
             assert_eq!(
                 headers.get("authorization").and_then(|v| v.to_str().ok()),
                 Some("Basic cm9vdDo=")
             );
             assert!(headers.get("label").and_then(|v| v.to_str().ok()).is_some());
             assert!(body.starts_with('['));
-            (StatusCode::OK, "{\"Status\":\"Success\",\"NumberLoadedRows\":1}".to_string())
+            (
+                StatusCode::OK,
+                "{\"Status\":\"Success\",\"NumberLoadedRows\":1}".to_string(),
+            )
         }
         let app = Router::new()
             .route(
@@ -1004,7 +1055,9 @@ mod tests {
                 }),
             )
             .route("/api/telemetry/events/_be_load", put(be_route));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");

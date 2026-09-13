@@ -21,9 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 fn default_channel() -> String {
     "INDRA_CHANNEL".to_string()
@@ -184,7 +182,11 @@ impl SnowflakeSinkConfig {
 
     /// Rows endpoint for the configured channel.
     pub fn rows_url(&self) -> String {
-        format!("{}/v1/data/streaming/channels/{}/rows", self.base_url(), self.channel)
+        format!(
+            "{}/v1/data/streaming/channels/{}/rows",
+            self.base_url(),
+            self.channel
+        )
     }
 
     pub fn effective_batch_size(&self) -> usize {
@@ -196,7 +198,9 @@ impl SnowflakeSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -232,9 +236,7 @@ impl SnowflakeSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -251,7 +253,13 @@ impl SnowflakeSinkConfig {
     /// Resolve the table and normalize to uppercase (Snowflake
     /// unquoted-identifier convention). Anything outside
     /// `[A-Za-z0-9_]` becomes `_` so topic hierarchies stay valid.
-    pub fn resolve_table(&self, topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Result<String> {
+    pub fn resolve_table(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+    ) -> Result<String> {
         let vars = Self::template_vars(topic, payload, qos, millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -305,9 +313,8 @@ pub fn build_jwt_assertion(
         iat: now_secs,
         exp: now_secs.saturating_add(3_600),
     };
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|e| {
-        ConnectorError::Dispatch(format!("snowflake private key rejected: {e}"))
-    })?;
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+        .map_err(|e| ConnectorError::Dispatch(format!("snowflake private key rejected: {e}")))?;
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
@@ -430,9 +437,9 @@ impl SnowflakeTransport for MockSnowflakeTransport {
                 Err(ConnectorError::Connection(message))
             }
             Some(MockSnowflakeOutcome::HttpStatus(status)) => Err(match status {
-                429 | 503 => ConnectorError::Connection(format!(
-                    "mock snowflake throttled with {status}"
-                )),
+                429 | 503 => {
+                    ConnectorError::Connection(format!("mock snowflake throttled with {status}"))
+                }
                 _ => ConnectorError::Dispatch(format!("mock snowflake failed with {status}")),
             }),
         }
@@ -585,13 +592,13 @@ impl SnowflakeSink {
         qos: QoS,
         millis: i64,
     ) -> Result<(SnowflakeRow, usize)> {
-        let text = std::str::from_utf8(payload).map_err(|_| {
-            ConnectorError::Dispatch("snowflake payload must be UTF-8".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-            ConnectorError::Dispatch("snowflake payload must be JSON".to_string())
-        })?;
-        let table = self.config.resolve_table(topic.as_str(), payload, qos, millis)?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("snowflake payload must be UTF-8".to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|_| ConnectorError::Dispatch("snowflake payload must be JSON".to_string()))?;
+        let table = self
+            .config
+            .resolve_table(topic.as_str(), payload, qos, millis)?;
         let mut fields: Vec<(String, serde_json::Value)> = Vec::new();
         if self.config.column_mappings.is_empty() {
             match &value {
@@ -609,7 +616,9 @@ impl SnowflakeSink {
             columns.sort();
             for column in columns {
                 let template = &self.config.column_mappings[column];
-                let rendered = self.config.event_vars(topic.as_str(), payload, qos, millis, template)?;
+                let rendered =
+                    self.config
+                        .event_vars(topic.as_str(), payload, qos, millis, template)?;
                 // Rendered numbers/bools keep native types so payload
                 // passthrough preserves fidelity (raw text stays S).
                 let field = serde_json::from_str::<serde_json::Value>(&rendered)
@@ -621,7 +630,10 @@ impl SnowflakeSink {
         }
         fields.push(("_MQTT_TOPIC".to_string(), serde_json::json!(topic.as_str())));
         fields.push(("_MQTT_TIMESTAMP".to_string(), serde_json::json!(millis)));
-        let bytes: usize = fields.iter().map(|(k, v)| k.len() + v.to_string().len()).sum();
+        let bytes: usize = fields
+            .iter()
+            .map(|(k, v)| k.len() + v.to_string().len())
+            .sum();
         Ok((SnowflakeRow { table, fields }, bytes))
     }
 
@@ -641,7 +653,9 @@ impl SnowflakeSink {
         }
         let mut groups: Vec<(String, Vec<SnowflakeRowItem>)> = Vec::new();
         for row in &rows {
-            let item = SnowflakeRowItem { fields: row.fields.clone() };
+            let item = SnowflakeRowItem {
+                fields: row.fields.clone(),
+            };
             match groups.iter_mut().find(|(table, _)| table == &row.table) {
                 Some((_, items)) => items.push(item),
                 None => groups.push((row.table.clone(), vec![item])),
@@ -655,7 +669,11 @@ impl SnowflakeSink {
             let token = self.fresh_token()?;
             let mut outcome: Result<()> = Ok(());
             for (table, items) in &groups {
-                if let Err(e) = self.transport.insert_rows(table, items.clone(), &token).await {
+                if let Err(e) = self
+                    .transport
+                    .insert_rows(table, items.clone(), &token)
+                    .await
+                {
                     outcome = Err(e);
                     break;
                 }
@@ -663,7 +681,8 @@ impl SnowflakeSink {
             match outcome {
                 Ok(()) => {
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    self.sent_batches
+                        .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -759,8 +778,8 @@ impl super::Connector for SnowflakeConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Sink;
     use crate::test_rsa_keys::{PRIVATE_PEM, PUBLIC_PEM};
+    use crate::Sink;
 
     fn test_config() -> SnowflakeSinkConfig {
         SnowflakeSinkConfig {
@@ -775,7 +794,10 @@ mod tests {
             channel: "INDRA_CHANNEL".to_string(),
             column_mappings: HashMap::from([
                 ("device_id".to_string(), "${client_id}".to_string()),
-                ("temperature".to_string(), "${payload.temperature}".to_string()),
+                (
+                    "temperature".to_string(),
+                    "${payload.temperature}".to_string(),
+                ),
             ]),
             batch_size: Some(500),
             batch_bytes: Some(4_194_304),
@@ -786,9 +808,7 @@ mod tests {
         }
     }
 
-    fn test_sink(
-        config: SnowflakeSinkConfig,
-    ) -> (Arc<SnowflakeSink>, Arc<MockSnowflakeTransport>) {
+    fn test_sink(config: SnowflakeSinkConfig) -> (Arc<SnowflakeSink>, Arc<MockSnowflakeTransport>) {
         let transport = Arc::new(MockSnowflakeTransport::new());
         let sink = Arc::new(SnowflakeSink::new(config, transport.clone()).unwrap());
         (sink, transport)
@@ -815,7 +835,9 @@ mod tests {
         assert!(config.validate().is_err());
         config.table_template = test_config().table_template;
 
-        config.column_mappings.insert("".to_string(), "x".to_string());
+        config
+            .column_mappings
+            .insert("".to_string(), "x".to_string());
         assert!(config.validate().is_err());
         config.column_mappings.remove("");
 
@@ -931,9 +953,13 @@ mod tests {
             MockSnowflakeOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         sink.flush().await.unwrap();
         assert_eq!(transport.calls(), 2);
         assert_eq!(sink.sent_batches(), 1);
@@ -951,9 +977,13 @@ mod tests {
             MockSnowflakeOutcome::Ok,
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("401 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
@@ -975,9 +1005,13 @@ mod tests {
             MockSnowflakeOutcome::ConnectionError("pool busy".to_string()),
         ]);
 
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         // Default max_retries 4: 5 attempts, then restore + fail fast.
         let err = sink.flush().await.expect_err("pool must exhaust");
         assert!(matches!(err, ConnectorError::Connection(_)));

@@ -368,7 +368,9 @@ impl SpbValue {
             Self::Double(v) => serde_json::json!(*v),
             Self::Bool(v) => serde_json::json!(*v),
             Self::Text(v) => serde_json::json!(v),
-            Self::Bytes(v) => serde_json::json!(base64::engine::general_purpose::STANDARD.encode(v)),
+            Self::Bytes(v) => {
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(v))
+            }
             Self::Null => serde_json::Value::Null,
         }
     }
@@ -495,7 +497,9 @@ pub fn decode_metric(buf: &[u8]) -> Result<(SpbMetric, usize)> {
                 let (bytes, used) = read_len(cursor)?;
                 name = Some(
                     std::str::from_utf8(bytes)
-                        .map_err(|_| ConnectorError::Dispatch("sparkplug metric name not UTF-8".to_string()))?
+                        .map_err(|_| {
+                            ConnectorError::Dispatch("sparkplug metric name not UTF-8".to_string())
+                        })?
                         .to_string(),
                 );
                 cursor = &cursor[used..];
@@ -527,14 +531,20 @@ pub fn decode_metric(buf: &[u8]) -> Result<(SpbMetric, usize)> {
             }
             (12, WIRE_FIXED32) => {
                 if cursor.len() < 4 {
-                    return Err(ConnectorError::Dispatch("sparkplug truncated float".to_string()));
+                    return Err(ConnectorError::Dispatch(
+                        "sparkplug truncated float".to_string(),
+                    ));
                 }
-                raw.float_bits = Some(u32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]));
+                raw.float_bits = Some(u32::from_le_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3],
+                ]));
                 cursor = &cursor[4..];
             }
             (13, WIRE_FIXED64) => {
                 if cursor.len() < 8 {
-                    return Err(ConnectorError::Dispatch("sparkplug truncated double".to_string()));
+                    return Err(ConnectorError::Dispatch(
+                        "sparkplug truncated double".to_string(),
+                    ));
                 }
                 raw.double_bits = Some(u64::from_le_bytes([
                     cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
@@ -629,7 +639,9 @@ fn resolve_value(datatype: SpbDataType, raw: &RawMetricValue) -> Result<SpbValue
             if let Some(bytes) = &raw.text {
                 return Ok(SpbValue::Text(
                     std::str::from_utf8(bytes)
-                        .map_err(|_| ConnectorError::Dispatch("sparkplug string not UTF-8".to_string()))?
+                        .map_err(|_| {
+                            ConnectorError::Dispatch("sparkplug string not UTF-8".to_string())
+                        })?
                         .to_string(),
                 ));
             }
@@ -726,7 +738,9 @@ pub fn decode_payload(buf: &[u8]) -> Result<SpbPayload> {
                 let (bytes, used) = read_len(cursor)?;
                 payload.uuid = Some(
                     std::str::from_utf8(bytes)
-                        .map_err(|_| ConnectorError::Dispatch("sparkplug uuid not UTF-8".to_string()))?
+                        .map_err(|_| {
+                            ConnectorError::Dispatch("sparkplug uuid not UTF-8".to_string())
+                        })?
                         .to_string(),
                 );
                 cursor = &cursor[used..];
@@ -770,16 +784,25 @@ pub fn payload_to_json(topic: &SparkplugTopic, payload: &SpbPayload) -> serde_js
     }
     let mut doc = serde_json::Map::new();
     doc.insert("group_id".to_string(), serde_json::json!(topic.group_id));
-    doc.insert("edge_node_id".to_string(), serde_json::json!(topic.edge_node_id));
+    doc.insert(
+        "edge_node_id".to_string(),
+        serde_json::json!(topic.edge_node_id),
+    );
     if let Some(device) = &topic.device_id {
         doc.insert("device_id".to_string(), serde_json::json!(device));
     }
-    doc.insert("msg_type".to_string(), serde_json::json!(topic.message_type.as_str()));
+    doc.insert(
+        "msg_type".to_string(),
+        serde_json::json!(topic.message_type.as_str()),
+    );
     doc.insert(
         "timestamp".to_string(),
         serde_json::json!(payload.timestamp.unwrap_or(0)),
     );
-    doc.insert("seq".to_string(), serde_json::json!(payload.seq.unwrap_or(0)));
+    doc.insert(
+        "seq".to_string(),
+        serde_json::json!(payload.seq.unwrap_or(0)),
+    );
     doc.insert("metrics".to_string(), serde_json::Value::Object(metrics));
     if let Some(uuid) = &payload.uuid {
         doc.insert("uuid".to_string(), serde_json::json!(uuid));
@@ -808,9 +831,12 @@ pub fn payload_from_json(doc: &serde_json::Value) -> Result<SpbPayload> {
             .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok()),
         metrics: Vec::new(),
     };
-    let metrics = doc.get("metrics").and_then(|v| v.as_object()).ok_or_else(|| {
-        ConnectorError::Dispatch("sparkplug document needs a metrics object".to_string())
-    })?;
+    let metrics = doc
+        .get("metrics")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            ConnectorError::Dispatch("sparkplug document needs a metrics object".to_string())
+        })?;
     let stamp = payload.timestamp;
     for (name, value) in metrics {
         let (datatype, typed) = SpbValue::from_json(value);
@@ -1156,7 +1182,9 @@ impl SparkplugSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 }
 
@@ -1172,7 +1200,10 @@ pub struct SparkplugBSink {
 }
 
 impl SparkplugBSink {
-    pub fn new(config: SparkplugSinkConfig, transport: Arc<dyn SparkplugTransport>) -> Result<Self> {
+    pub fn new(
+        config: SparkplugSinkConfig,
+        transport: Arc<dyn SparkplugTransport>,
+    ) -> Result<Self> {
         config.validate()?;
         let linger = config.effective_linger();
         Ok(Self {
@@ -1212,7 +1243,14 @@ impl SparkplugBSink {
         let record_count = rows.len() as u64;
         let mut failed: Option<ConnectorError> = None;
         for (topic, payload) in &rows {
-            match self.transport.publish(&SparkplugFrame { topic: topic.clone(), payload: payload.clone() }).await {
+            match self
+                .transport
+                .publish(&SparkplugFrame {
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                })
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => {
                     failed = Some(e);
@@ -1258,7 +1296,10 @@ impl SparkplugBSink {
         })?;
         let encoded = encode_payload(&payload_from_json(&doc)?);
         let _ = parsed;
-        Ok(self.buffer.lock().push((topic.as_str().to_string(), encoded)))
+        Ok(self
+            .buffer
+            .lock()
+            .push((topic.as_str().to_string(), encoded)))
     }
 }
 
@@ -1348,15 +1389,15 @@ mod tests {
         assert_eq!(state.edge_node_id, "host-app");
 
         for bad in [
-            "spBv1.0/plant1/DDATA/edge7",       // device type, no device
-            "spBv1.0/plant1/NDATA/edge7/plc3",  // node type with device
-            "spBv1.0/plant1/BOGUS/edge7",       // unknown type
-            "spBv1.0/STATE",                    // short STATE
-            "spBv1.0/STATE/a/b",                // long STATE
-            "mqtt/plant1/NDATA/edge7",          // wrong namespace
-            "spBv1.0/plant1/NDATA/+",           // wildcard
-            "spBv1.0//NDATA/edge7",             // empty group
-            "spBv1.0/plant1/NDATA/",            // trailing slash
+            "spBv1.0/plant1/DDATA/edge7",      // device type, no device
+            "spBv1.0/plant1/NDATA/edge7/plc3", // node type with device
+            "spBv1.0/plant1/BOGUS/edge7",      // unknown type
+            "spBv1.0/STATE",                   // short STATE
+            "spBv1.0/STATE/a/b",               // long STATE
+            "mqtt/plant1/NDATA/edge7",         // wrong namespace
+            "spBv1.0/plant1/NDATA/+",          // wildcard
+            "spBv1.0//NDATA/edge7",            // empty group
+            "spBv1.0/plant1/NDATA/",           // trailing slash
         ] {
             assert!(SparkplugTopic::parse(bad).is_err(), "must reject {bad:?}");
         }
@@ -1364,7 +1405,12 @@ mod tests {
 
     #[test]
     fn test_varint_edges() {
-        for (value, bytes) in [(0u64, vec![0x00]), (127, vec![0x7F]), (128, vec![0x80, 0x01]), (300, vec![0xAC, 0x02])] {
+        for (value, bytes) in [
+            (0u64, vec![0x00]),
+            (127, vec![0x7F]),
+            (128, vec![0x80, 0x01]),
+            (300, vec![0xAC, 0x02]),
+        ] {
             let mut out = Vec::new();
             encode_varint(value, &mut out);
             assert_eq!(out, bytes);
@@ -1386,15 +1432,69 @@ mod tests {
             uuid: Some("uuid-1".to_string()),
             body: Some(b"raw".to_vec()),
             metrics: vec![
-                SpbMetric { name: Some("i8".into()), alias: None, timestamp: None, datatype: SpbDataType::Int8, value: SpbValue::Int(-5) },
-                SpbMetric { name: Some("i64".into()), alias: None, timestamp: None, datatype: SpbDataType::Int64, value: SpbValue::Int(i64::MIN) },
-                SpbMetric { name: Some("u64".into()), alias: None, timestamp: None, datatype: SpbDataType::UInt64, value: SpbValue::UInt(u64::MAX) },
-                SpbMetric { name: Some("f".into()), alias: None, timestamp: None, datatype: SpbDataType::Float, value: SpbValue::Float(0.5) },
-                SpbMetric { name: Some("d".into()), alias: None, timestamp: None, datatype: SpbDataType::Double, value: SpbValue::Double(101.3) },
-                SpbMetric { name: Some("b".into()), alias: None, timestamp: None, datatype: SpbDataType::Boolean, value: SpbValue::Bool(true) },
-                SpbMetric { name: Some("s".into()), alias: None, timestamp: None, datatype: SpbDataType::String, value: SpbValue::Text("héllo".to_string()) },
-                SpbMetric { name: Some("by".into()), alias: None, timestamp: None, datatype: SpbDataType::Bytes, value: SpbValue::Bytes(vec![0x00, 0xFF]) },
-                SpbMetric { name: Some("n".into()), alias: None, timestamp: None, datatype: SpbDataType::Unknown, value: SpbValue::Null },
+                SpbMetric {
+                    name: Some("i8".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Int8,
+                    value: SpbValue::Int(-5),
+                },
+                SpbMetric {
+                    name: Some("i64".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Int64,
+                    value: SpbValue::Int(i64::MIN),
+                },
+                SpbMetric {
+                    name: Some("u64".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::UInt64,
+                    value: SpbValue::UInt(u64::MAX),
+                },
+                SpbMetric {
+                    name: Some("f".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Float,
+                    value: SpbValue::Float(0.5),
+                },
+                SpbMetric {
+                    name: Some("d".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Double,
+                    value: SpbValue::Double(101.3),
+                },
+                SpbMetric {
+                    name: Some("b".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Boolean,
+                    value: SpbValue::Bool(true),
+                },
+                SpbMetric {
+                    name: Some("s".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::String,
+                    value: SpbValue::Text("héllo".to_string()),
+                },
+                SpbMetric {
+                    name: Some("by".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Bytes,
+                    value: SpbValue::Bytes(vec![0x00, 0xFF]),
+                },
+                SpbMetric {
+                    name: Some("n".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Unknown,
+                    value: SpbValue::Null,
+                },
             ],
         };
         let bytes = encode_payload(&payload);
@@ -1463,15 +1563,22 @@ mod tests {
         let outcome = machine.ingest("spBv1.0/g1/NDATA/e1", &data).unwrap();
         assert!(!outcome.online);
         assert!(outcome.anomalies.contains(&SpbAnomaly::OfflineData));
-        assert!(outcome.anomalies.contains(&SpbAnomaly::UnknownAlias { alias: 1 }));
+        assert!(outcome
+            .anomalies
+            .contains(&SpbAnomaly::UnknownAlias { alias: 1 }));
 
         // Birth brings the node online and caches aliases.
-        let outcome = machine.ingest("spBv1.0/g1/NBIRTH/e1", &birth_payload(0)).unwrap();
+        let outcome = machine
+            .ingest("spBv1.0/g1/NBIRTH/e1", &birth_payload(0))
+            .unwrap();
         assert!(outcome.online);
         assert!(outcome.anomalies.is_empty());
         let state = machine.node_state("g1", "e1").unwrap();
         assert!(state.online);
-        assert_eq!(state.aliases.get(&1).map(String::as_str), Some("Temperature"));
+        assert_eq!(
+            state.aliases.get(&1).map(String::as_str),
+            Some("Temperature")
+        );
 
         // Aliased data now resolves without anomalies.
         let data_seq1 = encode_payload(&SpbPayload {
@@ -1493,7 +1600,9 @@ mod tests {
         let topic = SparkplugTopic::parse("spBv1.0/g1/NDATA/e1").unwrap();
         let decoded = decode_payload(&data_seq1).unwrap();
         assert_eq!(
-            machine.resolve_metric_name(&topic, &decoded.metrics[0]).as_deref(),
+            machine
+                .resolve_metric_name(&topic, &decoded.metrics[0])
+                .as_deref(),
             Some("Temperature")
         );
 
@@ -1514,8 +1623,12 @@ mod tests {
             .expect_err("device birth needs a node");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
 
-        machine.ingest("spBv1.0/g1/NBIRTH/e1", &birth_payload(0)).unwrap();
-        let outcome = machine.ingest("spBv1.0/g1/DBIRTH/e1/d1", &birth_payload(0)).unwrap();
+        machine
+            .ingest("spBv1.0/g1/NBIRTH/e1", &birth_payload(0))
+            .unwrap();
+        let outcome = machine
+            .ingest("spBv1.0/g1/DBIRTH/e1/d1", &birth_payload(0))
+            .unwrap();
         assert!(outcome.online);
         assert!(machine.device_state("g1", "e1", "d1").unwrap().online);
 
@@ -1529,20 +1642,38 @@ mod tests {
                 metrics: vec![],
             })
         };
-        let outcome = machine.ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(1)).unwrap();
+        let outcome = machine
+            .ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(1))
+            .unwrap();
         assert!(outcome.anomalies.is_empty());
-        let outcome = machine.ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(4)).unwrap();
-        assert_eq!(outcome.anomalies, vec![SpbAnomaly::SequenceGap { expected: 2, got: 4 }]);
-        let outcome = machine.ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(300)).unwrap();
-        assert!(outcome.anomalies.contains(&SpbAnomaly::SequenceOutOfRange { got: 300 }));
+        let outcome = machine
+            .ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(4))
+            .unwrap();
+        assert_eq!(
+            outcome.anomalies,
+            vec![SpbAnomaly::SequenceGap {
+                expected: 2,
+                got: 4
+            }]
+        );
+        let outcome = machine
+            .ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(300))
+            .unwrap();
+        assert!(outcome
+            .anomalies
+            .contains(&SpbAnomaly::SequenceOutOfRange { got: 300 }));
 
         // Wrap: drive to 255 then 0.
-        machine.ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(255)).unwrap();
-        let outcome = machine.ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(0)).unwrap();
-        assert!(!outcome.anomalies.iter().any(|anomaly| matches!(
-            anomaly,
-            SpbAnomaly::SequenceGap { expected: 0, .. }
-        )));
+        machine
+            .ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(255))
+            .unwrap();
+        let outcome = machine
+            .ingest("spBv1.0/g1/DDATA/e1/d1", &data_with_seq(0))
+            .unwrap();
+        assert!(!outcome
+            .anomalies
+            .iter()
+            .any(|anomaly| matches!(anomaly, SpbAnomaly::SequenceGap { expected: 0, .. })));
     }
 
     #[test]
@@ -1622,7 +1753,11 @@ mod tests {
 
         // Non-Sparkplug topics and non-JSON payloads are rejected.
         assert!(sink
-            .send(&Topic::new("sensors/t1").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
+            .send(
+                &Topic::new("sensors/t1").unwrap(),
+                &Bytes::from("{}"),
+                QoS::AtMostOnce
+            )
             .await
             .is_err());
         assert!(sink

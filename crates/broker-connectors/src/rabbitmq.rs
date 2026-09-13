@@ -263,14 +263,20 @@ struct AmqpEndpoint {
 /// guest, 5672, `/`; `%2f` decodes to `/` in the vhost).
 fn parse_endpoint(endpoint: &str) -> Result<AmqpEndpoint> {
     let rest = endpoint.strip_prefix("amqp://").ok_or_else(|| {
-        ConnectorError::Dispatch(format!("rabbitmq endpoint must start with amqp://: {endpoint:?}"))
+        ConnectorError::Dispatch(format!(
+            "rabbitmq endpoint must start with amqp://: {endpoint:?}"
+        ))
     })?;
     let (authority, vhost_raw) = match rest.split_once('/') {
         Some((authority, vhost)) => (authority, vhost),
         None => (rest, ""),
     };
     let vhost = vhost_raw.replace("%2f", "/").replace("%2F", "/");
-    let vhost = if vhost.is_empty() { "/".to_string() } else { vhost };
+    let vhost = if vhost.is_empty() {
+        "/".to_string()
+    } else {
+        vhost
+    };
     let (credentials, hostport) = match authority.rsplit_once('@') {
         Some((credentials, hostport)) => (credentials, hostport),
         None => ("guest:guest", authority),
@@ -339,7 +345,11 @@ async fn read_frame(stream: &mut TcpStream) -> Result<(u8, u16, Vec<u8>)> {
             end[0]
         )));
     }
-    Ok((header[0], u16::from_be_bytes([header[1], header[2]]), payload))
+    Ok((
+        header[0],
+        u16::from_be_bytes([header[1], header[2]]),
+        payload,
+    ))
 }
 
 async fn write_frame(stream: &mut TcpStream, frame: &AmqpFrame) -> Result<()> {
@@ -354,11 +364,7 @@ async fn write_frame(stream: &mut TcpStream, frame: &AmqpFrame) -> Result<()> {
     Ok(())
 }
 
-async fn expect_method(
-    stream: &mut TcpStream,
-    class_id: u16,
-    method_id: u16,
-) -> Result<Vec<u8>> {
+async fn expect_method(stream: &mut TcpStream, class_id: u16, method_id: u16) -> Result<Vec<u8>> {
     let (frame_type, _channel, payload) = read_frame(stream).await?;
     if frame_type != FRAME_METHOD || payload.len() < 4 {
         return Err(ConnectorError::Connection(format!(
@@ -449,9 +455,7 @@ impl TcpRabbitTransport {
                     self.endpoint.host, self.endpoint.port
                 ))
             })?
-            .map_err(|e| {
-                ConnectorError::Connection(format!("amqp connect failed: {e}"))
-            })?;
+            .map_err(|e| ConnectorError::Connection(format!("amqp connect failed: {e}")))?;
             let mut fresh = RabbitConn { stream };
             self.handshake(&mut fresh.stream).await?;
             *guard = Some(fresh);
@@ -522,9 +526,18 @@ impl Sink for RabbitMqSink {
             delivery_mode: self.config.delivery_mode,
             timestamp_secs: now_secs(),
             headers: vec![
-                ("mqtt.topic".to_string(), FieldValue::Str(topic.as_str().to_string())),
-                ("mqtt.qos".to_string(), FieldValue::I32(u8::from(qos) as i32)),
-                ("mqtt.timestamp".to_string(), FieldValue::Timestamp(now_secs())),
+                (
+                    "mqtt.topic".to_string(),
+                    FieldValue::Str(topic.as_str().to_string()),
+                ),
+                (
+                    "mqtt.qos".to_string(),
+                    FieldValue::I32(u8::from(qos) as i32),
+                ),
+                (
+                    "mqtt.timestamp".to_string(),
+                    FieldValue::Timestamp(now_secs()),
+                ),
             ],
             body: payload.clone(),
         };
@@ -684,7 +697,9 @@ mod tests {
     /// captures the published frames for byte-level assertions.
     #[tokio::test]
     async fn test_tcp_transport_handshake_and_publish() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
         let captured_rx = captured.clone();
@@ -706,15 +721,16 @@ mod tests {
             send_method(&mut stream, 0, 10, 41, &[0]).await; // Open-Ok
             let _ = read_method(&mut stream).await; // Channel.Open
             send_method(&mut stream, 1, 20, 11, &[0, 0, 0, 0]).await; // Open-Ok
-            // Publish triple: capture raw bytes.
+                                                                      // Publish triple: capture raw bytes.
             for _ in 0..3 {
                 let raw = read_raw_frame(&mut stream).await;
                 captured_rx.lock().extend_from_slice(&raw);
             }
         });
 
-        let transport = TcpRabbitTransport::new(&format!("amqp://guest:guest@127.0.0.1:{port}/%2f"))
-            .expect("valid endpoint");
+        let transport =
+            TcpRabbitTransport::new(&format!("amqp://guest:guest@127.0.0.1:{port}/%2f"))
+                .expect("valid endpoint");
         let sink = RabbitMqSink::new(test_config(), Arc::new(transport)).expect("valid sink");
         sink.send(
             &Topic::new("a/b").unwrap(),
@@ -741,11 +757,20 @@ mod tests {
         assert!(finished, "fake broker never consumed the publish");
         server.await.expect("fake broker task");
         let wire = captured.lock().clone();
-        assert!(wire.windows(10).any(|w| w == b"sensor.a.b"), "routing key dots");
+        assert!(
+            wire.windows(10).any(|w| w == b"sensor.a.b"),
+            "routing key dots"
+        );
         let payload = br#"{ "v": 1 }"#;
-        assert!(wire.windows(payload.len()).any(|w| w == payload), "body bytes");
+        assert!(
+            wire.windows(payload.len()).any(|w| w == payload),
+            "body bytes"
+        );
         assert!(wire.windows(10).any(|w| w == b"mqtt.topic"), "header table");
-        assert!(wire.iter().filter(|b| **b == FRAME_END).count() >= 3, "frame ends");
+        assert!(
+            wire.iter().filter(|b| **b == FRAME_END).count() >= 3,
+            "frame ends"
+        );
     }
 
     fn start_args() -> Vec<u8> {

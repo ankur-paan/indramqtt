@@ -2,8 +2,8 @@ pub mod license;
 pub use license::{ClusterLicense, LicensePayload, LicenseStatus};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use broker_protocol::{QoS, Topic, TopicFilter};
+use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,7 +63,13 @@ pub trait RoutingPlane: Send + Sync {
     async fn resolve_route(&self, topic: &Topic) -> Result<HashSet<NodeId>>;
 
     /// Publish a message once to a target node
-    async fn forward_message(&self, target: &NodeId, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()>;
+    async fn forward_message(
+        &self,
+        target: &NodeId,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+    ) -> Result<()>;
 
     /// Receive the next message forwarded to this node (`None` when the
     /// plane is shut down).
@@ -333,11 +339,7 @@ impl RoutingPlane for ChannelRoutingPlane {
         payload: &Bytes,
         qos: QoS,
     ) -> Result<()> {
-        let tx = self
-            .peers
-            .read()
-            .get(target)
-            .map(|peer| peer.tx.clone());
+        let tx = self.peers.read().get(target).map(|peer| peer.tx.clone());
         match tx {
             Some(tx) => tx
                 .send(ClusterMessage {
@@ -395,7 +397,10 @@ mod tests {
         // Revoking unknown entries is a no-op.
         table.remove_route(&filter("nope/#"), &node("node-zzz"));
         table.remove_route(&filter("sensors/+"), &node("node-zzz"));
-        assert_eq!(table.resolve_nodes(&topic("sensors/temp")), HashSet::from([node("node-b")]));
+        assert_eq!(
+            table.resolve_nodes(&topic("sensors/temp")),
+            HashSet::from([node("node-b")])
+        );
     }
 
     #[tokio::test]
@@ -463,10 +468,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_node_holds_directory_and_membership() {
-        let membership: Arc<dyn ClusterMembership> = Arc::new(StaticMembership::new(
-            node("n1"),
-            vec![node("n1")],
-        ));
+        let membership: Arc<dyn ClusterMembership> =
+            Arc::new(StaticMembership::new(node("n1"), vec![node("n1")]));
         let member = ClusterNode::new(node("n1"), membership.clone());
         assert_eq!(member.node_id, node("n1"));
         assert_eq!(member.route_table.local_node_id(), &node("n1"));

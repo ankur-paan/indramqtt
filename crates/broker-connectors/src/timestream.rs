@@ -21,9 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
-};
+use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 pub const TIMESTREAM_TARGET: &str = "Timestream_20181101.WriteRecords";
 pub const TIMESTREAM_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
@@ -223,7 +221,9 @@ impl TimestreamSinkConfig {
     }
 
     pub fn effective_linger(&self) -> Duration {
-        self.linger_ms.map(Duration::from_millis).unwrap_or(Duration::MAX)
+        self.linger_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX)
     }
 
     /// Template variables for one event.
@@ -259,9 +259,7 @@ impl TimestreamSinkConfig {
                 let name = &after[..close];
                 let value = match doc.get(name) {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => {
-                        scalar.to_string()
-                    }
+                    Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
                     _ => String::new(),
                 };
                 vars.push((format!("payload.{name}"), value));
@@ -382,8 +380,11 @@ pub fn classify_write_response(status: u16, body: &[u8]) -> Result<TimestreamOut
         .unwrap_or_default();
     let short_fault = fault.rsplit(['#', ':']).next().unwrap_or_default();
     match short_fault {
-        "ThrottlingException" | "Throttling" | "TooManyRequestsException"
-        | "InternalServerError" | "InternalFailure" => Err(ConnectorError::Connection(format!(
+        "ThrottlingException"
+        | "Throttling"
+        | "TooManyRequestsException"
+        | "InternalServerError"
+        | "InternalFailure" => Err(ConnectorError::Connection(format!(
             "timestream throttled with {fault}"
         ))),
         "RejectedRecordsException" => {
@@ -432,7 +433,10 @@ pub fn sign_write_records(
     let payload_hash = super::sha256_hex(body);
     let date = super::amz_date(millis);
     let mut headers = vec![
-        ("content-type".to_string(), "application/x-amz-json-1.0".to_string()),
+        (
+            "content-type".to_string(),
+            "application/x-amz-json-1.0".to_string(),
+        ),
         ("host".to_string(), host.to_string()),
         ("x-amz-date".to_string(), date.clone()),
         (
@@ -477,10 +481,7 @@ pub enum MockTimestreamOutcome {
 
 #[async_trait]
 pub trait TimestreamTransport: Send + Sync {
-    async fn write_records(
-        &self,
-        req: &TimestreamWriteRequest,
-    ) -> Result<TimestreamWriteResponse>;
+    async fn write_records(&self, req: &TimestreamWriteRequest) -> Result<TimestreamWriteResponse>;
 }
 
 /// In-memory transport with scripted outcomes (tests, dry runs).
@@ -512,10 +513,7 @@ impl MockTimestreamTransport {
 
 #[async_trait]
 impl TimestreamTransport for MockTimestreamTransport {
-    async fn write_records(
-        &self,
-        req: &TimestreamWriteRequest,
-    ) -> Result<TimestreamWriteResponse> {
+    async fn write_records(&self, req: &TimestreamWriteRequest) -> Result<TimestreamWriteResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(TimestreamWriteRequest {
             database: req.database.clone(),
@@ -577,10 +575,7 @@ impl HttpTimestreamTransport {
 
 #[async_trait]
 impl TimestreamTransport for HttpTimestreamTransport {
-    async fn write_records(
-        &self,
-        req: &TimestreamWriteRequest,
-    ) -> Result<TimestreamWriteResponse> {
+    async fn write_records(&self, req: &TimestreamWriteRequest) -> Result<TimestreamWriteResponse> {
         let body = render_write_records_body(&req.database, &req.table, &req.records);
         let millis = now_millis();
         let (auth, date) = sign_write_records(
@@ -710,7 +705,13 @@ impl TimestreamSink {
         for (name, template) in &self.config.dimensions {
             dimensions.push((
                 name.clone(),
-                self.config.event_vars(&row.topic, &row.payload, qos_from(row.qos), row.millis, template)?,
+                self.config.event_vars(
+                    &row.topic,
+                    &row.payload,
+                    qos_from(row.qos),
+                    row.millis,
+                    template,
+                )?,
             ));
         }
         dimensions.push(("topic".to_string(), row.topic.clone()));
@@ -724,8 +725,7 @@ impl TimestreamSink {
             )?,
             None => "metrics".to_string(),
         };
-        let mut measure_names: Vec<&String> =
-            self.config.multi_measure_mappings.keys().collect();
+        let mut measure_names: Vec<&String> = self.config.multi_measure_mappings.keys().collect();
         measure_names.sort();
         let mut measures = Vec::new();
         for field in measure_names {
@@ -873,24 +873,25 @@ impl TimestreamSink {
 /// Render one JSON scalar in the declared measure type.
 fn json_scalar_text(value: &serde_json::Value, measure_type: &str) -> Result<String> {
     match (value, measure_type) {
-        (serde_json::Value::Number(n), "DOUBLE") => n
-            .as_f64()
-            .map(|v| v.to_string())
-            .ok_or_else(|| ConnectorError::Dispatch("timestream DOUBLE needs a number".to_string())),
-        (serde_json::Value::Number(n), "BIGINT") => n
-            .as_i64()
-            .map(|v| v.to_string())
-            .ok_or_else(|| ConnectorError::Dispatch("timestream BIGINT needs an integer".to_string())),
+        (serde_json::Value::Number(n), "DOUBLE") => {
+            n.as_f64().map(|v| v.to_string()).ok_or_else(|| {
+                ConnectorError::Dispatch("timestream DOUBLE needs a number".to_string())
+            })
+        }
+        (serde_json::Value::Number(n), "BIGINT") => {
+            n.as_i64().map(|v| v.to_string()).ok_or_else(|| {
+                ConnectorError::Dispatch("timestream BIGINT needs an integer".to_string())
+            })
+        }
         (serde_json::Value::Bool(v), "BOOLEAN") => Ok(v.to_string()),
         (serde_json::Value::String(v), "VARCHAR") => Ok(v.clone()),
         (serde_json::Value::Number(n), "VARCHAR") => Ok(n.to_string()),
         (serde_json::Value::Bool(v), "VARCHAR") => Ok(v.to_string()),
-        (serde_json::Value::Number(n), "TIMESTAMP") => n
-            .as_i64()
-            .map(|v| v.to_string())
-            .ok_or_else(|| {
+        (serde_json::Value::Number(n), "TIMESTAMP") => {
+            n.as_i64().map(|v| v.to_string()).ok_or_else(|| {
                 ConnectorError::Dispatch("timestream TIMESTAMP needs epoch millis".to_string())
-            }),
+            })
+        }
         (serde_json::Value::String(v), "TIMESTAMP") => Ok(v.clone()),
         _ => Err(ConnectorError::Dispatch(format!(
             "timestream value {value} does not fit {measure_type}"
@@ -1003,11 +1004,15 @@ mod tests {
         assert!(config.validate().is_err());
         config.dimensions.remove("");
 
-        config.dimensions.insert("bad".to_string(), "${nope}".to_string());
+        config
+            .dimensions
+            .insert("bad".to_string(), "${nope}".to_string());
         assert!(config.validate().is_err());
         config.dimensions.remove("bad");
 
-        config.multi_measure_mappings.insert("x".to_string(), "FLOAT".to_string());
+        config
+            .multi_measure_mappings
+            .insert("x".to_string(), "FLOAT".to_string());
         assert!(config.validate().is_err());
         config.multi_measure_mappings.remove("x");
 
@@ -1022,7 +1027,10 @@ mod tests {
 
     #[test]
     fn test_time_unit_rendering() {
-        assert_eq!(TimestreamTimeUnit::Milliseconds.render(1_789_211_889_123), "1789211889123");
+        assert_eq!(
+            TimestreamTimeUnit::Milliseconds.render(1_789_211_889_123),
+            "1789211889123"
+        );
         assert_eq!(
             TimestreamTimeUnit::Microseconds.render(1_789_211_889_123),
             "1789211889123000"
@@ -1042,7 +1050,11 @@ mod tests {
                 ("device_id".to_string(), "sensor-1".to_string()),
             ],
             measure_name: "sensor_metrics".to_string(),
-            measures: vec![("temperature".to_string(), "24.5".to_string(), "DOUBLE".to_string())],
+            measures: vec![(
+                "temperature".to_string(),
+                "24.5".to_string(),
+                "DOUBLE".to_string(),
+            )],
             time: "1726160000000".to_string(),
             time_unit: TimestreamTimeUnit::Milliseconds,
         };
@@ -1072,7 +1084,10 @@ mod tests {
         )
         .is_err());
         assert!(matches!(
-            classify_write_response(400, br#"{"__type":"com.amazonaws.timestream#ValidationException"}"#),
+            classify_write_response(
+                400,
+                br#"{"__type":"com.amazonaws.timestream#ValidationException"}"#
+            ),
             Err(ConnectorError::Dispatch(_))
         ));
     }
@@ -1151,9 +1166,13 @@ mod tests {
 
         let topic = Topic::new("t").unwrap();
         for temp in [20.5, 21.5] {
-            sink.send(&topic, &Bytes::from(format!("{{\"temperature\":{temp}}}")), QoS::AtMostOnce)
-                .await
-                .unwrap();
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{\"temperature\":{temp}}}")),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
         }
         sink.flush().await.unwrap();
 
@@ -1218,9 +1237,13 @@ mod tests {
         // Payload without mapped fields: the record would carry no
         // measures, so buffering still succeeds but flush fails loudly.
         let (sink, _) = test_sink(test_config());
-        sink.send(&Topic::new("t").unwrap(), &Bytes::from("{}"), QoS::AtMostOnce)
-            .await
-            .unwrap();
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
         let err = sink.flush().await.expect_err("empty measures must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
     }

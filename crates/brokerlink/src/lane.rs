@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use crate::error::Result;
 use crate::frame::BrokerFrame;
 use crate::transport::BrokerLinkTransport;
+use std::sync::Arc;
 
 /// Multi-lane dispatcher for parallel BrokerLink IPC channels.
 ///
@@ -15,7 +15,10 @@ pub struct LaneDispatcher {
 
 impl LaneDispatcher {
     pub fn new(lanes: Vec<Arc<dyn BrokerLinkTransport>>) -> Self {
-        assert!(!lanes.is_empty(), "LaneDispatcher requires at least one lane");
+        assert!(
+            !lanes.is_empty(),
+            "LaneDispatcher requires at least one lane"
+        );
         Self { lanes }
     }
 
