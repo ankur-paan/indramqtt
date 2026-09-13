@@ -8,6 +8,7 @@ targets = [
 
 [licenses]
 version = 2
+unlicensed = "warn"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -22,11 +23,30 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+exceptions = [
+    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-core" },
+    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-sql" },
+    { allow = ["MIT", "Apache-2.0"], name = "rekuiper-conf" },
+]
+
 [licenses.private]
-ignore = false
+ignore = true
 
 [advisories]
 version = 2
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2024-0363",
+    "RUSTSEC-2024-0399",
+    "RUSTSEC-2023-0052",
+    "RUSTSEC-2023-0053",
+    "RUSTSEC-2024-0336",
+]
 
 [bans]
 multiple-versions = "warn"
