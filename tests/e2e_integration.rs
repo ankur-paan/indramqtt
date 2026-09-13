@@ -8,7 +8,7 @@
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
-use broker_session::{ClientSession, SessionManager};
+use broker_session::{QueuedMessage, SessionManager};
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +26,10 @@ impl BrokerSink for TestBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
-        self.published.lock().unwrap().push((topic, payload, qos, retain));
+        self.published
+            .lock()
+            .unwrap()
+            .push((topic, payload, qos, retain));
         Ok(())
     }
 }
@@ -73,7 +76,12 @@ async fn test_e2e_router_and_rules_pipeline() {
 
     assert_eq!(router.matches(&normal_topic).len(), 1);
     engine
-        .dispatch_ingress(&normal_topic, &normal_payload, QoS::AtLeastOnce, &broker_sink)
+        .dispatch_ingress(
+            &normal_topic,
+            &normal_payload,
+            QoS::AtLeastOnce,
+            &broker_sink,
+        )
         .await;
     assert_eq!(sink.published.lock().unwrap().len(), 0);
 
@@ -100,24 +108,32 @@ fn test_e2e_session_lifecycle_and_offline_queue() {
     let session_mgr = SessionManager::new_with_limits(Some(50));
     let client_id = "edge-station-42";
 
-    // Create or resume clean session
-    let mut session = ClientSession::new(client_id, false);
-    assert_eq!(session.client_id(), client_id);
+    // Create durable session
+    let (session, present) = session_mgr.get_or_create(client_id, false);
+    assert!(!present);
+    assert_eq!(session.client_id, client_id);
 
     // Queue offline messages
     for i in 1..=20 {
         let topic = Topic::new(format!("downstream/job-{i}")).unwrap();
         let payload = Bytes::from(format!("payload-{i}"));
-        session.queue_offline(topic, payload, QoS::AtLeastOnce, false);
+        session.push_offline(QueuedMessage {
+            topic,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload,
+        });
     }
-    assert_eq!(session.offline_queue_len(), 20);
+    assert_eq!(session.offline_len(), 20);
 
-    // Register session into session manager
-    session_mgr.insert(session);
-    assert!(session_mgr.contains(client_id));
+    // Reconnecting retrieves the same session with all 20 queued messages
+    let (resumed, present2) = session_mgr.get_or_create(client_id, false);
+    assert!(present2);
+    assert_eq!(resumed.id, session.id);
+    assert_eq!(resumed.offline_len(), 20);
 
-    // Retrieve and verify session state
-    let retrieved = session_mgr.get(client_id).expect("session exists");
-    let session_lock = retrieved.read();
-    assert_eq!(session_lock.offline_queue_len(), 20);
+    // Drain offline messages on reconnection
+    let drained = resumed.drain_offline();
+    assert_eq!(drained.len(), 20);
+    assert_eq!(resumed.offline_len(), 0);
 }

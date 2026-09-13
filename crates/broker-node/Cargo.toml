@@ -9,6 +9,14 @@ repository.workspace = true
 name = "indramqtt"
 path = "src/main.rs"
 
+[[test]]
+name = "e2e_integration"
+path = "../../tests/e2e_integration.rs"
+
+[[test]]
+name = "soak_chaos_suite"
+path = "../../tests/soak_chaos_suite.rs"
+
 [dependencies]
 brokerlink = { workspace = true }
 broker-protocol = { workspace = true }
