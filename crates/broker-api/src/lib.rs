@@ -868,6 +868,95 @@ async fn build_connector(
                 Ok(("opc_ua".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            "azure_blob" | "azureblob" | "azblob" => {
+                let config: broker_connectors::AzureBlobSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid azure_blob config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid azure_blob config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpAzureBlobTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid azure_blob transport: {e}"))?,
+                );
+                let sink = broker_connectors::AzureBlobSink::new(config, transport)
+                    .map_err(|e| format!("invalid azure_blob sink: {e}"))?;
+                Ok(("azure_blob".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "tablestore" | "ots" | "alibaba_tablestore" => {
+                let config: broker_connectors::TablestoreSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid tablestore config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid tablestore config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpTablestoreTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid tablestore transport: {e}"))?,
+                );
+                let sink = broker_connectors::TablestoreSink::new(config, transport)
+                    .map_err(|e| format!("invalid tablestore sink: {e}"))?;
+                Ok(("tablestore".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "s3_tables" | "s3tables" | "iceberg" => {
+                let config: broker_connectors::S3TablesSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid s3_tables config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid s3_tables config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::HttpS3TablesTransport::new(
+                        &config,
+                        reqwest::Client::new(),
+                    )
+                    .map_err(|e| format!("invalid s3_tables transport: {e}"))?,
+                );
+                let sink = broker_connectors::S3TablesSink::new(config, transport)
+                    .map_err(|e| format!("invalid s3_tables sink: {e}"))?;
+                Ok(("s3_tables".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "confluent" | "confluent_kafka" | "confluent_cloud" => {
+                let config: broker_connectors::ConfluentKafkaConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid confluent config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid confluent config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpConfluentTransport::new(&config)
+                        .map_err(|e| format!("invalid confluent transport: {e}"))?,
+                );
+                let sink = broker_connectors::ConfluentKafkaSink::new(config, transport)
+                    .map_err(|e| format!("invalid confluent sink: {e}"))?;
+                Ok(("confluent".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
+            "rocketmq" | "rocket_mq" | "apache_rocketmq" => {
+                let config: broker_connectors::RocketMqSinkConfig =
+                    serde_json::from_value(req.config.clone())
+                        .map_err(|e| format!("invalid rocketmq config: {e}"))?;
+                config
+                    .validate()
+                    .map_err(|e| format!("invalid rocketmq config: {e}"))?;
+                let transport = std::sync::Arc::new(
+                    broker_connectors::TcpRocketMqTransport::new(&config)
+                        .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
+                );
+                let sink = broker_connectors::RocketMqSink::new(config, transport)
+                    .map_err(|e| format!("invalid rocketmq sink: {e}"))?;
+                Ok(("rocketmq".to_string(), std::sync::Arc::new(sink)
+                    as std::sync::Arc<dyn broker_connectors::Sink>))
+            }
             "mongodb" | "mongo" | "documentdb" => {
                 let config: broker_connectors::MongoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1650,6 +1739,16 @@ mod tests {
             "value=\"doris\"",
             "value=\"bigquery\"",
             "value=\"redshift\"",
+            "value=\"azure_blob\"",
+            "value=\"tablestore\"",
+            "value=\"s3_tables\"",
+            "value=\"confluent\"",
+            "value=\"rocketmq\"",
+            "conn-azblob-account",
+            "conn-ots-endpoint",
+            "conn-s3t-arn",
+            "conn-cfl-servers",
+            "conn-rmq-endpoints",
             "conn-hook-url",
             "conn-bridge-address",
             "conn-disk-dir",
@@ -2512,17 +2611,118 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("opc_ua"));
 
+        // Azure Blob sink: validated without touching Azure.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "azblob-1",
+                       "kind": "azure_blob",
+                       "config": {"account_name": "mydeviceblobs",
+                                  "container_name": "telemetry",
+                                  "auth": {"type": "sharedkey",
+                                            "account_key": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="},
+                                  "blob_path_template": "telemetry/year=${date.year}/${batch_id}.json",
+                                  "compression": "none",
+                                  "max_records_per_blob": 10000,
+                                  "max_bytes_per_blob": 10485760,
+                                  "flush_interval_secs": 60}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("azure_blob"));
+
+        // Tablestore sink: validated without touching Alibaba Cloud.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "ots-1",
+                       "kind": "tablestore",
+                       "config": {"endpoint": "https://test-instance.cn-hangzhou.ots.aliyuncs.com",
+                                  "instance_name": "test-instance",
+                                  "table_name": "telemetry",
+                                  "access_key_id": "test-key-id",
+                                  "access_key_secret": "test-secret",
+                                  "primary_keys": [{"name": "device_id",
+                                                    "source": "${client_id}",
+                                                    "data_type": "string"}],
+                                  "attribute_columns": [{"name": "temperature",
+                                                         "source": "${payload.temperature}",
+                                                         "data_type": "double"}],
+                                  "batch_size": 200}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("tablestore"));
+
+        // S3 Tables sink: validated without touching AWS.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "s3t-1",
+                       "kind": "s3_tables",
+                       "config": {"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry-bucket",
+                                  "namespace": "production_iot",
+                                  "table_name": "device_events",
+                                  "region": "us-east-1",
+                                  "access_key_id": "AKID",
+                                  "secret_access_key": "secret",
+                                  "partition_spec": [{"source_name": "date", "transform": "day"}],
+                                  "target_format": "ndjsoncompressed",
+                                  "batch_size": 1000}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("s3_tables"));
+
+        // Confluent Cloud sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "confluent-1",
+                       "kind": "confluent",
+                       "config": {"bootstrap_servers": ["pkc-test.us-east-1.aws.confluent.cloud:9092"],
+                                  "api_key": "confluent-key",
+                                  "api_secret": "confluent-secret",
+                                  "auth_mechanism": "plain",
+                                  "topic_template": "telemetry-${topic_segment_1}",
+                                  "partition_key_template": "${client_id}",
+                                  "partitions": 12,
+                                  "batch_size": 500}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("confluent"));
+
+        // RocketMQ sink: validated without opening any socket.
+        let (status, created) = server
+            .post(
+                "/api/v1/connectors",
+                json!({"id": "rmq-1",
+                       "kind": "rocketmq",
+                       "config": {"endpoints": ["127.0.0.1:8081"],
+                                  "topic": "rocket-telemetry",
+                                  "tag_template": "${topic_segment_2}",
+                                  "access_key": "rocket-key",
+                                  "secret_key": "rocket-secret",
+                                  "batch_size": 128}}),
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["kind"], json!("rocketmq"));
+
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
              json!([{"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
+                    {"id": "azblob-1", "kind": "azure_blob", "tier": "enterprise"},
                     {"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
                     {"id": "azure-iot-1", "kind": "azure_iot", "tier": "enterprise"},
                    {"id": "bigquery-1", "kind": "bigquery", "tier": "enterprise"},
                    {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
                    {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
-                   {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
+                    {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
+                    {"id": "confluent-1", "kind": "confluent", "tier": "enterprise"},
                    {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
                    {"id": "databricks-1", "kind": "databricks", "tier": "enterprise"},
                    {"id": "diag", "kind": "console", "tier": "community"},
@@ -2541,13 +2741,16 @@ mod tests {
                    {"id": "mssql-1", "kind": "mssql", "tier": "enterprise"},
                     {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
                     {"id": "oci-1", "kind": "oci_streaming", "tier": "enterprise"},
-                    {"id": "opcua-1", "kind": "opc_ua", "tier": "enterprise"},
+                     {"id": "opcua-1", "kind": "opc_ua", "tier": "enterprise"},
+                     {"id": "ots-1", "kind": "tablestore", "tier": "enterprise"},
                     {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
                    {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
                    {"id": "rabbit-sink-1", "kind": "rabbitmq", "tier": "community"},
                    {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
-                   {"id": "redshift-1", "kind": "redshift", "tier": "enterprise"},
-                   {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
+                    {"id": "redshift-1", "kind": "redshift", "tier": "enterprise"},
+                    {"id": "rmq-1", "kind": "rocketmq", "tier": "enterprise"},
+                    {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
+                    {"id": "s3t-1", "kind": "s3_tables", "tier": "enterprise"},
                    {"id": "snowflake-1", "kind": "snowflake", "tier": "enterprise"},
                    {"id": "spb-1", "kind": "sparkplug_b", "tier": "enterprise"},
                    {"id": "tdengine-1", "kind": "tdengine", "tier": "enterprise"},
@@ -2701,13 +2904,41 @@ mod tests {
                               "region": "us-east-1",
                                "access_key_id": "AKID",
                                "secret_access_key": "secret"}}),
+            json!({"id": "bad-azblob", "kind": "azure_blob",
+                   "config": {"account_name": "AB",
+                              "container_name": "telemetry",
+                              "auth": {"type": "sharedkey",
+                                        "account_key": "a2V5"},
+                              "blob_path_template": "t/${batch_id}.json"}}),
+            json!({"id": "bad-ots", "kind": "tablestore",
+                   "config": {"endpoint": "https://i.cn-hangzhou.ots.aliyuncs.com",
+                              "instance_name": "i",
+                              "table_name": "t",
+                              "access_key_id": "k",
+                              "access_key_secret": "s",
+                              "primary_keys": []}}),
+            json!({"id": "bad-s3t", "kind": "s3_tables",
+                   "config": {"table_bucket_arn": "arn:aws:s3:::plain",
+                              "namespace": "ns",
+                              "table_name": "t",
+                              "region": "us-east-1",
+                              "access_key_id": "AKID",
+                              "secret_access_key": "secret"}}),
+            json!({"id": "bad-confluent", "kind": "confluent",
+                   "config": {"bootstrap_servers": [],
+                              "api_key": "k",
+                              "api_secret": "s",
+                              "topic_template": "t"}}),
+            json!({"id": "bad-rmq", "kind": "rocketmq",
+                   "config": {"endpoints": ["127.0.0.1:8081"],
+                              "topic": ""}}),
         ] {
             let (status, _) = server.post("/api/v1/connectors", payload).await;
             assert_eq!(status, 400);
         }
         let (status, body) = server.get("/api/v1/connectors").await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 37);
+        assert_eq!(body.as_array().expect("list").len(), 42);
     }
 
     #[tokio::test]

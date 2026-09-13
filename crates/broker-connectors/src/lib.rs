@@ -45,6 +45,11 @@ pub mod aws_iot;
 pub mod azure_iot;
 pub mod gcp_iot;
 pub mod oci_streaming;
+pub mod azure_blob;
+pub mod tablestore;
+pub mod s3_tables;
+pub mod confluent;
+pub mod rocketmq;
 
 pub use kafka::{KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, TcpKafkaTransport};
 pub use rabbitmq::{AmqpFrame, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport, MemoryAmqpTransport, TcpRabbitTransport};
@@ -82,6 +87,11 @@ pub use aws_iot::{AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIot
 pub use azure_iot::{AzureIotAuth, AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink, AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TcpAzureIotTransport, TwinTopics, d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token};
 pub use gcp_iot::{CapturedGcpIotPublish, DownlinkRoute, GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport, MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink, state_topic, telemetry_topic, validate_state_snapshot};
 pub use oci_streaming::{HttpOciStreamingTransport, MockOciOutcome, MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage, OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport, authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages, rfc1123_date, rsa_sign, signing_string};
+pub use azure_blob::{AzureBlobAuth, AzureBlobCompression, AzureBlobConnector, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig, AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, azure_error_code, canonicalized_resource, classify_blob_status, shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AZURE_STORAGE_VERSION};
+pub use tablestore::{AttributeColumnMapping, AttributeColumnType, MockTablestoreOutcome, OtsOutcome, OtsRow, OtsRowFailure, OtsValue, PrimaryKeyMapping, PrimaryKeyType, TablestoreAuth, TablestoreConnector, TablestoreSink, TablestoreSinkConfig, TablestoreTransport, HttpTablestoreTransport, MockTablestoreTransport, classify_error_code as classify_ots_error_code, classify_http_status as classify_ots_http_status, content_md5_b64, failed_positions as tablestore_failed_positions, ots_authorization, render_batch_body as render_ots_batch_body, string_to_sign as ots_string_to_sign, BATCH_WRITE_ROW_PATH, OTS_API_VERSION};
+pub use s3_tables::{HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport, S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSink, S3TablesSinkConfig, S3TablesSigning, S3TablesTransport, SnapshotFile, TableBucketArn, apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path, parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization};
+pub use confluent::{ConfluentKafkaConfig, ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord, ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport, SaslMechanism, ScramHash, ScramServerFirst, TcpConfluentTransport, classify_kafka_error, frame_schema_registry, parse_scram_server_first, resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template, resolve_topic as resolve_confluent_topic, sasl_plain_payload, schema_registry_basic_auth, scram_client_first_message, scram_client_proof as scram_confluent_client_proof, scram_hi, scram_nonce, scram_server_signature, split_schema_registry};
+pub use rocketmq::{RocketMqConnector, RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink, RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport, MockRocketMqTransport, TcpRocketMqTransport, authorization_header as rocketmq_authorization, build_system_properties as build_rocketmq_properties, classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope, encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32, md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field, signing_string as rocketmq_signing_string, ENVELOPE_VERSION};
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
@@ -121,7 +131,8 @@ pub struct ConnectorInfo {
 
 /// Open-core tier tag for a connector kind: the multi-cloud
 /// streaming bridges, Sparkplug B, the enterprise databases, the
-/// industrial time-series stores and the lakehouse sinks are
+/// industrial time-series stores, the lakehouse sinks, the cloud
+/// object/wide-column stores and the enterprise messaging bridges are
 /// Enterprise; everything else is Community.
 pub fn connector_tier(kind: &str) -> &'static str {
     match kind {
@@ -129,7 +140,8 @@ pub fn connector_tier(kind: &str) -> &'static str {
         | "mongodb" | "mssql" | "cassandra" | "couchbase"
         | "tdengine" | "iotdb" | "timestream" | "dynamodb"
         | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
-        | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua" => "enterprise",
+        | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua"
+        | "azure_blob" | "tablestore" | "s3_tables" | "confluent" | "rocketmq" => "enterprise",
         _ => "community",
     }
 }
@@ -570,6 +582,35 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// HMAC-SHA1 (sha1 only, no extra dependency). Shared by the
+/// Alibaba Tablestore and RocketMQ signers (clean-room, same shape
+/// as the HMAC-SHA256 core above).
+pub(crate) fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = sha1::Sha1::digest(key);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    use sha1::Digest;
+    let mut inner = sha1::Sha1::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = sha1::Sha1::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().to_vec()
+}
+
 /// SigV4 `x-amz-date` timestamp (`YYYYMMDDTHHMMSSZ`, UTC).
 pub(crate) fn amz_date(millis: i64) -> String {
     let (year, month, day) = ymd_from_millis(millis);
@@ -722,7 +763,8 @@ mod tests {
 
     #[test]
     fn test_connector_tier_tags() {
-        // Enterprise bridges (cloud, Sparkplug, databases, time-series, lakehouse).
+        // Enterprise bridges (cloud, Sparkplug, databases, time-series,
+        // lakehouse, IoT hubs, cloud stores, enterprise messaging).
         for kind in [
             "kinesis",
             "gcp_pubsub",
@@ -742,6 +784,16 @@ mod tests {
             "doris",
             "bigquery",
             "redshift",
+            "oci_streaming",
+            "aws_iot",
+            "azure_iot",
+            "gcp_iot",
+            "opc_ua",
+            "azure_blob",
+            "tablestore",
+            "s3_tables",
+            "confluent",
+            "rocketmq",
         ] {
             assert_eq!(connector_tier(kind), "enterprise", "{kind} must be enterprise");
         }

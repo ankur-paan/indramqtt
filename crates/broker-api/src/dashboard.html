@@ -147,6 +147,11 @@
       <option value="azure_iot">azure_iot ★ enterprise</option>
       <option value="gcp_iot">gcp_iot ★ enterprise</option>
       <option value="opc_ua">opc_ua ★ enterprise</option>
+      <option value="azure_blob">azure_blob ★ enterprise</option>
+      <option value="tablestore">tablestore ★ enterprise</option>
+      <option value="s3_tables">s3_tables ★ enterprise</option>
+      <option value="confluent">confluent ★ enterprise</option>
+      <option value="rocketmq">rocketmq ★ enterprise</option>
       <option value="mongodb">mongodb ★ enterprise</option>
       <option value="mssql">mssql ★ enterprise</option>
       <option value="cassandra">cassandra ★ enterprise</option>
@@ -304,6 +309,48 @@
     <input id="conn-opcua-url" placeholder="endpoint url, e.g. opc.tcp://127.0.0.1:4840" size="32">
     <input id="conn-opcua-node" placeholder="node id, e.g. ns=2;s=Temperature" size="26">
     <input id="conn-opcua-topic" placeholder="publish topic template, e.g. opcua/${node}" size="24">
+  </div>
+  <div class="row"><label>Azure Blob config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-azblob-account" placeholder="account, e.g. mydeviceblobs" size="16">
+    <input id="conn-azblob-container" placeholder="container, e.g. telemetry" size="14">
+    <input id="conn-azblob-endpoint" placeholder="endpoint (blank = Azure cloud, Azurite e.g. http://127.0.0.1:10000/devstoreaccount1)" size="44">
+    <input id="conn-azblob-key" placeholder="account key (SharedKey, base64)" type="password" size="20">
+    <input id="conn-azblob-sas" placeholder="SAS token (blank = SharedKey)" size="24">
+    <input id="conn-azblob-path" placeholder="path template, e.g. telemetry/year=${date.year}/${batch_id}.json" size="40">
+  </div>
+  <div class="row"><label>Tablestore config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-ots-endpoint" placeholder="endpoint, e.g. https://instance.cn-hangzhou.ots.aliyuncs.com" size="40">
+    <input id="conn-ots-instance" placeholder="instance name" size="14">
+    <input id="conn-ots-table" placeholder="table, e.g. telemetry" size="14">
+    <input id="conn-ots-keyid" placeholder="access key id" size="16">
+    <input id="conn-ots-secret" placeholder="access key secret" type="password" size="18">
+  </div>
+  <div class="row"><label>S3 Tables config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-s3t-arn" placeholder="bucket ARN, e.g. arn:aws:s3tables:us-east-1:123456789012:bucket/b" size="44">
+    <input id="conn-s3t-namespace" placeholder="namespace, e.g. production_iot" size="16">
+    <input id="conn-s3t-table" placeholder="table, e.g. device_events" size="16">
+    <input id="conn-s3t-region" placeholder="region, e.g. us-east-1" size="12">
+    <input id="conn-s3t-key" placeholder="access key id" size="16">
+    <input id="conn-s3t-secret" placeholder="secret access key" type="password" size="18">
+  </div>
+  <div class="row"><label>Confluent config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-cfl-servers" placeholder="bootstrap, e.g. pkc-xxxx.us-east-1.aws.confluent.cloud:9092" size="40">
+    <input id="conn-cfl-key" placeholder="API key" size="16">
+    <input id="conn-cfl-secret" placeholder="API secret" type="password" size="18">
+    <input id="conn-cfl-topic" placeholder="topic template, e.g. telemetry-${topic_segment_1}" size="30">
+    <select id="conn-cfl-mech">
+      <option value="plain">plain</option>
+      <option value="scramsha256">scramsha256</option>
+      <option value="scramsha512">scramsha512</option>
+    </select>
+  </div>
+  <div class="row"><label>RocketMQ config <span class="badge enterprise">enterprise</span></label>
+    <input id="conn-rmq-endpoints" placeholder="endpoints, e.g. 127.0.0.1:8081" size="22">
+    <input id="conn-rmq-topic" placeholder="topic, e.g. rocket-telemetry" size="18">
+    <input id="conn-rmq-tag" placeholder="tag template, e.g. ${topic_segment_2}" size="22">
+    <input id="conn-rmq-group" placeholder="FIFO group template, e.g. group-${client_id}" size="24">
+    <input id="conn-rmq-key" placeholder="access key (blank = anonymous)" size="16">
+    <input id="conn-rmq-secret" placeholder="secret key" type="password" size="18">
   </div>
   <div class="row"><label>MongoDB config <span class="badge enterprise">enterprise</span></label>
     <input id="conn-mongo-url" placeholder="connection string, e.g. mongodb://u:p@127.0.0.1:27017" size="36">
@@ -862,6 +909,58 @@ $("conn-add").onclick = async () => {
                                     sampling_interval_ms: 1000,
                                     publish_topic_template: $("conn-opcua-topic").value.trim() || "opcua/${node}"}],
               batch_size: 200, linger_ms: 50};
+  } else if (kind === "azure_blob") {
+    const sas = $("conn-azblob-sas").value.trim();
+    config = {account_name: $("conn-azblob-account").value.trim() || "mydeviceblobs",
+              container_name: $("conn-azblob-container").value.trim() || "telemetry",
+              auth: sas !== "" ? {type: "sastoken", sas_token: sas}
+                               : {type: "sharedkey", account_key: $("conn-azblob-key").value},
+              blob_path_template: $("conn-azblob-path").value.trim() || "telemetry/year=${date.year}/${batch_id}.json",
+              compression: "none",
+              max_records_per_blob: 10000, max_bytes_per_blob: 10485760,
+              flush_interval_secs: 60};
+    const azendpoint = $("conn-azblob-endpoint").value.trim();
+    if (azendpoint !== "") config.endpoint = azendpoint;
+  } else if (kind === "tablestore") {
+    config = {endpoint: $("conn-ots-endpoint").value.trim() || "https://test-instance.cn-hangzhou.ots.aliyuncs.com",
+              instance_name: $("conn-ots-instance").value.trim() || "test-instance",
+              table_name: $("conn-ots-table").value.trim() || "telemetry",
+              access_key_id: $("conn-ots-keyid").value.trim(),
+              access_key_secret: $("conn-ots-secret").value,
+              primary_keys: [{name: "device_id", source: "${client_id}", data_type: "string"},
+                             {name: "ts", source: "${timestamp}", data_type: "integer"}],
+              attribute_columns: [{name: "temperature", source: "${payload.temperature}", data_type: "double"}],
+              batch_size: 200, linger_ms: 100};
+  } else if (kind === "s3_tables") {
+    config = {table_bucket_arn: $("conn-s3t-arn").value.trim(),
+              namespace: $("conn-s3t-namespace").value.trim() || "production_iot",
+              table_name: $("conn-s3t-table").value.trim() || "device_events",
+              region: $("conn-s3t-region").value.trim() || "us-east-1",
+              access_key_id: $("conn-s3t-key").value.trim(),
+              secret_access_key: $("conn-s3t-secret").value,
+              partition_spec: [{source_name: "date", transform: "day"}],
+              target_format: "ndjsoncompressed",
+              batch_size: 1000, linger_ms: 1000};
+  } else if (kind === "confluent") {
+    config = {bootstrap_servers: [$("conn-cfl-servers").value.trim() || "pkc-test.us-east-1.aws.confluent.cloud:9092"],
+              api_key: $("conn-cfl-key").value.trim(),
+              api_secret: $("conn-cfl-secret").value,
+              auth_mechanism: $("conn-cfl-mech").value,
+              topic_template: $("conn-cfl-topic").value.trim() || "telemetry-${topic_segment_1}",
+              partition_key_template: "${client_id}",
+              partitions: 12,
+              batch_size: 500};
+  } else if (kind === "rocketmq") {
+    config = {endpoints: [$("conn-rmq-endpoints").value.trim() || "127.0.0.1:8081"],
+              topic: $("conn-rmq-topic").value.trim() || "rocket-telemetry",
+              batch_size: 128, linger_ms: 100};
+    const rtag = $("conn-rmq-tag").value.trim();
+    if (rtag !== "") config.tag_template = rtag;
+    const rgroup = $("conn-rmq-group").value.trim();
+    if (rgroup !== "") config.message_group_template = rgroup;
+    const rkey = $("conn-rmq-key").value.trim();
+    const rsecret = $("conn-rmq-secret").value;
+    if (rkey !== "" && rsecret !== "") { config.access_key = rkey; config.secret_key = rsecret; }
   } else if (kind === "mongodb") {
     config = {connection_string: $("conn-mongo-url").value.trim() || "mongodb://127.0.0.1:27017",
               database: $("conn-mongo-db").value.trim() || "telemetry",

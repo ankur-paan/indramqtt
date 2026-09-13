@@ -4706,4 +4706,259 @@ mod tests {
         assert!(encoded.contains(r#""status":"online""#), "projected payload");
         assert!(!encoded.contains("hide_me"), "secrets never leave the rule");
     }
+
+    /// Sprint 25 studio fanout (INDRA-224): one ingress event routes
+    /// through five streaming SQL `INTO connector(...)` rules and lands
+    /// simultaneously in the Azure Blob, Tablestore, S3 Tables,
+    /// Confluent and RocketMQ mocks. All transports are in-memory.
+    #[tokio::test]
+    async fn test_into_fans_out_to_storage_messaging_sinks() {
+        use broker_connectors::{
+            AttributeColumnMapping, AttributeColumnType, AzureBlobAuth, AzureBlobSink,
+            AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink,
+            IcebergPartitionField, IcebergTransform, MemoryConfluentTransport,
+            MockAzureBlobTransport, MockRocketMqTransport, MockS3TablesTransport,
+            MockTablestoreTransport, PrimaryKeyMapping, PrimaryKeyType, RocketMqSink,
+            RocketMqSinkConfig, S3TablesSink, S3TablesSinkConfig, SaslMechanism,
+            TablestoreSink, TablestoreSinkConfig,
+        };
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Azure Blob (auto-flush every row, SharedKey proof runs).
+        let blob_transport = Arc::new(MockAzureBlobTransport::new());
+        let blob = Arc::new(
+            AzureBlobSink::new(
+                AzureBlobSinkConfig {
+                    account_name: "mydeviceblobs".to_string(),
+                    container_name: "telemetry".to_string(),
+                    endpoint: None,
+                    auth: AzureBlobAuth::SharedKey {
+                        account_key:
+                            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+                    },
+                    blob_path_template:
+                        "telemetry/year=${date.year}/month=${date.month}/day=${date.day}/${batch_id}.json"
+                            .to_string(),
+                    compression: broker_connectors::AzureBlobCompression::None,
+                    max_records_per_blob: Some(1),
+                    max_bytes_per_blob: None,
+                    flush_interval_secs: 60,
+                    buffer_capacity: None,
+                },
+                blob_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("blob_store", blob.clone());
+
+        // Tablestore (auto-flush every row).
+        let ots_transport = Arc::new(MockTablestoreTransport::new());
+        let ots = Arc::new(
+            TablestoreSink::new(
+                TablestoreSinkConfig {
+                    endpoint: "https://test-instance.cn-hangzhou.ots.aliyuncs.com".to_string(),
+                    instance_name: "test-instance".to_string(),
+                    table_name: "telemetry".to_string(),
+                    access_key_id: "test-key-id".to_string(),
+                    access_key_secret: "test-secret".to_string(),
+                    primary_keys: vec![PrimaryKeyMapping {
+                        name: "device_id".to_string(),
+                        source: "${client_id}".to_string(),
+                        data_type: PrimaryKeyType::String,
+                    }],
+                    attribute_columns: vec![AttributeColumnMapping {
+                        name: "val".to_string(),
+                        source: "${payload.sensor_val}".to_string(),
+                        data_type: AttributeColumnType::Double,
+                    }],
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                },
+                ots_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("ots_store", ots.clone());
+
+        // S3 Tables (auto-flush every row).
+        let tables_transport = Arc::new(MockS3TablesTransport::new());
+        let tables = Arc::new(
+            S3TablesSink::new(
+                S3TablesSinkConfig {
+                    table_bucket_arn:
+                        "arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry-bucket"
+                            .to_string(),
+                    namespace: "production_iot".to_string(),
+                    table_name: "device_events".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "AKID".to_string(),
+                    secret_access_key: "secret".to_string(),
+                    session_token: None,
+                    endpoint: None,
+                    partition_spec: vec![
+                        IcebergPartitionField {
+                            source_name: "date".to_string(),
+                            transform: IcebergTransform::Day,
+                        },
+                        IcebergPartitionField {
+                            source_name: "device_id".to_string(),
+                            transform: IcebergTransform::Identity,
+                        },
+                    ],
+                    target_format: broker_connectors::S3TablesFormat::NdjsonCompressed,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                },
+                tables_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("iceberg_table", tables.clone());
+
+        // Confluent Cloud (auto-flush every row, SASL dummies).
+        let confluent_transport = Arc::new(MemoryConfluentTransport::new());
+        let confluent = Arc::new(
+            ConfluentKafkaSink::new(
+                ConfluentKafkaConfig {
+                    bootstrap_servers:
+                        vec!["pkc-test.us-east-1.aws.confluent.cloud:9092".to_string()],
+                    api_key: "confluent-key".to_string(),
+                    api_secret: "confluent-secret".to_string(),
+                    auth_mechanism: SaslMechanism::Plain,
+                    topic_template: "telemetry-${topic_segment_2}".to_string(),
+                    partition_key_template: Some("${client_id}".to_string()),
+                    schema_registry: None,
+                    partitions: 12,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                },
+                confluent_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("cloud_kafka", confluent.clone());
+
+        // RocketMQ (auto-flush every row, anonymous proxy).
+        let rmq_transport = Arc::new(MockRocketMqTransport::new());
+        let rmq = Arc::new(
+            RocketMqSink::new(
+                RocketMqSinkConfig {
+                    endpoints: vec!["127.0.0.1:8081".to_string()],
+                    topic: "rocket-telemetry".to_string(),
+                    tag_template: Some("${topic_segment_2}".to_string()),
+                    keys_template: Some("${client_id}-${message_id}".to_string()),
+                    message_group_template: None,
+                    access_key: None,
+                    secret_key: None,
+                    batch_size: Some(1),
+                    buffer_capacity: None,
+                    linger_ms: Some(10),
+                },
+                rmq_transport.clone(),
+            )
+            .expect("valid sink"),
+        );
+        engine.connectors().register("rocket_producer", rmq.clone());
+
+        // One INTO rule per studio connector.
+        for (id, connector) in [
+            ("blob-rule", "blob_store"),
+            ("ots-rule", "ots_store"),
+            ("tables-rule", "iceberg_table"),
+            ("confluent-rule", "cloud_kafka"),
+            ("rmq-rule", "rocket_producer"),
+        ] {
+            engine
+                .create_rule(
+                    id.to_string(),
+                    TopicFilter::new("storage/stream/#").unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, sensor_val, now() AS ts FROM "storage/stream/#" WHERE sensor_val > 100.0 INTO connector("{connector}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("rule creates");
+        }
+
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("storage/stream/line1").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor-42", "sensor_val": 150.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        // Azure Blob: one object with the projected row.
+        let puts = blob_transport.puts();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0].path.ends_with("/0.json"), "got {:?}", puts[0].path);
+        let row: serde_json::Value =
+            serde_json::from_str(String::from_utf8(puts[0].body.clone()).unwrap().trim_end())
+                .unwrap();
+        assert_eq!(row["payload"]["client_id"], "sensor-42");
+        assert_eq!(row["payload"]["sensor_val"], 150.0);
+        assert!(row["payload"]["ts"].as_i64().unwrap_or(0) > 0);
+
+        // Tablestore: one typed row (string PK, double attribute).
+        let batches = ots_transport.captured();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(
+            batches[0][0].primary_keys[0].1,
+            broker_connectors::OtsValue::String("sensor-42".to_string())
+        );
+        assert_eq!(
+            batches[0][0].attributes[0].1,
+            broker_connectors::OtsValue::Double(150.0)
+        );
+
+        // S3 Tables: one gzip data file on the day/device partition.
+        let files = tables_transport.puts();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].key.contains("device_id=__null__/"), "got {:?}", files[0].key);
+        assert!(files[0].key.ends_with(".data.gz"));
+
+        // Confluent: one record on the templated topic, keyed by client.
+        let records = confluent_transport.records_flat();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].topic, "telemetry-stream");
+        assert_eq!(records[0].key, Some(Bytes::from_static(b"sensor-42")));
+        let value: serde_json::Value = serde_json::from_slice(&records[0].value).unwrap();
+        assert_eq!(value["sensor_val"], 150.0);
+
+        // RocketMQ: one envelope with tag + business keys.
+        let envelopes = rmq_transport.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].topic, "rocket-telemetry");
+        assert_eq!(envelopes[0].messages.len(), 1);
+        assert_eq!(
+            envelopes[0].messages[0].system_properties.tag.as_deref(),
+            Some("stream")
+        );
+        assert_eq!(
+            envelopes[0].messages[0].system_properties.keys,
+            vec!["sensor-42-0".to_string()]
+        );
+
+        // Below-threshold telemetry fires nothing anywhere.
+        engine
+            .dispatch_ingress(
+                &Topic::new("storage/stream/line1").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor-42", "sensor_val": 50.0 }"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(blob_transport.puts().len(), 1);
+        assert_eq!(ots_transport.captured().len(), 1);
+        assert_eq!(tables_transport.puts().len(), 1);
+        assert_eq!(confluent_transport.records_flat().len(), 1);
+        assert_eq!(rmq_transport.envelopes().len(), 1);
+    }
 }

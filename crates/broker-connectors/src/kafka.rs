@@ -300,7 +300,7 @@ impl KafkaTransport for MemoryKafkaTransport {
     }
 }
 
-fn encode_request_header(api_key: i16, api_version: i16, correlation: i32, client_id: &str) -> Vec<u8> {
+pub(crate) fn encode_request_header(api_key: i16, api_version: i16, correlation: i32, client_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&api_key.to_be_bytes());
     out.extend_from_slice(&api_version.to_be_bytes());
@@ -315,7 +315,7 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(s.as_bytes());
 }
 
-async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub(crate) async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf))
         .await
@@ -335,7 +335,7 @@ async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
+pub(crate) async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
     let mut prefixed = (frame.len() as i32).to_be_bytes().to_vec();
     prefixed.append(&mut frame);
     stream
@@ -351,11 +351,11 @@ async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
 
 /// Minimal ApiVersions v0 exchange: proves the peer speaks Kafka and
 /// surfaces broker-side errors early.
-fn encode_api_versions_request(correlation: i32, client_id: &str) -> Vec<u8> {
+pub(crate) fn encode_api_versions_request(correlation: i32, client_id: &str) -> Vec<u8> {
     encode_request_header(18, 0, correlation, client_id)
 }
 
-fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
+pub(crate) fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
     if body.len() < 6 {
         return Err(ConnectorError::Connection(
             "truncated ApiVersions response".to_string(),
@@ -377,7 +377,7 @@ fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
 }
 
 /// Produce v3 request for pre-grouped `(topic, partition) -> records`.
-fn encode_produce_request(
+pub(crate) fn encode_produce_request(
     correlation: i32,
     client_id: &str,
     acks: i16,
@@ -399,7 +399,7 @@ fn encode_produce_request(
     frame
 }
 
-fn parse_acks(acks: &str) -> Result<i16> {
+pub(crate) fn parse_acks(acks: &str) -> Result<i16> {
     match acks {
         "all" | "-1" => Ok(-1),
         "1" => Ok(1),
