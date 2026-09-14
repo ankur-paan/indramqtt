@@ -139,9 +139,16 @@ pub struct TdengineSinkConfig {
     /// Retry delay ceiling in ms (default 3000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request / network timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl TdengineSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
             return Err(ConnectorError::Dispatch(format!(
@@ -224,14 +231,27 @@ impl TdengineSinkConfig {
         template: &str,
     ) -> Result<String> {
         let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
-        let field = |name: &str| match doc.get(name) {
+        let field = |name: &str| {
+            let val = doc.get(name)
+                .or_else(|| doc.get("payload").and_then(|p| p.get(name)));
+            match val {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                _ => String::new(),
+            }
+        };
+        let client_id_val = doc.get("client_id")
+            .or_else(|| doc.get("clientid"))
+            .or_else(|| doc.get("device_id"))
+            .or_else(|| doc.get("payload").and_then(|p| p.get("client_id").or_else(|| p.get("clientid")).or_else(|| p.get("device_id"))));
+        let client_id = match client_id_val {
             Some(serde_json::Value::String(text)) => text.clone(),
             Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
             _ => String::new(),
         };
         let mut vars = vec![
             ("topic".to_string(), topic.to_string()),
-            ("client_id".to_string(), field("client_id")),
+            ("client_id".to_string(), client_id),
             ("qos".to_string(), u8::from(qos).to_string()),
             ("timestamp".to_string(), millis.to_string()),
         ];
@@ -273,8 +293,13 @@ impl TdengineSinkConfig {
 
     fn base_vars(topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Vec<(String, String)> {
         let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
-        let client_id = match doc.get("client_id") {
+        let client_id_val = doc.get("client_id")
+            .or_else(|| doc.get("clientid"))
+            .or_else(|| doc.get("device_id"))
+            .or_else(|| doc.get("payload").and_then(|p| p.get("client_id").or_else(|| p.get("clientid")).or_else(|| p.get("device_id"))));
+        let client_id = match client_id_val {
             Some(serde_json::Value::String(text)) => text.clone(),
+            Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
             _ => String::new(),
         };
         vec![
@@ -768,6 +793,7 @@ mod tests {
             max_retries: Some(4),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(3_000),
+            timeout_ms: None,
         }
     }
 

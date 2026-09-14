@@ -103,9 +103,16 @@ pub struct ElasticsearchSinkConfig {
     /// In-place retries on 429/503 before restoring (default 5).
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// Network request timeout in ms (default 5000).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 impl ElasticsearchSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
             return Err(ConnectorError::Dispatch(format!(
@@ -586,6 +593,7 @@ mod tests {
             batch_size: 500,
             batch_timeout_ms: 100,
             max_retries: 5,
+            request_timeout_ms: None,
         }
     }
 

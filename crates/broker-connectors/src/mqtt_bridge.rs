@@ -1,7 +1,7 @@
 //! Remote MQTT outbound bridge sink (INDRA-156).
 //!
-//! Forwards IndraMQTT events to an upstream MQTT broker (EMQX,
-//! HiveMQ, AWS IoT Core) with topic remapping and clean-room MQTT
+//! Forwards IndraMQTT events to an upstream MQTT broker (such as
+//! HiveMQ, AWS IoT Core, or another IndraMQTT cluster) with topic remapping and clean-room MQTT
 //! 3.1.1 / 5.0 PUBLISH framing. QoS and retain flags are preserved
 //! unless overridden; packet identifiers cycle 1..=65535 per sink.
 //!

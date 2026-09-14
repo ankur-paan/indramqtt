@@ -72,6 +72,9 @@ pub struct RocketMqSinkConfig {
     /// Linger flush window in ms (default 100).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
+    /// Network request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_batch_size() -> Option<usize> {
@@ -83,6 +86,10 @@ fn default_linger_ms() -> Option<u64> {
 }
 
 impl RocketMqSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoints.is_empty() || self.endpoints.iter().any(|e| e.trim().is_empty()) {
             return Err(ConnectorError::Dispatch(
@@ -519,6 +526,7 @@ impl RocketMqTransport for MockRocketMqTransport {
 /// exchange at a time; dropped connections redial once.
 pub struct TcpRocketMqTransport {
     endpoint: String,
+    timeout: Duration,
     conn: AsyncMutex<Option<TcpStream>>,
 }
 
@@ -527,6 +535,7 @@ impl TcpRocketMqTransport {
         config.validate()?;
         Ok(Self {
             endpoint: config.endpoints[0].clone(),
+            timeout: config.timeout(),
             conn: AsyncMutex::new(None),
         })
     }
@@ -536,7 +545,7 @@ impl TcpRocketMqTransport {
         for attempt in 0..2 {
             if guard.is_none() {
                 let stream = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    self.timeout,
                     TcpStream::connect(&self.endpoint),
                 )
                 .await
@@ -570,17 +579,23 @@ impl TcpRocketMqTransport {
                 stream.read_exact(&mut body).await?;
                 Ok::<Vec<u8>, std::io::Error>(body)
             };
-            match exchange.await {
-                Ok(body) => return Ok(body),
-                Err(_) if attempt == 0 => {
+            match tokio::time::timeout(self.timeout, exchange).await {
+                Ok(Ok(body)) => return Ok(body),
+                Ok(Err(_)) | Err(_) if attempt == 0 => {
                     *guard = None;
                     continue;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     *guard = None;
                     return Err(ConnectorError::Connection(format!(
                         "rocketmq exchange failed: {e}"
                     )));
+                }
+                Err(_) => {
+                    *guard = None;
+                    return Err(ConnectorError::Connection(
+                        "rocketmq exchange timed out".to_string(),
+                    ));
                 }
             }
         }
@@ -876,6 +891,7 @@ mod tests {
             batch_size: Some(128),
             buffer_capacity: None,
             linger_ms: Some(100),
+            timeout_ms: None,
         }
     }
 

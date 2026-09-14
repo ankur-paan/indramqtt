@@ -108,9 +108,16 @@ pub struct ConfluentKafkaConfig {
     /// Buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Network request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl ConfluentKafkaConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.bootstrap_servers.is_empty()
             || self.bootstrap_servers.iter().any(|s| s.trim().is_empty())
@@ -619,6 +626,7 @@ pub struct TcpConfluentTransport {
     mechanism: SaslMechanism,
     username: String,
     password: String,
+    timeout: Duration,
     conn: AsyncMutex<Option<TcpConfluentConn>>,
 }
 
@@ -637,6 +645,7 @@ impl TcpConfluentTransport {
             mechanism: config.auth_mechanism,
             username: config.api_key.clone(),
             password: config.api_secret.clone(),
+            timeout: config.timeout(),
             conn: AsyncMutex::new(None),
         })
     }
@@ -657,8 +666,8 @@ impl TcpConfluentTransport {
                 send_frame(&mut conn.stream, frame).await?;
                 read_response(&mut conn.stream).await
             };
-            match exchange.await {
-                Ok(mut response) => {
+            match tokio::time::timeout(self.timeout, exchange).await {
+                Ok(Ok(mut response)) => {
                     if response.len() < 4 {
                         *guard = None;
                         if attempt == 0 {
@@ -682,13 +691,19 @@ impl TcpConfluentTransport {
                     response.drain(..4);
                     return Ok(response);
                 }
-                Err(_) if attempt == 0 => {
+                Ok(Err(_)) | Err(_) if attempt == 0 => {
                     *guard = None;
                     continue;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     *guard = None;
                     return Err(e);
+                }
+                Err(_) => {
+                    *guard = None;
+                    return Err(ConnectorError::Connection(
+                        "confluent exchange timed out".to_string(),
+                    ));
                 }
             }
         }
@@ -699,7 +714,7 @@ impl TcpConfluentTransport {
 
     async fn dial(&self) -> Result<TcpConfluentConn> {
         let stream =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.endpoint))
+            tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
                 .await
                 .map_err(|_| {
                     ConnectorError::Connection(format!(
@@ -1208,6 +1223,7 @@ mod tests {
             partitions: 12,
             batch_size: Some(500),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

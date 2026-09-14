@@ -106,6 +106,9 @@ pub struct BigQuerySinkConfig {
     /// Retry delay ceiling in ms (default 2500).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -113,6 +116,10 @@ fn default_true() -> bool {
 }
 
 impl BigQuerySinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !is_resource_id(&self.project_id) {
             return Err(ConnectorError::Dispatch(format!(

@@ -12,6 +12,7 @@ members = [
     "crates/broker-api",
     "crates/broker-observability",
     "crates/broker-node",
+    "crates/broker-gateway",
 ]
 resolver = "2"
 
@@ -64,6 +65,7 @@ broker-connectors = { path = "crates/broker-connectors" }
 broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
 broker-observability = { path = "crates/broker-observability" }
+broker-gateway = { path = "crates/broker-gateway" }
 
 [profile.release]
 opt-level = 3

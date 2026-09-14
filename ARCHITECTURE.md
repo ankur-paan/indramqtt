@@ -62,7 +62,7 @@ graph TB
 ## 2. Core Architectural Invariants
 
 ### 1. Connection != Session (Core Restart Immunity)
-In legacy brokers (e.g., EMQX, HiveMQ, VerneMQ), a broker node restart or software upgrade tears down all client TCP sockets, triggering massive "reconnect storms" and thundering-herd issues on downstream authentication backends.
+In legacy brokers (e.g., HiveMQ, VerneMQ, Mosquitto), a broker node restart or software upgrade tears down all client TCP sockets, triggering massive "reconnect storms" and thundering-herd issues on downstream authentication backends.
 
 In IndraMQTT:
 - The **BEAM Network Appliance** (Erlang/OTP) owns client sockets, TLS sessions, packet framing, and keepalives. It has no business logic, no distributed database, and no rule engine.

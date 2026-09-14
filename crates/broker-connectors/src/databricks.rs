@@ -105,11 +105,22 @@ pub struct DatabricksSinkConfig {
     /// Retry delay ceiling in ms (default 2000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl DatabricksSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.host.trim().is_empty() || self.host.contains('/') || self.host.contains(' ') {
+        let bare = self
+            .host
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        if bare.trim().is_empty() || bare.contains('/') || bare.contains(' ') {
             return Err(ConnectorError::Dispatch(format!(
                 "databricks host must be a bare hostname: {:?}",
                 self.host
@@ -170,9 +181,13 @@ impl DatabricksSinkConfig {
         Ok(())
     }
 
-    /// `POST https://{host}/api/2.0/sql/statements`.
+    /// `POST {scheme}://{host}/api/2.0/sql/statements`.
     pub fn statements_url(&self) -> String {
-        format!("https://{}/api/2.0/sql/statements", self.host)
+        if self.host.starts_with("http://") || self.host.starts_with("https://") {
+            format!("{}/api/2.0/sql/statements", self.host.trim_end_matches('/'))
+        } else {
+            format!("https://{}/api/2.0/sql/statements", self.host.trim_end_matches('/'))
+        }
     }
 
     /// Warehouse id from the HTTP path tail (None when unconfigured).

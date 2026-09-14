@@ -70,9 +70,16 @@ pub struct AlloydbConfig {
     /// In-memory queue buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Network connect/query timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl AlloydbConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -296,21 +303,61 @@ pub trait AlloydbTransport: Send + Sync {
     async fn execute(&self, query: &str, params: &[AlloydbValue]) -> Result<AlloydbQueryResult>;
 }
 
+fn format_alloydb_value(v: &AlloydbValue) -> String {
+    match v {
+        AlloydbValue::Null => "NULL".to_string(),
+        AlloydbValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        AlloydbValue::Integer(i) => i.to_string(),
+        AlloydbValue::Number(n) => n.to_string(),
+        AlloydbValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
+async fn read_alloydb_pg_msg(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<(u8, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 5];
+    tokio::time::timeout(timeout, stream.read_exact(&mut header))
+        .await
+        .map_err(|_| ConnectorError::Connection("alloydb read timeout".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("alloydb read failed: {e}")))?;
+    let tag = header[0];
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if !(4..=16 * 1024 * 1024).contains(&len) {
+        return Err(ConnectorError::Connection(format!(
+            "alloydb bad message length: {len}"
+        )));
+    }
+    let mut body = vec![0u8; len - 4];
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
+        .await
+        .map_err(|_| ConnectorError::Connection("alloydb read timeout".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("alloydb read failed: {e}")))?;
+    Ok((tag, body))
+}
+
 /// Native TCP transport connecting to Google Cloud AlloyDB.
 pub struct TcpAlloydbTransport {
     host: String,
     port: u16,
     database: String,
     username: String,
+    password: Option<String>,
+    timeout: Duration,
 }
 
 impl TcpAlloydbTransport {
     pub fn new(config: &AlloydbConfig) -> Self {
+        let password = match &config.auth {
+            AlloydbAuth::Password { password } => Some(password.clone()),
+            AlloydbAuth::IamToken { token } => Some(token.clone()),
+        };
         Self {
             host: config.host.clone(),
             port: config.port,
             database: config.database.clone(),
             username: config.username.clone(),
+            password,
+            timeout: config.timeout(),
         }
     }
 }
@@ -318,17 +365,111 @@ impl TcpAlloydbTransport {
 #[async_trait]
 impl AlloydbTransport for TcpAlloydbTransport {
     async fn execute(&self, query: &str, params: &[AlloydbValue]) -> Result<AlloydbQueryResult> {
-        tracing::debug!(
-            "executing AlloyDB query on {}:{}/{} for user {}: {} with {} params",
-            self.host,
-            self.port,
-            self.database,
-            self.username,
-            query,
-            params.len()
-        );
+        use tokio::io::AsyncWriteExt;
+        let mut full_sql = query.to_string();
+        for (idx, p) in params.iter().enumerate() {
+            let placeholder = format!("${}", idx + 1);
+            full_sql = full_sql.replace(&placeholder, &format_alloydb_value(p));
+        }
+
+        let addr = format!("{}:{}", self.host, self.port);
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("alloydb connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("alloydb connect failed: {e}")))?;
+
+        // Send StartupMessage
+        let mut params_buf = Vec::new();
+        params_buf.extend_from_slice(b"user\0");
+        params_buf.extend_from_slice(self.username.as_bytes());
+        params_buf.push(0);
+        params_buf.extend_from_slice(b"database\0");
+        params_buf.extend_from_slice(self.database.as_bytes());
+        params_buf.push(0);
+        params_buf.push(0);
+
+        let mut startup_body = Vec::new();
+        startup_body.extend_from_slice(&0x0003_0000u32.to_be_bytes());
+        startup_body.extend_from_slice(&params_buf);
+        let len = (startup_body.len() + 4) as u32;
+        let mut startup_msg = Vec::new();
+        startup_msg.extend_from_slice(&len.to_be_bytes());
+        startup_msg.extend_from_slice(&startup_body);
+        stream
+            .write_all(&startup_msg)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("alloydb startup write failed: {e}")))?;
+
+        // Drain until 'Z' (ReadyForQuery)
+        loop {
+            let (tag, body) = read_alloydb_pg_msg(&mut stream, self.timeout).await?;
+            if tag == b'Z' {
+                break;
+            } else if tag == b'R' {
+                let auth_type = if body.len() >= 4 {
+                    i32::from_be_bytes([body[0], body[1], body[2], body[3]])
+                } else {
+                    0
+                };
+                if auth_type == 3 {
+                    // CleartextPassword
+                    let pass = self.password.as_deref().unwrap_or("");
+                    let p_bytes = pass.as_bytes();
+                    let p_len = (p_bytes.len() + 5) as u32;
+                    let mut p_msg = Vec::with_capacity(p_len as usize + 1);
+                    p_msg.push(b'p');
+                    p_msg.extend_from_slice(&p_len.to_be_bytes());
+                    p_msg.extend_from_slice(p_bytes);
+                    p_msg.push(0);
+                    stream
+                        .write_all(&p_msg)
+                        .await
+                        .map_err(|e| ConnectorError::Connection(format!("alloydb password write failed: {e}")))?;
+                }
+            } else if tag == b'E' {
+                let msg = String::from_utf8_lossy(&body).into_owned();
+                return Err(ConnectorError::Connection(format!("alloydb startup error: {msg}")));
+            }
+        }
+
+        // Send Simple Query ('Q')
+        let sql_bytes = full_sql.as_bytes();
+        let q_len = (sql_bytes.len() + 5) as u32;
+        let mut q_msg = Vec::with_capacity(q_len as usize + 1);
+        q_msg.push(b'Q');
+        q_msg.extend_from_slice(&q_len.to_be_bytes());
+        q_msg.extend_from_slice(sql_bytes);
+        q_msg.push(0);
+        stream
+            .write_all(&q_msg)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("alloydb query write failed: {e}")))?;
+
+        let mut rows_affected = 1;
+        let mut error_msg = None;
+        loop {
+            let (tag, body) = read_alloydb_pg_msg(&mut stream, self.timeout).await?;
+            if tag == b'C' {
+                let s = String::from_utf8_lossy(&body);
+                if let Some(cnt_str) = s.split_whitespace().last() {
+                    if let Ok(cnt) = cnt_str.trim_matches('\0').parse::<usize>() {
+                        rows_affected = cnt;
+                    }
+                }
+            } else if tag == b'E' {
+                let s = String::from_utf8_lossy(&body).into_owned();
+                error_msg = Some(s);
+            } else if tag == b'Z' {
+                break;
+            }
+        }
+
+        if let Some(err) = error_msg {
+            return Err(ConnectorError::Dispatch(format!("alloydb query error: {err}")));
+        }
+
         Ok(AlloydbQueryResult {
-            rows_affected: 1,
+            rows_affected,
             status: "SUCCESS".into(),
             sqlstate: None,
             error_message: None,
@@ -566,6 +707,7 @@ mod tests {
             ],
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 
@@ -582,6 +724,7 @@ mod tests {
             column_mappings: Vec::new(),
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

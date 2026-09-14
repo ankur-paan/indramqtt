@@ -29,6 +29,7 @@ broker-connectors = { workspace = true }
 broker-cluster = { workspace = true }
 broker-api = { workspace = true }
 broker-observability = { workspace = true }
+broker-gateway = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

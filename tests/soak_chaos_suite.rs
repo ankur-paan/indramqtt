@@ -12,7 +12,8 @@
 #![allow(clippy::manual_is_multiple_of)]
 
 use broker_auth::{
-    AclAction, AclRule, AuthError, Authenticator, Authorizer, MemoryAuth, UserQuotas,
+    AclAction, AclRule, AuthError, Authenticator, Authorizer, KerberosAuthenticator,
+    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, UserQuotas,
 };
 use broker_cluster::{
     ChannelSwimNetwork, ClusterRouteTable, NodeId, NodeStatus, SwimConfig, SwimMembership,
@@ -26,10 +27,12 @@ use broker_connectors::{
     MemoryRedisTransport, MySqlSink, MySqlSinkConfig, PostgreSqlSink, PostgreSqlSinkConfig,
     RedisCommandKind, RedisSink, RedisSinkConfig,
 };
+use broker_gateway::{coap, lwm2m, ocpp, GatewayManager, GatewayProtocol};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager, TokenBucket};
+use broker_storage::DurableStreamStore;
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -1797,4 +1800,443 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     drop(beta_sink);
     drop(alpha_transport);
     drop(beta_transport);
+}
+
+// ============================================================================
+// 10. Multi-Protocol Gateways, Enterprise Auth & Durable Stream Replay
+// ============================================================================
+
+#[tokio::test]
+async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
+    // ------------------------------------------------------------------------
+    // Part 1: CoAP RFC 7252 Ingest -> Rekuiper SQL -> Kafka Sink
+    // ------------------------------------------------------------------------
+    let (gw_mgr, mut gw_rx) = GatewayManager::new(300);
+    let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::Block));
+    let alert_sink = Arc::new(StressBrokerSink::default());
+    let broker_sink: Arc<dyn BrokerSink> = alert_sink.clone();
+
+    let kafka_transport = Arc::new(MemoryKafkaTransport::new());
+    let kafka_sink = Arc::new(
+        KafkaSink::new(
+            KafkaSinkConfig {
+                bootstrap_servers: "127.0.0.1:9092".to_string(),
+                topic_template: "coap-kafka-events".to_string(),
+                partition_key_field: Some("sensor".to_string()),
+                partitions: 4,
+                client_id: "coap-ingest-tester".to_string(),
+                acks: "all".to_string(),
+                batch_max_records: 10,
+                batch_max_bytes: 32 * 1024,
+            },
+            kafka_transport.clone(),
+        )
+        .expect("kafka sink"),
+    );
+
+    engine
+        .connectors()
+        .register("target_kafka_coap", kafka_sink.clone());
+
+    let coap_filter = TopicFilter::new("coap/industrial/+").unwrap();
+    let coap_sql = r#"SELECT sensor, celsius, celsius * 1.8 + 32.0 AS fahrenheit FROM "coap/industrial/+" WHERE celsius > 30.0 INTO connector("target_kafka_coap")"#;
+    engine
+        .create_rule(
+            "rule_coap_kafka".to_string(),
+            coap_filter,
+            Some(coap_sql.to_string()),
+            true,
+            vec![],
+        )
+        .expect("create coap rule");
+
+    // Simulate CoAP client publishing 20 sensor telemetry datagrams via RFC 7252
+    for i in 0..20 {
+        let celsius = 25.0 + (i as f64); // 25..44, >=31 qualifies (14 records)
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "sensor": format!("coap-sensor-{}", i),
+            "celsius": celsius,
+            "raw_voltage": 3.3
+        }))
+        .unwrap();
+
+        let req = coap::CoapMessage {
+            message_type: coap::CoapType::Confirmable,
+            code: coap::CoapCode::POST,
+            message_id: 1000 + (i as u16),
+            token: Bytes::from(format!("tok{}", i)),
+            options: vec![
+                coap::CoapOption {
+                    number: coap::option_number::URI_PATH,
+                    value: Bytes::from_static(b"ps"),
+                },
+                coap::CoapOption {
+                    number: coap::option_number::URI_PATH,
+                    value: Bytes::from_static(b"coap"),
+                },
+                coap::CoapOption {
+                    number: coap::option_number::URI_PATH,
+                    value: Bytes::from_static(b"industrial"),
+                },
+                coap::CoapOption {
+                    number: coap::option_number::URI_PATH,
+                    value: Bytes::from(format!("sensor{}", i)),
+                },
+            ],
+            payload: Bytes::from(payload),
+        };
+
+        let resp = gw_mgr
+            .handle_coap("coap-client", &req)
+            .expect("handle coap");
+        assert!(resp.is_some());
+        let resp_msg = resp.unwrap();
+        assert_eq!(resp_msg.code, coap::CoapCode::CHANGED);
+
+        // Receive normalized message from GatewayManager channel
+        let gw_msg = gw_rx.try_recv().expect("receive coap normalized message");
+        assert_eq!(gw_msg.protocol, GatewayProtocol::CoAP);
+        assert_eq!(gw_msg.topic, format!("coap/industrial/sensor{}", i));
+
+        let topic = Topic::new(&gw_msg.topic).unwrap();
+        engine
+            .dispatch_ingress(&topic, &gw_msg.payload, gw_msg.qos, &broker_sink)
+            .await;
+    }
+
+    kafka_sink.flush().await.expect("flush kafka sink");
+
+    // Verify Kafka Sink received exactly 14 records above 30.0C with projected fahrenheit
+    let kafka_records = kafka_transport.records_flat();
+    assert_eq!(
+        kafka_records.len(),
+        14,
+        "Expected 14 records where celsius > 30.0"
+    );
+    for r in &kafka_records {
+        assert_eq!(r.topic, "coap-kafka-events");
+        let parsed: serde_json::Value = serde_json::from_slice(&r.value).unwrap();
+        let c = parsed["celsius"].as_f64().unwrap();
+        let f = parsed["fahrenheit"].as_f64().unwrap();
+        assert!(c > 30.0);
+        assert!((f - (c * 1.8 + 32.0)).abs() < 1e-4);
+        assert!(
+            parsed.get("raw_voltage").is_none(),
+            "raw_voltage must be stripped"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 2: LwM2M OMA TLV Ingest -> Rekuiper SQL -> PostgreSQL Sink
+    // ------------------------------------------------------------------------
+    let pg_transport = Arc::new(MemoryPgTransport::new());
+    let pg_sink = Arc::new(
+        PostgreSqlSink::new(
+            PostgreSqlSinkConfig {
+                connection_url: "postgres://user:pass@127.0.0.1:5432/lwm2m_db".to_string(),
+                sql_template:
+                    "INSERT INTO lwm2m_readings (topic, qos, payload) VALUES ($1, $2, $3)"
+                        .to_string(),
+                pool_size: 2,
+                batch_size: 10,
+                batch_timeout_ms: 10,
+            },
+            pg_transport.clone(),
+        )
+        .expect("pg sink"),
+    );
+
+    engine
+        .connectors()
+        .register("target_pg_lwm2m", pg_sink.clone());
+
+    let lwm2m_filter = TopicFilter::new("lwm2m/+/up/data").unwrap();
+    let lwm2m_sql = r#"SELECT endpoint, object_id, instance_id FROM "lwm2m/+/up/data" WHERE object_id = 3303 INTO connector("target_pg_lwm2m")"#;
+    engine
+        .create_rule(
+            "rule_lwm2m_pg".to_string(),
+            lwm2m_filter,
+            Some(lwm2m_sql.to_string()),
+            true,
+            vec![],
+        )
+        .expect("create lwm2m rule");
+
+    // Register 5 LwM2M devices and send Object 3303 (Temperature) TLVs
+    for i in 0..5 {
+        let ep = format!("pump-station-{i}");
+        let reg_id = gw_mgr.lwm2m.register(&ep, 300, "U", "1.1");
+        assert!(reg_id.starts_with("rd-"));
+
+        let temp_bytes = (20.0f32 + (i as f32)).to_be_bytes().to_vec();
+        let tlv_rec = lwm2m::TlvRecord::resource_value(5700, temp_bytes);
+        let tlv_bytes = tlv_rec.encode();
+
+        let (topic_str, _) = gw_mgr
+            .handle_lwm2m_tlv(&ep, 3303, 0, &tlv_bytes)
+            .expect("handle lwm2m tlv");
+
+        let gw_msg = gw_rx.try_recv().expect("receive lwm2m normalized message");
+        assert_eq!(gw_msg.protocol, GatewayProtocol::LwM2M);
+        assert_eq!(gw_msg.topic, topic_str);
+
+        let topic = Topic::new(&gw_msg.topic).unwrap();
+        engine
+            .dispatch_ingress(&topic, &gw_msg.payload, gw_msg.qos, &broker_sink)
+            .await;
+    }
+
+    pg_sink.flush().await.expect("flush pg sink");
+
+    // Verify PostgreSQL Sink received all 5 LwM2M readings
+    let batches = pg_transport.batches();
+    assert!(
+        !batches.is_empty(),
+        "PostgreSQL batches should not be empty"
+    );
+    let mut pg_row_count = 0;
+    for batch in &batches {
+        for row in &batch.rows {
+            pg_row_count += 1;
+            let payload_str = std::str::from_utf8(&row[2]).expect("utf8 payload");
+            let parsed: serde_json::Value = serde_json::from_str(payload_str).unwrap();
+            assert_eq!(parsed["object_id"], 3303);
+            assert!(parsed["endpoint"]
+                .as_str()
+                .unwrap()
+                .starts_with("pump-station-"));
+        }
+    }
+    assert_eq!(pg_row_count, 5, "Expected 5 LwM2M rows inserted into PG");
+
+    // ------------------------------------------------------------------------
+    // Part 3: OCPP 1.6-J EV Charging -> Rekuiper SQL -> Redis Stream Sink
+    // ------------------------------------------------------------------------
+    let redis_transport = Arc::new(MemoryRedisTransport::new());
+    let redis_sink = Arc::new(
+        RedisSink::new(
+            RedisSinkConfig {
+                endpoint: "redis://127.0.0.1:6379".to_string(),
+                command: RedisCommandKind::XAdd {
+                    stream_template: "ocpp-stream".to_string(),
+                    maxlen: Some(500),
+                },
+            },
+            redis_transport.clone(),
+        )
+        .expect("redis sink"),
+    );
+
+    engine
+        .connectors()
+        .register("target_redis_ocpp", redis_sink.clone());
+
+    let ocpp_filter = TopicFilter::new("ocpp/+/up/+").unwrap();
+    let ocpp_sql = r#"SELECT charge_point_id, action FROM "ocpp/+/up/+" WHERE action = 'BootNotification' INTO connector("target_redis_ocpp")"#;
+    engine
+        .create_rule(
+            "rule_ocpp_redis".to_string(),
+            ocpp_filter,
+            Some(ocpp_sql.to_string()),
+            true,
+            vec![],
+        )
+        .expect("create ocpp rule");
+
+    // Send BootNotification from 3 EV Charge Points
+    for i in 0..3 {
+        let cp_id = format!("chargepoint-uk-{}", i);
+        let boot_call = format!(
+            r#"[2, "call-boot-{}", "BootNotification", {{"chargePointVendor": "IndraVolt", "chargePointModel": "HyperCharge-350", "firmwareVersion": "2.4.1"}}]"#,
+            i
+        );
+
+        // Verify direct frame parsing via ocpp module
+        let parsed_call = ocpp::OcppMessage::parse(&boot_call).expect("parse ocpp call");
+        assert!(matches!(parsed_call, ocpp::OcppMessage::Call { .. }));
+
+        let (topic_str, _, resp) = gw_mgr
+            .handle_ocpp_frame(&cp_id, &boot_call)
+            .expect("handle ocpp boot");
+        assert!(resp.is_some());
+        let resp_str = resp.unwrap();
+        assert!(resp_str.contains("\"status\":\"Accepted\""));
+
+        let gw_msg = gw_rx.try_recv().expect("receive ocpp normalized message");
+        assert_eq!(gw_msg.protocol, GatewayProtocol::OCPP);
+        assert_eq!(gw_msg.topic, topic_str);
+
+        let topic = Topic::new(&gw_msg.topic).unwrap();
+        engine
+            .dispatch_ingress(&topic, &gw_msg.payload, gw_msg.qos, &broker_sink)
+            .await;
+    }
+
+    // Verify Redis stream received 3 BootNotification entries
+    let commands = redis_transport.commands();
+    assert_eq!(
+        commands.len(),
+        3,
+        "Expected 3 BootNotification entries in Redis stream"
+    );
+    for cmd in &commands {
+        assert_eq!(cmd.argv[0], b"XADD".to_vec());
+        assert_eq!(cmd.argv[1], b"ocpp-stream".to_vec());
+        let payload_str = std::str::from_utf8(&cmd.argv[cmd.argv.len() - 1]).expect("utf8 payload");
+        let parsed: serde_json::Value = serde_json::from_str(payload_str).unwrap();
+        assert_eq!(parsed["action"], "BootNotification");
+        assert!(parsed["charge_point_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("chargepoint-uk-"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 4: Enterprise Authentication (Active Directory LDAP & Kerberos)
+    // ------------------------------------------------------------------------
+    // 4A: LDAP Bind Authentication
+    let ldap_config = LdapConfig {
+        server_url: "ldap://ad.enterprise.corp:389".to_string(),
+        base_dn: "dc=enterprise,dc=corp".to_string(),
+        bind_dn_template: "cn={username},ou=Operators,dc=enterprise,dc=corp".to_string(),
+        filter_template: "(&(objectClass=user)(sAMAccountName={username}))".to_string(),
+        timeout_ms: 5000,
+    };
+    let ldap_auth = LdapAuthenticator::new(ldap_config);
+    let mut ldap_attrs = HashMap::new();
+    ldap_attrs.insert("sAMAccountName".to_string(), "ops_admin".to_string());
+    ldap_attrs.insert("department".to_string(), "DevOps".to_string());
+    ldap_auth.add_entry(
+        "cn=ops_admin,ou=Operators,dc=enterprise,dc=corp",
+        b"EnterpriseSecurePass2026!",
+        ldap_attrs,
+    );
+
+    // Valid credentials -> success
+    assert!(ldap_auth
+        .authenticate(
+            "admin-console",
+            Some("ops_admin"),
+            Some(b"EnterpriseSecurePass2026!")
+        )
+        .await
+        .is_ok());
+
+    // Bad password -> fail
+    assert!(ldap_auth
+        .authenticate("admin-console", Some("ops_admin"), Some(b"wrong_secret"))
+        .await
+        .is_err());
+
+    // Non-existent user -> fail
+    assert!(ldap_auth
+        .authenticate("admin-console", Some("intruder"), Some(b"secret"))
+        .await
+        .is_err());
+
+    // 4B: Kerberos SPN and SPNEGO Ticket Authentication
+    let krb_config = KerberosConfig {
+        service_principal_name: "mqtt/broker.enterprise.corp@ENTERPRISE.CORP".to_string(),
+        realm: "ENTERPRISE.CORP".to_string(),
+        allowed_realms: vec!["ENTERPRISE.CORP".to_string()],
+    };
+    let krb_auth = KerberosAuthenticator::new(krb_config);
+    krb_auth.add_principal("operator@ENTERPRISE.CORP");
+
+    let valid_krb_ticket = KerberosAuthenticator::create_test_token(
+        "operator@ENTERPRISE.CORP",
+        "mqtt/broker.enterprise.corp@ENTERPRISE.CORP",
+        "ENTERPRISE.CORP",
+    );
+
+    // Valid Kerberos ticket -> success
+    assert!(krb_auth
+        .authenticate("workstation-1", Some("operator"), Some(&valid_krb_ticket))
+        .await
+        .is_ok());
+
+    // Wrong SPN ticket -> fail
+    let bad_spn_ticket = KerberosAuthenticator::create_test_token(
+        "operator@ENTERPRISE.CORP",
+        "http/web.enterprise.corp@ENTERPRISE.CORP",
+        "ENTERPRISE.CORP",
+    );
+    assert!(krb_auth
+        .authenticate("workstation-1", Some("operator"), Some(&bad_spn_ticket))
+        .await
+        .is_err());
+
+    // ------------------------------------------------------------------------
+    // Part 5: Durable Stream Partition Storage & Point-in-Time Seek Replay
+    // ------------------------------------------------------------------------
+    let stream_store = DurableStreamStore::new();
+    let stream_topic = Topic::new("factory/line1/vibration").unwrap();
+
+    let base_ts = 1_710_000_000_000u64;
+
+    // Append 100 historical telemetry frames with sequential 64-bit offsets
+    for i in 0..100 {
+        let payload = Bytes::from(format!("vibration_amplitude_{i}"));
+        let mut headers = HashMap::new();
+        headers.insert("seq".to_string(), i.to_string());
+
+        let offset = stream_store.append_with_timestamp(
+            stream_topic.clone(),
+            QoS::AtLeastOnce,
+            payload,
+            headers,
+            base_ts + (i * 100),
+        );
+        assert_eq!(offset, i);
+    }
+
+    assert_eq!(stream_store.stream_len("factory/line1/vibration"), 100);
+    assert_eq!(
+        stream_store.earliest_offset("factory/line1/vibration"),
+        Some(0)
+    );
+    assert_eq!(
+        stream_store.latest_offset("factory/line1/vibration"),
+        Some(99)
+    );
+
+    // Seek offset from 60 to 100 (replay 40 records)
+    let replayed = stream_store
+        .seek_offset("factory/line1/vibration", 60, 40)
+        .expect("seek offset");
+    assert_eq!(replayed.len(), 40);
+    assert_eq!(replayed[0].offset, 60);
+    assert_eq!(
+        replayed[0].payload,
+        Bytes::from_static(b"vibration_amplitude_60")
+    );
+    assert_eq!(replayed[39].offset, 99);
+    assert_eq!(
+        replayed[39].payload,
+        Bytes::from_static(b"vibration_amplitude_99")
+    );
+
+    // Seek timestamp from base_ts + 7550ms -> should start at record 76
+    let time_replayed = stream_store
+        .seek_timestamp("factory/line1/vibration", base_ts + 7550, 10)
+        .expect("seek timestamp");
+    assert_eq!(time_replayed.len(), 10);
+    assert_eq!(time_replayed[0].offset, 76);
+    assert_eq!(time_replayed[0].timestamp_ms, base_ts + 7600);
+
+    // Retention policy purge: prune records older than base_ts + 5000ms (first 50 records)
+    let purged_count = stream_store.purge_retention("factory/line1/vibration", base_ts + 5000);
+    assert_eq!(purged_count, 50);
+    assert_eq!(stream_store.stream_len("factory/line1/vibration"), 50);
+    assert_eq!(
+        stream_store.earliest_offset("factory/line1/vibration"),
+        Some(50)
+    );
+
+    // ------------------------------------------------------------------------
+    // Part 6: Clean Up
+    // ------------------------------------------------------------------------
+    engine.connectors().unregister("target_kafka_coap");
+    engine.connectors().unregister("target_pg_lwm2m");
+    engine.connectors().unregister("target_redis_ocpp");
 }

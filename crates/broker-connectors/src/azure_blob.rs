@@ -107,9 +107,16 @@ pub struct AzureBlobSinkConfig {
     /// Buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl AzureBlobSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_account_name(&self.account_name)?;
         validate_container_name(&self.container_name)?;

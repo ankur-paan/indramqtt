@@ -79,9 +79,16 @@ pub struct OpenTsdbConfig {
     /// In-memory queue buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Request / network timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl OpenTsdbConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -177,10 +184,20 @@ pub fn extract_numeric_value(val: &serde_json::Value, field_expr: &str) -> Optio
 
     let parts: Vec<&str> = clean.split('.').collect();
     let mut curr = val;
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
         match curr {
             serde_json::Value::Object(map) => {
-                curr = map.get(part)?;
+                if let Some(next) = map.get(*part) {
+                    curr = next;
+                } else if i == 0 {
+                    if let Some(sub) = map.get("payload").and_then(|p| p.get(*part)) {
+                        curr = sub;
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -256,7 +273,7 @@ pub fn render_opentsdb_template(template: &str, val: &serde_json::Value, topic: 
                 }
             } else {
                 let json_path = var.trim_start_matches("payload.");
-                if let Some(v) = extract_json_path(val, json_path).or_else(|| val.get(&var)) {
+                if let Some(v) = extract_json_path(val, json_path).or_else(|| val.get(&var)).or_else(|| val.get("payload").and_then(|p| p.get(json_path))) {
                     match v {
                         serde_json::Value::String(s) => out.push_str(s),
                         serde_json::Value::Number(n) => out.push_str(&n.to_string()),
@@ -337,7 +354,7 @@ impl NetworkOpenTsdbTransport {
         };
         Self {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(config.timeout())
                 .build()
                 .unwrap_or_default(),
             http_url,
@@ -642,6 +659,7 @@ mod tests {
             compression: OpenTsdbCompression::None,
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 
@@ -659,6 +677,7 @@ mod tests {
             compression: OpenTsdbCompression::None,
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

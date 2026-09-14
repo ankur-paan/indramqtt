@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 fn default_batch_size() -> Option<usize> {
     Some(500)
@@ -43,9 +45,16 @@ pub struct CockroachDbConfig {
     /// In-memory queue buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl CockroachDbConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.connection_string.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -266,15 +275,87 @@ pub trait CockroachDbTransport: Send + Sync {
         -> Result<CockroachQueryResult>;
 }
 
+fn format_cockroach_value(v: &CockroachValue) -> String {
+    match v {
+        CockroachValue::Null => "NULL".to_string(),
+        CockroachValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        CockroachValue::Integer(i) => i.to_string(),
+        CockroachValue::Number(n) => n.to_string(),
+        CockroachValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
+fn parse_cr_conn_str(conn_str: &str) -> (String, u16, String, String) {
+    let mut s = conn_str.trim();
+    if let Some(rest) = s.strip_prefix("postgresql://").or_else(|| s.strip_prefix("postgres://")) {
+        s = rest;
+    }
+    if let Some((before_q, _)) = s.split_once('?') {
+        s = before_q;
+    }
+    let (auth, host_part) = if let Some((a, h)) = s.split_once('@') {
+        (Some(a), h)
+    } else {
+        (None, s)
+    };
+    let user = if let Some(a) = auth {
+        if let Some((u, _p)) = a.split_once(':') {
+            u.to_string()
+        } else {
+            a.to_string()
+        }
+    } else {
+        "root".to_string()
+    };
+    let (host_port, db) = if let Some((hp, d)) = host_part.split_once('/') {
+        (hp, d.to_string())
+    } else {
+        (host_part, "defaultdb".to_string())
+    };
+    let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
+        let parsed_p = p.parse::<u16>().unwrap_or(26257);
+        (h.to_string(), parsed_p)
+    } else {
+        (host_port.to_string(), 26257)
+    };
+    let host = if host.is_empty() { "127.0.0.1".to_string() } else { host };
+    let db = if db.is_empty() { "defaultdb".to_string() } else { db };
+    let user = if user.is_empty() { "root".to_string() } else { user };
+    (host, port, user, db)
+}
+
+async fn read_cr_pg_msg(stream: &mut TcpStream, timeout: Duration) -> Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 5];
+    tokio::time::timeout(timeout, stream.read_exact(&mut header))
+        .await
+        .map_err(|_| ConnectorError::Connection("cockroachdb read timeout".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("cockroachdb read failed: {e}")))?;
+    let tag = header[0];
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if !(4..=16 * 1024 * 1024).contains(&len) {
+        return Err(ConnectorError::Connection(format!(
+            "cockroachdb bad message length: {len}"
+        )));
+    }
+    let mut body = vec![0u8; len - 4];
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
+        .await
+        .map_err(|_| ConnectorError::Connection("cockroachdb read timeout".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("cockroachdb read failed: {e}")))?;
+    Ok((tag, body))
+}
+
 /// Native TCP transport connecting to CockroachDB.
 pub struct TcpCockroachDbTransport {
     connection_string: String,
+    timeout: Duration,
 }
 
 impl TcpCockroachDbTransport {
     pub fn new(config: &CockroachDbConfig) -> Self {
         Self {
             connection_string: config.connection_string.clone(),
+            timeout: config.timeout(),
         }
     }
 
@@ -290,16 +371,89 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         query: &str,
         params: &[CockroachValue],
     ) -> Result<CockroachQueryResult> {
-        // Native TCP connection logic via SQL wire protocol.
-        // For testing/mocking, mock transports provide deterministic capture.
-        tracing::debug!(
-            "executing CockroachDB query on {}: {} with {} params",
-            self.connection_string,
-            query,
-            params.len()
-        );
+        let mut full_sql = query.to_string();
+        for (idx, p) in params.iter().enumerate() {
+            let placeholder = format!("${}", idx + 1);
+            full_sql = full_sql.replace(&placeholder, &format_cockroach_value(p));
+        }
+
+        let (host, port, user, database) = parse_cr_conn_str(&self.connection_string);
+        let addr = format!("{host}:{port}");
+        let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("cockroachdb connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("cockroachdb connect failed: {e}")))?;
+
+        // Send StartupMessage
+        let mut params_buf = Vec::new();
+        params_buf.extend_from_slice(b"user\0");
+        params_buf.extend_from_slice(user.as_bytes());
+        params_buf.push(0);
+        params_buf.extend_from_slice(b"database\0");
+        params_buf.extend_from_slice(database.as_bytes());
+        params_buf.push(0);
+        params_buf.push(0);
+
+        let mut startup_body = Vec::new();
+        startup_body.extend_from_slice(&0x0003_0000u32.to_be_bytes());
+        startup_body.extend_from_slice(&params_buf);
+        let len = (startup_body.len() + 4) as u32;
+        let mut startup_msg = Vec::new();
+        startup_msg.extend_from_slice(&len.to_be_bytes());
+        startup_msg.extend_from_slice(&startup_body);
+        stream
+            .write_all(&startup_msg)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("cockroachdb startup write failed: {e}")))?;
+
+        // Drain until 'Z'
+        loop {
+            let (tag, body) = read_cr_pg_msg(&mut stream, self.timeout).await?;
+            if tag == b'Z' {
+                break;
+            } else if tag == b'E' {
+                let msg = String::from_utf8_lossy(&body).into_owned();
+                return Err(ConnectorError::Connection(format!("cockroachdb startup error: {msg}")));
+            }
+        }
+
+        // Send Simple Query ('Q')
+        let sql_bytes = full_sql.as_bytes();
+        let q_len = (sql_bytes.len() + 5) as u32;
+        let mut q_msg = Vec::with_capacity(q_len as usize + 1);
+        q_msg.push(b'Q');
+        q_msg.extend_from_slice(&q_len.to_be_bytes());
+        q_msg.extend_from_slice(sql_bytes);
+        q_msg.push(0);
+        stream
+            .write_all(&q_msg)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("cockroachdb query write failed: {e}")))?;
+
+        let mut rows_affected = 1;
+        let mut error_msg = None;
+        loop {
+            let (tag, body) = read_cr_pg_msg(&mut stream, self.timeout).await?;
+            if tag == b'C' {
+                let s = String::from_utf8_lossy(&body);
+                if let Some(cnt_str) = s.split_whitespace().last() {
+                    if let Ok(cnt) = cnt_str.trim_matches('\0').parse::<usize>() {
+                        rows_affected = cnt;
+                    }
+                }
+            } else if tag == b'E' {
+                let s = String::from_utf8_lossy(&body).into_owned();
+                error_msg = Some(s);
+            } else if tag == b'Z' {
+                break;
+            }
+        }
+        if let Some(err) = error_msg {
+            return Err(ConnectorError::Dispatch(format!("cockroachdb query failed: {err}")));
+        }
+
         Ok(CockroachQueryResult {
-            rows_affected: 1,
+            rows_affected,
             status: "SUCCESS".into(),
             sqlstate: None,
             error_message: None,
@@ -577,6 +731,7 @@ mod tests {
             batch_size: Some(1),
             max_retry_attempts: 3,
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

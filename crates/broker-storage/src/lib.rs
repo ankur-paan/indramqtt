@@ -1,3 +1,6 @@
+pub mod stream;
+pub use stream::{DurableStreamStore, StreamRecord};
+
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;

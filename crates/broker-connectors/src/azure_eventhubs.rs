@@ -113,9 +113,16 @@ pub struct AzureEventHubsSinkConfig {
     /// Retry delay ceiling in ms (default 2500).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl AzureEventHubsSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !is_namespace(&self.namespace) {
             return Err(ConnectorError::Dispatch(format!(
@@ -183,7 +190,11 @@ impl AzureEventHubsSinkConfig {
 
     /// Resource URI covered by SAS tokens (scheme + host + hub).
     pub fn resource_uri(&self) -> String {
-        format!("https://{}/{}", self.host(), self.event_hub)
+        let scheme = match &self.endpoint {
+            Some(e) if e.starts_with("http://") => "http",
+            _ => "https",
+        };
+        format!("{scheme}://{}/{}", self.host(), self.event_hub)
     }
 
     /// Batch send URL: `{resource_uri}/messages`.

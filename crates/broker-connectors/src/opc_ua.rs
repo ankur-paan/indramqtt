@@ -819,6 +819,9 @@ pub struct OpcUaSinkConfig {
     /// Linger flush window in ms (default 50).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
+    /// Network connect / request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_batch_size() -> Option<usize> {
@@ -830,6 +833,10 @@ fn default_linger_ms() -> Option<u64> {
 }
 
 impl OpcUaSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.endpoint_url.starts_with("opc.tcp://") {
             return Err(ConnectorError::Dispatch(format!(
@@ -988,6 +995,7 @@ pub struct TcpOpcUaTransport {
     hello: OpcUaHello,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     sequence: AtomicU64,
+    timeout: Duration,
 }
 
 impl TcpOpcUaTransport {
@@ -1011,6 +1019,7 @@ impl TcpOpcUaTransport {
             },
             stream: tokio::sync::Mutex::new(None),
             sequence: AtomicU64::new(1),
+            timeout: config.timeout(),
         })
     }
 
@@ -1046,7 +1055,7 @@ impl OpcUaTransport for TcpOpcUaTransport {
         }
         let addr = format!("{}:{}", self.host, self.port);
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            self.timeout,
             tokio::net::TcpStream::connect(&addr),
         )
         .await
@@ -1059,7 +1068,7 @@ impl OpcUaTransport for TcpOpcUaTransport {
             .await
             .map_err(|e| ConnectorError::Connection(format!("opc-ua hello write failed: {e}")))?;
         let mut header = [0u8; 8];
-        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
+        tokio::time::timeout(self.timeout, stream.read_exact(&mut header))
             .await
             .map_err(|_| ConnectorError::Connection("opc-ua ack timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("opc-ua ack read failed: {e}")))?;
@@ -1248,7 +1257,19 @@ impl OpcUaSink {
             .map_err(|_| ConnectorError::Dispatch("opc-ua payload must be UTF-8".to_string()))?;
         let value: serde_json::Value = serde_json::from_str(text)
             .map_err(|_| ConnectorError::Dispatch("opc-ua payload must be JSON".to_string()))?;
-        let variant = match &value {
+        let inner_val = match &value {
+            serde_json::Value::Object(map) => {
+                if let Some(v) = map.get("value") {
+                    v
+                } else if map.len() == 1 {
+                    map.values().next().unwrap()
+                } else {
+                    &value
+                }
+            }
+            _ => &value,
+        };
+        let variant = match inner_val {
             serde_json::Value::Bool(v) => OpcUaVariant::Boolean(*v),
             serde_json::Value::Number(n) => {
                 if let Some(v) = n.as_i64() {
@@ -1343,6 +1364,7 @@ mod tests {
             buffer_capacity: None,
             batch_size: Some(100),
             linger_ms: Some(50),
+            timeout_ms: None,
         }
     }
 

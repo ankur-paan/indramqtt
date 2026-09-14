@@ -156,6 +156,9 @@ pub struct MssqlSinkConfig {
     /// Retry delay ceiling in ms (default 2500).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Network connect/query timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -163,6 +166,10 @@ fn default_true() -> bool {
 }
 
 impl MssqlSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -627,9 +634,9 @@ pub fn parse_reply_tokens(mut cursor: &[u8]) -> Result<TdsReply> {
 
 /// Read one TDS packet payload (strips the 8-byte header, requires
 /// a REPLY packet).
-async fn read_packet(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+async fn read_packet(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<Vec<u8>> {
     let mut header = [0u8; 8];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
+    tokio::time::timeout(timeout, stream.read_exact(&mut header))
         .await
         .map_err(|_| ConnectorError::Connection("mssql read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("mssql read failed: {e}")))?;
@@ -646,9 +653,9 @@ async fn read_packet(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
         )));
     }
     let mut body = vec![0u8; length - 8];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
         .await
+        .map_err(|_| ConnectorError::Connection("mssql read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("mssql read failed: {e}")))?;
     Ok(body)
 }
@@ -752,6 +759,7 @@ pub struct NativeMssqlTransport {
     query_mode: MssqlQueryMode,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     packet_id: AtomicU64,
+    timeout: Duration,
 }
 
 impl NativeMssqlTransport {
@@ -773,6 +781,7 @@ impl NativeMssqlTransport {
             query_mode: config.query_mode.clone(),
             stream: tokio::sync::Mutex::new(None),
             packet_id: AtomicU64::new(0),
+            timeout: config.timeout(),
         })
     }
 
@@ -783,7 +792,7 @@ impl NativeMssqlTransport {
         }
         let addr = format!("{}:{}", self.host, self.port);
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            self.timeout,
             tokio::net::TcpStream::connect(&addr),
         )
         .await
@@ -794,7 +803,7 @@ impl NativeMssqlTransport {
             .write_all(&tds_packet(packet::PRELOGIN, 0, &encode_prelogin()))
             .await
             .map_err(|e| ConnectorError::Connection(format!("mssql prelogin write failed: {e}")))?;
-        let reply = read_packet(&mut stream).await?;
+        let reply = read_packet(&mut stream, self.timeout).await?;
         if decode_prelogin_encryption(&reply)? == 0x03 {
             return Err(ConnectorError::Dispatch(
                 "mssql server requires TLS encryption; terminate TLS in a sidecar proxy"
@@ -814,7 +823,7 @@ impl NativeMssqlTransport {
             .write_all(&tds_packet(packet::LOGIN, 1, &login))
             .await
             .map_err(|e| ConnectorError::Connection(format!("mssql login write failed: {e}")))?;
-        let reply = read_packet(&mut stream).await?;
+        let reply = read_packet(&mut stream, self.timeout).await?;
         match parse_reply_tokens(&reply)? {
             TdsReply::Done => {}
             TdsReply::Error { number, message } => {
@@ -860,7 +869,7 @@ impl MssqlTransport for NativeMssqlTransport {
             stream.write_all(&packet).await.map_err(|e| {
                 ConnectorError::Connection(format!("mssql batch write failed: {e}"))
             })?;
-            let reply = read_packet(stream).await?;
+            let reply = read_packet(stream, self.timeout).await?;
             match parse_reply_tokens(&reply)? {
                 TdsReply::Done => {}
                 TdsReply::Error { number, message } => {
@@ -1118,6 +1127,7 @@ mod tests {
             max_retries: Some(3),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_500),
+            timeout_ms: None,
         }
     }
 

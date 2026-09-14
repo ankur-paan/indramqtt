@@ -106,7 +106,7 @@ pub fn encode_field_table(entries: &[(String, FieldValue)]) -> Result<Vec<u8>> {
         match value {
             FieldValue::Str(text) => {
                 body.push(b'S');
-                encode_shortstr(text, &mut body)?;
+                encode_longstr(text.as_bytes(), &mut body);
             }
             FieldValue::Bool(flag) => {
                 body.push(b't');
@@ -178,8 +178,8 @@ pub fn encode_basic_publish(publish: &AmqpPublish) -> Result<Vec<AmqpFrame>> {
     method_args.extend_from_slice(&0u16.to_be_bytes()); // reserved-1
     encode_shortstr(&publish.exchange, &mut method_args)?;
     encode_shortstr(&publish.routing_key, &mut method_args)?;
-    method_args.push(0u8); // mandatory
-    method_args.push(0u8); // immediate
+    // In AMQP 0-9-1, consecutive bit fields (mandatory, immediate) are packed into a single octet.
+    method_args.push(0u8);
     let method = method_frame(1, 60, 40, &method_args);
 
     let mut header_payload = Vec::new();

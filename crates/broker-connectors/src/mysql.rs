@@ -218,6 +218,7 @@ impl MySqlTransport for MemoryMySqlTransport {
 
 const CAP_LONG_PASSWORD: u32 = 0x0000_0001;
 const CAP_LONG_FLAG: u32 = 0x0000_0004;
+const CAP_CONNECT_WITH_DB: u32 = 0x0000_0008;
 const CAP_PROTOCOL_41: u32 = 0x0000_0200;
 const CAP_SECURE_CONNECTION: u32 = 0x0000_8000;
 const CAP_PLUGIN_AUTH: u32 = 0x0008_0000;
@@ -497,7 +498,11 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
     // HandshakeResponse41.
     let token = native_password_token(endpoint.password.as_bytes(), &salt[..salt.len().min(20)]);
     let mut body = Vec::new();
-    body.extend_from_slice(&CLIENT_CAPABILITIES.to_le_bytes());
+    let mut caps = CLIENT_CAPABILITIES;
+    if !endpoint.database.is_empty() {
+        caps |= CAP_CONNECT_WITH_DB;
+    }
+    body.extend_from_slice(&caps.to_le_bytes());
     body.extend_from_slice(&0x01000000u32.to_le_bytes()); // max packet 16MB
     body.push(45); // utf8mb4
     body.extend_from_slice(&[0u8; 23]);
@@ -507,8 +512,8 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
     body.extend_from_slice(&token);
     if !endpoint.database.is_empty() {
         body.extend_from_slice(endpoint.database.as_bytes());
+        body.push(0);
     }
-    body.push(0);
     body.extend_from_slice(MYSQL_NATIVE_PASSWORD.as_bytes());
     body.push(0);
     write_packet(stream, seq, &body).await?;
@@ -599,7 +604,8 @@ impl TcpMySqlTransport {
 async fn prepare_statement(conn: &mut MysqlConn, sql: &str) -> Result<(u32, u16)> {
     let mut body = vec![0x16];
     body.extend_from_slice(sql.as_bytes());
-    write_packet(&mut conn.stream, &mut conn.seq, &body).await?;
+    let mut seq = 0u8;
+    write_packet(&mut conn.stream, &mut seq, &body).await?;
     let response = read_packet(&mut conn.stream).await?;
     if response.body.first() == Some(&0xFF) {
         return Err(ConnectorError::Dispatch(format!(
@@ -618,7 +624,7 @@ async fn prepare_statement(conn: &mut MysqlConn, sql: &str) -> Result<(u32, u16)
         response.body[3],
         response.body[4],
     ]);
-    let _columns = u16::from_le_bytes([response.body[5], response.body[6]]);
+    let columns = u16::from_le_bytes([response.body[5], response.body[6]]);
     let params = u16::from_le_bytes([response.body[7], response.body[8]]);
     // Drain parameter + column definitions (each followed by EOF).
     for _ in 0..(params as usize) {
@@ -631,6 +637,18 @@ async fn prepare_statement(conn: &mut MysqlConn, sql: &str) -> Result<(u32, u16)
         }
     }
     if params > 0 {
+        expect_eof(&mut conn.stream).await?;
+    }
+    for _ in 0..(columns as usize) {
+        let packet = read_packet(&mut conn.stream).await?;
+        if packet.body.first() == Some(&0xFF) {
+            return Err(ConnectorError::Dispatch(format!(
+                "mysql prepare failed: {}",
+                error_text(&packet.body)
+            )));
+        }
+    }
+    if columns > 0 {
         expect_eof(&mut conn.stream).await?;
     }
     Ok((stmt_id, params))
@@ -679,15 +697,21 @@ impl MySqlTransport for TcpMySqlTransport {
         }
         let slot = (self.cursor.fetch_add(1, Ordering::SeqCst) as usize) % self.pool.len();
         let mut guard = self.pool[slot].lock().await;
-        for _ in 0..2 {
+        for attempt in 0..2 {
             if guard.is_none() {
                 *guard = Some(self.dial().await?);
             }
             let conn = guard.as_mut().expect("connected");
             match execute_batch_on_conn(conn, batch).await {
                 Ok(()) => return Ok(()),
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!("mysql execute_batch_on_conn error (attempt {attempt}): {e}");
                     *guard = None;
+                    if attempt == 1 {
+                        return Err(ConnectorError::Connection(format!(
+                            "mysql batch failed after reconnect: {e}"
+                        )));
+                    }
                 }
             }
         }
@@ -711,35 +735,13 @@ async fn execute_batch_on_conn(conn: &mut MysqlConn, batch: &MySqlBatch) -> Resu
             id
         }
     };
-    // Pipeline every row's Execute, then drain one OK/ERR per row.
     for row in &batch.rows {
         let frame = encode_execute(stmt_id, row);
-        let mut packet = Vec::with_capacity(4 + frame.len());
-        let len = frame.len() as u32;
-        packet.push((len & 0xFF) as u8);
-        packet.push(((len >> 8) & 0xFF) as u8);
-        packet.push(((len >> 16) & 0xFF) as u8);
-        packet.push(conn.seq);
-        conn.seq = conn.seq.wrapping_add(1);
-        packet.extend_from_slice(&frame);
-        conn.stream
-            .write_all(&packet)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mysql write failed: {e}")))?;
-    }
-    conn.stream
-        .flush()
-        .await
-        .map_err(|e| ConnectorError::Connection(format!("mysql flush failed: {e}")))?;
-    for _ in &batch.rows {
+        let mut seq = 0u8;
+        write_packet(&mut conn.stream, &mut seq, &frame).await?;
         let response = read_packet(&mut conn.stream).await?;
         match response.body.first() {
-            Some(0x00) => {
-                // OK packet: affected-rows + last-insert-id (lenenc).
-                let mut cursor = &response.body[1..];
-                decode_lenenc(&mut cursor)?;
-                decode_lenenc(&mut cursor)?;
-            }
+            Some(0x00) => {}
             Some(0xFF) => {
                 return Err(ConnectorError::Dispatch(format!(
                     "mysql execute failed: {}",

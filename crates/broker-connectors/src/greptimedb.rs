@@ -111,9 +111,16 @@ pub struct GreptimeDbConfig {
     /// In-memory queue buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Request / network timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl GreptimeDbConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -288,7 +295,15 @@ pub fn extract_greptime_record(
     let mut fields = Vec::new();
     if let serde_json::Value::Object(map) = json_val {
         for (k, v) in map {
-            fields.push((k, json_to_greptime_value(&v)));
+            if k == "payload" && v.is_object() {
+                if let serde_json::Value::Object(submap) = v {
+                    for (sk, sv) in submap {
+                        fields.push((sk, json_to_greptime_value(&sv)));
+                    }
+                }
+            } else {
+                fields.push((k, json_to_greptime_value(&v)));
+            }
         }
     } else {
         fields.push(("val".to_string(), json_to_greptime_value(&json_val)));
@@ -325,7 +340,7 @@ impl HttpGreptimeDbTransport {
 
         Self {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(config.timeout())
                 .build()
                 .unwrap_or_default(),
             sql_url,
@@ -656,6 +671,7 @@ mod tests {
             timestamp_precision: GreptimePrecision::Millisecond,
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 
@@ -669,6 +685,7 @@ mod tests {
             timestamp_precision: GreptimePrecision::Nanosecond,
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

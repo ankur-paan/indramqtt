@@ -144,9 +144,16 @@ pub struct CouchbaseSinkConfig {
     /// Retry delay ceiling in ms (default 2000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl CouchbaseSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         parse_connection_string(&self.connection_string)?;
         if self.bucket.trim().is_empty() || self.bucket.contains(['/', ' ', '\0']) {
@@ -221,9 +228,16 @@ impl CouchbaseSinkConfig {
             Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
             _ => String::new(),
         };
+        let mut client_id = field("client_id");
+        if client_id.is_empty() {
+            client_id = field("clientid");
+        }
+        if client_id.is_empty() {
+            client_id = field("device_id");
+        }
         vec![
             ("topic".to_string(), topic.to_string()),
-            ("client_id".to_string(), field("client_id")),
+            ("client_id".to_string(), client_id),
             ("qos".to_string(), u8::from(qos).to_string()),
             ("timestamp".to_string(), millis.to_string()),
             ("seq".to_string(), seq.to_string()),
@@ -249,7 +263,13 @@ impl CouchbaseSinkConfig {
             Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
             _ => String::new(),
         };
-        let client_id = field("client_id");
+        let mut client_id = field("client_id");
+        if client_id.is_empty() {
+            client_id = field("clientid");
+        }
+        if client_id.is_empty() {
+            client_id = field("device_id");
+        }
         if self.doc_id_template.contains("${client_id}") && client_id.is_empty() {
             return Err(ConnectorError::Dispatch(
                 "couchbase doc id needs a non-empty client_id".to_string(),
@@ -418,9 +438,9 @@ pub fn decode_response(frame: &[u8]) -> Result<KvResponse> {
 }
 
 /// Read one response packet from the stream.
-async fn read_response(stream: &mut tokio::net::TcpStream) -> Result<KvResponse> {
+async fn read_response(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<KvResponse> {
     let mut header = [0u8; 24];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
+    tokio::time::timeout(timeout, stream.read_exact(&mut header))
         .await
         .map_err(|_| ConnectorError::Connection("couchbase read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("couchbase read failed: {e}")))?;
@@ -431,9 +451,9 @@ async fn read_response(stream: &mut tokio::net::TcpStream) -> Result<KvResponse>
         ));
     }
     let mut body = vec![0u8; total];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
         .await
+        .map_err(|_| ConnectorError::Connection("couchbase read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("couchbase read failed: {e}")))?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
@@ -600,6 +620,7 @@ pub struct NativeCouchbaseTransport {
     operation: CouchbaseOperation,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     opaque: AtomicU64,
+    timeout: Duration,
 }
 
 impl NativeCouchbaseTransport {
@@ -612,6 +633,7 @@ impl NativeCouchbaseTransport {
             operation: config.operation,
             stream: tokio::sync::Mutex::new(None),
             opaque: AtomicU64::new(1),
+            timeout: config.timeout(),
         })
     }
 
@@ -629,7 +651,7 @@ impl NativeCouchbaseTransport {
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            self.timeout,
             tokio::net::TcpStream::connect(&addr),
         )
         .await
@@ -642,7 +664,7 @@ impl NativeCouchbaseTransport {
             .write_all(&auth)
             .await
             .map_err(|e| ConnectorError::Connection(format!("couchbase auth write failed: {e}")))?;
-        let reply = read_response(&mut stream).await?;
+        let reply = read_response(&mut stream, self.timeout).await?;
         if reply.opaque != opaque || reply.status != status::SUCCESS {
             return Err(ConnectorError::Connection(format!(
                 "couchbase auth failed with 0x{:04x}",
@@ -690,7 +712,7 @@ impl CouchbaseTransport for NativeCouchbaseTransport {
             ConnectorError::Connection(format!("couchbase batch write failed: {e}"))
         })?;
         for (item, opaque) in items.iter().zip(opaques.iter()) {
-            let reply = read_response(stream).await?;
+            let reply = read_response(stream, self.timeout).await?;
             if reply.opaque != *opaque || reply.opcode != self.operation.opcode() {
                 return Err(ConnectorError::Connection(
                     "couchbase opaque/opcode mismatch".to_string(),
@@ -972,6 +994,7 @@ mod tests {
             max_retries: Some(3),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_000),
+            timeout_ms: None,
         }
     }
 

@@ -74,6 +74,9 @@ pub struct GcpIotConfig {
     /// Retries on exhaustion (default 5).
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<usize>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_token_lifetime() -> u64 {
@@ -97,6 +100,10 @@ fn default_max_retries() -> Option<usize> {
 }
 
 impl GcpIotConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (label, value) in [
             ("project_id", &self.project_id),
@@ -454,6 +461,7 @@ impl TcpGcpIotTransport {
 #[async_trait]
 impl GcpIotTransport for TcpGcpIotTransport {
     async fn publish(&self, topic: &str, body: &[u8], _password_token: &str) -> Result<()> {
+        self.connect().await?;
         use tokio::io::AsyncWriteExt;
         let bytes = super::mqtt_bridge::encode_publish(topic, 0, false, 0, body, false)?;
         let mut guard = self.stream.lock().await;

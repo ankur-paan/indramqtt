@@ -29,7 +29,7 @@ All figures below are grounded in reproducible, multi-sample automated benchmark
 | **Idle Base Memory Footprint** | **< 15 MB RSS** | Standalone Rust Core daemon idle resident memory footprint | Zero client connections, baseline Tokio runtime + Router |
 
 > [!IMPORTANT]
-> **Scope Note**: The table above measures purely in-process, function-level microbenchmarks (radix trie matching and streaming SQL expression evaluation). It does **not** represent end-to-end network throughput over TCP/TLS sockets. For architectural comparison targets, competitor network baselines (EMQX, HiveMQ, VerneMQ, Mosquitto), and literature citations, see [BENCHMARKS.md](BENCHMARKS.md).
+> **Scope Note**: The table above measures purely in-process, function-level microbenchmarks (radix trie matching and streaming SQL expression evaluation). It does **not** represent end-to-end network throughput over TCP/TLS sockets. For architectural comparison targets, competitor network baselines (HiveMQ, VerneMQ, Mosquitto), and literature citations, see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 

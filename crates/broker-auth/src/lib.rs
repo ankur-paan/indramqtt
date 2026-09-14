@@ -1,3 +1,9 @@
+pub mod kerberos;
+pub mod ldap;
+
+pub use kerberos::{KerberosAuthenticator, KerberosConfig, KerberosTicket};
+pub use ldap::{LdapAuthenticator, LdapConfig, LdapEntry};
+
 use async_trait::async_trait;
 use broker_protocol::{Topic, TopicFilter};
 use parking_lot::RwLock;
@@ -256,6 +262,16 @@ impl MemoryAuth {
 
     pub fn clear_rules(&self) {
         self.rules.write().clear();
+    }
+
+    pub fn remove_rule(&self, index: usize) -> bool {
+        let mut rules = self.rules.write();
+        if index < rules.len() {
+            rules.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     fn check(

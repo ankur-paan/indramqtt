@@ -1134,6 +1134,9 @@ pub struct SparkplugSinkConfig {
     /// Linger flush window in ms (default 50, `None` disables).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
+    /// Request / dispatch timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_tier() -> String {
@@ -1149,6 +1152,10 @@ fn default_linger_ms() -> Option<u64> {
 }
 
 impl SparkplugSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.tier != SPARKPLUG_TIER {
             return Err(ConnectorError::Dispatch(format!(

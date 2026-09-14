@@ -265,6 +265,35 @@ impl Shared {
             metrics: metrics.clone(),
         });
         engine.set_broker_sink(sink.clone());
+
+        // Pre-seed end-to-end streaming pipelines connecting Ingress Source -> Rule SQL -> Connector Sink
+        let _ = engine.create_rule(
+            "factory-telemetry-to-kafka".to_string(),
+            TopicFilter::new("sensors/+/telemetry").unwrap(),
+            Some("SELECT payload.temperature as temp, payload.pressure as pressure, clientid FROM \"sensors/+/telemetry\" WHERE payload.temperature > 25".to_string()),
+            true,
+            vec![broker_rules::RuleAction::ForwardConnector {
+                connector_id: "kafka:kafka-prod".to_string(),
+            }],
+        );
+        let _ = engine.create_rule(
+            "critical-alerts-to-webhook".to_string(),
+            TopicFilter::new("sensors/+/alerts").unwrap(),
+            Some("SELECT payload.level as alert_level, payload.msg as message, clientid FROM \"sensors/+/alerts\" WHERE payload.level = 'CRITICAL'".to_string()),
+            true,
+            vec![broker_rules::RuleAction::ForwardConnector {
+                connector_id: "http:webhook-alerts".to_string(),
+            }],
+        );
+        let _ = engine.create_rule(
+            "telemetry-to-postgres".to_string(),
+            TopicFilter::new("sensors/+/telemetry").unwrap(),
+            Some("SELECT payload.temperature as temp, clientid FROM \"sensors/+/telemetry\"".to_string()),
+            true,
+            vec![broker_rules::RuleAction::ForwardConnector {
+                connector_id: "pgsql:postgres-analytics".to_string(),
+            }],
+        );
         Self {
             sessions,
             router,

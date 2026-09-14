@@ -206,6 +206,12 @@ pub struct Rule {
     pub tier: RuleTier,
     pub enabled: bool,
     pub actions: Vec<RuleAction>,
+    #[serde(skip_serializing)]
+    pub matched_cnt: Arc<AtomicU64>,
+    #[serde(skip_serializing)]
+    pub passed_cnt: Arc<AtomicU64>,
+    #[serde(skip_serializing)]
+    pub failed_cnt: Arc<AtomicU64>,
 }
 
 /// Actions a rule may execute per matched ingress event.
@@ -451,6 +457,9 @@ impl RuleEngine {
             tier,
             enabled,
             actions,
+            matched_cnt: Arc::new(AtomicU64::new(0)),
+            passed_cnt: Arc::new(AtomicU64::new(0)),
+            failed_cnt: Arc::new(AtomicU64::new(0)),
         };
         self.rules.write().insert(id.clone(), rule.clone());
         // Eager worker start when a runtime is available; otherwise the
@@ -477,6 +486,15 @@ impl RuleEngine {
             worker.handle.abort();
         }
         self.rules.write().remove(id).is_some()
+    }
+
+    pub fn set_rule_enabled(&self, id: &str, enabled: bool) -> bool {
+        if let Some(rule) = self.rules.write().get_mut(id) {
+            rule.enabled = enabled;
+            true
+        } else {
+            false
+        }
     }
 
     /// Route one matching record into an Enterprise window worker: parse
@@ -595,6 +613,7 @@ impl RuleEngine {
                 .collect()
         };
         for rule in &matched {
+            rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
             if rule.tier == RuleTier::Enterprise
                 && rule
                     .parsed_query
@@ -605,8 +624,10 @@ impl RuleEngine {
                 continue;
             }
             let Some(data) = apply_sql(&rule.parsed_query, payload, &rule.id) else {
+                rule.failed_cnt.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
             run_actions(
                 &rule.id,
                 &rule.actions,
@@ -810,6 +831,55 @@ async fn window_worker_loop(
                 // Aggregate the trailing window on every arrival.
                 let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
                 flush_window(&rule_id, &stmt, &actions, batch, cutoff, end, &flush_ctx).await;
+            }
+        }
+        WindowDef::Session { unit, max_duration, timeout } => {
+            let timeout_ms = window_length_ms(&unit, timeout);
+            let max_duration_ms = window_length_ms(&unit, max_duration);
+            let mut buffer: Vec<TimedRecord> = Vec::new();
+            let mut session_start: Option<u64> = None;
+            let mut last_arrival: Option<u64> = None;
+            loop {
+                let sleep_duration = match last_arrival {
+                    Some(last) => {
+                        let elapsed = now_ms().saturating_sub(last);
+                        std::time::Duration::from_millis(timeout_ms.saturating_sub(elapsed).max(1))
+                    }
+                    None => std::time::Duration::from_secs(3600),
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_duration), if last_arrival.is_some() => {
+                        let end = now_ms();
+                        let start = session_start.unwrap_or(end);
+                        let batch = std::mem::take(&mut buffer);
+                        flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx).await;
+                        session_start = None;
+                        last_arrival = None;
+                    }
+                    rec = rx.recv() => {
+                        match rec {
+                            Some(record) => {
+                                let now = record.arrived_ms;
+                                let start = match session_start {
+                                    Some(s) => s,
+                                    None => {
+                                        session_start = Some(now);
+                                        now
+                                    }
+                                };
+                                buffer.push(record);
+                                last_arrival = Some(now);
+                                if now.saturating_sub(start) >= max_duration_ms {
+                                    let batch = std::mem::take(&mut buffer);
+                                    flush_window(&rule_id, &stmt, &actions, batch, start, now, &flush_ctx).await;
+                                    session_start = None;
+                                    last_arrival = None;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
             }
         }
     }
@@ -2871,6 +2941,7 @@ mod tests {
                     format: "JSONEachRow".to_string(),
                     batch_size: 100,
                     batch_timeout_ms: 100,
+                    request_timeout_ms: None,
                 },
                 reqwest::Client::new(),
             )
@@ -2892,6 +2963,7 @@ mod tests {
                     precision: "ms".to_string(),
                     batch_size: 100,
                     batch_timeout_ms: 50,
+                    request_timeout_ms: None,
                 },
                 reqwest::Client::new(),
             )
@@ -3698,7 +3770,7 @@ mod tests {
                     },
                     topic_mappings: vec![BridgeTopicMapping {
                         local_topic: "sensors/+".to_string(),
-                        remote_topic: "emqx/up".to_string(),
+                        remote_topic: "indra/up".to_string(),
                         direction: broker_connectors::BridgeDirection::LocalToRemote,
                     }],
                     shadow_sync: None,
@@ -3858,7 +3930,7 @@ mod tests {
         // AWS IoT: one frame on the mapped remote topic.
         let captured = aws_transport.captured();
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].remote_topic, "emqx/up");
+        assert_eq!(captured[0].remote_topic, "indra/up");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&captured[0].payload).unwrap(),
             projected

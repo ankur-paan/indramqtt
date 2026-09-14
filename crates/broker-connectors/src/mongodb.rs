@@ -544,9 +544,16 @@ pub struct MongoDbSinkConfig {
     /// Retry delay ceiling in ms (default 3000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Socket / request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl MongoDbSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5_000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         parse_connection_string(&self.connection_string)?;
         if self.database.trim().is_empty() || self.database.contains(['/', ' ', '\0']) {
@@ -860,6 +867,7 @@ pub struct NativeMongoDbTransport {
     endpoint: MongoEndpoint,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     request_id: AtomicU32,
+    timeout: Duration,
 }
 
 impl NativeMongoDbTransport {
@@ -869,6 +877,7 @@ impl NativeMongoDbTransport {
             endpoint: parse_connection_string(&config.connection_string)?,
             stream: tokio::sync::Mutex::new(None),
             request_id: AtomicU32::new(1),
+            timeout: config.timeout(),
         })
     }
 
@@ -884,7 +893,7 @@ impl NativeMongoDbTransport {
             .await
             .map_err(|e| ConnectorError::Connection(format!("mongodb write failed: {e}")))?;
         let mut head = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut head))
+        tokio::time::timeout(self.timeout.saturating_mul(2), stream.read_exact(&mut head))
             .await
             .map_err(|_| ConnectorError::Connection("mongodb read timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("mongodb read failed: {e}")))?;
@@ -918,7 +927,7 @@ impl NativeMongoDbTransport {
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
         let stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            self.timeout,
             tokio::net::TcpStream::connect(&addr),
         )
         .await
@@ -1477,6 +1486,7 @@ mod tests {
             max_retries: Some(4),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(3_000),
+            timeout_ms: None,
         }
     }
 

@@ -118,9 +118,16 @@ pub struct S3TablesSinkConfig {
     /// Linger flush window in ms (default 1,000).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl S3TablesSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         parse_table_bucket_arn(&self.table_bucket_arn)
             .map_err(|e| ConnectorError::Dispatch(format!("s3_tables table_bucket_arn: {e}")))?;

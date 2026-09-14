@@ -293,13 +293,13 @@
   <div class="row"><label>AWS IoT Core config <span class="badge enterprise">enterprise</span></label>
     <input id="conn-awsiot-endpoint" placeholder="endpoint, e.g. abc-ats.iot.us-east-1.amazonaws.com" size="36">
     <input id="conn-awsiot-region" placeholder="region, e.g. us-east-1" size="14">
-    <input id="conn-awsiot-client" placeholder="client id, e.g. emqx-bridge-1" size="20">
+    <input id="conn-awsiot-client" placeholder="client id, e.g. indra-bridge-1" size="20">
     <input id="conn-awsiot-key" placeholder="access key id (SigV4)" size="18">
     <input id="conn-awsiot-secret" placeholder="secret access key (SigV4)" type="password" size="20">
   </div>
   <div class="row"><label>Azure IoT Hub config <span class="badge enterprise">enterprise</span></label>
     <input id="conn-aziot-hub" placeholder="hub name, e.g. my-hub" size="16">
-    <input id="conn-aziot-device" placeholder="device id, e.g. emqx-bridge-1" size="20">
+    <input id="conn-aziot-device" placeholder="device id, e.g. indra-bridge-1" size="20">
     <input id="conn-aziot-keyname" placeholder="key name, e.g. device" size="14">
     <input id="conn-aziot-key" placeholder="shared access key" type="password" size="20">
   </div>
@@ -928,16 +928,16 @@ $("conn-add").onclick = async () => {
   } else if (kind === "aws_iot") {
     config = {endpoint: $("conn-awsiot-endpoint").value.trim(),
               region: $("conn-awsiot-region").value.trim() || "us-east-1",
-              client_id: $("conn-awsiot-client").value.trim() || "emqx-bridge-1",
+              client_id: $("conn-awsiot-client").value.trim() || "indra-bridge-1",
               auth: {type: "sigv4", access_key_id: $("conn-awsiot-key").value.trim(),
                      secret_access_key: $("conn-awsiot-secret").value,
                      session_token: null},
-              topic_mappings: [{local_topic: "#", remote_topic: "emqx/${topic}",
+              topic_mappings: [{local_topic: "#", remote_topic: "indra/${topic}",
                                 direction: "LocalToRemote"}],
               batch_size: 200, linger_ms: 50, max_retries: 5};
   } else if (kind === "azure_iot") {
     config = {iot_hub_name: $("conn-aziot-hub").value.trim(),
-              device_id: $("conn-aziot-device").value.trim() || "emqx-bridge-1",
+              device_id: $("conn-aziot-device").value.trim() || "indra-bridge-1",
               auth: {type: "sharedaccesskey", key: $("conn-aziot-key").value,
                      key_name: $("conn-aziot-keyname").value.trim() || null},
               api_version: "2021-04-12",

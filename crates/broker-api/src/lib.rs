@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use broker_auth::{AclAction, AclRule, MemoryAuth};
@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod dashboard;
+pub mod swagger;
+pub mod v5;
 pub mod ws;
 
 /// Shared node state injected into every management endpoint: the rule
@@ -78,8 +80,18 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(redirect_to_dashboard))
         .route("/dashboard", get(get_dashboard))
+        .route("/ui", get(get_modern_ui))
+        .route("/swagger", get(get_swagger_ui))
+        .route("/api-docs/openapi.json", get(get_openapi_spec))
+        .route("/assets/*path", get(get_dashboard_asset))
+        .route("/static/*path", get(get_dashboard_static_asset))
+        .route("/favicon.ico", get(get_dashboard_favicon))
+        .route("/version", get(get_dashboard_version))
         .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
+        .route("/schemas", get(v5::schemas::list_schemas))
+        .route("/schemas/:name", get(v5::schemas::get_schema))
+        .nest("/api/v5", v5::router())
         .route("/api/v1/nodes", get(get_nodes))
         .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/clients/:id", get(get_client))
@@ -89,7 +101,9 @@ pub fn router(state: ApiState) -> Router {
             get(get_connectors).post(create_connector),
         )
         .route("/api/v1/auth/users", get(list_users).post(create_user))
+        .route("/api/v1/auth/users/:username", delete(delete_user))
         .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
+        .route("/api/v1/auth/acls/:id", delete(delete_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
@@ -112,11 +126,141 @@ async fn redirect_to_dashboard() -> Response {
 }
 
 async fn get_dashboard() -> Response {
+    for candidate in &["dashboard/dist/index.html", "../dashboard/dist/index.html"] {
+        if let Ok(content) = tokio::fs::read_to_string(candidate).await {
+            return ([("content-type", "text/html; charset=utf-8")], content).into_response();
+        }
+    }
     (
         [("content-type", "text/html; charset=utf-8")],
         dashboard::DASHBOARD_HTML,
     )
         .into_response()
+}
+
+async fn get_swagger_ui() -> Response {
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        swagger::swagger_ui_html(),
+    )
+        .into_response()
+}
+
+async fn get_openapi_spec() -> Response {
+    (
+        [("content-type", "application/json; charset=utf-8")],
+        swagger::openapi_spec_json(),
+    )
+        .into_response()
+}
+
+async fn get_modern_ui() -> Response {
+    for candidate in &["dashboard/dist/index.html", "../dashboard/dist/index.html"] {
+        if let Ok(content) = tokio::fs::read_to_string(candidate).await {
+            return ([("content-type", "text/html; charset=utf-8")], content).into_response();
+        }
+    }
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        dashboard::DASHBOARD_HTML,
+    )
+        .into_response()
+}
+
+async fn get_dashboard_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let clean = path.trim_start_matches('/').replace("..", "");
+    for base in &["dashboard/dist/assets", "../dashboard/dist/assets"] {
+        let p = std::path::PathBuf::from(base).join(&clean);
+        if let Ok(bytes) = tokio::fs::read(&p).await {
+            let mime = if clean.ends_with(".js") {
+                "application/javascript"
+            } else if clean.ends_with(".css") {
+                "text/css"
+            } else if clean.ends_with(".svg") {
+                "image/svg+xml"
+            } else if clean.ends_with(".png") {
+                "image/png"
+            } else if clean.ends_with(".ico") {
+                "image/x-icon"
+            } else {
+                "application/octet-stream"
+            };
+            return (
+                [
+                    ("content-type", mime),
+                    ("cache-control", "public, max-age=31536000, immutable"),
+                ],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "Asset not found").into_response()
+}
+
+async fn get_dashboard_static_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let clean = path.trim_start_matches('/').replace("..", "");
+    for base in &["dashboard/dist/static", "../dashboard/dist/static"] {
+        let p = std::path::PathBuf::from(base).join(&clean);
+        if let Ok(bytes) = tokio::fs::read(&p).await {
+            let mime = if clean.ends_with(".js") {
+                "application/javascript"
+            } else if clean.ends_with(".css") {
+                "text/css"
+            } else if clean.ends_with(".svg") {
+                "image/svg+xml"
+            } else if clean.ends_with(".png") {
+                "image/png"
+            } else if clean.ends_with(".ico") {
+                "image/x-icon"
+            } else if clean.ends_with(".woff2") {
+                "font/woff2"
+            } else if clean.ends_with(".woff") {
+                "font/woff"
+            } else if clean.ends_with(".ttf") {
+                "font/ttf"
+            } else if clean.ends_with(".json") {
+                "application/json"
+            } else {
+                "application/octet-stream"
+            };
+            return (
+                [
+                    ("content-type", mime),
+                    ("cache-control", "public, max-age=31536000, immutable"),
+                ],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "Static asset not found").into_response()
+}
+
+async fn get_dashboard_favicon() -> Response {
+    for candidate in &["dashboard/dist/favicon.ico", "../dashboard/dist/favicon.ico"] {
+        if let Ok(bytes) = tokio::fs::read(candidate).await {
+            return (
+                [("content-type", "image/x-icon")],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn get_dashboard_version() -> Response {
+    for candidate in &["dashboard/dist/version", "../dashboard/dist/version"] {
+        if let Ok(content) = tokio::fs::read_to_string(candidate).await {
+            return (
+                [("content-type", "text/plain; charset=utf-8")],
+                content,
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Creation payload: identifiers are assigned server-side (`rule-<n>`).
@@ -374,6 +518,28 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
         })),
     )
         .into_response()
+}
+
+async fn delete_user(
+    State(state): State<ApiState>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Response {
+    if state.auth.remove_user(&username) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+async fn delete_acl(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
+) -> Response {
+    if state.auth.remove_rule(id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 fn node_id() -> String {
@@ -1873,6 +2039,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_swagger_and_openapi_routes() {
+        let (server, _state) = TestServer::start().await;
+
+        // Test /swagger serves HTML
+        let (status, html) = server
+            .request_raw("GET /swagger HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+        assert!(html.contains("SwaggerUIBundle"));
+        assert!(html.contains("/api-docs/openapi.json"));
+
+        // Test /api-docs/openapi.json serves valid OpenAPI 3.0 specification
+        let (status, spec) = server.get("/api-docs/openapi.json").await;
+        assert_eq!(status, 200);
+        assert_eq!(spec["openapi"], "3.0.3");
+        assert_eq!(spec["info"]["title"], "IndraMQTT Management API");
+        assert!(spec["paths"]["/api/v1/nodes"]["get"].is_object());
+        assert!(spec["paths"]["/api/v1/clients"]["get"].is_object());
+        assert!(spec["paths"]["/api/v1/rules"]["get"].is_object());
+        assert!(spec["paths"]["/api/v1/connectors"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_modern_ui_routes() {
+        let (server, _state) = TestServer::start().await;
+
+        // Test /ui serves the modern React SPA (or fallback)
+        let (status, html) = server
+            .request_raw("GET /ui HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+        assert!(html.len() > 100);
+    }
+
+    #[tokio::test]
     async fn test_clients_detail_endpoint() {
         let (server, state) = TestServer::start().await;
 
@@ -2632,13 +2833,13 @@ mod tests {
                        "kind": "aws_iot",
                        "config": {"endpoint": "abc-ats.iot.us-east-1.amazonaws.com",
                                   "region": "us-east-1",
-                                  "client_id": "emqx-bridge-1",
+                                  "client_id": "indra-bridge-1",
                                   "auth": {"type": "sigv4",
                                             "access_key_id": "AKID",
                                             "secret_access_key": "secret",
                                             "session_token": null},
                                   "topic_mappings": [{"local_topic": "sensors/+",
-                                                      "remote_topic": "emqx/up",
+                                                      "remote_topic": "indra/up",
                                                       "direction": "localtoremote"}],
                                   "batch_size": 200,
                                   "linger_ms": 50,

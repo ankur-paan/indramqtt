@@ -102,9 +102,16 @@ pub struct DiskLogSinkConfig {
     /// Durability contract (default every batch).
     #[serde(default)]
     pub sync_mode: DiskSyncMode,
+    /// Flush / write timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl DiskLogSinkConfig {
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.directory.trim().is_empty() {
             return Err(ConnectorError::Dispatch(

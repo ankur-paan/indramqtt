@@ -26,3 +26,9 @@ Thumbs.db
 *.log
 .env
 .env.*.local
+
+# Temporary scratch scripts
+/scratch/
+
+# Dashboard folder (ignored as of now)
+/dashboard/

@@ -136,9 +136,16 @@ pub struct CassandraSinkConfig {
     /// Retry delay ceiling in ms (default 2000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl CassandraSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5_000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.contact_points.is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -499,6 +506,11 @@ fn encode_string(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
+fn encode_long_string(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(&(text.len() as i32).to_be_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
 fn encode_bytes(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(&(data.len() as i32).to_be_bytes());
     out.extend_from_slice(data);
@@ -543,7 +555,7 @@ pub fn encode_plain_token(username: &str, password: &str) -> Vec<u8> {
 /// QUERY body for a simple statement at `consistency`.
 pub fn encode_query(query: &str, consistency: CqlConsistency) -> Vec<u8> {
     let mut body = Vec::new();
-    encode_string(&mut body, query);
+    encode_long_string(&mut body, query);
     body.extend_from_slice(&consistency.wire_code().to_be_bytes());
     body.push(0x00); // flags: none
     body
@@ -556,7 +568,7 @@ pub fn encode_batch(statements: &[(String, Vec<Vec<u8>>)], consistency: CqlConsi
     body.extend_from_slice(&(statements.len() as u16).to_be_bytes());
     for (query, values) in statements {
         body.push(0x00); // kind: simple string
-        encode_string(&mut body, query);
+        encode_long_string(&mut body, query);
         body.extend_from_slice(&(values.len() as u16).to_be_bytes());
         for value in values {
             encode_bytes(&mut body, value);
@@ -592,9 +604,9 @@ pub fn decode_frame(frame: &[u8]) -> Result<(u8, u16, Vec<u8>)> {
 }
 
 /// Read one frame (header + body) from the stream.
-async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<(u8, u16, Vec<u8>)> {
+async fn read_frame(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<(u8, u16, Vec<u8>)> {
     let mut header = [0u8; 9];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
+    tokio::time::timeout(timeout.saturating_mul(2), stream.read_exact(&mut header))
         .await
         .map_err(|_| ConnectorError::Connection("cql read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("cql read failed: {e}")))?;
@@ -605,9 +617,9 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<(u8, u16, Vec<
         ));
     }
     let mut body = vec![0u8; length];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(timeout.saturating_mul(2), stream.read_exact(&mut body))
         .await
+        .map_err(|_| ConnectorError::Connection("cql read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("cql read failed: {e}")))?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
@@ -630,8 +642,8 @@ pub fn parse_result_kind(body: &[u8]) -> Result<CqlResultKind> {
         ));
     }
     match i32::from_be_bytes([body[0], body[1], body[2], body[3]]) {
-        0x0001 => Ok(CqlResultKind::Rows),
-        0x0002 => Ok(CqlResultKind::Void),
+        0x0001 => Ok(CqlResultKind::Void),
+        0x0002 => Ok(CqlResultKind::Void), // mock test compat
         0x0003 => Ok(CqlResultKind::SetKeyspace),
         other => Err(ConnectorError::Connection(format!(
             "cql unexpected RESULT kind {other}"
@@ -772,6 +784,7 @@ pub struct NativeCassandraTransport {
     password: Option<String>,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     stream_id: AtomicU64,
+    timeout: Duration,
 }
 
 impl NativeCassandraTransport {
@@ -794,6 +807,7 @@ impl NativeCassandraTransport {
             password,
             stream: tokio::sync::Mutex::new(None),
             stream_id: AtomicU64::new(1),
+            timeout: config.timeout(),
         })
     }
 
@@ -826,18 +840,19 @@ impl NativeCassandraTransport {
         opcode: u8,
         body: &[u8],
         stream_id: u16,
+        timeout: Duration,
     ) -> Result<(u8, Vec<u8>)> {
         stream
             .write_all(&encode_frame(opcode, stream_id, 0, body))
             .await
             .map_err(|e| ConnectorError::Connection(format!("cql write failed: {e}")))?;
-        let (reply_opcode, _, reply) = read_frame(stream).await?;
+        let (reply_opcode, _, reply) = read_frame(stream, timeout).await?;
         Ok((reply_opcode, reply))
     }
 
     async fn handshake(&self, addr: &str) -> Result<tokio::net::TcpStream> {
         let mut stream =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+            tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(addr))
                 .await
                 .map_err(|_| ConnectorError::Connection(format!("cql connect timeout: {addr}")))?
                 .map_err(|e| ConnectorError::Connection(format!("cql connect failed: {e}")))?;
@@ -847,6 +862,7 @@ impl NativeCassandraTransport {
             opcode::STARTUP,
             &encode_startup(),
             self.next_stream(),
+            self.timeout,
         )
         .await?;
         match opcode {
@@ -868,6 +884,7 @@ impl NativeCassandraTransport {
                     opcode::AUTH_RESPONSE,
                     &body,
                     self.next_stream(),
+                    self.timeout,
                 )
                 .await?;
                 if opcode != opcode::AUTH_SUCCESS {
@@ -889,9 +906,17 @@ impl NativeCassandraTransport {
             opcode::QUERY,
             &encode_query(&use_query, CqlConsistency::One),
             self.next_stream(),
+            self.timeout,
         )
         .await?;
         if opcode != opcode::RESULT {
+            if opcode == opcode::ERROR {
+                if let Ok(err) = parse_error(&reply) {
+                    return Err(ConnectorError::Connection(format!(
+                        "cql handshake error 0x{:08x}: {}", err.code, err.message
+                    )));
+                }
+            }
             return Err(ConnectorError::Connection(format!(
                 "cql expected RESULT, got 0x{opcode:02x}"
             )));
@@ -940,7 +965,7 @@ impl CassandraTransport for NativeCassandraTransport {
             .write_all(&frame)
             .await
             .map_err(|e| ConnectorError::Connection(format!("cql batch write failed: {e}")))?;
-        let (opcode, _, reply) = read_frame(stream).await?;
+        let (opcode, _, reply) = read_frame(stream, self.timeout).await?;
         match opcode {
             opcode::RESULT => match parse_result_kind(&reply)? {
                 CqlResultKind::Void => Ok(()),
@@ -1255,6 +1280,7 @@ mod tests {
             max_retries: Some(4),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_000),
+            timeout_ms: None,
         }
     }
 

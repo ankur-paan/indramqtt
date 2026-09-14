@@ -88,9 +88,16 @@ pub struct S3SinkConfig {
     /// Linger flush window (default 60,000 ms).
     #[serde(default = "default_batch_timeout_ms")]
     pub batch_timeout_ms: u64,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl S3SinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
             return Err(ConnectorError::Dispatch(format!(

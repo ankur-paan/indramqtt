@@ -48,9 +48,16 @@ pub struct DatalayersConfig {
     /// In-memory queue buffer capacity (`None` = unbounded).
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
+    /// Network request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl DatalayersConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -128,16 +135,36 @@ pub fn extract_datalayers_record(
     let mut tags = HashMap::new();
     let mut fields = HashMap::new();
 
-    if let serde_json::Value::Object(map) = json_val {
+    if let serde_json::Value::Object(map) = &json_val {
+        let empty_map = serde_json::Map::new();
+        let payload_map = map
+            .get("payload")
+            .and_then(|p| p.as_object())
+            .unwrap_or(&empty_map);
+
         for (k, v) in map {
-            if config.tag_columns.contains(&k) {
+            if k == "payload" {
+                continue;
+            }
+            if config.tag_columns.contains(k) {
                 let tag_str = match v {
-                    serde_json::Value::String(s) => s,
+                    serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                tags.insert(k, tag_str);
-            } else if config.field_columns.is_empty() || config.field_columns.contains(&k) {
-                fields.insert(k, v);
+                tags.insert(k.clone(), tag_str);
+            } else if config.field_columns.is_empty() || config.field_columns.contains(k) {
+                fields.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in payload_map {
+            if config.tag_columns.contains(k) {
+                let tag_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                tags.insert(k.clone(), tag_str);
+            } else if config.field_columns.is_empty() || config.field_columns.contains(k) {
+                fields.insert(k.clone(), v.clone());
             }
         }
     } else {
@@ -172,7 +199,7 @@ impl HttpDatalayersTransport {
 
         Self {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(config.timeout())
                 .build()
                 .unwrap_or_default(),
             write_url,
@@ -407,6 +434,7 @@ mod tests {
             field_columns: vec!["pressure".to_string(), "temperature".to_string()],
             batch_size: Some(1),
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 

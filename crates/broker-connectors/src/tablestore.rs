@@ -105,6 +105,9 @@ pub struct TablestoreSinkConfig {
     /// Linger flush window in ms (default 100).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_linger_ms() -> Option<u64> {
@@ -112,6 +115,10 @@ fn default_linger_ms() -> Option<u64> {
 }
 
 impl TablestoreSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
             return Err(ConnectorError::Dispatch(format!(

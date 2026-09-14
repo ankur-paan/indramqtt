@@ -248,13 +248,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "broker-auth",
+ "broker-cluster",
  "broker-connectors",
+ "broker-gateway",
  "broker-observability",
  "broker-protocol",
  "broker-router",
  "broker-rules",
  "broker-session",
+ "broker-storage",
  "brokerlink",
  "bytes",
  "rand",
@@ -262,6 +266,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]
@@ -323,6 +328,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "broker-protocol",
+ "broker-router",
+ "broker-session",
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "broker-node"
 version = "0.1.0"
 dependencies = [
@@ -331,6 +354,7 @@ dependencies = [
  "broker-auth",
  "broker-cluster",
  "broker-connectors",
+ "broker-gateway",
  "broker-observability",
  "broker-protocol",
  "broker-router",
@@ -2019,8 +2043,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rekuiper-conf"
-version = "0.423.0-beta"
-source = "git+https://github.com/ankur-paan/rekuiper.git#d53c3e801be84fa530e07af4dc8597741d42a2bb"
+version = "0.425.0-beta"
+source = "git+https://github.com/ankur-paan/rekuiper.git#da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f"
 dependencies = [
  "anyhow",
  "serde",
@@ -2030,8 +2054,8 @@ dependencies = [
 
 [[package]]
 name = "rekuiper-core"
-version = "0.423.0-beta"
-source = "git+https://github.com/ankur-paan/rekuiper.git#d53c3e801be84fa530e07af4dc8597741d42a2bb"
+version = "0.425.0-beta"
+source = "git+https://github.com/ankur-paan/rekuiper.git#da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2048,8 +2072,8 @@ dependencies = [
 
 [[package]]
 name = "rekuiper-sql"
-version = "0.423.0-beta"
-source = "git+https://github.com/ankur-paan/rekuiper.git#d53c3e801be84fa530e07af4dc8597741d42a2bb"
+version = "0.425.0-beta"
+source = "git+https://github.com/ankur-paan/rekuiper.git#da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -85,7 +85,8 @@ impl KafkaSinkConfig {
 /// Render `${topic}` placeholders against the MQTT topic. Unknown
 /// `${...}` sequences pass through literally.
 pub fn render_topic_template(template: &str, topic: &str) -> String {
-    template.replace("${topic}", topic)
+    let sanitized = topic.replace('/', ".");
+    template.replace("${topic}", &sanitized)
 }
 
 /// Kafka's murmur2 (seed 0x9747b28c): hash-compatible partitioning with
@@ -382,14 +383,11 @@ pub(crate) fn decode_api_versions_response(body: &[u8], correlation: i32) -> Res
     Ok(())
 }
 
-/// Produce v3 request for pre-grouped `(topic, partition) -> records`.
-pub(crate) fn encode_produce_request(
-    correlation: i32,
-    client_id: &str,
+pub(crate) fn encode_produce_body(
     acks: i16,
     grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
 ) -> Vec<u8> {
-    let mut frame = encode_request_header(0, 3, correlation, client_id);
+    let mut frame = Vec::new();
     frame.extend_from_slice(&(-1i16).to_be_bytes()); // transactional_id = null
     frame.extend_from_slice(&acks.to_be_bytes());
     frame.extend_from_slice(&30_000i32.to_be_bytes()); // timeout ms
@@ -402,6 +400,18 @@ pub(crate) fn encode_produce_request(
         frame.extend_from_slice(&(batch.len() as i32).to_be_bytes());
         frame.extend_from_slice(&batch);
     }
+    frame
+}
+
+/// Produce v3 request for pre-grouped `(topic, partition) -> records`.
+pub(crate) fn encode_produce_request(
+    correlation: i32,
+    client_id: &str,
+    acks: i16,
+    grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
+) -> Vec<u8> {
+    let mut frame = encode_request_header(0, 3, correlation, client_id);
+    frame.extend_from_slice(&encode_produce_body(acks, grouped));
     frame
 }
 
@@ -534,11 +544,7 @@ impl TcpKafkaTransport {
         if grouped.is_empty() {
             return Ok(());
         }
-        let body = {
-            // encode_produce_request builds header internally; strip it.
-            let framed = encode_produce_request(0, &self.client_id, self.acks, grouped);
-            framed[10..].to_vec()
-        };
+        let body = encode_produce_body(self.acks, grouped);
         let response = self.roundtrip(0, 3, body).await?;
         // Response: [topics]: name, [partitions]: index, error, base_offset,
         // log_append_time, log_start_offset, throttle.

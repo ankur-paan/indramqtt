@@ -111,11 +111,21 @@ pub struct OciStreamingSinkConfig {
     /// Retry delay ceiling in ms (default 2500).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl OciStreamingSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if !self.endpoint.starts_with("https://") {
+        if !self.endpoint.starts_with("https://")
+            && !self.endpoint.starts_with("http://127.0.0.1")
+            && !self.endpoint.starts_with("http://localhost")
+        {
             return Err(ConnectorError::Dispatch(format!(
                 "oci endpoint must be https://: {:?}",
                 self.endpoint

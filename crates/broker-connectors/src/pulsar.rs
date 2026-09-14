@@ -188,9 +188,16 @@ pub struct PulsarSinkConfig {
     /// Retry delay ceiling in ms (default 2000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// Network request / handshake timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl PulsarSinkConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         parse_service_url(&self.service_url)?;
         if !is_tenant_segment(&self.tenant) {
@@ -841,6 +848,7 @@ impl PulsarTransport for MemoryPulsarTransport {
 pub struct TcpPulsarTransport {
     endpoint: PulsarEndpoint,
     auth: PulsarAuth,
+    timeout: Duration,
     stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     producers: parking_lot::Mutex<HashMap<String, (u64, String)>>,
     next_producer_id: AtomicU64,
@@ -852,6 +860,7 @@ impl TcpPulsarTransport {
         Ok(Self {
             endpoint: parse_service_url(&config.service_url)?,
             auth: config.auth.clone(),
+            timeout: config.timeout(),
             stream: tokio::sync::Mutex::new(None),
             producers: parking_lot::Mutex::new(HashMap::new()),
             next_producer_id: AtomicU64::new(1),
@@ -864,7 +873,7 @@ impl TcpPulsarTransport {
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            self.timeout,
             tokio::net::TcpStream::connect(&addr),
         )
         .await
@@ -875,7 +884,7 @@ impl TcpPulsarTransport {
             .write_all(&connect)
             .await
             .map_err(|e| ConnectorError::Connection(format!("pulsar connect write failed: {e}")))?;
-        let reply = read_frame(&mut stream).await?;
+        let reply = read_frame(&mut stream, self.timeout).await?;
         let (command, _, _) = decode_frame(&reply)?;
         if decode_command_type(&command)? != PulsarCommand::Connected as u32 {
             return Err(ConnectorError::Connection(
@@ -900,7 +909,7 @@ impl TcpPulsarTransport {
         stream.write_all(&frame).await.map_err(|e| {
             ConnectorError::Connection(format!("pulsar producer write failed: {e}"))
         })?;
-        let reply = read_frame(stream).await?;
+        let reply = read_frame(stream, self.timeout).await?;
         let (command, _, _) = decode_frame(&reply)?;
         if decode_command_type(&command)? != PulsarCommand::ProducerSuccess as u32 {
             return Err(ConnectorError::Connection(
@@ -914,9 +923,9 @@ impl TcpPulsarTransport {
     }
 }
 
-async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+async fn read_frame(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<Vec<u8>> {
     let mut head = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+    tokio::time::timeout(timeout, stream.read_exact(&mut head))
         .await
         .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
@@ -927,9 +936,9 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
         ));
     }
     let mut body = vec![0u8; total];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(timeout, stream.read_exact(&mut body))
         .await
+        .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
         .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
     let mut frame = head.to_vec();
     frame.extend_from_slice(&body);
@@ -960,7 +969,7 @@ impl PulsarTransport for TcpPulsarTransport {
                 .write_all(&frame)
                 .await
                 .map_err(|e| ConnectorError::Connection(format!("pulsar send failed: {e}")))?;
-            let reply = read_frame(stream).await?;
+            let reply = read_frame(stream, self.timeout).await?;
             let (command, _, _) = decode_frame(&reply)?;
             if decode_command_type(&command)? != PulsarCommand::SendReceipt as u32 {
                 return Err(ConnectorError::Connection(
@@ -1252,6 +1261,7 @@ mod tests {
             max_retries: Some(3),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_000),
+            timeout_ms: None,
         }
     }
 
@@ -1488,7 +1498,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             // Connect: command-only frame with type 2 + token auth data.
-            let connect = read_frame(&mut stream).await.expect("connect");
+            let connect = read_frame(&mut stream, Duration::from_secs(5)).await.expect("connect");
             let (command, _, _) = decode_frame(&connect).expect("connect frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),
@@ -1500,7 +1510,7 @@ mod tests {
                 .await
                 .expect("connected");
             // Producer: command-only frame with type 11.
-            let producer = read_frame(&mut stream).await.expect("producer");
+            let producer = read_frame(&mut stream, Duration::from_secs(5)).await.expect("producer");
             let (command, _, _) = decode_frame(&producer).expect("producer frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),
@@ -1511,7 +1521,7 @@ mod tests {
                 .await
                 .expect("producer success");
             // Send: message frame with type 19; answer one receipt.
-            let send = read_frame(&mut stream).await.expect("send");
+            let send = read_frame(&mut stream, Duration::from_secs(5)).await.expect("send");
             let (command, metadata, payload) = decode_frame(&send).expect("send frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),

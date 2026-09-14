@@ -48,6 +48,9 @@ pub struct ClickHouseSinkConfig {
     pub format: String,
     pub batch_size: usize,
     pub batch_timeout_ms: u64,
+    /// Per-request HTTP timeout in ms (defaults to 5000 ms if omitted).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 impl ClickHouseSinkConfig {
@@ -91,6 +94,11 @@ impl ClickHouseSinkConfig {
             "INSERT INTO {}.{} FORMAT {}",
             self.database, self.table, self.format
         )
+    }
+
+    /// Per-request HTTP timeout; falls back to 5000 ms if not configured.
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms.unwrap_or(5_000).max(1))
     }
 }
 
@@ -166,7 +174,7 @@ impl ClickHouseSink {
             .query(&[("query", self.config.insert_query())])
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
             .body(body)
-            .timeout(Duration::from_millis(self.config.batch_timeout_ms.max(1)))
+            .timeout(self.config.request_timeout())
             .send()
             .await
             .map_err(|e| ConnectorError::Connection(format!("clickhouse post failed: {e}")))?;
@@ -264,6 +272,7 @@ mod tests {
             format: "JSONEachRow".to_string(),
             batch_size: 500,
             batch_timeout_ms: 100,
+            request_timeout_ms: None,
         }
     }
 

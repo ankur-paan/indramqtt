@@ -184,6 +184,9 @@ pub struct AwsIotConfig {
     /// unbounded, 0 none).
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<usize>,
+    /// Request timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_max_retries() -> Option<usize> {
@@ -195,6 +198,10 @@ fn default_linger_ms() -> Option<u64> {
 }
 
 impl AwsIotConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
