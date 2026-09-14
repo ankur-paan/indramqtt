@@ -15,6 +15,15 @@ use std::time::Duration;
 
 use super::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
 
+const PG_MAX_BIND_PARAMS: usize = 65535;
+
+fn rows_per_statement(columns: usize, max_params: usize) -> usize {
+    if columns == 0 {
+        return 1;
+    }
+    std::cmp::max(1, max_params / columns)
+}
+
 fn default_alloydb_port() -> u16 {
     5432
 }
@@ -535,6 +544,7 @@ pub struct MockAlloydbTransport {
     pub executions: Mutex<Vec<CapturedAlloydbExecution>>,
     pub fail_count: Mutex<usize>,
     pub outcome_code: Mutex<Option<String>>,
+    pub fail_at: Mutex<Option<usize>>,
 }
 
 impl MockAlloydbTransport {
@@ -543,6 +553,7 @@ impl MockAlloydbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(0),
             outcome_code: Mutex::new(None),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -551,6 +562,7 @@ impl MockAlloydbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(failures),
             outcome_code: Mutex::new(Some("57P01: read pool failover in progress".to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -559,6 +571,7 @@ impl MockAlloydbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(1),
             outcome_code: Mutex::new(Some(sqlstate.to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 }
@@ -576,6 +589,26 @@ impl AlloydbTransport for MockAlloydbTransport {
             query: query.to_string(),
             params: params.to_vec(),
         });
+
+        let call_idx = self.executions.lock().len().saturating_sub(1);
+        if let Some(fail_idx) = *self.fail_at.lock() {
+            if call_idx == fail_idx {
+                if let Some(code) = self.outcome_code.lock().clone() {
+                    let class = classify_alloydb_error(&code);
+                    if class == AlloydbErrorClassification::FailoverRetryable {
+                        return Err(ConnectorError::Connection(format!(
+                            "alloydb transient failover: {code}"
+                        )));
+                    }
+                    return Err(ConnectorError::Dispatch(format!(
+                        "alloydb terminal error: {code}"
+                    )));
+                }
+                return Err(ConnectorError::Connection(format!(
+                    "alloydb mock failure at call {call_idx}"
+                )));
+            }
+        }
 
         let mut fails = self.fail_count.lock();
         if *fails > 0 {
@@ -641,6 +674,10 @@ impl AlloydbSink {
     }
 
     pub async fn flush(&self) -> Result<()> {
+        self.flush_with_limit(PG_MAX_BIND_PARAMS).await
+    }
+
+    async fn flush_with_limit(&self, max_params: usize) -> Result<()> {
         self.backoff.lock().check()?;
 
         let (rows, oldest) = {
@@ -663,40 +700,61 @@ impl AlloydbSink {
                 }
             }
         }
-        let query = match build_alloydb_insert_query(&self.config.table, &columns, rows.len()) {
-            Ok(q) => q,
-            Err(e) => {
-                // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
-                tracing::warn!(error = %e, rows = rows.len(), "alloydb dropping unbuildable batch");
-                return Err(e);
-            }
-        };
+        if columns.len() > max_params {
+            tracing::warn!(
+                rows = rows.len(),
+                columns = columns.len(),
+                max_params = max_params,
+                "alloydb dropping batch that exceeds bind parameter limit"
+            );
+            return Err(ConnectorError::Dispatch(
+                "alloydb batch exceeds bind parameter limit".into(),
+            ));
+        }
+        let mut rows = rows;
+        let per_statement = rows_per_statement(columns.len(), max_params).max(1);
+        let total = rows.len();
+        let mut idx = 0;
+        while idx < total {
+            let end = (idx + per_statement).min(total);
+            let chunk_len = end - idx;
+            let query = match build_alloydb_insert_query(&self.config.table, &columns, chunk_len) {
+                Ok(q) => q,
+                Err(e) => {
+                    // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
+                    tracing::warn!(error = %e, rows = chunk_len, "alloydb dropping unbuildable batch");
+                    return Err(e);
+                }
+            };
 
-        let mut params = Vec::with_capacity(rows.len() * columns.len());
-        for row in &rows {
-            for col in &columns {
-                let val = row
-                    .columns
-                    .iter()
-                    .find(|(c, _)| c == col)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(AlloydbValue::Null);
-                params.push(val);
+            let mut params = Vec::with_capacity(chunk_len * columns.len());
+            for row in &rows[idx..end] {
+                for col in &columns {
+                    let val = row
+                        .columns
+                        .iter()
+                        .find(|(c, _)| c == col)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(AlloydbValue::Null);
+                    params.push(val);
+                }
+            }
+
+            match self.transport.execute(&query, &params).await {
+                Ok(_) => {
+                    self.sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                    idx = end;
+                }
+                Err(e) => {
+                    self.backoff.lock().failure();
+                    let remaining = rows.split_off(idx);
+                    self.queue.lock().restore(remaining, oldest);
+                    return Err(e);
+                }
             }
         }
-
-        match self.transport.execute(&query, &params).await {
-            Ok(_) => {
-                self.backoff.lock().success();
-                self.sent.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.backoff.lock().failure();
-                self.queue.lock().restore(rows, oldest);
-                Err(e)
-            }
-        }
+        self.backoff.lock().success();
+        Ok(())
     }
 }
 
@@ -1123,5 +1181,61 @@ mod tests {
             .await;
         assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
         assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[test]
+    fn test_rows_per_statement() {
+        assert_eq!(rows_per_statement(3, 65535), 21845);
+        assert_eq!(rows_per_statement(70, 65535), 936);
+        assert_eq!(rows_per_statement(70000, 65535), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_splits_into_chunks() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        sink.flush_with_limit(4).await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 3);
+        assert_eq!(execs[0].params.len(), 4);
+        assert_eq!(execs[1].params.len(), 4);
+        assert_eq!(execs[2].params.len(), 2);
+        assert_eq!(execs[0].query.matches('$').count(), 4);
+        assert_eq!(execs[1].query.matches('$').count(), 4);
+        assert_eq!(execs[2].query.matches('$').count(), 2);
+        assert_eq!(sink.sent_count(), 5);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_chunk_restores_only_unsent() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        *transport.fail_at.lock() = Some(1);
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        let res = sink.flush_with_limit(4).await;
+        assert!(res.is_err());
+        assert_eq!(sink.sent_count(), 2);
+        assert_eq!(sink.buffered_rows(), 3);
     }
 }

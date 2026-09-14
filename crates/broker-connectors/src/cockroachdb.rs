@@ -18,6 +18,15 @@ use super::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const PG_MAX_BIND_PARAMS: usize = 65535;
+
+fn rows_per_statement(columns: usize, max_params: usize) -> usize {
+    if columns == 0 {
+        return 1;
+    }
+    std::cmp::max(1, max_params / columns)
+}
+
 fn default_batch_size() -> Option<usize> {
     Some(500)
 }
@@ -543,6 +552,7 @@ pub struct MockCockroachDbTransport {
     pub executions: Mutex<Vec<CapturedCockroachExecution>>,
     pub fail_count: Mutex<usize>,
     pub sqlstate_outcome: Mutex<Option<String>>,
+    pub fail_at: Mutex<Option<usize>>,
 }
 
 impl MockCockroachDbTransport {
@@ -551,6 +561,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(0),
             sqlstate_outcome: Mutex::new(None),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -559,6 +570,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(failures),
             sqlstate_outcome: Mutex::new(Some("40001".to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -567,6 +579,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(1),
             sqlstate_outcome: Mutex::new(Some(sqlstate.to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 }
@@ -588,6 +601,35 @@ impl CockroachDbTransport for MockCockroachDbTransport {
             query: query.to_string(),
             params: params.to_vec(),
         });
+
+        let call_idx = self.executions.lock().len().saturating_sub(1);
+        if let Some(fail_idx) = *self.fail_at.lock() {
+            if call_idx == fail_idx {
+                if let Some(code) = self.sqlstate_outcome.lock().clone() {
+                    let class = classify_cockroach_sqlstate(&code);
+                    match class {
+                        CockroachErrorClassification::SerializationFailure => {
+                            return Err(ConnectorError::Connection(format!(
+                                "cockroachdb serialization failure: sqlstate={code}"
+                            )));
+                        }
+                        CockroachErrorClassification::ConnectionFailure => {
+                            return Err(ConnectorError::Connection(format!(
+                                "cockroachdb connection failure: sqlstate={code}"
+                            )));
+                        }
+                        _ => {
+                            return Err(ConnectorError::Dispatch(format!(
+                                "cockroachdb terminal failure: sqlstate={code}"
+                            )));
+                        }
+                    }
+                }
+                return Err(ConnectorError::Dispatch(format!(
+                    "cockroachdb mock failure at call {call_idx}"
+                )));
+            }
+        }
 
         let mut fails = self.fail_count.lock();
         if *fails > 0 {
@@ -664,6 +706,10 @@ impl CockroachDbSink {
     }
 
     pub async fn flush(&self) -> Result<()> {
+        self.flush_with_limit(PG_MAX_BIND_PARAMS).await
+    }
+
+    async fn flush_with_limit(&self, max_params: usize) -> Result<()> {
         self.backoff.lock().check()?;
 
         let (rows, oldest) = {
@@ -687,80 +733,111 @@ impl CockroachDbSink {
                 }
             }
         }
-        let query_result = if !self.config.upsert_conflict_columns.is_empty() {
-            build_on_conflict_upsert_query(
-                &self.config.table,
-                &columns,
-                &self.config.upsert_conflict_columns,
-                rows.len(),
-            )
-        } else {
-            build_native_upsert_query(&self.config.table, &columns, rows.len())
-        };
-        let query = match query_result {
-            Ok(q) => q,
-            Err(e) => {
-                // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
-                tracing::warn!(error = %e, rows = rows.len(), "cockroachdb dropping unbuildable batch");
-                return Err(e);
-            }
-        };
-
-        let mut params = Vec::with_capacity(rows.len() * columns.len());
-        for row in &rows {
-            for col in &columns {
-                let val = row
-                    .columns
-                    .iter()
-                    .find(|(c, _)| c == col)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(CockroachValue::Null);
-                params.push(val);
-            }
+        if columns.len() > max_params {
+            tracing::warn!(
+                rows = rows.len(),
+                columns = columns.len(),
+                max_params = max_params,
+                "cockroachdb dropping batch that exceeds bind parameter limit"
+            );
+            return Err(ConnectorError::Dispatch(
+                "cockroachdb batch exceeds bind parameter limit".into(),
+            ));
         }
-
-        // Retry loop for transaction serialization failure (SQLSTATE 40001)
-        let max_attempts = self.config.max_retry_attempts.max(1);
-        let mut attempts = 0;
-        let mut last_err = None;
-
-        while attempts < max_attempts {
-            attempts += 1;
-            match self.transport.execute(&query, &params).await {
-                Ok(_) => {
-                    self.backoff.lock().success();
-                    self.sent.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                    return Ok(());
-                }
+        let mut rows = rows;
+        let per_statement = rows_per_statement(columns.len(), max_params).max(1);
+        let total = rows.len();
+        let mut idx = 0;
+        while idx < total {
+            let end = (idx + per_statement).min(total);
+            let chunk_len = end - idx;
+            let query_result = if !self.config.upsert_conflict_columns.is_empty() {
+                build_on_conflict_upsert_query(
+                    &self.config.table,
+                    &columns,
+                    &self.config.upsert_conflict_columns,
+                    chunk_len,
+                )
+            } else {
+                build_native_upsert_query(&self.config.table, &columns, chunk_len)
+            };
+            let query = match query_result {
+                Ok(q) => q,
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    let classification = classify_cockroach_sqlstate(&err_msg);
+                    // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
+                    tracing::warn!(error = %e, rows = chunk_len, "cockroachdb dropping unbuildable batch");
+                    return Err(e);
+                }
+            };
 
-                    if classification == CockroachErrorClassification::SerializationFailure {
-                        // Retry transaction with brief pause
-                        tokio::time::sleep(Duration::from_millis(5 * attempts as u64)).await;
-                        last_err = Some(e);
-                        continue;
-                    } else if classification == CockroachErrorClassification::ConnectionFailure {
-                        self.backoff.lock().failure();
-                        self.queue.lock().restore(rows, oldest);
-                        return Err(e);
-                    } else {
-                        // Terminal error - do not retry
-                        self.backoff.lock().failure();
-                        self.queue.lock().restore(rows, oldest);
-                        return Err(e);
+            let mut params = Vec::with_capacity(chunk_len * columns.len());
+            for row in &rows[idx..end] {
+                for col in &columns {
+                    let val = row
+                        .columns
+                        .iter()
+                        .find(|(c, _)| c == col)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(CockroachValue::Null);
+                    params.push(val);
+                }
+            }
+
+            // Retry loop for transaction serialization failure (SQLSTATE 40001),
+            // applied per chunk so a large batch still makes progress.
+            let max_attempts = self.config.max_retry_attempts.max(1);
+            let mut attempts = 0;
+            let mut last_err = None;
+            let mut chunk_ok = false;
+
+            while attempts < max_attempts {
+                attempts += 1;
+                match self.transport.execute(&query, &params).await {
+                    Ok(_) => {
+                        self.sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                        chunk_ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        let classification = classify_cockroach_sqlstate(&err_msg);
+
+                        if classification == CockroachErrorClassification::SerializationFailure {
+                            // Retry transaction with brief pause
+                            tokio::time::sleep(Duration::from_millis(5 * attempts as u64)).await;
+                            last_err = Some(e);
+                            continue;
+                        } else if classification == CockroachErrorClassification::ConnectionFailure
+                        {
+                            self.backoff.lock().failure();
+                            let remaining = rows.split_off(idx);
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        } else {
+                            // Terminal error - do not retry
+                            self.backoff.lock().failure();
+                            let remaining = rows.split_off(idx);
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        }
                     }
                 }
             }
+
+            if !chunk_ok {
+                // Exhausted retries
+                self.backoff.lock().failure();
+                let remaining = rows.split_off(idx);
+                self.queue.lock().restore(remaining, oldest);
+                return Err(last_err.unwrap_or_else(|| {
+                    ConnectorError::Dispatch("cockroachdb max retry attempts exhausted".into())
+                }));
+            }
+            idx = end;
         }
 
-        // Exhausted retries
-        self.backoff.lock().failure();
-        self.queue.lock().restore(rows, oldest);
-        Err(last_err.unwrap_or_else(|| {
-            ConnectorError::Dispatch("cockroachdb max retry attempts exhausted".into())
-        }))
+        self.backoff.lock().success();
+        Ok(())
     }
 }
 
@@ -1155,5 +1232,61 @@ mod tests {
             .await;
         assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
         assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[test]
+    fn test_rows_per_statement() {
+        assert_eq!(rows_per_statement(3, 65535), 21845);
+        assert_eq!(rows_per_statement(70, 65535), 936);
+        assert_eq!(rows_per_statement(70000, 65535), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_splits_into_chunks() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        sink.flush_with_limit(4).await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 3);
+        assert_eq!(execs[0].params.len(), 4);
+        assert_eq!(execs[1].params.len(), 4);
+        assert_eq!(execs[2].params.len(), 2);
+        assert_eq!(execs[0].query.matches('$').count(), 4);
+        assert_eq!(execs[1].query.matches('$').count(), 4);
+        assert_eq!(execs[2].query.matches('$').count(), 2);
+        assert_eq!(sink.sent_count(), 5);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_chunk_restores_only_unsent() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        *transport.fail_at.lock() = Some(1);
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        let res = sink.flush_with_limit(4).await;
+        assert!(res.is_err());
+        assert_eq!(sink.sent_count(), 2);
+        assert_eq!(sink.buffered_rows(), 3);
     }
 }
