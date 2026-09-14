@@ -186,6 +186,27 @@ pub fn classify_alloydb_error(err_msg: &str) -> AlloydbErrorClassification {
     }
 }
 
+/// Quote a PostgreSQL identifier if needed.
+///
+/// Names matching `^[a-z_][a-z0-9_]*$` are returned unchanged so existing
+/// lower-case schemas behave exactly as today; any other non-empty name is
+/// wrapped in double quotes with embedded `"` doubled.
+fn quote_pg_ident(name: &str) -> Result<String> {
+    if name.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "cannot quote empty identifier".into(),
+        ));
+    }
+    let mut bytes = name.bytes();
+    let first = bytes.next().expect("non-empty checked above");
+    let first_ok = first == b'_' || first.is_ascii_lowercase();
+    let rest_ok = bytes.all(|b| b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit());
+    if first_ok && rest_ok {
+        return Ok(name.to_string());
+    }
+    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
 /// Build a multi-row parameterized `INSERT INTO` query.
 pub fn build_alloydb_insert_query(
     table: &str,
@@ -203,7 +224,11 @@ pub fn build_alloydb_insert_query(
         ));
     }
 
-    let cols_joined = columns.join(", ");
+    let mut quoted = Vec::with_capacity(columns.len());
+    for c in columns {
+        quoted.push(quote_pg_ident(c)?);
+    }
+    let cols_joined = quoted.join(", ");
     let mut row_placeholders = Vec::with_capacity(row_count);
 
     for r in 0..row_count {
@@ -284,7 +309,17 @@ pub fn extract_alloydb_row(
             columns.push((m.db_column.clone(), extracted));
         }
     } else if let serde_json::Value::Object(map) = json_val {
+        if map.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "alloydb payload object has no keys".into(),
+            ));
+        }
         for (k, v) in map {
+            if k.is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "alloydb payload contains an empty column name".into(),
+                ));
+            }
             columns.push((k, json_to_alloydb_value(&v)));
         }
     } else {
@@ -620,13 +655,33 @@ impl AlloydbSink {
             return Ok(());
         }
 
-        let columns: Vec<String> = rows[0].columns.iter().map(|(c, _)| c.clone()).collect();
-        let query = build_alloydb_insert_query(&self.config.table, &columns, rows.len())?;
-
-        let mut params = Vec::new();
+        let mut columns: Vec<String> = Vec::new();
         for row in &rows {
-            for (_, val) in &row.columns {
-                params.push(val.clone());
+            for (c, _) in &row.columns {
+                if !columns.iter().any(|e| e == c) {
+                    columns.push(c.clone());
+                }
+            }
+        }
+        let query = match build_alloydb_insert_query(&self.config.table, &columns, rows.len()) {
+            Ok(q) => q,
+            Err(e) => {
+                // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
+                tracing::warn!(error = %e, rows = rows.len(), "alloydb dropping unbuildable batch");
+                return Err(e);
+            }
+        };
+
+        let mut params = Vec::with_capacity(rows.len() * columns.len());
+        for row in &rows {
+            for col in &columns {
+                let val = row
+                    .columns
+                    .iter()
+                    .find(|(c, _)| c == col)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(AlloydbValue::Null);
+                params.push(val);
             }
         }
 
@@ -944,5 +999,129 @@ mod tests {
         let execs = transport.executions.lock();
         assert_eq!(execs.len(), 2);
         assert_eq!(execs[1].params.len(), 4);
+    }
+
+    fn strip_quoted_idents(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        let mut in_quotes = false;
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+            } else if c == '"' {
+                in_quotes = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_mixed_keys_batch_params_aligned() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/mixed").unwrap();
+        sink.send(&topic, &Bytes::from_static(br#"{"a":1}"#), QoS::AtLeastOnce)
+            .await
+            .expect("buffer row 1");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"b":2,"a":3}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer row 2");
+        sink.flush().await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 1);
+        assert!(execs[0].query.contains("(a, b)"));
+        assert_eq!(
+            execs[0].params,
+            vec![
+                AlloydbValue::Integer(1),
+                AlloydbValue::Null,
+                AlloydbValue::Integer(3),
+                AlloydbValue::Integer(2),
+            ]
+        );
+        assert_eq!(execs[0].query.matches('$').count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_hostile_key_is_quoted() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/hostile").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"x) VALUES (1); DROP TABLE t; --": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer hostile row");
+        sink.flush().await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 1);
+        let hostile = "x) VALUES (1); DROP TABLE t; --";
+        let quoted = format!("\"{hostile}\"");
+        assert!(execs[0].query.contains(&quoted));
+        let stripped = strip_quoted_idents(&execs[0].query);
+        assert!(!stripped.contains(hostile));
+        assert!(!stripped.contains(';'));
+    }
+
+    #[tokio::test]
+    async fn test_empty_key_rejected_at_send() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/empty-key").unwrap();
+        let res = sink
+            .send(&topic, &Bytes::from_static(br#"{"": 1}"#), QoS::AtLeastOnce)
+            .await;
+        assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
+        assert_eq!(sink.buffered_rows(), 0);
+
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"a": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer valid row");
+        sink.flush().await.expect("flush succeeds");
+        assert_eq!(sink.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_empty_object_rejected_at_send() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/empty-obj").unwrap();
+        let res = sink
+            .send(&topic, &Bytes::from_static(br#"{}"#), QoS::AtLeastOnce)
+            .await;
+        assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
+        assert_eq!(sink.buffered_rows(), 0);
     }
 }
