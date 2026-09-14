@@ -700,9 +700,14 @@ impl S3TablesSink {
         self.buffer.lock().queue.len()
     }
 
-    /// Flush buffered records as one data file (no-op when empty).
-    /// While backing off, fails fast without touching the transport.
-    /// Any failure restores rows, engages backoff, propagates.
+    /// Flush buffered records as one data file per partition group
+    /// (no-op when empty). Each row's partition comes from its own
+    /// dims and millis; groups keep first-seen order. While backing
+    /// off, fails fast without touching the transport. Any failure
+    /// restores the failed group plus every unsent group, engages
+    /// backoff, propagates. When at least one group already committed,
+    /// the snapshot of those files is stored before returning the
+    /// error so table readers see them.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = {
@@ -712,77 +717,133 @@ impl S3TablesSink {
         if rows.is_empty() {
             return Ok(());
         }
-        // Partition on the first row (micro-batches group one slice).
-        let first = &rows[0];
-        let dims = [
-            ("device_id", first.device_id.clone()),
-            ("client_id", first.client_id.clone()),
-            ("topic", first.topic.clone()),
-        ];
-        let partition = partition_path(&self.config.partition_spec, &dims, first.millis);
-        let key = data_file_path(&partition, self.config.target_format);
-        let mut raw = String::new();
+        // Partition each row individually, keeping first-seen group order.
+        let mut partitions: Vec<String> = Vec::new();
+        let mut group_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut row_group: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
-            raw.push_str(&row.line);
-            raw.push('\n');
-        }
-        let (body, content_encoding, content_type) = match self.config.target_format {
-            S3TablesFormat::NdjsonCompressed => (
-                gzip_bytes(raw.as_bytes())?,
-                Some("gzip"),
-                "application/x-ndjson",
-            ),
-            S3TablesFormat::ParquetPlaceholder => {
-                (raw.into_bytes(), None, "application/octet-stream")
+            let dims = [
+                ("device_id", row.device_id.clone()),
+                ("client_id", row.client_id.clone()),
+                ("topic", row.topic.clone()),
+            ];
+            let partition = partition_path(&self.config.partition_spec, &dims, row.millis);
+            if let Some(&gi) = group_index.get(&partition) {
+                row_group.push(gi);
+            } else {
+                let gi = partitions.len();
+                partitions.push(partition.clone());
+                group_index.insert(partition, gi);
+                row_group.push(gi);
             }
-        };
-        let millis = now_millis();
-        let payload_hash = super::sha256_hex(&body);
+        }
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); partitions.len()];
+        for (ri, gi) in row_group.iter().enumerate() {
+            members[*gi].push(ri);
+        }
+        let flush_millis = now_millis();
         let host = self.config.endpoint_host();
-        let (authorization, date) = s3tables_authorization(&S3TablesSigning {
-            access_key_id: &self.config.access_key_id,
-            secret_access_key: &self.config.secret_access_key,
-            session_token: self.config.session_token.as_deref(),
-            region: &self.config.region,
-            service: self.config.sigv4_service(),
-            host: &host,
-            key: &key,
-            payload_sha256_hex: &payload_hash,
-            millis,
-        });
-        let put = S3TablesPut {
-            key: key.clone(),
-            body: body.clone(),
-            content_type,
-            content_encoding,
-        };
-        let record_count = rows.len() as u64;
-        match self.transport.put_object(&put, &date, &authorization).await {
-            Ok(()) => {
-                let snapshot_id = self.snapshot_seq.fetch_add(1, Ordering::SeqCst);
-                *self.last_snapshot.lock() = render_snapshot(
-                    &self.config.namespace,
-                    &self.config.table_name,
-                    snapshot_id,
-                    millis,
-                    &[SnapshotFile {
+        let mut committed: Vec<SnapshotFile> = Vec::with_capacity(partitions.len());
+        for (gi, partition) in partitions.iter().enumerate() {
+            let mut raw = String::new();
+            for &ri in &members[gi] {
+                raw.push_str(&rows[ri].line);
+                raw.push('\n');
+            }
+            let (body, content_encoding, content_type) = match self.config.target_format {
+                S3TablesFormat::NdjsonCompressed => match gzip_bytes(raw.as_bytes()) {
+                    Ok(body) => (body, Some("gzip"), "application/x-ndjson"),
+                    Err(e) => {
+                        if !committed.is_empty() {
+                            let snapshot_id = self.snapshot_seq.fetch_add(1, Ordering::SeqCst);
+                            *self.last_snapshot.lock() = render_snapshot(
+                                &self.config.namespace,
+                                &self.config.table_name,
+                                snapshot_id,
+                                flush_millis,
+                                &committed,
+                            );
+                        }
+                        let mut unsent = Vec::new();
+                        for (ri, row) in rows.into_iter().enumerate() {
+                            if row_group[ri] >= gi {
+                                unsent.push(row);
+                            }
+                        }
+                        self.buffer.lock().queue.restore(unsent, oldest);
+                        self.backoff.lock().failure();
+                        return Err(e);
+                    }
+                },
+                S3TablesFormat::ParquetPlaceholder => {
+                    (raw.into_bytes(), None, "application/octet-stream")
+                }
+            };
+            let key = data_file_path(partition, self.config.target_format);
+            let payload_hash = super::sha256_hex(&body);
+            let (authorization, date) = s3tables_authorization(&S3TablesSigning {
+                access_key_id: &self.config.access_key_id,
+                secret_access_key: &self.config.secret_access_key,
+                session_token: self.config.session_token.as_deref(),
+                region: &self.config.region,
+                service: self.config.sigv4_service(),
+                host: &host,
+                key: &key,
+                payload_sha256_hex: &payload_hash,
+                millis: flush_millis,
+            });
+            let put = S3TablesPut {
+                key: key.clone(),
+                body: body.clone(),
+                content_type,
+                content_encoding,
+            };
+            let record_count = members[gi].len() as u64;
+            match self.transport.put_object(&put, &date, &authorization).await {
+                Ok(()) => {
+                    committed.push(SnapshotFile {
                         path: key,
                         record_count,
                         size_bytes: body.len() as u64,
-                        partition,
-                    }],
-                );
-                self.backoff.lock().success();
-                self.sent_files.fetch_add(1, Ordering::Relaxed);
-                self.sent_records.fetch_add(record_count, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.buffer.lock().queue.restore(rows, oldest);
-                self.backoff.lock().failure();
-                Err(e)
+                        partition: partition.clone(),
+                    });
+                    self.sent_files.fetch_add(1, Ordering::Relaxed);
+                    self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if !committed.is_empty() {
+                        let snapshot_id = self.snapshot_seq.fetch_add(1, Ordering::SeqCst);
+                        *self.last_snapshot.lock() = render_snapshot(
+                            &self.config.namespace,
+                            &self.config.table_name,
+                            snapshot_id,
+                            flush_millis,
+                            &committed,
+                        );
+                    }
+                    let mut unsent = Vec::new();
+                    for (ri, row) in rows.into_iter().enumerate() {
+                        if row_group[ri] >= gi {
+                            unsent.push(row);
+                        }
+                    }
+                    self.buffer.lock().queue.restore(unsent, oldest);
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
             }
         }
+        let snapshot_id = self.snapshot_seq.fetch_add(1, Ordering::SeqCst);
+        *self.last_snapshot.lock() = render_snapshot(
+            &self.config.namespace,
+            &self.config.table_name,
+            snapshot_id,
+            flush_millis,
+            &committed,
+        );
+        self.backoff.lock().success();
+        Ok(())
     }
 
     /// Validate + buffer one event. Returns true when the batch is
@@ -875,6 +936,7 @@ mod tests {
             batch_size: Some(1_000),
             buffer_capacity: None,
             linger_ms: Some(1_000),
+            timeout_ms: None,
         }
     }
 
@@ -1212,5 +1274,129 @@ mod tests {
         // The uploaded body gunzips to the single ndjson row.
         assert_eq!(&puts[0].body[..2], &[0x1f, 0x8b], "gzip magic");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_rows_partitioned_individually() {
+        let transport = Arc::new(MockS3TablesTransport::new());
+        let mut config = test_config();
+        config.partition_spec = vec![IcebergPartitionField {
+            source_name: "device_id".to_string(),
+            transform: IcebergTransform::Identity,
+        }];
+        config.batch_size = Some(1_000);
+        let sink = S3TablesSink::new(config, transport.clone()).unwrap();
+
+        let topic = Topic::new("sensors/t1").unwrap();
+        for device in ["dev-a", "dev-b", "dev-a", "dev-b"] {
+            let payload = format!(r#"{{"device_id":"{device}"}}"#);
+            sink.send(&topic, &Bytes::from(payload), QoS::AtMostOnce)
+                .await
+                .unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 4);
+        sink.flush().await.unwrap();
+
+        let puts = transport.puts();
+        assert_eq!(puts.len(), 2, "one data file per device, got {puts:?}");
+        assert_eq!(sink.sent_files(), 2);
+        assert_eq!(sink.sent_records(), 4);
+        let mut total_lines = 0usize;
+        for put in &puts {
+            let device = if put.key.contains("device_id=dev-a") {
+                "dev-a"
+            } else if put.key.contains("device_id=dev-b") {
+                "dev-b"
+            } else {
+                panic!("unexpected partition key {:?}", put.key);
+            };
+            let mut decoder = GzDecoder::new(&put.body[..]);
+            let mut raw = Vec::new();
+            decoder.read_to_end(&mut raw).unwrap();
+            let text = String::from_utf8(raw).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 2, "each device has 2 rows");
+            total_lines += lines.len();
+            for line in lines {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(row["payload"]["device_id"], device);
+            }
+        }
+        assert_eq!(total_lines, 4);
+    }
+
+    /// Test-only transport failing exactly one call number (1-indexed).
+    struct FailNthTransport {
+        puts: parking_lot::Mutex<Vec<S3TablesPut>>,
+        calls: AtomicU64,
+        fail_on_call: u64,
+    }
+
+    impl FailNthTransport {
+        fn new(fail_on_call: u64) -> Self {
+            Self {
+                puts: parking_lot::Mutex::new(Vec::new()),
+                calls: AtomicU64::new(0),
+                fail_on_call,
+            }
+        }
+
+        fn puts(&self) -> Vec<S3TablesPut> {
+            self.puts.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl S3TablesTransport for FailNthTransport {
+        async fn put_object(
+            &self,
+            put: &S3TablesPut,
+            _date: &str,
+            _authorization: &str,
+        ) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_call {
+                return Err(ConnectorError::Connection("mock s3tables down".to_string()));
+            }
+            self.puts.lock().push(put.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_failure_snapshots_committed_files() {
+        let transport = Arc::new(FailNthTransport::new(2));
+        let mut config = test_config();
+        config.partition_spec = vec![IcebergPartitionField {
+            source_name: "device_id".to_string(),
+            transform: IcebergTransform::Identity,
+        }];
+        config.batch_size = Some(1_000);
+        let sink = S3TablesSink::new(config, transport.clone()).unwrap();
+
+        let topic = Topic::new("sensors/t1").unwrap();
+        for device in ["dev-a", "dev-b"] {
+            let payload = format!(r#"{{"device_id":"{device}"}}"#);
+            sink.send(&topic, &Bytes::from(payload), QoS::AtMostOnce)
+                .await
+                .unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 2);
+        let err = sink.flush().await.expect_err("second put must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        // Only the failed second group is restored.
+        assert_eq!(sink.buffered_rows(), 1);
+        assert_eq!(sink.sent_files(), 1);
+        assert_eq!(sink.sent_records(), 1);
+        let puts = transport.puts();
+        assert_eq!(puts.len(), 1);
+        // The stored snapshot references exactly the committed file.
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&sink.last_snapshot.lock()).unwrap();
+        let files = snapshot["data_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], puts[0].key);
+        assert_eq!(files[0]["record_count"], 1);
+        assert_eq!(snapshot["manifest"]["total_records"], 1);
     }
 }
