@@ -245,17 +245,24 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
 pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
-    let (matched, passed, failed) = if let Some(r) = rules
-        .iter()
-        .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
+    let (matched, passed, failed, actions_total, actions_success, actions_failed) = if let Some(r) =
+        rules
+            .iter()
+            .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
     {
         (
             r.matched_cnt.load(std::sync::atomic::Ordering::Relaxed),
             r.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
             r.failed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_total_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_success_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_failed_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0, 0, 0)
     };
 
     (
@@ -266,6 +273,9 @@ pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<Stri
                 "matched": matched,
                 "passed": passed,
                 "failed": failed,
+                "actions.total": actions_total,
+                "actions.success": actions_success,
+                "actions.failed": actions_failed,
                 "rate": 0.0,
                 "rate_max": 0.0,
                 "rate_last5m": 0.0
@@ -277,6 +287,9 @@ pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<Stri
                         "matched": matched,
                         "passed": passed,
                         "failed": failed,
+                        "actions.total": actions_total,
+                        "actions.success": actions_success,
+                        "actions.failed": actions_failed,
                         "rate": 0.0
                     }
                 }
@@ -296,6 +309,12 @@ pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<St
         r.matched_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
         r.passed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
         r.failed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_total_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_success_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_failed_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
     StatusCode::NO_CONTENT.into_response()
 }

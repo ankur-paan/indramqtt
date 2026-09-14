@@ -212,6 +212,79 @@ pub struct Rule {
     pub passed_cnt: Arc<AtomicU64>,
     #[serde(skip_serializing)]
     pub failed_cnt: Arc<AtomicU64>,
+    #[serde(skip_serializing)]
+    pub actions_total_cnt: Arc<AtomicU64>,
+    #[serde(skip_serializing)]
+    pub actions_success_cnt: Arc<AtomicU64>,
+    #[serde(skip_serializing)]
+    pub actions_failed_cnt: Arc<AtomicU64>,
+}
+
+/// Per-action outcome counters shared with every `run_actions` call site.
+#[derive(Debug, Clone)]
+struct ActionCounters {
+    total: Arc<AtomicU64>,
+    success: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
+}
+
+impl ActionCounters {
+    fn from_rule(rule: &Rule) -> Self {
+        Self {
+            total: rule.actions_total_cnt.clone(),
+            success: rule.actions_success_cnt.clone(),
+            failed: rule.actions_failed_cnt.clone(),
+        }
+    }
+}
+
+/// Throttle state for one (rule id, connector id) pair: when the last
+/// forward-failure line was logged and how many failures were suppressed
+/// since then.
+#[derive(Debug, Clone, Copy)]
+struct ThrottleEntry {
+    last_logged_ms: u64,
+    suppressed: u64,
+}
+
+/// Maximum one forward-failure `warn!` per (rule id, connector id) per
+/// window; later failures inside the window are only counted.
+const FORWARD_FAILURE_LOG_WINDOW_MS: u64 = 10_000;
+
+/// Returns `Some(suppressed)` when the caller must log (first failure, or
+/// the window elapsed since the previous line), `None` when the failure
+/// must only be counted.
+fn forward_failure_should_log(
+    throttle: &parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>,
+    rule_id: &str,
+    connector_id: &str,
+    now_ms: u64,
+) -> Option<u64> {
+    let mut guard = throttle.lock();
+    let key = (rule_id.to_string(), connector_id.to_string());
+    match guard.get_mut(&key) {
+        None => {
+            guard.insert(
+                key,
+                ThrottleEntry {
+                    last_logged_ms: now_ms,
+                    suppressed: 0,
+                },
+            );
+            Some(0)
+        }
+        Some(entry) => {
+            if now_ms.saturating_sub(entry.last_logged_ms) >= FORWARD_FAILURE_LOG_WINDOW_MS {
+                let suppressed = entry.suppressed;
+                entry.last_logged_ms = now_ms;
+                entry.suppressed = 0;
+                Some(suppressed)
+            } else {
+                entry.suppressed += 1;
+                None
+            }
+        }
+    }
 }
 
 /// Actions a rule may execute per matched ingress event.
@@ -265,6 +338,7 @@ pub struct RuleEngine {
     flush_ctx: Arc<FlushContext>,
     window_workers: RwLock<HashMap<String, WindowWorker>>,
     window_channel_depth: usize,
+    forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
 }
 
 /// Shared flush context: what a window worker needs at flush time. The
@@ -274,6 +348,7 @@ pub struct RuleEngine {
 struct FlushContext {
     connectors: Arc<ConnectorManager>,
     broker_sink: RwLock<Option<Arc<dyn BrokerSink>>>,
+    forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
 }
 
 /// One timestamped record waiting inside a window buffer. The ingress
@@ -340,6 +415,7 @@ impl RuleEngine {
         window_channel_depth: usize,
     ) -> Self {
         let connectors = Arc::new(ConnectorManager::new());
+        let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         Self {
             rules: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -348,9 +424,11 @@ impl RuleEngine {
             flush_ctx: Arc::new(FlushContext {
                 connectors,
                 broker_sink: RwLock::new(None),
+                forward_throttle: forward_throttle.clone(),
             }),
             window_workers: RwLock::new(HashMap::new()),
             window_channel_depth: window_channel_depth.max(1),
+            forward_throttle,
         }
     }
 
@@ -460,6 +538,9 @@ impl RuleEngine {
             matched_cnt: Arc::new(AtomicU64::new(0)),
             passed_cnt: Arc::new(AtomicU64::new(0)),
             failed_cnt: Arc::new(AtomicU64::new(0)),
+            actions_total_cnt: Arc::new(AtomicU64::new(0)),
+            actions_success_cnt: Arc::new(AtomicU64::new(0)),
+            actions_failed_cnt: Arc::new(AtomicU64::new(0)),
         };
         self.rules.write().insert(id.clone(), rule.clone());
         // Eager worker start when a runtime is available; otherwise the
@@ -577,6 +658,7 @@ impl RuleEngine {
                 self.flush_ctx.clone(),
                 rx,
                 window,
+                ActionCounters::from_rule(rule),
             )),
         };
         self.window_workers.write().insert(rule.id.clone(), worker);
@@ -636,6 +718,8 @@ impl RuleEngine {
                 qos,
                 &self.connectors,
                 Some(broker_sink),
+                &ActionCounters::from_rule(rule),
+                &self.forward_throttle,
             )
             .await;
         }
@@ -658,6 +742,8 @@ async fn run_actions(
     qos_cap: QoS,
     connectors: &Arc<ConnectorManager>,
     broker_sink: Option<&Arc<dyn BrokerSink>>,
+    counters: &ActionCounters,
+    throttle: &parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>,
 ) {
     for action in actions {
         match action {
@@ -672,14 +758,21 @@ async fn run_actions(
                             .publish(dst.clone(), payload.clone(), effective, false)
                             .await
                         {
+                            counters.total.fetch_add(1, Ordering::Relaxed);
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 rule_id = %rule_id,
                                 error = %e,
                                 "Rule republish failed; continuing with remaining actions"
                             );
+                        } else {
+                            counters.total.fetch_add(1, Ordering::Relaxed);
+                            counters.success.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     None => {
+                        counters.total.fetch_add(1, Ordering::Relaxed);
+                        counters.failed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             rule_id = %rule_id,
                             "no broker sink configured; republish dropped"
@@ -688,6 +781,8 @@ async fn run_actions(
                 }
             }
             RuleAction::Log => {
+                counters.total.fetch_add(1, Ordering::Relaxed);
+                counters.success.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
                     rule_id = %rule_id,
                     topic = %topic,
@@ -699,12 +794,22 @@ async fn run_actions(
                     .send(connector_id, topic, &payload, qos_cap)
                     .await
                 {
-                    tracing::warn!(
-                        rule_id = %rule_id,
-                        connector = %connector_id,
-                        error = %e,
-                        "Rule connector forward failed; continuing with remaining actions"
-                    );
+                    counters.total.fetch_add(1, Ordering::Relaxed);
+                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(suppressed) =
+                        forward_failure_should_log(throttle, rule_id, connector_id, now_ms())
+                    {
+                        tracing::warn!(
+                            rule_id = %rule_id,
+                            connector = %connector_id,
+                            error = %e,
+                            suppressed = suppressed,
+                            "Rule connector forward failed; continuing with remaining actions"
+                        );
+                    }
+                } else {
+                    counters.total.fetch_add(1, Ordering::Relaxed);
+                    counters.success.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -721,6 +826,7 @@ async fn window_worker_loop(
     flush_ctx: Arc<FlushContext>,
     mut rx: mpsc::Receiver<TimedRecord>,
     window: WindowDef,
+    counters: ActionCounters,
 ) {
     match window {
         WindowDef::TumblingTime { unit, length } => {
@@ -734,7 +840,7 @@ async fn window_worker_loop(
                     _ = ticker.tick() => {
                         let end = now_ms();
                         let batch = std::mem::take(&mut buffer);
-                        flush_window(&rule_id, &stmt, &actions, batch, window_start, end, &flush_ctx).await;
+                        flush_window(&rule_id, &stmt, &actions, batch, window_start, end, &flush_ctx, &counters).await;
                         window_start = end;
                     }
                     rec = rx.recv() => {
@@ -765,7 +871,10 @@ async fn window_worker_loop(
                         std::mem::take(&mut buffer)
                     };
                     let start = batch.first().map(|r| r.arrived_ms).unwrap_or(end);
-                    flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx).await;
+                    flush_window(
+                        &rule_id, &stmt, &actions, batch, start, end, &flush_ctx, &counters,
+                    )
+                    .await;
                     since_flush = 0;
                 }
                 // Sliding retention cap: never hold more than one window.
@@ -802,6 +911,7 @@ async fn window_worker_loop(
                             cutoff,
                             end,
                             &flush_ctx,
+                            &counters,
                         )
                         .await;
                     }
@@ -830,7 +940,10 @@ async fn window_worker_loop(
                 }
                 // Aggregate the trailing window on every arrival.
                 let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
-                flush_window(&rule_id, &stmt, &actions, batch, cutoff, end, &flush_ctx).await;
+                flush_window(
+                    &rule_id, &stmt, &actions, batch, cutoff, end, &flush_ctx, &counters,
+                )
+                .await;
             }
         }
         WindowDef::Session {
@@ -856,7 +969,7 @@ async fn window_worker_loop(
                         let end = now_ms();
                         let start = session_start.unwrap_or(end);
                         let batch = std::mem::take(&mut buffer);
-                        flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx).await;
+                        flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx, &counters).await;
                         session_start = None;
                         last_arrival = None;
                     }
@@ -875,7 +988,7 @@ async fn window_worker_loop(
                                 last_arrival = Some(now);
                                 if now.saturating_sub(start) >= max_duration_ms {
                                     let batch = std::mem::take(&mut buffer);
-                                    flush_window(&rule_id, &stmt, &actions, batch, start, now, &flush_ctx).await;
+                                    flush_window(&rule_id, &stmt, &actions, batch, start, now, &flush_ctx, &counters).await;
                                     session_start = None;
                                     last_arrival = None;
                                 }
@@ -896,6 +1009,7 @@ async fn window_worker_loop(
 /// dispatch each resulting row through the rule actions. Empty windows
 /// and fully-having-filtered windows dispatch nothing. Each row routes
 /// with its partition's first record topic.
+#[allow(clippy::too_many_arguments)]
 async fn flush_window(
     rule_id: &str,
     stmt: &SelectStmt,
@@ -904,6 +1018,7 @@ async fn flush_window(
     window_start_ms: u64,
     window_end_ms: u64,
     flush_ctx: &FlushContext,
+    counters: &ActionCounters,
 ) {
     if batch.is_empty() {
         return;
@@ -954,6 +1069,8 @@ async fn flush_window(
             QoS::ExactlyOnce,
             &flush_ctx.connectors,
             sink.as_ref(),
+            counters,
+            &flush_ctx.forward_throttle,
         )
         .await;
     }
@@ -2814,7 +2931,8 @@ mod tests {
 
         let records = transport.records_flat();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].topic, "out-sensors/kitchen");
+        // Kafka topics cannot contain `/`, so `/` renders as `.`.
+        assert_eq!(records[0].topic, "out-sensors.kitchen");
         assert_eq!(records[0].key, Some(Bytes::from_static(b"d7")));
         let body: serde_json::Value =
             serde_json::from_slice(&records[0].value).expect("projected JSON");
@@ -5442,5 +5560,144 @@ mod tests {
         assert_eq!(opentsdb_transport.captured_points.lock().len(), 1);
         assert_eq!(greptimedb_transport.captured_sqls.lock().len(), 1);
         assert_eq!(datalayers_transport.captured_requests.lock().len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // R22: forward failures counted in action metrics, throttled log.
+    // ------------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct AlwaysFailConnector;
+
+    #[async_trait]
+    impl broker_connectors::Sink for AlwaysFailConnector {
+        async fn send(
+            &self,
+            _topic: &Topic,
+            _payload: &Bytes,
+            _qos: QoS,
+        ) -> Result<(), broker_connectors::ConnectorError> {
+            Err(broker_connectors::ConnectorError::Dispatch(
+                "target down".to_string(),
+            ))
+        }
+
+        fn kind(&self) -> &'static str {
+            "always-fail"
+        }
+    }
+
+    fn failing_forward_engine(connector_id: &str) -> (RuleEngine, Arc<dyn BrokerSink>) {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        engine
+            .connectors()
+            .register(connector_id, Arc::new(AlwaysFailConnector));
+        engine
+            .create_rule(
+                "forward-fail".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: connector_id.to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        (engine, sink)
+    }
+
+    #[tokio::test]
+    async fn test_forward_failures_counted_in_action_metrics() {
+        let (engine, sink) = failing_forward_engine("down");
+        let topic = Topic::new("sensors/temperature").unwrap();
+        for _ in 0..50 {
+            engine
+                .dispatch_ingress(
+                    &topic,
+                    &Bytes::from_static(b"21.5C"),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
+                .await;
+        }
+        let rule = engine.get_rule("rule-1").expect("rule stored");
+        assert_eq!(rule.matched_cnt.load(Ordering::Relaxed), 50);
+        assert_eq!(rule.passed_cnt.load(Ordering::Relaxed), 50);
+        assert_eq!(rule.actions_total_cnt.load(Ordering::Relaxed), 50);
+        assert_eq!(rule.actions_success_cnt.load(Ordering::Relaxed), 0);
+        assert_eq!(rule.actions_failed_cnt.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn test_forward_failure_throttle_decisions() {
+        let throttle = parking_lot::Mutex::new(HashMap::new());
+        assert_eq!(
+            forward_failure_should_log(&throttle, "rule-1", "down", 1_000),
+            Some(0)
+        );
+        for now in 1_001..=1_049 {
+            assert_eq!(
+                forward_failure_should_log(&throttle, "rule-1", "down", now),
+                None,
+                "failures inside the window must only be counted"
+            );
+        }
+        assert_eq!(
+            forward_failure_should_log(
+                &throttle,
+                "rule-1",
+                "down",
+                1_000 + FORWARD_FAILURE_LOG_WINDOW_MS
+            ),
+            Some(49)
+        );
+        assert_eq!(
+            forward_failure_should_log(
+                &throttle,
+                "rule-1",
+                "down",
+                1_000 + FORWARD_FAILURE_LOG_WINDOW_MS
+            ),
+            None
+        );
+        assert_eq!(
+            forward_failure_should_log(&throttle, "rule-1", "other", 1_050),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_success_counted() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let recorder: Arc<RecordingConnector> = Arc::new(RecordingConnector::default());
+        engine.connectors().register("up", recorder);
+        engine
+            .create_rule(
+                "forward-ok".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "up".to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        let topic = Topic::new("sensors/temperature").unwrap();
+        for _ in 0..5 {
+            engine
+                .dispatch_ingress(
+                    &topic,
+                    &Bytes::from_static(b"21.5C"),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
+                .await;
+        }
+        let rule = engine.get_rule("rule-1").expect("rule stored");
+        assert_eq!(rule.actions_total_cnt.load(Ordering::Relaxed), 5);
+        assert_eq!(rule.actions_success_cnt.load(Ordering::Relaxed), 5);
+        assert_eq!(rule.actions_failed_cnt.load(Ordering::Relaxed), 0);
     }
 }
