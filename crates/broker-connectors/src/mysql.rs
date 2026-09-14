@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 
 fn default_pool_size() -> usize {
     10
@@ -164,9 +165,22 @@ pub struct MySqlBatch {
     pub rows: Vec<Vec<Vec<u8>>>,
 }
 
+/// Outcome of one batch execution: `processed` counts the prefix of
+/// rows that reached a final state (inserted or rejected — those rows
+/// are never sent again), `rejected` carries the batch index and server
+/// message of each row the server refused, and `error` reports the
+/// connection- or statement-level failure that stopped the batch early,
+/// if any.
+#[derive(Debug, Default)]
+pub struct MySqlBatchOutcome {
+    pub processed: usize,
+    pub rejected: Vec<(usize, String)>,
+    pub error: Option<ConnectorError>,
+}
+
 #[async_trait]
 pub trait MySqlTransport: Send + Sync {
-    async fn execute_batch(&self, batch: &MySqlBatch) -> Result<()>;
+    async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome;
 }
 
 /// In-memory transport recording every flushed batch (tests, dry runs).
@@ -198,17 +212,25 @@ impl MemoryMySqlTransport {
 
 #[async_trait]
 impl MySqlTransport for MemoryMySqlTransport {
-    async fn execute_batch(&self, batch: &MySqlBatch) -> Result<()> {
+    async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut failures = self.failures_left.lock();
         if *failures > 0 {
             *failures -= 1;
-            return Err(ConnectorError::Connection(
-                "mock transport down".to_string(),
-            ));
+            return MySqlBatchOutcome {
+                processed: 0,
+                rejected: Vec::new(),
+                error: Some(ConnectorError::Connection(
+                    "mock transport down".to_string(),
+                )),
+            };
         }
         self.batches.lock().push(batch.clone());
-        Ok(())
+        MySqlBatchOutcome {
+            processed: batch.rows.len(),
+            rejected: Vec::new(),
+            error: None,
+        }
     }
 }
 
@@ -303,50 +325,6 @@ fn encode_lenenc(value: u64, out: &mut Vec<u8>) {
     } else {
         out.push(0xFE);
         out.extend_from_slice(&value.to_le_bytes());
-    }
-}
-
-fn decode_lenenc(cursor: &mut &[u8]) -> Result<u64> {
-    fn underflow() -> ConnectorError {
-        ConnectorError::Connection("truncated mysql packet".to_string())
-    }
-    if cursor.is_empty() {
-        return Err(underflow());
-    }
-    let first = cursor[0];
-    *cursor = &cursor[1..];
-    match first {
-        0xFB => Err(ConnectorError::Connection(
-            "unexpected mysql NULL length".to_string(),
-        )),
-        0xFC => {
-            if cursor.len() < 2 {
-                return Err(underflow());
-            }
-            let value = u16::from_le_bytes([cursor[0], cursor[1]]) as u64;
-            *cursor = &cursor[2..];
-            Ok(value)
-        }
-        0xFD => {
-            if cursor.len() < 3 {
-                return Err(underflow());
-            }
-            let value = u32::from_le_bytes([cursor[0], cursor[1], cursor[2], 0]) as u64;
-            *cursor = &cursor[3..];
-            Ok(value)
-        }
-        0xFE => {
-            if cursor.len() < 8 {
-                return Err(underflow());
-            }
-            let value = u64::from_le_bytes([
-                cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
-                cursor[7],
-            ]);
-            *cursor = &cursor[8..];
-            Ok(value)
-        }
-        byte => Ok(byte as u64),
     }
 }
 
@@ -453,11 +431,10 @@ fn error_text(body: &[u8]) -> String {
 
 struct MysqlConn {
     stream: TcpStream,
-    seq: u8,
     prepared_stmt: Option<u32>,
 }
 
-async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u8) -> Result<()> {
+async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream) -> Result<()> {
     // Server greeting.
     let greeting = read_packet(stream).await?;
     if greeting.seq != 0 {
@@ -465,6 +442,8 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
             "mysql greeting must use sequence 0".to_string(),
         ));
     }
+    // Client packets continue the server's sequence within the handshake.
+    let mut seq = greeting.seq.wrapping_add(1);
     if greeting.body.first() == Some(&0xFF) {
         return Err(ConnectorError::Connection(format!(
             "mysql greeting failed: {}",
@@ -516,7 +495,7 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
     }
     body.extend_from_slice(MYSQL_NATIVE_PASSWORD.as_bytes());
     body.push(0);
-    write_packet(stream, seq, &body).await?;
+    write_packet(stream, &mut seq, &body).await?;
 
     // Auth switch / more-data loop, then OK.
     loop {
@@ -539,9 +518,12 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream, seq: &mut u
                         "unsupported mysql auth plugin {name:?} (only mysql_native_password)"
                     )));
                 }
-                let seed = cursor.to_vec();
-                let token = native_password_token(endpoint.password.as_bytes(), &seed);
-                write_packet(stream, seq, &token).await?;
+                // The seed is NUL-terminated on the wire; the scramble
+                // uses only the bytes before the terminator.
+                let seed = cursor.strip_suffix(&[0]).unwrap_or(cursor);
+                let token = native_password_token(endpoint.password.as_bytes(), seed);
+                seq = packet.seq.wrapping_add(1);
+                write_packet(stream, &mut seq, &token).await?;
             }
             Some(0x01) => {
                 return Err(ConnectorError::Connection(
@@ -586,14 +568,9 @@ impl TcpMySqlTransport {
             .await
             .map_err(|_| ConnectorError::Connection(format!("mysql connect timeout: {addr}")))?
             .map_err(|e| ConnectorError::Connection(format!("mysql connect failed: {e}")))?;
-        let mut seq = 0u8;
-        // Greeting sequence number starts at 0 server-side; our first
-        // client packet uses 1.
-        seq = seq.wrapping_add(1);
-        handshake(&self.endpoint, &mut stream, &mut seq).await?;
+        handshake(&self.endpoint, &mut stream).await?;
         Ok(MysqlConn {
             stream,
-            seq,
             prepared_stmt: None,
         })
     }
@@ -691,71 +668,138 @@ fn encode_execute(stmt_id: u32, row: &[Vec<u8>]) -> Vec<u8> {
 
 #[async_trait]
 impl MySqlTransport for TcpMySqlTransport {
-    async fn execute_batch(&self, batch: &MySqlBatch) -> Result<()> {
+    async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
+        let mut outcome = MySqlBatchOutcome::default();
         if batch.rows.is_empty() {
-            return Ok(());
+            return outcome;
         }
         let slot = (self.cursor.fetch_add(1, Ordering::SeqCst) as usize) % self.pool.len();
         let mut guard = self.pool[slot].lock().await;
         for attempt in 0..2 {
             if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let conn = guard.as_mut().expect("connected");
-            match execute_batch_on_conn(conn, batch).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    tracing::warn!("mysql execute_batch_on_conn error (attempt {attempt}): {e}");
-                    *guard = None;
-                    if attempt == 1 {
-                        return Err(ConnectorError::Connection(format!(
-                            "mysql batch failed after reconnect: {e}"
-                        )));
+                match self.dial().await {
+                    Ok(conn) => *guard = Some(conn),
+                    Err(e) => {
+                        outcome.error = Some(e);
+                        return outcome;
                     }
                 }
             }
+            let conn = guard.as_mut().expect("connected");
+            let part = execute_batch_on_conn(conn, batch, outcome.processed).await;
+            outcome.processed += part.processed;
+            outcome.rejected.extend(part.rejected);
+            let Some(error) = part.error else {
+                return outcome;
+            };
+            if !matches!(error, ConnectorError::Connection(_)) {
+                // Statement-level failure (prepare rejected, parameter
+                // count mismatch): the connection is still usable, so
+                // keep it and do not reconnect — retrying would fail
+                // the same way.
+                outcome.error = Some(error);
+                return outcome;
+            }
+            tracing::warn!("mysql connection lost during batch (attempt {attempt}): {error}");
+            *guard = None;
+            if attempt == 1 {
+                outcome.error = Some(ConnectorError::Connection(format!(
+                    "mysql batch failed after reconnect: {error}"
+                )));
+                return outcome;
+            }
+            // Reconnect once and resume from the first row that has not
+            // reached a final state; processed rows are never re-sent.
         }
-        Err(ConnectorError::Connection(
-            "mysql batch failed after reconnect".to_string(),
-        ))
+        outcome
     }
 }
 
-async fn execute_batch_on_conn(conn: &mut MysqlConn, batch: &MySqlBatch) -> Result<()> {
+/// Per-connection outcome: `processed` counts rows executed to a final
+/// state on this call, `rejected` lists batch-relative row indices the
+/// server refused, and `error` stops the batch when set.
+struct ConnExecuteOutcome {
+    processed: usize,
+    rejected: Vec<(usize, String)>,
+    error: Option<ConnectorError>,
+}
+
+/// Run the batch's unprocessed rows (the `skip` prefix is already done)
+/// on one connection. A row the server rejects with an ERR packet is
+/// dropped (logged and counted) and execution continues with the next
+/// row on the same connection; only connection- and statement-level
+/// failures stop the batch.
+async fn execute_batch_on_conn(
+    conn: &mut MysqlConn,
+    batch: &MySqlBatch,
+    skip: usize,
+) -> ConnExecuteOutcome {
+    let mut outcome = ConnExecuteOutcome {
+        processed: 0,
+        rejected: Vec::new(),
+        error: None,
+    };
     let stmt_id = match conn.prepared_stmt {
         Some(id) => id,
         None => {
-            let (id, param_count) = prepare_statement(conn, &batch.sql).await?;
+            let (id, param_count) = match prepare_statement(conn, &batch.sql).await {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    outcome.error = Some(e);
+                    return outcome;
+                }
+            };
             if param_count as usize != batch.rows.first().map(|row| row.len()).unwrap_or(0) {
-                return Err(ConnectorError::Dispatch(format!(
+                outcome.error = Some(ConnectorError::Dispatch(format!(
                     "mysql prepared param count {param_count} mismatches row width"
                 )));
+                return outcome;
             }
             conn.prepared_stmt = Some(id);
             id
         }
     };
-    for row in &batch.rows {
+    for (index, row) in batch.rows.iter().enumerate().skip(skip) {
         let frame = encode_execute(stmt_id, row);
         let mut seq = 0u8;
-        write_packet(&mut conn.stream, &mut seq, &frame).await?;
-        let response = read_packet(&mut conn.stream).await?;
+        if let Err(e) = write_packet(&mut conn.stream, &mut seq, &frame).await {
+            outcome.error = Some(e);
+            return outcome;
+        }
+        let response = match read_packet(&mut conn.stream).await {
+            Ok(response) => response,
+            Err(e) => {
+                // The reply is lost, so the row may or may not have been
+                // applied server-side: it has not reached a final state
+                // and is re-sent after the reconnect. Delivery across a
+                // reconnect is therefore at-least-once (a duplicate is
+                // possible), never exactly-once.
+                outcome.error = Some(e);
+                return outcome;
+            }
+        };
         match response.body.first() {
-            Some(0x00) => {}
+            Some(0x00) => {
+                outcome.processed += 1;
+            }
             Some(0xFF) => {
-                return Err(ConnectorError::Dispatch(format!(
-                    "mysql execute failed: {}",
-                    error_text(&response.body)
-                )));
+                // Row-level rejection (e.g. a CHECK constraint): log and
+                // count the row, then continue with the next row on the
+                // same connection.
+                let message = error_text(&response.body);
+                tracing::warn!("mysql row {index} rejected by server: {message}");
+                outcome.rejected.push((index, message));
+                outcome.processed += 1;
             }
             _ => {
-                return Err(ConnectorError::Connection(
+                outcome.error = Some(ConnectorError::Connection(
                     "unexpected mysql execute response".to_string(),
                 ));
+                return outcome;
             }
         }
     }
-    Ok(())
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -764,44 +808,34 @@ async fn execute_batch_on_conn(conn: &mut MysqlConn, batch: &MySqlBatch) -> Resu
 
 /// MySQL sink: buffers MQTT events as 3-column rows
 /// (`?` topic, QoS, payload positional) and flushes full or stale
-/// batches through the transport, with the same backoff-with-restore
-/// contract as the PostgreSQL sink.
+/// batches through the transport, with the same backoff contract as the
+/// PostgreSQL sink. Rows the server rejects are dropped (counted via
+/// [`MySqlSink::rejected_rows`]); after a failure only rows that never
+/// reached a final state are restored to the buffer, in order.
 pub struct MySqlSink {
+    core: Arc<MySqlSinkCore>,
+}
+
+/// Shared sink state; the linger-flush task holds only a weak reference
+/// to it, so dropping the sink stops the task.
+struct MySqlSinkCore {
     config: MySqlSinkConfig,
     transport: Arc<dyn MySqlTransport>,
     buffer: parking_lot::Mutex<super::BatchQueue<Vec<Vec<u8>>>>,
     backoff: parking_lot::Mutex<super::BackoffState>,
     sent_batches: AtomicU64,
+    inserted_rows: AtomicU64,
+    rejected_rows: AtomicU64,
+    /// Notifies the linger task that new rows are available.
+    linger_notify: Arc<Notify>,
+    /// Tracks the last logged error text for rate-limiting.
+    last_linger_error: parking_lot::Mutex<Option<String>>,
+    /// Tracks when the last linger error was logged.
+    last_linger_error_time: parking_lot::Mutex<Option<Instant>>,
 }
 
-impl MySqlSink {
-    pub fn new(config: MySqlSinkConfig, transport: Arc<dyn MySqlTransport>) -> Result<Self> {
-        config.validate()?;
-        let linger = Duration::from_millis(config.batch_timeout_ms);
-        Ok(Self {
-            buffer: parking_lot::Mutex::new(super::BatchQueue::new(config.batch_size, linger)),
-            config,
-            transport,
-            backoff: parking_lot::Mutex::new(super::BackoffState::default()),
-            sent_batches: AtomicU64::new(0),
-        })
-    }
-
-    pub fn config(&self) -> &MySqlSinkConfig {
-        &self.config
-    }
-
-    pub fn sent_batches(&self) -> u64 {
-        self.sent_batches.load(Ordering::Relaxed)
-    }
-
-    pub fn buffered_rows(&self) -> usize {
-        self.buffer.lock().len()
-    }
-
-    /// Flush buffered rows as one batch (no-op when empty). While
-    /// backing off, fails fast without touching the transport.
-    pub async fn flush(&self) -> Result<()> {
+impl MySqlSinkCore {
+    async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
         if rows.is_empty() {
@@ -811,27 +845,226 @@ impl MySqlSink {
             sql: self.config.sql_template.clone(),
             rows,
         };
-        match self.transport.execute_batch(&batch).await {
-            Ok(()) => {
+        let outcome = self.transport.execute_batch(&batch).await;
+        let inserted = outcome.processed.saturating_sub(outcome.rejected.len()) as u64;
+        self.inserted_rows.fetch_add(inserted, Ordering::Relaxed);
+        self.rejected_rows
+            .fetch_add(outcome.rejected.len() as u64, Ordering::Relaxed);
+        match outcome.error {
+            None => {
                 self.backoff.lock().success();
                 self.sent_batches.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(e) => {
-                self.buffer.lock().restore(batch.rows, oldest);
+            Some(e) => {
+                // Only rows that never reached a final state go back
+                // into the buffer, in their original order; inserted or
+                // rejected rows are never sent again.
+                let remaining: Vec<_> = batch.rows.into_iter().skip(outcome.processed).collect();
+                self.buffer.lock().restore(remaining, oldest);
+                // Notify the linger task that rows are available again
+                self.linger_notify.notify_one();
                 self.backoff.lock().failure();
                 Err(e)
             }
         }
     }
+}
+
+impl MySqlSink {
+    pub fn new(config: MySqlSinkConfig, transport: Arc<dyn MySqlTransport>) -> Result<Self> {
+        config.validate()?;
+        let linger = Duration::from_millis(config.batch_timeout_ms);
+        let core = Arc::new(MySqlSinkCore {
+            buffer: parking_lot::Mutex::new(super::BatchQueue::new(config.batch_size, linger)),
+            config,
+            transport,
+            backoff: parking_lot::Mutex::new(super::BackoffState::default()),
+            sent_batches: AtomicU64::new(0),
+            inserted_rows: AtomicU64::new(0),
+            rejected_rows: AtomicU64::new(0),
+            linger_notify: Arc::new(Notify::new()),
+            last_linger_error: parking_lot::Mutex::new(None),
+            last_linger_error_time: parking_lot::Mutex::new(None),
+        });
+        spawn_linger_flush(&core, linger);
+        Ok(Self { core })
+    }
+
+    pub fn config(&self) -> &MySqlSinkConfig {
+        &self.core.config
+    }
+
+    pub fn sent_batches(&self) -> u64 {
+        self.core.sent_batches.load(Ordering::Relaxed)
+    }
+
+    /// Rows the server acknowledged (OK reply to COM_STMT_EXECUTE).
+    pub fn inserted_rows(&self) -> u64 {
+        self.core.inserted_rows.load(Ordering::Relaxed)
+    }
+
+    /// Rows the server rejected (ERR reply) and the sink dropped.
+    pub fn rejected_rows(&self) -> u64 {
+        self.core.rejected_rows.load(Ordering::Relaxed)
+    }
+
+    pub fn buffered_rows(&self) -> usize {
+        self.core.buffer.lock().len()
+    }
+
+    /// Flush buffered rows as one batch (no-op when empty). While
+    /// backing off, fails fast without touching the transport.
+    pub async fn flush(&self) -> Result<()> {
+        self.core.flush().await
+    }
 
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> bool {
-        self.buffer.lock().push(vec![
+        let was_empty = self.core.buffer.lock().is_empty();
+        let should_flush = self.core.buffer.lock().push(vec![
             topic.as_str().as_bytes().to_vec(),
             u8::from(qos).to_string().into_bytes(),
             payload.to_vec(),
-        ])
+        ]);
+        if was_empty {
+            self.core.linger_notify.notify_one();
+        }
+        should_flush
     }
+}
+
+/// Flush stale rows without waiting for new events: the timer runs only
+/// while rows are buffered. It arms when a row lands in an empty buffer
+/// or rows are restored after a failure; it ends when the buffer is
+/// empty. While backing off, it waits for the backoff window instead of
+/// spinning. The task holds only a weak reference to the sink state, so
+/// dropping the sink stops it; with no tokio runtime (sink built outside
+/// one) no task is spawned and flushing stays event-driven.
+fn spawn_linger_flush(core: &Arc<MySqlSinkCore>, linger: Duration) {
+    if linger.is_zero() {
+        // Zero linger flushes on every push, and a zero period would
+        // panic tokio's interval.
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(core);
+    let notify = core.linger_notify.clone();
+
+    handle.spawn(async move {
+        const BACKOFF_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const ERROR_LOG_THROTTLE: Duration = Duration::from_secs(30);
+
+        loop {
+            // Snapshot buffer/backoff state, then drop the strong
+            // reference before any wait so a dropped sink is freed
+            // promptly instead of being pinned for up to 60 s.
+            let (has_rows, is_stale, in_backoff) = match weak.upgrade() {
+                None => break,
+                Some(core) => {
+                    let (has_rows, is_stale) = {
+                        let buffer = core.buffer.lock();
+                        (!buffer.is_empty(), buffer.is_stale())
+                    };
+                    let in_backoff = core.backoff.lock().check().is_err();
+                    drop(core);
+                    (has_rows, is_stale, in_backoff)
+                }
+            };
+
+            if !has_rows {
+                // Buffer empty: wait for notification of new rows.
+                // Use a long periodic sleep to re-check sink existence.
+                tokio::select! {
+                    _ = notify.notified() => continue,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => continue,
+                }
+            }
+
+            // Buffer has rows. Check backoff state.
+            if in_backoff {
+                // In backoff: wait for backoff window or new rows.
+                tokio::select! {
+                    _ = notify.notified() => continue,
+                    _ = tokio::time::sleep(BACKOFF_POLL_INTERVAL) => continue,
+                }
+            }
+
+            // Not in backoff. If stale, flush immediately; else wait for linger or new rows.
+            if !is_stale {
+                let timed_out = tokio::select! {
+                    _ = notify.notified() => false,
+                    _ = tokio::time::sleep(linger) => true,
+                };
+                if !timed_out {
+                    continue;
+                }
+                // Linger timeout: re-check staleness (a new row may have arrived).
+                let is_stale = match weak.upgrade() {
+                    None => break,
+                    Some(core) => {
+                        let stale = core.buffer.lock().is_stale();
+                        drop(core);
+                        stale
+                    }
+                };
+                if !is_stale {
+                    continue;
+                }
+                // Fall through to flush.
+            }
+
+            // Re-upgrade for the flush; holding the strong reference
+            // during `flush().await` is fine.
+            let Some(core) = weak.upgrade() else {
+                break;
+            };
+
+            // Flush stale batch.
+            let result = core.flush().await;
+
+            // Logging with rate limiting. The backoff fast-fail is not a
+            // new failure (its cause was already logged), so it is never
+            // logged here.
+            match result {
+                Ok(()) => {
+                    let mut last_error = core.last_linger_error.lock();
+                    let mut last_error_time = core.last_linger_error_time.lock();
+                    // Successful flush after previous failure: log recovery once.
+                    if last_error.is_some() {
+                        tracing::info!("mysql linger flush recovered");
+                        *last_error = None;
+                        *last_error_time = None;
+                    }
+                }
+                Err(e) => {
+                    let error_text = e.to_string();
+                    if error_text.contains("sink backing off after errors") {
+                        continue;
+                    }
+                    let mut last_error = core.last_linger_error.lock();
+                    let mut last_error_time = core.last_linger_error_time.lock();
+                    let now = Instant::now();
+                    let should_log = last_error
+                        .as_ref()
+                        .map(|last| last != &error_text)
+                        .unwrap_or(true)
+                        || last_error_time
+                            .map(|t| now.saturating_duration_since(t) > ERROR_LOG_THROTTLE)
+                            .unwrap_or(true);
+
+                    if should_log {
+                        tracing::warn!("mysql linger flush failed: {error_text}");
+                        *last_error = Some(error_text);
+                        *last_error_time = Some(now);
+                    }
+                    // Backoff is already recorded by flush(); the loop will
+                    // pick it up on the next iteration and wait.
+                }
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -1120,10 +1353,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_batch_flushes_on_linger() {
-        // Batch of 100 never fills; the second row arrives after the
-        // linger timeout, so the stale batch flushes through the
-        // in-memory transport.
+    async fn test_stale_rows_flush_without_new_events() {
+        // One buffered row flushes on its own once it outlives the
+        // linger window; no further event is needed.
         let transport = Arc::new(MemoryMySqlTransport::new());
         let mut config = test_config();
         config.batch_size = 100;
@@ -1136,21 +1368,258 @@ mod tests {
             QoS::AtMostOnce,
         )
         .await
-        .expect("row one buffers");
+        .expect("row buffers");
         assert_eq!(sink.buffered_rows(), 1);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        sink.send(
-            &topic,
-            &Bytes::from_static(br#"{ "v": 2 }"#),
-            QoS::AtMostOnce,
-        )
-        .await
-        .expect("stale batch flushes");
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(sink.sent_batches(), 1);
         assert_eq!(sink.buffered_rows(), 0);
         let batches = transport.batches();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].rows.len(), 2);
+        assert_eq!(batches[0].rows.len(), 1);
+    }
+
+    /// Server-rejected rows are dropped, counted, and never replayed:
+    /// the batch continues on the same connection and no reconnect
+    /// happens.
+    #[tokio::test]
+    async fn test_rejected_row_is_dropped_without_replaying_batch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            // Greeting: protocol 10, version, conn id, seed parts.
+            let mut greeting = vec![10u8];
+            greeting.extend_from_slice(b"8.4.11-test\0");
+            greeting.extend_from_slice(&42u32.to_le_bytes());
+            greeting.extend_from_slice(b"12345678");
+            greeting.push(0);
+            greeting.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            greeting.push(33);
+            greeting.extend_from_slice(&0u16.to_be_bytes());
+            greeting.extend_from_slice(&0u16.to_be_bytes()); // cap high
+            greeting.push(21);
+            greeting.extend_from_slice(&[0u8; 10]);
+            greeting.extend_from_slice(b"ABCDEFGHJKLM");
+            greeting.push(0);
+            greeting.extend_from_slice(b"mysql_native_password\0");
+            write_server_packet(&mut stream, 0, &greeting).await;
+            let _request = read_server_packet(&mut stream).await; // handshake response
+            write_server_packet(&mut stream, 1, &[0x00, 0, 0, 0, 0, 0, 0]).await;
+            // Prepare: report stmt 7 with 3 params, then the parameter
+            // definitions plus EOF the client drains.
+            let request = read_server_packet(&mut stream).await;
+            assert_eq!(request[1], 0x16);
+            let mut prepare_ok = vec![0x00];
+            prepare_ok.extend_from_slice(&7u32.to_le_bytes());
+            prepare_ok.extend_from_slice(&0u16.to_le_bytes());
+            prepare_ok.extend_from_slice(&3u16.to_le_bytes());
+            prepare_ok.extend_from_slice(&0u16.to_le_bytes());
+            prepare_ok.extend_from_slice(&[0u8; 3]);
+            write_server_packet(&mut stream, 2, &prepare_ok).await;
+            for _ in 0..3 {
+                // Minimal column definition: empty catalog/schema/table.
+                let mut def = vec![0, 0, 0, 0, 0, 0];
+                def.extend_from_slice(&33u16.to_le_bytes());
+                def.extend_from_slice(&0u32.to_be_bytes());
+                def.push(0xFD);
+                def.extend_from_slice(&0u16.to_be_bytes());
+                def.push(0);
+                def.extend_from_slice(&[0, 0]);
+                write_server_packet(&mut stream, 2, &def).await;
+            }
+            write_server_packet(&mut stream, 2, &[0xFE, 0, 0, 0, 0]).await;
+            // Three executes: OK, ERR 3819 (CHECK constraint), OK.
+            for reply in 0..3 {
+                let request = read_server_packet(&mut stream).await;
+                assert_eq!(request[1], 0x17);
+                let stmt_id = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+                assert_eq!(stmt_id, 7);
+                if reply == 1 {
+                    let mut err = vec![0xFF];
+                    err.extend_from_slice(&3819u16.to_le_bytes());
+                    err.push(b'#');
+                    err.extend_from_slice(b"23000");
+                    err.extend_from_slice(b"Check constraint 'payload_chk' is violated.");
+                    write_server_packet(&mut stream, 3, &err).await;
+                } else {
+                    write_server_packet(&mut stream, 3, &[0x00, 1, 0, 0, 0, 0, 0]).await;
+                }
+            }
+            // No replay and no reconnect: the connection stays quiet and
+            // no second connection arrives.
+            let mut header = [0u8; 4];
+            let extra =
+                tokio::time::timeout(Duration::from_millis(200), stream.read_exact(&mut header))
+                    .await;
+            assert!(extra.is_err(), "no further packets on the connection");
+            let second = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+            assert!(second.is_err(), "no second connection within 200 ms");
+        });
+
+        let transport = TcpMySqlTransport::new(&format!("mysql://u:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
+        let mut config = test_config();
+        config.batch_size = 3;
+        config.batch_timeout_ms = 60_000; // keep the linger task out of the way
+        let sink = MySqlSink::new(config, Arc::new(transport)).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        for i in 0..3 {
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{ \"v\": {i} }}")),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("row accepted");
+        }
+        assert_eq!(sink.sent_batches(), 1);
+        assert_eq!(sink.inserted_rows(), 2);
+        assert_eq!(sink.rejected_rows(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        server.await.expect("fake server assertions hold");
+    }
+
+    /// Test transport: the first call processes `first_processed` rows
+    /// then fails with a connection error; later calls succeed fully.
+    struct PartialMySqlTransport {
+        first_processed: usize,
+        batches: parking_lot::Mutex<Vec<MySqlBatch>>,
+    }
+
+    impl PartialMySqlTransport {
+        fn new(first_processed: usize) -> Self {
+            Self {
+                first_processed,
+                batches: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn batches(&self) -> Vec<MySqlBatch> {
+            self.batches.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MySqlTransport for PartialMySqlTransport {
+        async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
+            let first = {
+                let mut batches = self.batches.lock();
+                let first = batches.is_empty();
+                batches.push(batch.clone());
+                first
+            };
+            if first {
+                return MySqlBatchOutcome {
+                    processed: self.first_processed,
+                    rejected: Vec::new(),
+                    error: Some(ConnectorError::Connection(
+                        "mock partial failure".to_string(),
+                    )),
+                };
+            }
+            MySqlBatchOutcome {
+                processed: batch.rows.len(),
+                rejected: Vec::new(),
+                error: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_failure_retries_only_unprocessed_rows() {
+        let transport = Arc::new(PartialMySqlTransport::new(2));
+        let mut config = test_config();
+        config.batch_size = 4;
+        config.batch_timeout_ms = 60_000; // keep the linger task out of the way
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        for i in 0..3 {
+            sink.send(&topic, &Bytes::from(format!("row-{i}")), QoS::AtLeastOnce)
+                .await
+                .expect("rows buffer");
+        }
+        // The fourth row fills the batch; the transport fails after
+        // processing two of the four rows.
+        let err = sink
+            .send(&topic, &Bytes::from_static(b"row-3"), QoS::AtLeastOnce)
+            .await
+            .expect_err("partial failure surfaces");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        assert_eq!(sink.inserted_rows(), 2);
+        assert_eq!(sink.buffered_rows(), 2);
+        // During backoff, flush fails fast without touching the transport.
+        assert!(sink.flush().await.is_err());
+        assert_eq!(transport.batches().len(), 1);
+        // After the backoff window, the retry carries exactly rows 3 and
+        // 4, in order; the first two rows are never re-sent.
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        sink.flush().await.expect("retry succeeds");
+        assert_eq!(sink.inserted_rows(), 4);
+        assert_eq!(sink.buffered_rows(), 0);
+        let batches = transport.batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].rows.len(), 2);
+        assert_eq!(batches[1].rows[0][2], b"row-2");
+        assert_eq!(batches[1].rows[1][2], b"row-3");
+    }
+
+    /// MySQL 8.x greets with caching_sha2_password even for a
+    /// mysql_native_password account, then sends an AuthSwitchRequest.
+    /// The reply must continue the server's sequence and scramble only
+    /// the 20 seed bytes before the NUL terminator.
+    #[tokio::test]
+    async fn test_tcp_handshake_auth_switch_to_native_password() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut greeting = vec![10u8];
+            greeting.extend_from_slice(b"8.4.11-test\0");
+            greeting.extend_from_slice(&42u32.to_le_bytes());
+            greeting.extend_from_slice(b"12345678");
+            greeting.push(0);
+            greeting.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            greeting.push(33);
+            greeting.extend_from_slice(&0u16.to_be_bytes());
+            greeting.extend_from_slice(&0u16.to_be_bytes()); // cap high
+            greeting.push(21);
+            greeting.extend_from_slice(&[0u8; 10]);
+            greeting.extend_from_slice(b"ABCDEFGHJKLM");
+            greeting.push(0);
+            greeting.extend_from_slice(b"caching_sha2_password\0");
+            write_server_packet(&mut stream, 0, &greeting).await;
+            let response = read_server_packet(&mut stream).await;
+            assert_eq!(response[0], 1, "handshake response uses sequence 1");
+            let switch_seed = b"zyxwvutsrqponmlkjihg";
+            let mut switch = vec![0xFE];
+            switch.extend_from_slice(b"mysql_native_password\0");
+            switch.extend_from_slice(switch_seed);
+            switch.push(0);
+            write_server_packet(&mut stream, 2, &switch).await;
+            let auth = read_server_packet(&mut stream).await;
+            assert_eq!(
+                auth[0], 3,
+                "auth switch reply continues the server sequence"
+            );
+            assert_eq!(
+                &auth[1..],
+                native_password_token(b"pwd", switch_seed).as_slice(),
+                "scramble uses the seed without its NUL terminator"
+            );
+            write_server_packet(&mut stream, 4, &[0x00, 0, 0, 0, 0, 0, 0]).await;
+        });
+
+        let transport = TcpMySqlTransport::new(&format!("mysql://u:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
+        transport
+            .dial()
+            .await
+            .expect("auth switch handshake succeeds");
+        server.await.expect("fake server assertions hold");
     }
 
     async fn read_server_packet(stream: &mut TcpStream) -> Vec<u8> {
@@ -1202,5 +1671,380 @@ mod tests {
             ),
             byte => (byte as usize, &cursor[1..]),
         }
+    }
+
+    /// A test transport that always fails with the given message.
+    struct AlwaysFailTransport {
+        message: String,
+        calls: AtomicU64,
+    }
+
+    impl AlwaysFailTransport {
+        fn new(message: String) -> Self {
+            Self {
+                message,
+                calls: AtomicU64::new(0),
+            }
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl MySqlTransport for AlwaysFailTransport {
+        async fn execute_batch(&self, _batch: &MySqlBatch) -> MySqlBatchOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            MySqlBatchOutcome {
+                processed: 0,
+                rejected: Vec::new(),
+                error: Some(ConnectorError::Connection(self.message.clone())),
+            }
+        }
+    }
+
+    /// A test transport that succeeds on the first call, then fails once,
+    /// then succeeds again (for recovery test).
+    struct FailOnceTransport {
+        fail_on_call: u64,
+        calls: AtomicU64,
+    }
+
+    impl FailOnceTransport {
+        fn new(fail_on_call: u64) -> Self {
+            Self {
+                fail_on_call,
+                calls: AtomicU64::new(0),
+            }
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl MySqlTransport for FailOnceTransport {
+        async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
+            let call_num = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call_num == self.fail_on_call {
+                MySqlBatchOutcome {
+                    processed: 0,
+                    rejected: Vec::new(),
+                    error: Some(ConnectorError::Connection(
+                        "mock transient failure".to_string(),
+                    )),
+                }
+            } else {
+                MySqlBatchOutcome {
+                    processed: batch.rows.len(),
+                    rejected: Vec::new(),
+                    error: None,
+                }
+            }
+        }
+    }
+
+    /// A test transport that records every flushed batch.
+    struct RecordingTransport {
+        batches: parking_lot::Mutex<Vec<MySqlBatch>>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                batches: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn batches(&self) -> Vec<MySqlBatch> {
+            self.batches.lock().clone()
+        }
+
+        fn calls(&self) -> u64 {
+            self.batches.lock().len() as u64
+        }
+    }
+
+    #[async_trait]
+    impl MySqlTransport for RecordingTransport {
+        async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
+            self.batches.lock().push(batch.clone());
+            MySqlBatchOutcome {
+                processed: batch.rows.len(),
+                rejected: Vec::new(),
+                error: None,
+            }
+        }
+    }
+
+    /// Simple test subscriber that captures log lines.
+    struct TestSubscriber {
+        logs: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl TestSubscriber {
+        fn new() -> Self {
+            Self {
+                logs: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn count_contains(&self, needle: &str) -> usize {
+            self.logs
+                .lock()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl tracing::Subscriber for TestSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            let mut visitor = TestVisitor(&mut message);
+            event.record(&mut visitor);
+            let metadata = event.metadata();
+            let level = *metadata.level();
+            let target = metadata.target();
+            let log_line = format!("{} {}: {}", level, target, message);
+            self.logs.lock().push(log_line);
+        }
+
+        fn enter(&self, _id: &tracing::span::Id) {}
+
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    struct TestVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for TestVisitor<'_> {
+        fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // Formatted event messages (e.g. `tracing::warn!("... {x}")`)
+            // arrive here as `fmt::Arguments`.
+            self.0.push_str(&format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+            self.0.push_str(value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_linger_flush_failure_is_logged_once_per_backoff() {
+        let subscriber = Arc::new(TestSubscriber::new());
+        let _guard = tracing::subscriber::set_default(subscriber.clone());
+
+        let transport = Arc::new(AlwaysFailTransport::new(
+            "mock connection error".to_string(),
+        ));
+        let mut config = test_config();
+        config.batch_size = 100;
+        config.batch_timeout_ms = 50;
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+
+        // Send one row (fewer than batch_size, so only linger flushes it)
+        sink.send(&topic, &Bytes::from_static(b"row-1"), QoS::AtMostOnce)
+            .await
+            .expect("row buffers");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Wait through the first 2s backoff window: the linger task keeps
+        // polling during backoff but must not reflood the log.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert!(
+            transport.calls() >= 1,
+            "the linger task attempted at least one flush"
+        );
+        assert_eq!(
+            subscriber.count_contains("mysql linger flush failed"),
+            1,
+            "the failure is logged exactly once, not on every tick"
+        );
+
+        // The backoff fast-fail should NOT be logged on every tick
+        let backoff_logs = subscriber.count_contains("sink backing off after errors");
+        assert_eq!(
+            backoff_logs, 0,
+            "backoff fast-fail should not be logged by linger task"
+        );
+
+        // Clean up
+        drop(sink);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn test_linger_flush_logs_recovery_on_success() {
+        let subscriber = Arc::new(TestSubscriber::new());
+        let _guard = tracing::subscriber::set_default(subscriber.clone());
+
+        // The first linger flush fails; the retry after the 2s backoff
+        // window succeeds.
+        let transport = Arc::new(FailOnceTransport::new(1));
+        let mut config = test_config();
+        config.batch_size = 100;
+        config.batch_timeout_ms = 50;
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+
+        sink.send(&topic, &Bytes::from_static(b"row-1"), QoS::AtMostOnce)
+            .await
+            .expect("row buffers");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert_eq!(transport.calls(), 2, "one failed flush plus one retry");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_batches(), 1);
+        assert_eq!(
+            subscriber.count_contains("mysql linger flush failed"),
+            1,
+            "the failure is logged once"
+        );
+        assert_eq!(
+            subscriber.count_contains("mysql linger flush recovered"),
+            1,
+            "recovery is logged once at info"
+        );
+
+        drop(sink);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn test_linger_timer_idle_when_buffer_empty() {
+        let transport = Arc::new(RecordingTransport::new());
+        let mut config = test_config();
+        config.batch_size = 100;
+        config.batch_timeout_ms = 50;
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+
+        // Send one row - it will be flushed by linger timer
+        sink.send(&topic, &Bytes::from_static(b"row-1"), QoS::AtMostOnce)
+            .await
+            .expect("row buffers");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Wait for linger flush
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Row should be flushed
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_batches(), 1);
+        assert_eq!(transport.calls(), 1);
+
+        // Now wait longer - the timer should be idle, no more flushes
+        let calls_after_idle = transport.calls();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            transport.calls(),
+            calls_after_idle,
+            "timer should be idle when buffer empty"
+        );
+
+        // Send another row - timer should re-arm and flush
+        sink.send(&topic, &Bytes::from_static(b"row-2"), QoS::AtMostOnce)
+            .await
+            .expect("row buffers");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_batches(), 2);
+        assert_eq!(transport.calls(), 2);
+
+        drop(sink);
+    }
+
+    #[tokio::test]
+    async fn test_row_arriving_while_timer_stops_is_not_stranded() {
+        // Many short send/flush cycles with rows arriving around the
+        // linger deadline; every row is eventually flushed.
+        let transport = Arc::new(RecordingTransport::new());
+        let mut config = test_config();
+        config.batch_size = 100;
+        config.batch_timeout_ms = 20;
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+
+        let mut expected_rows = 0;
+
+        for i in 0..50 {
+            sink.send(&topic, &Bytes::from(format!("row-{i}")), QoS::AtMostOnce)
+                .await
+                .expect("send");
+            expected_rows += 1;
+
+            // Random small delay around the linger timeout to create races
+            if i % 7 == 0 {
+                tokio::time::sleep(Duration::from_millis(15)).await; // less than linger
+            } else if i % 11 == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await; // more than linger
+            }
+        }
+
+        // Final wait to ensure all lingering rows flush
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(sink.buffered_rows(), 0, "no rows should be stranded");
+        assert_eq!(
+            sink.sent_batches(),
+            transport.calls(),
+            "sent_batches should match transport calls"
+        );
+
+        // Total rows sent should equal total rows in all batches
+        let total_rows: usize = transport.batches().iter().map(|b| b.rows.len()).sum();
+        assert_eq!(
+            total_rows, expected_rows,
+            "all rows should be flushed exactly once"
+        );
+
+        drop(sink);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_sink_stops_linger_task_promptly() {
+        // With an empty buffer the linger task waits on a timer or
+        // notification; it must not pin the sink core while waiting,
+        // so dropping the sink frees the core within 200 ms.
+        // The probe clones the inner `linger_notify` Arc: while the
+        // core is alive the count is 3 (core + task + probe), and once
+        // the core is freed it drops to 2 (task + probe).
+        let transport = Arc::new(MemoryMySqlTransport::new());
+        let mut config = test_config();
+        config.batch_size = 100;
+        config.batch_timeout_ms = 50;
+        let sink = MySqlSink::new(config, transport).expect("valid sink");
+        let probe = sink.core.linger_notify.clone();
+        assert_eq!(Arc::strong_count(&probe), 3);
+        drop(sink);
+        let mut freed = false;
+        for _ in 0..20 {
+            if Arc::strong_count(&probe) == 2 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(freed, "dropped sink core was not freed within 200 ms");
     }
 }
