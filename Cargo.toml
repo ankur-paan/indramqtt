@@ -30,7 +30,7 @@ categories = ["network-programming", "asynchronous"]
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }
 bytes = "1.6"
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

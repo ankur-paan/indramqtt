@@ -280,7 +280,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -296,7 +296,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -321,7 +321,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -339,7 +339,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -386,7 +386,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -397,7 +397,7 @@ dependencies = [
  "broker-protocol",
  "brokerlink",
  "parking_lot",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -419,7 +419,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -432,7 +432,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -445,7 +445,7 @@ dependencies = [
  "broker-protocol",
  "bytes",
  "parking_lot",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -455,7 +455,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
