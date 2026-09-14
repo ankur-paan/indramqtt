@@ -101,13 +101,12 @@ pub struct ScramChallengeResponse {
     pub iterations: u32,
 }
 
-pub async fn scram_challenge(
-    Json(req): Json<ScramChallengeRequest>,
-) -> Response {
+pub async fn scram_challenge(Json(req): Json<ScramChallengeRequest>) -> Response {
     let mut rng = rand::thread_rng();
     let mut server_nonce_bytes = [0u8; 24];
     rng.fill_bytes(&mut server_nonce_bytes);
-    let server_nonce = BASE64.encode(server_nonce_bytes)
+    let server_nonce = BASE64
+        .encode(server_nonce_bytes)
         .replace('+', "-")
         .replace('/', "_")
         .replace('=', "");
@@ -118,7 +117,8 @@ pub async fn scram_challenge(
 
     let mut challenge_id_bytes = [0u8; 24];
     rng.fill_bytes(&mut challenge_id_bytes);
-    let challenge_id = BASE64.encode(challenge_id_bytes)
+    let challenge_id = BASE64
+        .encode(challenge_id_bytes)
         .replace('+', "-")
         .replace('/', "_")
         .replace('=', "");
@@ -221,7 +221,12 @@ pub async fn scram_verify(
     let salt_b64 = BASE64.encode(&ch.salt);
     let auth_message = format!(
         "n={},r={},r={},s={},i={},c=biws,r={}",
-        escaped_user, ch.client_nonce, req.combined_nonce, salt_b64, ch.iterations, req.combined_nonce
+        escaped_user,
+        ch.client_nonce,
+        req.combined_nonce,
+        salt_b64,
+        ch.iterations,
+        req.combined_nonce
     );
 
     let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
@@ -248,12 +253,20 @@ pub async fn scram_verify(
     // Mint token
     let mut token_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut token_bytes);
-    let token = format!("indra_{}", BASE64.encode(token_bytes).replace('+', "").replace('/', ""));
+    let token = format!(
+        "indra_{}",
+        BASE64.encode(token_bytes).replace('+', "").replace('/', "")
+    );
 
-    active_tokens().lock().unwrap().insert(token.clone(), (ch.username.clone(), Instant::now()));
+    active_tokens()
+        .lock()
+        .unwrap()
+        .insert(token.clone(), (ch.username.clone(), Instant::now()));
 
     // Record login in memory auth if user doesn't exist
-    state.auth.add_user(ch.username.clone(), password.as_bytes());
+    state
+        .auth
+        .add_user(ch.username.clone(), password.as_bytes());
 
     (
         StatusCode::OK,
@@ -285,7 +298,15 @@ pub async fn direct_login(
     let valid = if req.username == "admin" && req.password == "public" {
         true
     } else {
-        state.auth.authenticate("dashboard", Some(&req.username), Some(req.password.as_bytes())).await.is_ok()
+        state
+            .auth
+            .authenticate(
+                "dashboard",
+                Some(&req.username),
+                Some(req.password.as_bytes()),
+            )
+            .await
+            .is_ok()
     };
 
     if !valid {
@@ -301,9 +322,15 @@ pub async fn direct_login(
 
     let mut token_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut token_bytes);
-    let token = format!("indra_{}", BASE64.encode(token_bytes).replace('+', "").replace('/', ""));
+    let token = format!(
+        "indra_{}",
+        BASE64.encode(token_bytes).replace('+', "").replace('/', "")
+    );
 
-    active_tokens().lock().unwrap().insert(token.clone(), (req.username.clone(), Instant::now()));
+    active_tokens()
+        .lock()
+        .unwrap()
+        .insert(token.clone(), (req.username.clone(), Instant::now()));
 
     (
         StatusCode::OK,
@@ -364,13 +391,11 @@ pub async fn user_scopes() -> Response {
 }
 
 pub async fn list_users(State(state): State<ApiState>) -> Response {
-    let mut users = vec![
-        serde_json::json!({
-            "username": "admin",
-            "role": "administrator",
-            "description": "IndraMQTT Root Operator"
-        })
-    ];
+    let mut users = vec![serde_json::json!({
+        "username": "admin",
+        "role": "administrator",
+        "description": "IndraMQTT Root Operator"
+    })];
     for u in state.auth.usernames() {
         if u != "admin" {
             users.push(serde_json::json!({
@@ -395,7 +420,9 @@ pub async fn create_user(
     State(state): State<ApiState>,
     Json(req): Json<CreateUserReq>,
 ) -> Response {
-    state.auth.add_user(req.username.clone(), req.password.as_bytes());
+    state
+        .auth
+        .add_user(req.username.clone(), req.password.as_bytes());
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -432,10 +459,7 @@ pub async fn update_user(
         .into_response()
 }
 
-pub async fn delete_user(
-    State(state): State<ApiState>,
-    Path(username): Path<String>,
-) -> Response {
+pub async fn delete_user(State(state): State<ApiState>, Path(username): Path<String>) -> Response {
     if username == "admin" {
         return (
             StatusCode::BAD_REQUEST,
@@ -490,14 +514,13 @@ pub async fn get_authentication(Path(id): Path<String>) -> Response {
 }
 
 pub async fn create_authentication(Json(body): Json<serde_json::Value>) -> Response {
-    (
-        StatusCode::CREATED,
-        Json(body),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
-pub async fn update_authentication(Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> Response {
+pub async fn update_authentication(
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let mut resp = body;
     if let Some(obj) = resp.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
@@ -509,18 +532,18 @@ pub async fn delete_authentication(Path(_id): Path<String>) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn list_authn_users(
-    State(state): State<ApiState>,
-    Path(_id): Path<String>,
-) -> Response {
+pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<String>) -> Response {
     let names = state.auth.usernames();
-    let data: Vec<_> = names.into_iter().map(|name| {
-        serde_json::json!({
-            "user_id": name,
-            "is_superuser": false,
-            "created_at": "2026-09-13T21:00:00Z"
+    let data: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "user_id": name,
+                "is_superuser": false,
+                "created_at": "2026-09-13T21:00:00Z"
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -550,7 +573,9 @@ pub async fn create_authn_user(
     Path(_id): Path<String>,
     Json(req): Json<CreateAuthnUserReq>,
 ) -> Response {
-    state.auth.add_user(req.user_id.clone(), req.password.as_bytes());
+    state
+        .auth
+        .add_user(req.user_id.clone(), req.password.as_bytes());
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -571,7 +596,9 @@ pub async fn update_authn_user(
     Path((_id, user_id)): Path<(String, String)>,
     Json(req): Json<UpdateAuthnUserReq>,
 ) -> Response {
-    state.auth.add_user(user_id.clone(), req.password.as_bytes());
+    state
+        .auth
+        .add_user(user_id.clone(), req.password.as_bytes());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -638,19 +665,23 @@ pub async fn list_authz_rules(
     Path(_type): Path<String>,
 ) -> Response {
     let rules = state.auth.acl_rules();
-    let data: Vec<_> = rules.into_iter().enumerate().map(|(idx, r)| {
-        serde_json::json!({
-            "id": idx,
-            "clientid": r.client_pattern,
-            "action": match r.action {
-                AclAction::Publish => "publish",
-                AclAction::Subscribe => "subscribe",
-                AclAction::All => "all",
-            },
-            "topic": r.topic_pattern,
-            "permission": if r.allow { "allow" } else { "deny" }
+    let data: Vec<_> = rules
+        .into_iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            serde_json::json!({
+                "id": idx,
+                "clientid": r.client_pattern,
+                "action": match r.action {
+                    AclAction::Publish => "publish",
+                    AclAction::Subscribe => "subscribe",
+                    AclAction::All => "all",
+                },
+                "topic": r.topic_pattern,
+                "permission": if r.allow { "allow" } else { "deny" }
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -687,7 +718,9 @@ pub async fn create_authz_rule(
     };
     let allow = req.permission.to_lowercase() == "allow";
 
-    state.auth.add_rule(AclRule::new(client_pattern, action, req.topic, allow));
+    state
+        .auth
+        .add_rule(AclRule::new(client_pattern, action, req.topic, allow));
     StatusCode::CREATED.into_response()
 }
 

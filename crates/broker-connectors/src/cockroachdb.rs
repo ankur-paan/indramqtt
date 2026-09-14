@@ -278,7 +278,13 @@ pub trait CockroachDbTransport: Send + Sync {
 fn format_cockroach_value(v: &CockroachValue) -> String {
     match v {
         CockroachValue::Null => "NULL".to_string(),
-        CockroachValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        CockroachValue::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
         CockroachValue::Integer(i) => i.to_string(),
         CockroachValue::Number(n) => n.to_string(),
         CockroachValue::String(s) => format!("'{}'", s.replace('\'', "''")),
@@ -287,7 +293,10 @@ fn format_cockroach_value(v: &CockroachValue) -> String {
 
 fn parse_cr_conn_str(conn_str: &str) -> (String, u16, String, String) {
     let mut s = conn_str.trim();
-    if let Some(rest) = s.strip_prefix("postgresql://").or_else(|| s.strip_prefix("postgres://")) {
+    if let Some(rest) = s
+        .strip_prefix("postgresql://")
+        .or_else(|| s.strip_prefix("postgres://"))
+    {
         s = rest;
     }
     if let Some((before_q, _)) = s.split_once('?') {
@@ -318,9 +327,21 @@ fn parse_cr_conn_str(conn_str: &str) -> (String, u16, String, String) {
     } else {
         (host_port.to_string(), 26257)
     };
-    let host = if host.is_empty() { "127.0.0.1".to_string() } else { host };
-    let db = if db.is_empty() { "defaultdb".to_string() } else { db };
-    let user = if user.is_empty() { "root".to_string() } else { user };
+    let host = if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    let db = if db.is_empty() {
+        "defaultdb".to_string()
+    } else {
+        db
+    };
+    let user = if user.is_empty() {
+        "root".to_string()
+    } else {
+        user
+    };
     (host, port, user, db)
 }
 
@@ -381,7 +402,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         let addr = format!("{host}:{port}");
         let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| ConnectorError::Connection(format!("cockroachdb connect timeout: {addr}")))?
+            .map_err(|_| {
+                ConnectorError::Connection(format!("cockroachdb connect timeout: {addr}"))
+            })?
             .map_err(|e| ConnectorError::Connection(format!("cockroachdb connect failed: {e}")))?;
 
         // Send StartupMessage
@@ -401,10 +424,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         let mut startup_msg = Vec::new();
         startup_msg.extend_from_slice(&len.to_be_bytes());
         startup_msg.extend_from_slice(&startup_body);
-        stream
-            .write_all(&startup_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("cockroachdb startup write failed: {e}")))?;
+        stream.write_all(&startup_msg).await.map_err(|e| {
+            ConnectorError::Connection(format!("cockroachdb startup write failed: {e}"))
+        })?;
 
         // Drain until 'Z'
         loop {
@@ -413,7 +435,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
                 break;
             } else if tag == b'E' {
                 let msg = String::from_utf8_lossy(&body).into_owned();
-                return Err(ConnectorError::Connection(format!("cockroachdb startup error: {msg}")));
+                return Err(ConnectorError::Connection(format!(
+                    "cockroachdb startup error: {msg}"
+                )));
             }
         }
 
@@ -425,10 +449,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         q_msg.extend_from_slice(&q_len.to_be_bytes());
         q_msg.extend_from_slice(sql_bytes);
         q_msg.push(0);
-        stream
-            .write_all(&q_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("cockroachdb query write failed: {e}")))?;
+        stream.write_all(&q_msg).await.map_err(|e| {
+            ConnectorError::Connection(format!("cockroachdb query write failed: {e}"))
+        })?;
 
         let mut rows_affected = 1;
         let mut error_msg = None;
@@ -449,7 +472,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
             }
         }
         if let Some(err) = error_msg {
-            return Err(ConnectorError::Dispatch(format!("cockroachdb query failed: {err}")));
+            return Err(ConnectorError::Dispatch(format!(
+                "cockroachdb query failed: {err}"
+            )));
         }
 
         Ok(CockroachQueryResult {

@@ -186,7 +186,10 @@ impl DatabricksSinkConfig {
         if self.host.starts_with("http://") || self.host.starts_with("https://") {
             format!("{}/api/2.0/sql/statements", self.host.trim_end_matches('/'))
         } else {
-            format!("https://{}/api/2.0/sql/statements", self.host.trim_end_matches('/'))
+            format!(
+                "https://{}/api/2.0/sql/statements",
+                self.host.trim_end_matches('/')
+            )
         }
     }
 

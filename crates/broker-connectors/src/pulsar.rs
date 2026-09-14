@@ -872,13 +872,10 @@ impl TcpPulsarTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("pulsar connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("pulsar connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("pulsar connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("pulsar connect failed: {e}")))?;
         let connect = encode_command_frame(&encode_connect("IndraMQTT-0.1.0", &self.auth));
         stream
             .write_all(&connect)
@@ -1498,7 +1495,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             // Connect: command-only frame with type 2 + token auth data.
-            let connect = read_frame(&mut stream, Duration::from_secs(5)).await.expect("connect");
+            let connect = read_frame(&mut stream, Duration::from_secs(5))
+                .await
+                .expect("connect");
             let (command, _, _) = decode_frame(&connect).expect("connect frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),
@@ -1510,7 +1509,9 @@ mod tests {
                 .await
                 .expect("connected");
             // Producer: command-only frame with type 11.
-            let producer = read_frame(&mut stream, Duration::from_secs(5)).await.expect("producer");
+            let producer = read_frame(&mut stream, Duration::from_secs(5))
+                .await
+                .expect("producer");
             let (command, _, _) = decode_frame(&producer).expect("producer frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),
@@ -1521,7 +1522,9 @@ mod tests {
                 .await
                 .expect("producer success");
             // Send: message frame with type 19; answer one receipt.
-            let send = read_frame(&mut stream, Duration::from_secs(5)).await.expect("send");
+            let send = read_frame(&mut stream, Duration::from_secs(5))
+                .await
+                .expect("send");
             let (command, metadata, payload) = decode_frame(&send).expect("send frame");
             assert_eq!(
                 decode_command_type(&command).expect("type"),

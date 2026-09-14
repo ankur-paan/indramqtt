@@ -833,7 +833,11 @@ async fn window_worker_loop(
                 flush_window(&rule_id, &stmt, &actions, batch, cutoff, end, &flush_ctx).await;
             }
         }
-        WindowDef::Session { unit, max_duration, timeout } => {
+        WindowDef::Session {
+            unit,
+            max_duration,
+            timeout,
+        } => {
             let timeout_ms = window_length_ms(&unit, timeout);
             let max_duration_ms = window_length_ms(&unit, max_duration);
             let mut buffer: Vec<TimedRecord> = Vec::new();

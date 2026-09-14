@@ -73,7 +73,10 @@ pub async fn get_gateway(Path(name): Path<String>) -> Response {
         .into_response()
 }
 
-pub async fn update_gateway(Path(name): Path<String>, Json(body): Json<serde_json::Value>) -> Response {
+pub async fn update_gateway(
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let mut resp = body;
     if let Some(obj) = resp.as_object_mut() {
         obj.insert("name".to_string(), serde_json::Value::String(name));
@@ -246,7 +249,10 @@ pub async fn add_listener(Path(id): Path<String>, Json(body): Json<serde_json::V
     (StatusCode::CREATED, Json(resp)).into_response()
 }
 
-pub async fn update_listener(Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> Response {
+pub async fn update_listener(
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let mut resp = body;
     if let Some(obj) = resp.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
@@ -344,7 +350,10 @@ pub async fn list_traces() -> Response {
 pub async fn create_trace(Json(mut body): Json<serde_json::Value>) -> Response {
     if let Some(obj) = body.as_object_mut() {
         if !obj.contains_key("status") {
-            obj.insert("status".to_string(), serde_json::Value::String("running".to_string()));
+            obj.insert(
+                "status".to_string(),
+                serde_json::Value::String("running".to_string()),
+            );
         }
         if !obj.contains_key("log_size") {
             obj.insert(
@@ -401,7 +410,9 @@ pub async fn download_trace(Path(name): Path<String>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}.log\"", name).parse().unwrap(),
+        format!("attachment; filename=\"{}.log\"", name)
+            .parse()
+            .unwrap(),
     );
     headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
     (StatusCode::OK, headers, log_content).into_response()
@@ -412,7 +423,10 @@ pub async fn stop_trace(Path(name): Path<String>) -> Response {
     for t in traces.iter_mut() {
         if t.get("name").and_then(|v| v.as_str()) == Some(&name) {
             if let Some(obj) = t.as_object_mut() {
-                obj.insert("status".to_string(), serde_json::Value::String("stopped".to_string()));
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String("stopped".to_string()),
+                );
             }
         }
     }

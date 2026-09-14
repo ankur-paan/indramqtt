@@ -1054,13 +1054,10 @@ impl OpcUaTransport for TcpOpcUaTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("opc-ua connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("opc-ua connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("opc-ua connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua connect failed: {e}")))?;
         let mut body = Vec::new();
         self.hello.encode(&mut body);
         stream

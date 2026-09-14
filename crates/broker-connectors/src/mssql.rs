@@ -791,13 +791,10 @@ impl NativeMssqlTransport {
             return Ok(());
         }
         let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("mssql connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("mssql connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("mssql connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("mssql connect failed: {e}")))?;
         // PRELOGIN.
         stream
             .write_all(&tds_packet(packet::PRELOGIN, 0, &encode_prelogin()))

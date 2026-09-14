@@ -198,7 +198,9 @@ async fn get_dashboard_asset(axum::extract::Path(path): axum::extract::Path<Stri
     (StatusCode::NOT_FOUND, "Asset not found").into_response()
 }
 
-async fn get_dashboard_static_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+async fn get_dashboard_static_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
     let clean = path.trim_start_matches('/').replace("..", "");
     for base in &["dashboard/dist/static", "../dashboard/dist/static"] {
         let p = std::path::PathBuf::from(base).join(&clean);
@@ -238,13 +240,12 @@ async fn get_dashboard_static_asset(axum::extract::Path(path): axum::extract::Pa
 }
 
 async fn get_dashboard_favicon() -> Response {
-    for candidate in &["dashboard/dist/favicon.ico", "../dashboard/dist/favicon.ico"] {
+    for candidate in &[
+        "dashboard/dist/favicon.ico",
+        "../dashboard/dist/favicon.ico",
+    ] {
         if let Ok(bytes) = tokio::fs::read(candidate).await {
-            return (
-                [("content-type", "image/x-icon")],
-                bytes,
-            )
-                .into_response();
+            return ([("content-type", "image/x-icon")], bytes).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -253,11 +254,7 @@ async fn get_dashboard_favicon() -> Response {
 async fn get_dashboard_version() -> Response {
     for candidate in &["dashboard/dist/version", "../dashboard/dist/version"] {
         if let Ok(content) = tokio::fs::read_to_string(candidate).await {
-            return (
-                [("content-type", "text/plain; charset=utf-8")],
-                content,
-            )
-                .into_response();
+            return ([("content-type", "text/plain; charset=utf-8")], content).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()

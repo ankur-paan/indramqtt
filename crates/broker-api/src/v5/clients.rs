@@ -40,11 +40,18 @@ pub async fn list_clients(
 
     let mut data = Vec::new();
     let start = (params.page.saturating_sub(1)) * params.limit;
-    let page_ids: Vec<String> = all_client_ids.into_iter().skip(start).take(params.limit).collect();
+    let page_ids: Vec<String> = all_client_ids
+        .into_iter()
+        .skip(start)
+        .take(params.limit)
+        .collect();
 
     for cid in page_ids {
         let session = state.sessions.get(&cid);
-        let is_connected = session.as_ref().map(|s| *s.connected.read()).unwrap_or(false);
+        let is_connected = session
+            .as_ref()
+            .map(|s| *s.connected.read())
+            .unwrap_or(false);
 
         if let Some(state_filter) = &params.conn_state {
             if (state_filter == "connected" && !is_connected)
@@ -54,7 +61,8 @@ pub async fn list_clients(
             }
         }
 
-        let keepalive = session.as_ref()
+        let keepalive = session
+            .as_ref()
             .map(|s| *s.keepalive_secs.read())
             .unwrap_or(60);
 
@@ -95,12 +103,12 @@ pub async fn list_clients(
         .into_response()
 }
 
-pub async fn get_client(
-    State(state): State<ApiState>,
-    Path(client_id): Path<String>,
-) -> Response {
+pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
     let session = state.sessions.get(&client_id);
-    let is_connected = session.as_ref().map(|s| *s.connected.read()).unwrap_or(false);
+    let is_connected = session
+        .as_ref()
+        .map(|s| *s.connected.read())
+        .unwrap_or(false);
 
     if session.is_none() && !is_connected {
         return (
@@ -113,7 +121,8 @@ pub async fn get_client(
             .into_response();
     }
 
-    let keepalive = session.as_ref()
+    let keepalive = session
+        .as_ref()
         .map(|s| *s.keepalive_secs.read())
         .unwrap_or(60);
 
@@ -141,10 +150,7 @@ pub async fn get_client(
         .into_response()
 }
 
-pub async fn kick_client(
-    State(state): State<ApiState>,
-    Path(client_id): Path<String>,
-) -> Response {
+pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
     if let Some(session) = state.sessions.get(&client_id) {
         if let Some(conn_id) = *session.conn_id.read() {
             state.conns.unregister(conn_id);
@@ -175,7 +181,9 @@ pub async fn get_client_subscriptions(
 ) -> Response {
     let session = state.sessions.get(&client_id);
     let subs: Vec<serde_json::Value> = match session {
-        Some(s) => s.subscriptions.read()
+        Some(s) => s
+            .subscriptions
+            .read()
             .iter()
             .map(|(filter, qos)| {
                 serde_json::json!({
@@ -215,15 +223,25 @@ pub async fn client_subscribe(
     };
     let qos = QoS::try_from(req.qos).unwrap_or(QoS::AtMostOnce);
 
-    state.sessions.add_subscription(&client_id, filter.clone(), qos);
+    state
+        .sessions
+        .add_subscription(&client_id, filter.clone(), qos);
 
-    let conn_id = state.sessions.get(&client_id)
+    let conn_id = state
+        .sessions
+        .get(&client_id)
         .and_then(|s| *s.conn_id.read())
         .unwrap_or(1);
 
-    state.router.subscribe(&filter, Subscription::new(&*client_id, conn_id, qos));
+    state
+        .router
+        .subscribe(&filter, Subscription::new(&*client_id, conn_id, qos));
 
-    (StatusCode::CREATED, Json(serde_json::json!({ "result": "ok" }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "result": "ok" })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -278,7 +296,8 @@ pub async fn get_client_mqueue(
                 "hasnext": false
             }
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn get_client_inflight(
@@ -296,7 +315,8 @@ pub async fn get_client_inflight(
                 "hasnext": false
             }
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn list_subscriptions(State(state): State<ApiState>) -> Response {
@@ -461,7 +481,10 @@ pub async fn publish_message(
         metrics: state.metrics.clone(),
     });
 
-    let rules_fired = state.engine.dispatch_ingress(&topic, &payload, qos, &sink).await;
+    let rules_fired = state
+        .engine
+        .dispatch_ingress(&topic, &payload, qos, &sink)
+        .await;
     state.metrics.inc_rules_executed_by(rules_fired as u64);
 
     (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()

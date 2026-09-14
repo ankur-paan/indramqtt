@@ -306,14 +306,23 @@ pub trait AlloydbTransport: Send + Sync {
 fn format_alloydb_value(v: &AlloydbValue) -> String {
     match v {
         AlloydbValue::Null => "NULL".to_string(),
-        AlloydbValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        AlloydbValue::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
         AlloydbValue::Integer(i) => i.to_string(),
         AlloydbValue::Number(n) => n.to_string(),
         AlloydbValue::String(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
-async fn read_alloydb_pg_msg(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<(u8, Vec<u8>)> {
+async fn read_alloydb_pg_msg(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+) -> Result<(u8, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
     let mut header = [0u8; 5];
     tokio::time::timeout(timeout, stream.read_exact(&mut header))
@@ -395,10 +404,9 @@ impl AlloydbTransport for TcpAlloydbTransport {
         let mut startup_msg = Vec::new();
         startup_msg.extend_from_slice(&len.to_be_bytes());
         startup_msg.extend_from_slice(&startup_body);
-        stream
-            .write_all(&startup_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("alloydb startup write failed: {e}")))?;
+        stream.write_all(&startup_msg).await.map_err(|e| {
+            ConnectorError::Connection(format!("alloydb startup write failed: {e}"))
+        })?;
 
         // Drain until 'Z' (ReadyForQuery)
         loop {
@@ -421,14 +429,15 @@ impl AlloydbTransport for TcpAlloydbTransport {
                     p_msg.extend_from_slice(&p_len.to_be_bytes());
                     p_msg.extend_from_slice(p_bytes);
                     p_msg.push(0);
-                    stream
-                        .write_all(&p_msg)
-                        .await
-                        .map_err(|e| ConnectorError::Connection(format!("alloydb password write failed: {e}")))?;
+                    stream.write_all(&p_msg).await.map_err(|e| {
+                        ConnectorError::Connection(format!("alloydb password write failed: {e}"))
+                    })?;
                 }
             } else if tag == b'E' {
                 let msg = String::from_utf8_lossy(&body).into_owned();
-                return Err(ConnectorError::Connection(format!("alloydb startup error: {msg}")));
+                return Err(ConnectorError::Connection(format!(
+                    "alloydb startup error: {msg}"
+                )));
             }
         }
 
@@ -465,7 +474,9 @@ impl AlloydbTransport for TcpAlloydbTransport {
         }
 
         if let Some(err) = error_msg {
-            return Err(ConnectorError::Dispatch(format!("alloydb query error: {err}")));
+            return Err(ConnectorError::Dispatch(format!(
+                "alloydb query error: {err}"
+            )));
         }
 
         Ok(AlloydbQueryResult {

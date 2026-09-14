@@ -247,10 +247,17 @@ impl IotDbSinkConfig {
     /// Template variables for one event.
     fn template_vars(topic: &str, payload: &[u8], qos: QoS, millis: i64) -> Vec<(String, String)> {
         let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
-        let client_id_val = doc.get("client_id")
+        let client_id_val = doc
+            .get("client_id")
             .or_else(|| doc.get("clientid"))
             .or_else(|| doc.get("device_id"))
-            .or_else(|| doc.get("payload").and_then(|p| p.get("client_id").or_else(|| p.get("clientid")).or_else(|| p.get("device_id"))));
+            .or_else(|| {
+                doc.get("payload").and_then(|p| {
+                    p.get("client_id")
+                        .or_else(|| p.get("clientid"))
+                        .or_else(|| p.get("device_id"))
+                })
+            });
         let client_id = match client_id_val {
             Some(serde_json::Value::String(text)) => text.clone(),
             Some(scalar) if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
@@ -279,7 +286,8 @@ impl IotDbSinkConfig {
             let after = &rest[start + "${payload.".len()..];
             if let Some(close) = after.find('}') {
                 let name = &after[..close];
-                let val = doc.get(name)
+                let val = doc
+                    .get(name)
                     .or_else(|| doc.get("payload").and_then(|p| p.get(name)));
                 let value = match val {
                     Some(serde_json::Value::String(text)) => text.clone(),
@@ -622,10 +630,13 @@ impl IotDbSink {
             .iter()
             .zip(self.config.data_types.iter())
         {
-            let field = value.get(measurement)
+            let field = value
+                .get(measurement)
                 .or_else(|| value.get("payload").and_then(|p| p.get(measurement)))
                 .ok_or_else(|| {
-                    ConnectorError::Dispatch(format!("iotdb payload lacks measurement {measurement:?}"))
+                    ConnectorError::Dispatch(format!(
+                        "iotdb payload lacks measurement {measurement:?}"
+                    ))
                 })?;
             values.push(data_type.coerce(field)?);
         }

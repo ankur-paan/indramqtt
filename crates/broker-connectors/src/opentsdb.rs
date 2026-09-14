@@ -273,7 +273,10 @@ pub fn render_opentsdb_template(template: &str, val: &serde_json::Value, topic: 
                 }
             } else {
                 let json_path = var.trim_start_matches("payload.");
-                if let Some(v) = extract_json_path(val, json_path).or_else(|| val.get(&var)).or_else(|| val.get("payload").and_then(|p| p.get(json_path))) {
+                if let Some(v) = extract_json_path(val, json_path)
+                    .or_else(|| val.get(&var))
+                    .or_else(|| val.get("payload").and_then(|p| p.get(json_path)))
+                {
                     match v {
                         serde_json::Value::String(s) => out.push_str(s),
                         serde_json::Value::Number(n) => out.push_str(&n.to_string()),

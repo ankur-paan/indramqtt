@@ -604,7 +604,10 @@ pub fn decode_frame(frame: &[u8]) -> Result<(u8, u16, Vec<u8>)> {
 }
 
 /// Read one frame (header + body) from the stream.
-async fn read_frame(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<(u8, u16, Vec<u8>)> {
+async fn read_frame(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+) -> Result<(u8, u16, Vec<u8>)> {
     let mut header = [0u8; 9];
     tokio::time::timeout(timeout.saturating_mul(2), stream.read_exact(&mut header))
         .await
@@ -851,11 +854,10 @@ impl NativeCassandraTransport {
     }
 
     async fn handshake(&self, addr: &str) -> Result<tokio::net::TcpStream> {
-        let mut stream =
-            tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(addr))
-                .await
-                .map_err(|_| ConnectorError::Connection(format!("cql connect timeout: {addr}")))?
-                .map_err(|e| ConnectorError::Connection(format!("cql connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("cql connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("cql connect failed: {e}")))?;
         // STARTUP.
         let (opcode, _reply) = Self::exchange(
             &mut stream,
@@ -913,7 +915,8 @@ impl NativeCassandraTransport {
             if opcode == opcode::ERROR {
                 if let Ok(err) = parse_error(&reply) {
                     return Err(ConnectorError::Connection(format!(
-                        "cql handshake error 0x{:08x}: {}", err.code, err.message
+                        "cql handshake error 0x{:08x}: {}",
+                        err.code, err.message
                     )));
                 }
             }

@@ -38,10 +38,7 @@ pub async fn list_nodes(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(vec![node])).into_response()
 }
 
-pub async fn get_node(
-    State(state): State<ApiState>,
-    Path(node_name): Path<String>,
-) -> Response {
+pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<String>) -> Response {
     let conns = state.metrics.connections_active().max(0);
     (
         StatusCode::OK,
