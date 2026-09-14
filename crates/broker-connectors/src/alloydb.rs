@@ -601,7 +601,13 @@ impl AlloydbSink {
         self.sent.load(Ordering::Relaxed)
     }
 
+    pub fn buffered_rows(&self) -> usize {
+        self.queue.lock().len()
+    }
+
     pub async fn flush(&self) -> Result<()> {
+        self.backoff.lock().check()?;
+
         let (rows, oldest) = {
             let mut q = self.queue.lock();
             if q.is_empty() {
@@ -613,8 +619,6 @@ impl AlloydbSink {
         if rows.is_empty() {
             return Ok(());
         }
-
-        self.backoff.lock().check()?;
 
         let columns: Vec<String> = rows[0].columns.iter().map(|(c, _)| c.clone()).collect();
         let query = build_alloydb_insert_query(&self.config.table, &columns, rows.len())?;
@@ -899,5 +903,46 @@ mod tests {
         let res = sink.send(&topic, &payload, QoS::AtLeastOnce).await;
         assert!(res.is_err());
         assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
+    }
+
+    #[tokio::test]
+    async fn test_backoff_keeps_buffered_rows() {
+        let mut cfg = sample_password_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::with_failover(1));
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload1 =
+            Bytes::from_static(br#"{"device_id": "dev-10", "metrics": {"temperature": 20.0}}"#);
+        let payload2 =
+            Bytes::from_static(br#"{"device_id": "dev-11", "metrics": {"temperature": 21.0}}"#);
+
+        sink.send(&topic, &payload1, QoS::AtLeastOnce)
+            .await
+            .expect("buffer first row");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // First flush fails transiently, restores the batch and enters backoff.
+        let first = sink.flush().await;
+        assert!(first.is_err());
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Still inside the backoff window: flush must fail without dropping rows.
+        sink.send(&topic, &payload2, QoS::AtLeastOnce)
+            .await
+            .expect("buffer second row");
+        let second = sink.flush().await;
+        assert!(second.is_err());
+        assert_eq!(sink.buffered_rows(), 2);
+
+        // After the backoff resets, one flush delivers both rows exactly once.
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry flush succeeds");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 2);
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[1].params.len(), 4);
     }
 }
