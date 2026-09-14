@@ -257,10 +257,16 @@ struct EsRow {
 }
 
 /// Bulk outcome from the transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BulkOutcome {
-    /// 2xx: rows are durably indexed.
-    Indexed,
+    /// 2xx: rows reached Elasticsearch; the body carries the `_bulk`
+    /// response so per-item failures can be counted. Empty bodies are
+    /// treated as full success (legacy scripted transports).
+    Indexed { body: Vec<u8> },
+    /// 2xx status, but the response body could not be read, so the
+    /// batch cannot be verified. The batch reached Elasticsearch, so
+    /// the caller must not restore or retry it.
+    IndexedUnverified(String),
     /// 429/503: retry in place with backoff, rows preserved.
     Retryable(u16),
     /// Any other non-2xx: dispatch failure, no retry.
@@ -279,14 +285,30 @@ pub struct CapturedBulk {
     pub auth: Option<String>,
 }
 
-/// In-memory transport with a scripted status queue (tests, dry runs).
-/// Each `bulk_post` consumes the next scripted status (default 200);
-/// every request is captured regardless of outcome.
-#[derive(Debug, Default)]
+/// In-memory transport with a scripted response queue (tests, dry runs).
+/// Each `bulk_post` consumes the next scripted response (default 200 with
+/// an empty body); every request is captured regardless of outcome.
+#[derive(Debug)]
 pub struct MockElasticsearchTransport {
-    scripted: parking_lot::Mutex<Vec<u16>>,
+    scripted: parking_lot::Mutex<std::collections::VecDeque<MockScripted>>,
     captured: parking_lot::Mutex<Vec<CapturedBulk>>,
     calls: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+enum MockScripted {
+    Response(u16, Vec<u8>),
+    Unverified(String),
+}
+
+impl Default for MockElasticsearchTransport {
+    fn default() -> Self {
+        Self {
+            scripted: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            captured: parking_lot::Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        }
+    }
 }
 
 impl MockElasticsearchTransport {
@@ -295,8 +317,33 @@ impl MockElasticsearchTransport {
     }
 
     /// Queue response statuses consumed in order (e.g. `[429, 200]`).
+    /// Scripted statuses carry an empty `_bulk` body, which counts as
+    /// full success on 2xx.
     pub fn script_statuses(&self, statuses: Vec<u16>) {
-        *self.scripted.lock() = statuses;
+        self.scripted.lock().extend(
+            statuses
+                .into_iter()
+                .map(|status| MockScripted::Response(status, Vec::new())),
+        );
+    }
+
+    /// Queue full `(status, body)` responses consumed in order. Use this
+    /// to script `_bulk` response bodies with per-item results.
+    pub fn script_responses(&self, responses: Vec<(u16, Vec<u8>)>) {
+        self.scripted.lock().extend(
+            responses
+                .into_iter()
+                .map(|(status, body)| MockScripted::Response(status, body)),
+        );
+    }
+
+    /// Queue a 2xx response whose body could not be read (e.g. a
+    /// truncated stream). The next `bulk_post` reports it as
+    /// [`BulkOutcome::IndexedUnverified`].
+    pub fn script_unverified(&self, reason: impl Into<String>) {
+        self.scripted
+            .lock()
+            .push_back(MockScripted::Unverified(reason.into()));
     }
 
     pub fn captured(&self) -> Vec<CapturedBulk> {
@@ -313,15 +360,20 @@ impl ElasticsearchTransport for MockElasticsearchTransport {
     async fn bulk_post(&self, body: Vec<u8>, auth: Option<String>) -> Result<BulkOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured.lock().push(CapturedBulk { body, auth });
-        let status = if self.scripted.lock().is_empty() {
-            200
-        } else {
-            self.scripted.lock().remove(0)
-        };
-        Ok(match status {
-            200..=299 => BulkOutcome::Indexed,
-            429 | 503 => BulkOutcome::Retryable(status),
-            other => BulkOutcome::Failed(other),
+        let next = self
+            .scripted
+            .lock()
+            .pop_front()
+            .unwrap_or(MockScripted::Response(200, Vec::new()));
+        Ok(match next {
+            MockScripted::Unverified(reason) => BulkOutcome::IndexedUnverified(reason),
+            MockScripted::Response(status, response_body) => match status {
+                200..=299 => BulkOutcome::Indexed {
+                    body: response_body,
+                },
+                429 | 503 => BulkOutcome::Retryable(status),
+                other => BulkOutcome::Failed(other),
+            },
         })
     }
 }
@@ -361,7 +413,12 @@ impl ElasticsearchTransport for HttpElasticsearchTransport {
             .map_err(|e| ConnectorError::Connection(format!("elasticsearch bulk failed: {e}")))?;
         let status = response.status().as_u16();
         Ok(match status {
-            200..=299 => BulkOutcome::Indexed,
+            200..=299 => match response.bytes().await {
+                Ok(body) => BulkOutcome::Indexed {
+                    body: body.to_vec(),
+                },
+                Err(e) => BulkOutcome::IndexedUnverified(e.to_string()),
+            },
             429 | 503 => BulkOutcome::Retryable(status),
             _ => BulkOutcome::Failed(status),
         })
@@ -381,6 +438,8 @@ pub struct ElasticsearchSink {
     seq: AtomicU64,
     sent_batches: AtomicU64,
     sent_records: AtomicU64,
+    inserted_docs: AtomicU64,
+    rejected_docs: AtomicU64,
 }
 
 impl ElasticsearchSink {
@@ -398,6 +457,8 @@ impl ElasticsearchSink {
             seq: AtomicU64::new(0),
             sent_batches: AtomicU64::new(0),
             sent_records: AtomicU64::new(0),
+            inserted_docs: AtomicU64::new(0),
+            rejected_docs: AtomicU64::new(0),
         })
     }
 
@@ -411,6 +472,16 @@ impl ElasticsearchSink {
 
     pub fn sent_records(&self) -> u64 {
         self.sent_records.load(Ordering::Relaxed)
+    }
+
+    /// Documents the `_bulk` response acknowledged as indexed.
+    pub fn inserted_docs(&self) -> u64 {
+        self.inserted_docs.load(Ordering::Relaxed)
+    }
+
+    /// Documents the `_bulk` response reported as failed per item.
+    pub fn rejected_docs(&self) -> u64 {
+        self.rejected_docs.load(Ordering::Relaxed)
     }
 
     pub fn buffered_rows(&self) -> usize {
@@ -459,12 +530,162 @@ impl ElasticsearchSink {
         }
         Ok(body)
     }
+}
+
+/// Truncate an error reason to about 200 characters for logs.
+fn truncate_reason(reason: &str) -> String {
+    const LIMIT: usize = 200;
+    if reason.chars().count() <= LIMIT {
+        reason.to_string()
+    } else {
+        let truncated: String = reason.chars().take(LIMIT).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// Inspect one `_bulk` item result object (the value behind `index` /
+/// `create` / `update` / `delete`). Returns `(status, error_type,
+/// reason)` when the item failed (status >= 300 or an `error` field
+/// is present).
+fn bulk_item_failure(result: &serde_json::Value) -> Option<(Option<u64>, String, String)> {
+    let failed_status = result
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|status| status >= 300);
+    let error = result.get("error");
+    if !failed_status && error.is_none() {
+        return None;
+    }
+    let status = result.get("status").and_then(serde_json::Value::as_u64);
+    let (error_type, reason) = match error {
+        Some(serde_json::Value::Object(map)) => {
+            let error_type = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let reason = map
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || {
+                        result
+                            .get("error")
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown bulk item error".to_string())
+                    },
+                    std::string::ToString::to_string,
+                );
+            (error_type, reason)
+        }
+        Some(serde_json::Value::String(reason)) => ("unknown".to_string(), reason.clone()),
+        Some(other) => ("unknown".to_string(), other.to_string()),
+        None => (
+            "unknown".to_string(),
+            "bulk item status indicates failure".to_string(),
+        ),
+    };
+    Some((status, error_type, reason))
+}
+
+/// Count per-item `_bulk` failures. Returns `(inserted, rejected)`.
+/// Logs each failed item at `warn` with its batch position, status,
+/// error type and (truncated) reason; document bodies are never logged.
+fn count_bulk_item_outcome(items: &[serde_json::Value]) -> (u64, u64) {
+    let mut inserted = 0u64;
+    let mut rejected = 0u64;
+    for (position, item) in items.iter().enumerate() {
+        let result = item.as_object().and_then(|map| map.values().next());
+        match result.and_then(bulk_item_failure) {
+            Some((status, error_type, reason)) => {
+                rejected += 1;
+                tracing::warn!(
+                    position,
+                    ?status,
+                    error_type = error_type.as_str(),
+                    reason = truncate_reason(&reason).as_str(),
+                    "elasticsearch bulk item failed"
+                );
+            }
+            None => {
+                inserted += 1;
+            }
+        }
+    }
+    (inserted, rejected)
+}
+
+impl ElasticsearchSink {
+    /// Account for a 2xx `_bulk` response body. Empty bodies count the
+    /// whole batch as inserted (legacy scripted transports); otherwise
+    /// the body must be valid JSON with an `items` array whenever it
+    /// reports `"errors": true`.
+    fn account_bulk_body(&self, response_body: &[u8], record_count: u64) -> Result<()> {
+        if response_body.iter().all(u8::is_ascii_whitespace) {
+            self.inserted_docs
+                .fetch_add(record_count, Ordering::Relaxed);
+            return Ok(());
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(response_body).map_err(|e| {
+            ConnectorError::Dispatch(format!(
+                "elasticsearch bulk response was not valid JSON: {e}"
+            ))
+        })?;
+        let errors = parsed
+            .get("errors")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let items = parsed.get("items").and_then(serde_json::Value::as_array);
+        match (errors, items) {
+            (true, None) => Err(ConnectorError::Dispatch(
+                "elasticsearch bulk response reported errors but contained no `items` array"
+                    .to_string(),
+            )),
+            (false, None) => {
+                self.inserted_docs
+                    .fetch_add(record_count, Ordering::Relaxed);
+                Ok(())
+            }
+            (_, Some(items)) => {
+                let (inserted, rejected) = count_bulk_item_outcome(items);
+                self.inserted_docs.fetch_add(inserted, Ordering::Relaxed);
+                self.rejected_docs.fetch_add(rejected, Ordering::Relaxed);
+                if items.len() as u64 != record_count {
+                    tracing::warn!(
+                        items = items.len(),
+                        documents = record_count,
+                        inserted,
+                        rejected,
+                        "elasticsearch bulk response item count mismatch"
+                    );
+                    return Err(ConnectorError::Dispatch(format!(
+                        "elasticsearch bulk response has {} items for {} documents",
+                        items.len(),
+                        record_count
+                    )));
+                }
+                if rejected > 0 {
+                    let total = items.len() as u64;
+                    return Err(ConnectorError::Dispatch(format!(
+                        "elasticsearch bulk partially failed: {rejected} of {total} documents rejected"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// Flush buffered rows as one `_bulk` (no-op when empty). While
     /// backing off, fails fast without touching the transport. 429/503
     /// retries in place up to `max_retries` with exponential backoff
     /// (2s, 4s, ... capped by [`BackoffState`]); terminal failures
     /// restore the buffer, engage backoff, and propagate.
+    ///
+    /// 2xx responses are additionally inspected per item: documents
+    /// Elasticsearch rejected inside an otherwise successful `_bulk`
+    /// are counted via [`Self::rejected_docs`] and reported as a
+    /// [`ConnectorError::Dispatch`] without restoring the buffer (the
+    /// successful documents are already stored).
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
@@ -478,11 +699,36 @@ impl ElasticsearchSink {
         let mut attempt = 0usize;
         loop {
             match self.transport.bulk_post(body.clone(), auth.clone()).await {
-                Ok(BulkOutcome::Indexed) => {
+                Ok(BulkOutcome::Indexed {
+                    body: response_body,
+                }) => {
+                    match self.account_bulk_body(&response_body, record_count) {
+                        Ok(()) => {
+                            self.backoff.lock().success();
+                            self.sent_batches.fetch_add(1, Ordering::Relaxed);
+                            self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // The HTTP batch landed: successes are stored,
+                            // so never restore or retry; just report.
+                            self.backoff.lock().success();
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(BulkOutcome::IndexedUnverified(reason)) => {
+                    // The batch reached Elasticsearch (2xx) but the body
+                    // could not be read, so nothing is verified: never
+                    // restore or retry, and count nothing as inserted.
                     self.backoff.lock().success();
-                    self.sent_batches.fetch_add(1, Ordering::Relaxed);
-                    self.sent_records.fetch_add(record_count, Ordering::Relaxed);
-                    return Ok(());
+                    tracing::warn!(
+                        reason = truncate_reason(&reason).as_str(),
+                        "elasticsearch bulk response body could not be read"
+                    );
+                    return Err(ConnectorError::Dispatch(format!(
+                        "elasticsearch bulk response body could not be read: {reason}"
+                    )));
                 }
                 Ok(BulkOutcome::Retryable(status)) if attempt < self.config.max_retries => {
                     attempt += 1;
@@ -794,5 +1040,154 @@ mod tests {
         let err = sink.flush().await.expect_err("400 must fail");
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_all_items_succeed_counts_inserted() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        let response = serde_json::json!({
+            "took": 5,
+            "errors": false,
+            "items": [
+                {"index": {"_index": "iot", "status": 201}},
+                {"index": {"_index": "iot", "status": 201}},
+                {"index": {"_index": "iot", "status": 201}}
+            ]
+        });
+        transport.script_responses(vec![(200, serde_json::to_vec(&response).unwrap())]);
+
+        let topic = Topic::new("sensors/a").unwrap();
+        for _ in 0..3 {
+            sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+                .await
+                .unwrap();
+        }
+        sink.flush().await.unwrap();
+        assert_eq!(sink.inserted_docs(), 3);
+        assert_eq!(sink.rejected_docs(), 0);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_partial_item_failures_are_counted_and_reported() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        let response = serde_json::json!({
+            "took": 5,
+            "errors": true,
+            "items": [
+                {"index": {"_index": "iot", "status": 201}},
+                {"index": {
+                    "_index": "iot",
+                    "status": 400,
+                    "error": {
+                        "type": "mapper_parsing_exception",
+                        "reason": "failed to parse field [v]"
+                    }
+                }},
+                {"index": {"_index": "iot", "status": 201}}
+            ]
+        });
+        transport.script_responses(vec![(200, serde_json::to_vec(&response).unwrap())]);
+
+        let topic = Topic::new("sensors/a").unwrap();
+        for _ in 0..3 {
+            sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+                .await
+                .unwrap();
+        }
+        let err = sink.flush().await.expect_err("partial failure must err");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("1 of 3"),
+                "dispatch must state 1 of 3, got: {message}"
+            ),
+            other => panic!("expected Dispatch, got: {other:?}"),
+        }
+        assert_eq!(sink.inserted_docs(), 2);
+        assert_eq!(sink.rejected_docs(), 1);
+        // Successful documents are already stored: nothing is restored.
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_malformed_error_body_is_a_clear_error() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        transport.script_responses(vec![(200, br#"{"took":5,"errors":true}"#.to_vec())]);
+
+        let topic = Topic::new("sensors/a").unwrap();
+        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        let err = sink.flush().await.expect_err("malformed body must err");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "expected Dispatch, got: {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_unreadable_body_is_not_counted_as_success() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        transport.script_unverified("connection reset");
+
+        let topic = Topic::new("sensors/a").unwrap();
+        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        let err = sink.flush().await.expect_err("unreadable body must err");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("elasticsearch bulk response body could not be read")
+                    && message.contains("connection reset"),
+                "dispatch must report unreadable body, got: {message}"
+            ),
+            other => panic!("expected Dispatch, got: {other:?}"),
+        }
+        assert_eq!(sink.inserted_docs(), 0);
+        assert_eq!(sink.rejected_docs(), 0);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_item_count_mismatch_is_reported() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        let response = serde_json::json!({
+            "took": 5,
+            "errors": false,
+            "items": [
+                {"index": {"_index": "iot", "status": 201}},
+                {"index": {"_index": "iot", "status": 201}}
+            ]
+        });
+        transport.script_responses(vec![(200, serde_json::to_vec(&response).unwrap())]);
+
+        let topic = Topic::new("sensors/a").unwrap();
+        for _ in 0..3 {
+            sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+                .await
+                .unwrap();
+        }
+        let err = sink.flush().await.expect_err("item mismatch must err");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("has 2 items for 3 documents"),
+                "dispatch must state 2 items for 3 documents, got: {message}"
+            ),
+            other => panic!("expected Dispatch, got: {other:?}"),
+        }
+        assert_eq!(sink.inserted_docs(), 2);
+        assert_eq!(sink.rejected_docs(), 0);
+        assert_eq!(sink.buffered_rows(), 0);
     }
 }
