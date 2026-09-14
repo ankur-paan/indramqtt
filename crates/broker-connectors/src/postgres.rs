@@ -574,14 +574,23 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
     let client_nonce = scram_nonce();
     let client_first_bare = format!("n={},r={}", escape_scram_name(user), client_nonce);
 
-    // SASLInitialResponse: mechanism + initial response.
+    // SASLInitialResponse: mechanism + initial response. RFC 5802
+    // requires the GS2 header (`n,,` with no channel binding) in the
+    // client-first-message; `auth_message` keeps the bare form.
+    let client_first = format!("n,,{client_first_bare}");
     let mut initial = b"SCRAM-SHA-256\0".to_vec();
-    initial.extend_from_slice(&(client_first_bare.len() as i32).to_be_bytes());
-    initial.extend_from_slice(client_first_bare.as_bytes());
+    initial.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    initial.extend_from_slice(client_first.as_bytes());
     write_msg(stream, b'p', &initial).await?;
 
     // AuthenticationSASLContinue: server-first-message.
     let (tag, body) = read_msg(stream).await?;
+    if tag == b'E' {
+        return Err(ConnectorError::Connection(format!(
+            "postgres SCRAM authentication failed: {}",
+            error_message(&body)
+        )));
+    }
     if tag != b'R'
         || body.len() < 4
         || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 11
@@ -639,6 +648,12 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
 
     // AuthenticationSASLFinal: verify the server signature (no blind trust).
     let (tag, body) = read_msg(stream).await?;
+    if tag == b'E' {
+        return Err(ConnectorError::Connection(format!(
+            "postgres SCRAM authentication failed: {}",
+            error_message(&body)
+        )));
+    }
     if tag != b'R'
         || body.len() < 4
         || i32::from_be_bytes([body[0], body[1], body[2], body[3]]) != 12
@@ -1223,8 +1238,22 @@ mod tests {
             let rest = &body[mech_end + 1..];
             let initial_len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
             let initial = std::str::from_utf8(&rest[4..4 + initial_len]).expect("utf8");
-            assert!(initial.starts_with("n=user,r="));
-            let client_nonce = initial["n=user,r=".len()..].to_string();
+            // Strict GS2 check (RFC 5802): a real server rejects a
+            // header-less client-first-message with an ErrorResponse.
+            if !initial.starts_with("n,,") {
+                let mut err_body = Vec::new();
+                err_body.extend_from_slice(b"SERROR\0");
+                err_body.extend_from_slice(b"Mmissing GS2 header in SCRAM client-first-message\0");
+                err_body.push(0);
+                write_pg_msg(&mut stream, b'E', &err_body).await;
+                panic!("client-first-message missing GS2 header n,,: {initial:?}");
+            }
+            let client_first_bare = initial
+                .strip_prefix("n,,")
+                .expect("strip GS2 header")
+                .to_string();
+            assert!(client_first_bare.starts_with("n=user,r="));
+            let client_nonce = client_first_bare["n=user,r=".len()..].to_string();
             // Server-first with a fixed salt + low iteration count.
             let salt = b"testsalt";
             let iterations = 4096u32;
@@ -1242,7 +1271,6 @@ mod tests {
             let client_final = std::str::from_utf8(&body).expect("utf8");
             assert!(client_final.starts_with("c=biws,r="));
             let proof_b64 = client_final.rsplit(",p=").next().expect("proof");
-            let client_first_bare = format!("n=user,r={client_nonce}");
             let without_proof = &client_final[..client_final.len() - proof_b64.len() - 3];
             let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
             let salted = pbkdf2_sha256(b"pwd", salt, iterations);
@@ -1309,6 +1337,57 @@ mod tests {
             Err(e) => panic!("scram flush failed: {e}"),
         }
         assert_eq!(sink.sent_batches(), 1);
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("fake broker finishes")
+            .expect("fake broker task");
+    }
+
+    /// A SASL ErrorResponse must surface the server's message text
+    /// instead of the generic "expected SASL continue/final".
+    #[tokio::test]
+    async fn test_scram_server_error_is_surfaced() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut probe = [0u8; 8];
+            stream.read_exact(&mut probe).await.expect("ssl probe");
+            stream.write_all(b"N").await.expect("ssl deny");
+            let _params = read_startup(&mut stream).await;
+            let mut auth = 10i32.to_be_bytes().to_vec();
+            auth.extend_from_slice(b"SCRAM-SHA-256\0\0");
+            write_pg_msg(&mut stream, b'R', &auth).await;
+            // Consume the SASLInitialResponse, then reject with an error.
+            let (tag, _) = read_pg_msg(&mut stream).await;
+            assert_eq!(tag, b'p');
+            let mut err_body = Vec::new();
+            err_body.extend_from_slice(b"SERROR\0");
+            err_body.extend_from_slice(b"VERROR\0");
+            err_body.extend_from_slice(b"Mpassword authentication failed for user \"x\"\0");
+            err_body.push(0);
+            write_pg_msg(&mut stream, b'E', &err_body).await;
+        });
+
+        let transport = TcpPgTransport::new(&format!("postgresql://x:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
+        let sink = PostgreSqlSink::new(test_config(), Arc::new(transport)).expect("valid sink");
+        sink.send(
+            &Topic::new("t").unwrap(),
+            &Bytes::from_static(b"{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("buffered");
+        let err = sink.flush().await.expect_err("server error must fail");
+        let text = format!("{err}");
+        assert!(
+            text.contains(r#"password authentication failed for user "x""#),
+            "server message must surface, got: {text}"
+        );
 
         tokio::time::timeout(Duration::from_secs(10), server)
             .await
