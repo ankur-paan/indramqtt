@@ -190,11 +190,7 @@ pub fn extract_numeric_value(val: &serde_json::Value, field_expr: &str) -> Optio
                 if let Some(next) = map.get(*part) {
                     curr = next;
                 } else if i == 0 {
-                    if let Some(sub) = map.get("payload").and_then(|p| p.get(*part)) {
-                        curr = sub;
-                    } else {
-                        return None;
-                    }
+                    curr = map.get("payload").and_then(|p| p.get(*part))?;
                 } else {
                     return None;
                 }
