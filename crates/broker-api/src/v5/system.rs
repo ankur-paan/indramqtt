@@ -102,11 +102,7 @@ pub async fn get_configs() -> Response {
 }
 
 pub async fn list_api_keys() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([])),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 pub async fn get_api_key_scopes() -> Response {

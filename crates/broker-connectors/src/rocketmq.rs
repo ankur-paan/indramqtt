@@ -544,23 +544,20 @@ impl TcpRocketMqTransport {
         let mut guard = self.conn.lock().await;
         for attempt in 0..2 {
             if guard.is_none() {
-                let stream = tokio::time::timeout(
-                    self.timeout,
-                    TcpStream::connect(&self.endpoint),
-                )
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!(
-                        "rocketmq connect timeout: {}",
-                        self.endpoint
-                    ))
-                })?
-                .map_err(|e| {
-                    ConnectorError::Connection(format!(
-                        "rocketmq connect to {} failed: {e}",
-                        self.endpoint
-                    ))
-                })?;
+                let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::Connection(format!(
+                            "rocketmq connect timeout: {}",
+                            self.endpoint
+                        ))
+                    })?
+                    .map_err(|e| {
+                        ConnectorError::Connection(format!(
+                            "rocketmq connect to {} failed: {e}",
+                            self.endpoint
+                        ))
+                    })?;
                 *guard = Some(stream);
             }
             let stream = guard.as_mut().expect("connected");

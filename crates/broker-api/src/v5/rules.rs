@@ -93,9 +93,12 @@ pub async fn create_rule(
     State(state): State<ApiState>,
     Json(req): Json<CreateRuleV5Request>,
 ) -> Response {
-    let name = req.name.unwrap_or_else(|| req.id.unwrap_or_else(|| "rule-1".to_string()));
+    let name = req
+        .name
+        .unwrap_or_else(|| req.id.unwrap_or_else(|| "rule-1".to_string()));
     let topic_str = if req.sql.contains("FROM \"") {
-        req.sql.split("FROM \"")
+        req.sql
+            .split("FROM \"")
             .nth(1)
             .and_then(|s| s.split('"').next())
             .unwrap_or("t/#")
@@ -117,7 +120,11 @@ pub async fn create_rule(
             });
             resp_actions.push(id_str.to_string());
         } else if let Some(obj) = a.as_object() {
-            if let Some(conn_id) = obj.get("id").or_else(|| obj.get("name")).and_then(|v| v.as_str()) {
+            if let Some(conn_id) = obj
+                .get("id")
+                .or_else(|| obj.get("name"))
+                .and_then(|v| v.as_str())
+            {
                 actions.push(broker_rules::RuleAction::ForwardConnector {
                     connector_id: conn_id.to_string(),
                 });
@@ -166,12 +173,12 @@ pub async fn create_rule(
     }
 }
 
-pub async fn get_rule(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn get_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let rules = state.engine.list_rules();
-    if let Some(r) = rules.into_iter().find(|rule| rule.id == id || rule.name == id) {
+    if let Some(r) = rules
+        .into_iter()
+        .find(|rule| rule.id == id || rule.name == id)
+    {
         let topic = r.topic_filter.as_str().to_string();
         let actions: Vec<String> = if r.actions.is_empty() {
             vec!["kafka:kafka-prod".to_string()]
@@ -230,28 +237,32 @@ pub async fn update_rule(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-pub async fn delete_rule(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let _ = state.engine.remove_rule(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn get_rule_metrics(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
-    let (matched, passed, failed) = if let Some(r) = rules.iter().find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id) {
+    let (matched, passed, failed, actions_total, actions_success, actions_failed) = if let Some(r) =
+        rules
+            .iter()
+            .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
+    {
         (
             r.matched_cnt.load(std::sync::atomic::Ordering::Relaxed),
             r.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
             r.failed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_total_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_success_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            r.actions_failed_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0, 0, 0)
     };
 
     (
@@ -262,6 +273,9 @@ pub async fn get_rule_metrics(
                 "matched": matched,
                 "passed": passed,
                 "failed": failed,
+                "actions.total": actions_total,
+                "actions.success": actions_success,
+                "actions.failed": actions_failed,
                 "rate": 0.0,
                 "rate_max": 0.0,
                 "rate_last5m": 0.0
@@ -273,6 +287,9 @@ pub async fn get_rule_metrics(
                         "matched": matched,
                         "passed": passed,
                         "failed": failed,
+                        "actions.total": actions_total,
+                        "actions.success": actions_success,
+                        "actions.failed": actions_failed,
                         "rate": 0.0
                     }
                 }
@@ -282,16 +299,22 @@ pub async fn get_rule_metrics(
         .into_response()
 }
 
-pub async fn reset_rule_metrics(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
-    if let Some(r) = rules.iter().find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id) {
+    if let Some(r) = rules
+        .iter()
+        .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
+    {
         r.matched_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
         r.passed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
         r.failed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_total_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_success_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        r.actions_failed_cnt
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -385,7 +408,8 @@ pub async fn get_rule_events() -> Response {
 // Data Connectors
 // ---------------------------------------------------------------------------
 
-static CONNECTORS: LazyLock<RwLock<Vec<serde_json::Value>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+static CONNECTORS: LazyLock<RwLock<Vec<serde_json::Value>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 pub async fn list_connectors() -> Response {
     let list = CONNECTORS.read().unwrap().clone();
@@ -393,7 +417,7 @@ pub async fn list_connectors() -> Response {
 }
 
 pub async fn get_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let connectors = CONNECTORS.read().unwrap();
     if let Some(conn) = connectors.iter().find(|c| {
         c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -449,7 +473,8 @@ async fn register_live_sink(
 ) {
     match conn_type {
         "redis" => {
-            let servers = body.get("servers")
+            let servers = body
+                .get("servers")
                 .or_else(|| body.get("server"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:6379");
@@ -467,30 +492,54 @@ async fn register_live_sink(
                         field_template: "payload".to_string(),
                     },
                 };
-                if let Ok(sink) = broker_connectors::redis::RedisSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::redis::RedisSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("redis:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("redis:{}", name), sink);
                 }
             }
         }
         "alloydb" => {
-            let server = body.get("server")
+            let server = body
+                .get("server")
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("host"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:5433");
-            let clean_server = server.split("://").last().unwrap_or(server).split('/').next().unwrap_or(server);
+            let clean_server = server
+                .split("://")
+                .last()
+                .unwrap_or(server)
+                .split('/')
+                .next()
+                .unwrap_or(server);
             let (host, port) = if let Some((h, p)) = clean_server.split_once(':') {
                 (h.to_string(), p.parse::<u16>().unwrap_or(5433))
             } else {
                 (clean_server.to_string(), 5433)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let table = body.get("table").and_then(|v| v.as_str()).unwrap_or("sensor_events");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("postgres");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("password");
-            let timeout_ms = body.get("timeout_ms")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let table = body
+                .get("table")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor_events");
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("postgres");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("password");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -508,15 +557,20 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::alloydb::TcpAlloydbTransport::new(&config));
+            let transport = Arc::new(broker_connectors::alloydb::TcpAlloydbTransport::new(
+                &config,
+            ));
             if let Ok(sink) = broker_connectors::alloydb::AlloydbSink::new(config, transport) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("alloydb:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("alloydb:{}", name), sink);
             }
         }
         "http" => {
-            let url = body.get("url")
+            let url = body
+                .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("http://127.0.0.1:8080");
             let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
@@ -528,7 +582,8 @@ async fn register_live_sink(
             engine.connectors().register(format!("http:{}", name), sink);
         }
         "kafka" => {
-            let servers = body.get("bootstrap_hosts")
+            let servers = body
+                .get("bootstrap_hosts")
                 .or_else(|| body.get("servers"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:9092");
@@ -547,19 +602,35 @@ async fn register_live_sink(
                     batch_max_records: 1,
                     batch_max_bytes: 65536,
                 };
-                if let Ok(sink) = broker_connectors::kafka::KafkaSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::kafka::KafkaSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("kafka:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("kafka:{}", name), sink);
                 }
             }
         }
         "pgsql" => {
-            let server = body.get("server").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:5432");
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("postgres");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("postgres");
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:5432");
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("postgres");
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("postgres");
             let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let conn_url = format!("postgres://{}:{}@{}/{}", username, password, server, database);
+            let conn_url = format!(
+                "postgres://{}:{}@{}/{}",
+                username, password, server, database
+            );
             if let Ok(transport) = broker_connectors::postgres::TcpPgTransport::new(&conn_url, 1) {
                 let config = broker_connectors::postgres::PostgreSqlSinkConfig {
                     connection_url: conn_url,
@@ -568,17 +639,30 @@ async fn register_live_sink(
                     batch_size: 1,
                     batch_timeout_ms: 10,
                 };
-                if let Ok(sink) = broker_connectors::postgres::PostgreSqlSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::postgres::PostgreSqlSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("pgsql:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("pgsql:{}", name), sink);
                 }
             }
         }
         "mysql" => {
-            let server = body.get("server").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:3306");
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("test");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("root");
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:3306");
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
             let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
             let conn_url = if password.is_empty() {
                 format!("mysql://{}@{}/{}", username, server, database)
@@ -588,45 +672,67 @@ async fn register_live_sink(
             if let Ok(transport) = broker_connectors::mysql::TcpMySqlTransport::new(&conn_url, 1) {
                 let config = broker_connectors::mysql::MySqlSinkConfig {
                     connection_url: conn_url,
-                    sql_template: "INSERT INTO test_mqtt_events (topic, qos, payload) VALUES (?, ?, ?)".to_string(),
+                    sql_template:
+                        "INSERT INTO test_mqtt_events (topic, qos, payload) VALUES (?, ?, ?)"
+                            .to_string(),
                     pool_size: 1,
                     batch_size: 1,
                     batch_timeout_ms: 10,
                 };
-                if let Ok(sink) = broker_connectors::mysql::MySqlSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::mysql::MySqlSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("mysql:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("mysql:{}", name), sink);
                 }
             }
         }
         "rabbitmq" => {
-            let endpoint = body.get("server").and_then(|v| v.as_str())
+            let endpoint = body
+                .get("server")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("endpoint").and_then(|v| v.as_str()))
                 .unwrap_or("127.0.0.1:5672");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("guest");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("guest");
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("guest");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("guest");
             let full_endpoint = if endpoint.starts_with("amqp://") {
                 endpoint.to_string()
             } else {
                 format!("amqp://{}:{}@{}/", username, password, endpoint)
             };
-            if let Ok(transport) = broker_connectors::rabbitmq::TcpRabbitTransport::new(&full_endpoint) {
+            if let Ok(transport) =
+                broker_connectors::rabbitmq::TcpRabbitTransport::new(&full_endpoint)
+            {
                 let config = broker_connectors::rabbitmq::RabbitMqSinkConfig {
                     endpoint: full_endpoint,
                     exchange: "amq.topic".to_string(),
                     routing_key_template: "sensor.${topic}".to_string(),
                     delivery_mode: 1,
                 };
-                if let Ok(sink) = broker_connectors::rabbitmq::RabbitMqSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::rabbitmq::RabbitMqSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("rabbitmq:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("rabbitmq:{}", name), sink);
                 }
             }
         }
         "clickhouse" => {
-            let url = body.get("url").and_then(|v| v.as_str())
+            let url = body
+                .get("url")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("server").and_then(|v| v.as_str()))
                 .unwrap_or("http://127.0.0.1:8123");
             let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
@@ -634,9 +740,16 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", url)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("default");
-            let table = body.get("table").and_then(|v| v.as_str()).unwrap_or("test_mqtt_events");
-            let request_timeout_ms = body.get("request_timeout_ms")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            let table = body
+                .get("table")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test_mqtt_events");
+            let request_timeout_ms = body
+                .get("request_timeout_ms")
                 .or_else(|| body.get("timeout_ms"))
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
@@ -649,20 +762,34 @@ async fn register_live_sink(
                 batch_timeout_ms: 10,
                 request_timeout_ms,
             };
-            if let Ok(sink) = broker_connectors::clickhouse::ClickHouseSink::new(config, reqwest::Client::new()) {
+            if let Ok(sink) =
+                broker_connectors::clickhouse::ClickHouseSink::new(config, reqwest::Client::new())
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("clickhouse:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("clickhouse:{}", name), sink);
             }
         }
         "mqtt_bridge" | "bridge" => {
-            let server = body.get("server").and_then(|v| v.as_str())
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("broker_address").and_then(|v| v.as_str()))
                 .unwrap_or("127.0.0.1:1883");
-            let client_id = body.get("client_id").and_then(|v| v.as_str())
+            let client_id = body
+                .get("client_id")
+                .and_then(|v| v.as_str())
                 .unwrap_or("indra-bridge");
-            let username = body.get("username").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let password = body.get("password").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let config = broker_connectors::MqttBridgeSinkConfig {
                 broker_address: server.to_string(),
                 client_id: client_id.to_string(),
@@ -680,16 +807,24 @@ async fn register_live_sink(
                 protocol: broker_connectors::MqttBridgeProtocol::V311,
             };
             if let Ok(transport) = broker_connectors::TcpMqttBridgeTransport::new(&config) {
-                if let Ok(sink) = broker_connectors::MqttBridgeSink::new(config, Arc::new(transport)) {
+                if let Ok(sink) =
+                    broker_connectors::MqttBridgeSink::new(config, Arc::new(transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("bridge:{}", name), sink.clone());
-                    engine.connectors().register(format!("mqtt_bridge:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("bridge:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("mqtt_bridge:{}", name), sink);
                 }
             }
         }
         "influxdb" => {
-            let url = body.get("url").and_then(|v| v.as_str())
+            let url = body
+                .get("url")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("server").and_then(|v| v.as_str()))
                 .unwrap_or("http://127.0.0.1:8086");
             let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
@@ -697,13 +832,22 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", url)
             };
-            let bucket = body.get("bucket").and_then(|v| v.as_str()).unwrap_or("default");
+            let bucket = body
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
             let org = body.get("org").and_then(|v| v.as_str()).unwrap_or("idacs");
-            let token = body.get("token").and_then(|v| v.as_str()).unwrap_or("idacs_test_token");
-            let measurement = body.get("measurement").and_then(|v| v.as_str())
+            let token = body
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("idacs_test_token");
+            let measurement = body
+                .get("measurement")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("measurement_template").and_then(|v| v.as_str()))
                 .unwrap_or("mqtt_events");
-            let request_timeout_ms = body.get("request_timeout_ms")
+            let request_timeout_ms = body
+                .get("request_timeout_ms")
                 .or_else(|| body.get("timeout_ms"))
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
@@ -721,23 +865,34 @@ async fn register_live_sink(
             if let Ok(sink) = broker_connectors::InfluxDbSink::new(config, reqwest::Client::new()) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("influxdb:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("influxdb:{}", name), sink);
             }
         }
         "mongodb" | "mongo" => {
-            let server = body.get("server").and_then(|v| v.as_str())
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("connection_string").and_then(|v| v.as_str()))
                 .unwrap_or("127.0.0.1:27017");
-            let conn_str = if server.starts_with("mongodb://") || server.starts_with("mongodb+srv://") {
-                server.to_string()
-            } else {
-                format!("mongodb://{}", server)
-            };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let collection = body.get("collection").and_then(|v| v.as_str())
+            let conn_str =
+                if server.starts_with("mongodb://") || server.starts_with("mongodb+srv://") {
+                    server.to_string()
+                } else {
+                    format!("mongodb://{}", server)
+                };
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let collection = body
+                .get("collection")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("collection_template").and_then(|v| v.as_str()))
                 .unwrap_or("telemetry_${topic}");
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -759,19 +914,31 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::MongoDbSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("mongodb:{}", name), sink.clone());
-                    engine.connectors().register(format!("mongo:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("mongodb:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("mongo:{}", name), sink);
                 }
             }
         }
         "cassandra" | "scylla" | "scylladb" => {
-            let server = body.get("server").and_then(|v| v.as_str())
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("servers").and_then(|v| v.as_str()))
                 .or_else(|| body.get("contact_points").and_then(|v| v.as_str()))
                 .unwrap_or("127.0.0.1:9042");
-            let contact_points: Vec<String> = server.split(',').map(|s| s.trim().to_string()).collect();
-            let keyspace = body.get("keyspace").and_then(|v| v.as_str()).unwrap_or("idacs");
-            let table = body.get("table").and_then(|v| v.as_str())
+            let contact_points: Vec<String> =
+                server.split(',').map(|s| s.trim().to_string()).collect();
+            let keyspace = body
+                .get("keyspace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("idacs");
+            let table = body
+                .get("table")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("table_template").and_then(|v| v.as_str()))
                 .unwrap_or("sensor_events");
             let username = body.get("username").and_then(|v| v.as_str());
@@ -784,7 +951,8 @@ async fn register_live_sink(
             } else {
                 broker_connectors::CassandraAuth::None
             };
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -811,18 +979,28 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::CassandraSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("cassandra:{}", name), sink.clone());
-                    engine.connectors().register(format!("scylla:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("cassandra:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("scylla:{}", name), sink);
                 }
             }
         }
         "cockroachdb" | "cockroach" => {
-            let conn_str = body.get("connection_string").and_then(|v| v.as_str())
+            let conn_str = body
+                .get("connection_string")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("server").and_then(|v| v.as_str()))
                 .or_else(|| body.get("url").and_then(|v| v.as_str()))
                 .unwrap_or("postgresql://root@127.0.0.1:26257/idacs?sslmode=disable");
-            let table = body.get("table").and_then(|v| v.as_str()).unwrap_or("sensor_events");
-            let timeout_ms = body.get("timeout_ms")
+            let table = body
+                .get("table")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor_events");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -839,25 +1017,48 @@ async fn register_live_sink(
             if let Ok(sink) = broker_connectors::CockroachDbSink::new(config, transport) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("cockroachdb:{}", name), sink.clone());
-                engine.connectors().register(format!("cockroach:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("cockroachdb:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("cockroach:{}", name), sink);
             }
         }
         "couchbase" => {
-            let server = body.get("server").and_then(|v| v.as_str())
+            let server = body
+                .get("server")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("connection_string").and_then(|v| v.as_str()))
                 .unwrap_or("couchbase://127.0.0.1:11210");
-            let conn_str = if server.starts_with("couchbase://") || server.starts_with("couchbases://") {
-                server.to_string()
-            } else {
-                format!("couchbase://{}", server)
-            };
-            let bucket = body.get("bucket").and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let scope = body.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let collection = body.get("collection").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("Administrator");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("password");
-            let timeout_ms = body.get("timeout_ms")
+            let conn_str =
+                if server.starts_with("couchbase://") || server.starts_with("couchbases://") {
+                    server.to_string()
+                } else {
+                    format!("couchbase://{}", server)
+                };
+            let bucket = body
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let scope = body
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let collection = body
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Administrator");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("password");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -870,7 +1071,8 @@ async fn register_live_sink(
                     username: username.to_string(),
                     password: password.to_string(),
                 },
-                doc_id_template: body.get("doc_id_template")
+                doc_id_template: body
+                    .get("doc_id_template")
                     .and_then(|v| v.as_str())
                     .unwrap_or("${client_id}::${timestamp}")
                     .to_string(),
@@ -889,30 +1091,50 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::CouchbaseSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("couchbase:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("couchbase:{}", name), sink);
                 }
             }
         }
         "mssql" | "sqlserver" => {
-            let server = body.get("server")
+            let server = body
+                .get("server")
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("host"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:1433");
-            let clean_server = server.split("://").last().unwrap_or(server).split('/').next().unwrap_or(server);
+            let clean_server = server
+                .split("://")
+                .last()
+                .unwrap_or(server)
+                .split('/')
+                .next()
+                .unwrap_or(server);
             let (host, port) = if let Some((h, p)) = clean_server.split_once(':') {
                 (h.to_string(), p.parse::<u16>().ok())
             } else {
                 (clean_server.to_string(), None)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let table = body.get("table")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let table = body
+                .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("dbo.SensorEvents");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("sa");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("secret");
-            let timeout_ms = body.get("timeout_ms")
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sa");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("secret");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -940,20 +1162,36 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::MssqlSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("mssql:{}", name), sink.clone());
-                    engine.connectors().register(format!("sqlserver:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("mssql:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("sqlserver:{}", name), sink);
                 }
             }
         }
         "oracle" => {
-            let url = body.get("url").and_then(|v| v.as_str())
+            let url = body
+                .get("url")
+                .and_then(|v| v.as_str())
                 .or_else(|| body.get("server").and_then(|v| v.as_str()))
                 .unwrap_or("http://127.0.0.1:8080/ords/hr/_/sql");
             let schema = body.get("schema").and_then(|v| v.as_str()).unwrap_or("HR");
-            let table = body.get("table").and_then(|v| v.as_str()).unwrap_or("TELEMETRY");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("c##appuser");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("password");
-            let timeout_ms = body.get("timeout_ms")
+            let table = body
+                .get("table")
+                .and_then(|v| v.as_str())
+                .unwrap_or("TELEMETRY");
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("c##appuser");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("password");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -973,11 +1211,14 @@ async fn register_live_sink(
             if let Ok(sink) = broker_connectors::oracle::OracleSink::new(config, transport) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("oracle:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("oracle:{}", name), sink);
             }
         }
         "tdengine" => {
-            let server = body.get("server")
+            let server = body
+                .get("server")
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("endpoint"))
@@ -988,18 +1229,30 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", server)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("power");
-            let stable = body.get("stable_name")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("power");
+            let stable = body
+                .get("stable_name")
                 .or_else(|| body.get("table"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("meters");
-            let subtable = body.get("subtable_template")
+            let subtable = body
+                .get("subtable_template")
                 .or_else(|| body.get("subtable"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("d_meters");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("root");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("taosdata");
-            let timeout_ms = body.get("timeout_ms")
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("taosdata");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1032,17 +1285,23 @@ async fn register_live_sink(
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) = broker_connectors::tdengine::HttpTdengineTransport::new(&config, client) {
+            if let Ok(transport) =
+                broker_connectors::tdengine::HttpTdengineTransport::new(&config, client)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::tdengine::TdengineSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::tdengine::TdengineSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("tdengine:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("tdengine:{}", name), sink);
                 }
             }
         }
         "greptimedb" | "greptime" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
@@ -1053,8 +1312,12 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", server)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("public");
-            let table = body.get("table")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("public");
+            let table = body
+                .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("sensor_events");
@@ -1068,7 +1331,8 @@ async fn register_live_sink(
             } else {
                 None
             };
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1083,16 +1347,24 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(&config));
-            if let Ok(sink) = broker_connectors::greptimedb::GreptimeDbSink::new(config, transport) {
+            let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(
+                &config,
+            ));
+            if let Ok(sink) = broker_connectors::greptimedb::GreptimeDbSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("greptimedb:{}", name), sink.clone());
-                engine.connectors().register(format!("greptime:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("greptimedb:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("greptime:{}", name), sink);
             }
         }
         "iotdb" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
@@ -1103,13 +1375,21 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", server)
             };
-            let device_path = body.get("device_path_template")
+            let device_path = body
+                .get("device_path_template")
                 .or_else(|| body.get("device_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("root.factory.${payload.plant_id}.${client_id}");
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("root");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("root");
-            let timeout_ms = body.get("timeout_ms")
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1136,43 +1416,61 @@ async fn register_live_sink(
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) = broker_connectors::iotdb::HttpIotDbTransport::new(&config, client) {
+            if let Ok(transport) =
+                broker_connectors::iotdb::HttpIotDbTransport::new(&config, client)
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::iotdb::IotDbSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("iotdb:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("iotdb:{}", name), sink);
                 }
             }
         }
         "opentsdb" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("http://127.0.0.1:4242");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") || server.starts_with("telnet://") {
+            let endpoint = if server.starts_with("http://")
+                || server.starts_with("https://")
+                || server.starts_with("telnet://")
+            {
                 server.to_string()
             } else {
                 format!("http://{}", server)
             };
-            let metric_template = body.get("metric_template")
+            let metric_template = body
+                .get("metric_template")
                 .or_else(|| body.get("metric"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("factory.telemetry");
-            let value_field = body.get("value_field")
+            let value_field = body
+                .get("value_field")
                 .or_else(|| body.get("value"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("temperature");
-            let summary = body.get("summary").and_then(|v| v.as_bool()).unwrap_or(true);
-            let timeout_ms = body.get("timeout_ms")
+            let summary = body
+                .get("summary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
             let mut tag_mappings = std::collections::HashMap::new();
-            if let Some(tags) = body.get("tag_mappings").or_else(|| body.get("tags")).and_then(|v| v.as_object()) {
+            if let Some(tags) = body
+                .get("tag_mappings")
+                .or_else(|| body.get("tags"))
+                .and_then(|v| v.as_object())
+            {
                 for (k, v) in tags {
                     if let Some(s) = v.as_str() {
                         tag_mappings.insert(k.clone(), s.to_string());
@@ -1194,15 +1492,20 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::opentsdb::NetworkOpenTsdbTransport::new(&config));
+            let transport = Arc::new(broker_connectors::opentsdb::NetworkOpenTsdbTransport::new(
+                &config,
+            ));
             if let Ok(sink) = broker_connectors::opentsdb::OpenTsdbSink::new(config, transport) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("opentsdb:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("opentsdb:{}", name), sink);
             }
         }
         "doris" => {
-            let server = body.get("server")
+            let server = body
+                .get("server")
                 .or_else(|| body.get("fe_host"))
                 .or_else(|| body.get("host"))
                 .or_else(|| body.get("endpoint"))
@@ -1215,19 +1518,34 @@ async fn register_live_sink(
                 .next()
                 .unwrap_or("127.0.0.1")
                 .to_string();
-            let http_port = body.get("http_port")
+            let http_port = body
+                .get("http_port")
                 .or_else(|| body.get("port"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(8030) as u16;
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("telemetry").to_string();
-            let table = body.get("table_template")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry")
+                .to_string();
+            let table = body
+                .get("table_template")
                 .or_else(|| body.get("table"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("events")
                 .to_string();
-            let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("root").to_string();
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let timeout_ms = body.get("timeout_ms")
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root")
+                .to_string();
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1237,10 +1555,7 @@ async fn register_live_sink(
                 http_port,
                 database,
                 table_template: table,
-                auth: broker_connectors::doris::DorisAuth {
-                    username,
-                    password,
-                },
+                auth: broker_connectors::doris::DorisAuth { username, password },
                 format: broker_connectors::doris::DorisFormat::Json,
                 jsonpaths: None,
                 strip_outer_array: true,
@@ -1257,17 +1572,22 @@ async fn register_live_sink(
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) = broker_connectors::doris::HttpDorisTransport::new(&config, client) {
+            if let Ok(transport) =
+                broker_connectors::doris::HttpDorisTransport::new(&config, client)
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::doris::DorisSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("doris:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("doris:{}", name), sink);
                 }
             }
         }
         "datalayers" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
@@ -1278,17 +1598,24 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", server)
             };
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("factory_db").to_string();
-            let table = body.get("table")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("factory_db")
+                .to_string();
+            let table = body
+                .get("table")
                 .or_else(|| body.get("measurement"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("sensor_events")
                 .to_string();
-            let auth_token = body.get("auth_token")
+            let auth_token = body
+                .get("auth_token")
                 .or_else(|| body.get("token"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1305,15 +1632,21 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::datalayers::HttpDatalayersTransport::new(&config));
-            if let Ok(sink) = broker_connectors::datalayers::DatalayersSink::new(config, transport) {
+            let transport = Arc::new(broker_connectors::datalayers::HttpDatalayersTransport::new(
+                &config,
+            ));
+            if let Ok(sink) = broker_connectors::datalayers::DatalayersSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("datalayers:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("datalayers:{}", name), sink);
             }
         }
         "elasticsearch" | "opensearch" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
@@ -1324,7 +1657,8 @@ async fn register_live_sink(
             } else {
                 format!("http://{}", server)
             };
-            let index = body.get("index_template")
+            let index = body
+                .get("index_template")
                 .or_else(|| body.get("index"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("sensor_events")
@@ -1339,7 +1673,8 @@ async fn register_live_sink(
             } else {
                 broker_connectors::elasticsearch::ElasticsearchAuth::None
             };
-            let timeout_ms = body.get("request_timeout_ms")
+            let timeout_ms = body
+                .get("request_timeout_ms")
                 .or_else(|| body.get("timeout_ms"))
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
@@ -1358,42 +1693,66 @@ async fn register_live_sink(
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) = broker_connectors::elasticsearch::HttpElasticsearchTransport::new(&config, client) {
+            if let Ok(transport) =
+                broker_connectors::elasticsearch::HttpElasticsearchTransport::new(&config, client)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::elasticsearch::ElasticsearchSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::elasticsearch::ElasticsearchSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("elasticsearch:{}", name), sink.clone());
-                    engine.connectors().register(format!("opensearch:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("elasticsearch:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("opensearch:{}", name), sink);
                 }
             }
         }
         "pulsar" => {
-            let server = body.get("service_url")
+            let server = body
+                .get("service_url")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("pulsar://127.0.0.1:6650");
-            let service_url = if server.starts_with("pulsar://") || server.starts_with("http://") || server.starts_with("https://") {
+            let service_url = if server.starts_with("pulsar://")
+                || server.starts_with("http://")
+                || server.starts_with("https://")
+            {
                 server.to_string()
             } else {
                 format!("pulsar://{}", server)
             };
-            let topic = body.get("topic")
+            let topic = body
+                .get("topic")
                 .or_else(|| body.get("topic_template"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("persistent://public/default/telemetry")
                 .to_string();
-            let tenant = body.get("tenant").and_then(|v| v.as_str()).unwrap_or("public").to_string();
-            let namespace = body.get("namespace").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            let tenant = body
+                .get("tenant")
+                .and_then(|v| v.as_str())
+                .unwrap_or("public")
+                .to_string();
+            let namespace = body
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
             let token = body.get("token").and_then(|v| v.as_str());
             let auth = if let Some(t) = token {
-                broker_connectors::pulsar::PulsarAuth::Token { token: t.to_string() }
+                broker_connectors::pulsar::PulsarAuth::Token {
+                    token: t.to_string(),
+                }
             } else {
                 broker_connectors::pulsar::PulsarAuth::None
             };
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1419,22 +1778,39 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::pulsar::PulsarSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("pulsar:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("pulsar:{}", name), sink);
                 }
             }
         }
         "rocketmq" => {
-            let server = body.get("endpoint")
+            let server = body
+                .get("endpoint")
                 .or_else(|| body.get("endpoints"))
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:9876");
-            let endpoint = server.trim_start_matches("http://").trim_start_matches("tcp://").to_string();
-            let topic = body.get("topic").and_then(|v| v.as_str()).unwrap_or("rocket-telemetry").to_string();
-            let access_key = body.get("access_key").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let secret_key = body.get("secret_key").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let endpoint = server
+                .trim_start_matches("http://")
+                .trim_start_matches("tcp://")
+                .to_string();
+            let topic = body
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rocket-telemetry")
+                .to_string();
+            let access_key = body
+                .get("access_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let secret_key = body
+                .get("secret_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1454,37 +1830,48 @@ async fn register_live_sink(
             };
             if let Ok(transport) = broker_connectors::rocketmq::TcpRocketMqTransport::new(&config) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::rocketmq::RocketMqSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::rocketmq::RocketMqSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("rocketmq:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("rocketmq:{}", name), sink);
                 }
             }
         }
         "confluent" => {
-            let server = body.get("bootstrap_servers")
+            let server = body
+                .get("bootstrap_servers")
                 .or_else(|| body.get("bootstrap_hosts"))
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:9092");
-            let bootstrap = server.trim_start_matches("http://").trim_start_matches("tcp://").to_string();
-            let topic = body.get("topic_template")
+            let bootstrap = server
+                .trim_start_matches("http://")
+                .trim_start_matches("tcp://")
+                .to_string();
+            let topic = body
+                .get("topic_template")
                 .or_else(|| body.get("topic"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("telemetry-events")
                 .to_string();
-            let api_key = body.get("api_key")
+            let api_key = body
+                .get("api_key")
                 .or_else(|| body.get("username"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("confluent-key")
                 .to_string();
-            let api_secret = body.get("api_secret")
+            let api_secret = body
+                .get("api_secret")
                 .or_else(|| body.get("password"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("confluent-secret")
                 .to_string();
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1502,30 +1889,39 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::confluent::TcpConfluentTransport::new(&config) {
+            if let Ok(transport) = broker_connectors::confluent::TcpConfluentTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::confluent::ConfluentKafkaSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::confluent::ConfluentKafkaSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("confluent:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("confluent:{}", name), sink);
                 }
             }
         }
         "disk_log" | "disk" | "disklog" => {
-            let dir = body.get("directory")
+            let dir = body
+                .get("directory")
                 .or_else(|| body.get("dir"))
                 .or_else(|| body.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("./target/disk_logs");
-            let prefix = body.get("filename_prefix")
+            let prefix = body
+                .get("filename_prefix")
                 .or_else(|| body.get("prefix"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("indra");
-            let ext = body.get("filename_extension")
+            let ext = body
+                .get("filename_extension")
                 .or_else(|| body.get("extension"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("log");
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1542,17 +1938,23 @@ async fn register_live_sink(
                 sync_mode: broker_connectors::disk_log::DiskSyncMode::EveryBatch,
                 timeout_ms,
             };
-            if let Ok(writer) = broker_connectors::disk_log::FileDiskLogWriter::open(&config).await {
-                if let Ok(sink) = broker_connectors::disk_log::DiskLogSink::new(config, Arc::new(writer)) {
+            if let Ok(writer) = broker_connectors::disk_log::FileDiskLogWriter::open(&config).await
+            {
+                if let Ok(sink) =
+                    broker_connectors::disk_log::DiskLogSink::new(config, Arc::new(writer))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("disk_log:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("disk_log:{}", name), sink.clone());
                     engine.connectors().register(format!("disk:{}", name), sink);
                 }
             }
         }
         "opc_ua" | "opcua" => {
-            let endpoint_url = body.get("endpoint_url")
+            let endpoint_url = body
+                .get("endpoint_url")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("endpoint"))
@@ -1563,10 +1965,12 @@ async fn register_live_sink(
             } else {
                 format!("opc.tcp://{}", endpoint_url.trim_start_matches("tcp://"))
             };
-            let node_id = body.get("node_id")
+            let node_id = body
+                .get("node_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ns=1;i=1001");
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1576,14 +1980,12 @@ async fn register_live_sink(
                 security_policy: broker_connectors::opc_ua::OpcUaSecurityPolicy::None,
                 security_mode: broker_connectors::opc_ua::OpcUaSecurityMode::None,
                 auth: broker_connectors::opc_ua::OpcUaAuth::Anonymous,
-                node_subscriptions: vec![
-                    broker_connectors::opc_ua::NodeSubscriptionConfig {
-                        node_id: node_id.to_string(),
-                        sampling_interval_ms: 1000,
-                        publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
-                        write_topic_pattern: Some("#".to_string()),
-                    }
-                ],
+                node_subscriptions: vec![broker_connectors::opc_ua::NodeSubscriptionConfig {
+                    node_id: node_id.to_string(),
+                    sampling_interval_ms: 1000,
+                    publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
+                    write_topic_pattern: Some("#".to_string()),
+                }],
                 buffer_capacity: None,
                 batch_size: Some(1),
                 linger_ms: Some(10),
@@ -1594,16 +1996,22 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::opc_ua::OpcUaSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("opc_ua:{}", name), sink.clone());
-                    engine.connectors().register(format!("opcua:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("opc_ua:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("opcua:{}", name), sink);
                 }
             }
         }
         "sparkplug_b" | "sparkplug" => {
-            let topic_prefix = body.get("topic_prefix")
+            let topic_prefix = body
+                .get("topic_prefix")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1615,26 +2023,49 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::sparkplug_b::MemorySparkplugTransport::new());
-            if let Ok(sink) = broker_connectors::sparkplug_b::SparkplugBSink::new(config, transport) {
+            let transport =
+                Arc::new(broker_connectors::sparkplug_b::MemorySparkplugTransport::new());
+            if let Ok(sink) = broker_connectors::sparkplug_b::SparkplugBSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
-                engine.connectors().register(format!("sparkplug_b:{}", name), sink.clone());
-                engine.connectors().register(format!("sparkplug:{}", name), sink);
+                engine
+                    .connectors()
+                    .register(format!("sparkplug_b:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("sparkplug:{}", name), sink);
             }
         }
         "s3" | "minio" => {
-            let endpoint = body.get("endpoint")
+            let endpoint = body
+                .get("endpoint")
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("server"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("http://127.0.0.1:9000");
-            let bucket = body.get("bucket").and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let access_key_id = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("");
-            let secret_access_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("");
-            let key_template = body.get("key_template").and_then(|v| v.as_str()).unwrap_or("telemetry/${topic}_${seq}.ndjson");
-            let timeout_ms = body.get("timeout_ms")
+            let bucket = body
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let access_key_id = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let secret_access_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let key_template = body
+                .get("key_template")
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry/${topic}_${seq}.ndjson");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1652,29 +2083,57 @@ async fn register_live_sink(
                 batch_timeout_ms: 10,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::s3::HttpS3Transport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) =
+                broker_connectors::s3::HttpS3Transport::new(&config, reqwest::Client::new())
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::s3::S3Sink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("s3:{}", name), sink.clone());
-                    engine.connectors().register(format!("minio:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("s3:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("minio:{}", name), sink);
                 }
             }
         }
         "s3_tables" | "s3tables" => {
-            let arn = body.get("table_bucket_arn")
+            let arn = body
+                .get("table_bucket_arn")
                 .or_else(|| body.get("bucket_arn"))
                 .or_else(|| body.get("arn"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry");
-            let namespace = body.get("namespace").and_then(|v| v.as_str()).unwrap_or("production_iot");
-            let table = body.get("table_name").or_else(|| body.get("table")).and_then(|v| v.as_str()).unwrap_or("device_events");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let access_key = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("test");
-            let secret_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("test");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let namespace = body
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("production_iot");
+            let table = body
+                .get("table_name")
+                .or_else(|| body.get("table"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("device_events");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let access_key = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let secret_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1695,23 +2154,49 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::s3_tables::HttpS3TablesTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::s3_tables::HttpS3TablesTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::s3_tables::S3TablesSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::s3_tables::S3TablesSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("s3_tables:{}", name), sink.clone());
-                    engine.connectors().register(format!("s3tables:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("s3_tables:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("s3tables:{}", name), sink);
                 }
             }
         }
         "kinesis" | "aws_kinesis" => {
-            let stream = body.get("stream_name").or_else(|| body.get("stream")).and_then(|v| v.as_str()).unwrap_or("telemetry-stream");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let access_key = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("test");
-            let secret_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("test");
-            let timeout_ms = body.get("timeout_ms")
+            let stream = body
+                .get("stream_name")
+                .or_else(|| body.get("stream"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry-stream");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let access_key = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let secret_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1733,23 +2218,49 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::kinesis::HttpKinesisTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::kinesis::HttpKinesisTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::kinesis::KinesisSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("kinesis:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("kinesis:{}", name), sink);
                 }
             }
         }
         "dynamodb" | "dynamo" => {
-            let table = body.get("table_name").or_else(|| body.get("table")).and_then(|v| v.as_str()).unwrap_or("sensor_events");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let access_key = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("test");
-            let secret_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("test");
-            let partition_key_name = body.get("partition_key").and_then(|v| v.as_str()).unwrap_or("id");
-            let timeout_ms = body.get("timeout_ms")
+            let table = body
+                .get("table_name")
+                .or_else(|| body.get("table"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor_events");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let access_key = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let secret_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let partition_key_name = body
+                .get("partition_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("id");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1778,23 +2289,51 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::dynamodb::HttpDynamoDbTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::dynamodb::HttpDynamoDbTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::dynamodb::DynamoDbSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::dynamodb::DynamoDbSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("dynamodb:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("dynamodb:{}", name), sink);
                 }
             }
         }
         "timestream" => {
-            let database = body.get("database_name").or_else(|| body.get("database")).and_then(|v| v.as_str()).unwrap_or("telemetry_db");
-            let table = body.get("table_name").or_else(|| body.get("table")).and_then(|v| v.as_str()).unwrap_or("metrics");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let access_key = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("test");
-            let secret_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("test");
-            let timeout_ms = body.get("timeout_ms")
+            let database = body
+                .get("database_name")
+                .or_else(|| body.get("database"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry_db");
+            let table = body
+                .get("table_name")
+                .or_else(|| body.get("table"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("metrics");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let access_key = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let secret_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1824,24 +2363,56 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::timestream::HttpTimestreamTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::timestream::HttpTimestreamTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::timestream::TimestreamSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::timestream::TimestreamSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("timestream:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("timestream:{}", name), sink);
                 }
             }
         }
         "redshift" => {
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("dev");
-            let table = body.get("table_template").or_else(|| body.get("table")).and_then(|v| v.as_str()).unwrap_or("sensor_events");
-            let workgroup = body.get("workgroup_name").or_else(|| body.get("workgroup")).and_then(|v| v.as_str()).unwrap_or("default");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let access_key = body.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("test");
-            let secret_key = body.get("secret_access_key").and_then(|v| v.as_str()).unwrap_or("test");
-            let timeout_ms = body.get("timeout_ms")
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("dev");
+            let table = body
+                .get("table_template")
+                .or_else(|| body.get("table"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor_events");
+            let workgroup = body
+                .get("workgroup_name")
+                .or_else(|| body.get("workgroup"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let access_key = body
+                .get("access_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let secret_key = body
+                .get("secret_access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1866,20 +2437,38 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::redshift::HttpRedshiftTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::redshift::HttpRedshiftTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::redshift::RedshiftSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::redshift::RedshiftSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("redshift:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("redshift:{}", name), sink);
                 }
             }
         }
         "aws_iot" | "aws_iot_core" => {
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).or_else(|| body.get("server")).and_then(|v| v.as_str()).unwrap_or("127.0.0.1:8883");
-            let region = body.get("region").and_then(|v| v.as_str()).unwrap_or("us-east-1");
-            let client_id = body.get("client_id").and_then(|v| v.as_str()).unwrap_or("indra-bridge");
-            let timeout_ms = body.get("timeout_ms")
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .or_else(|| body.get("server"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:8883");
+            let region = body
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-east-1");
+            let client_id = body
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("indra-bridge");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
@@ -1893,13 +2482,11 @@ async fn register_live_sink(
                     secret_access_key: "test".to_string(),
                     session_token: None,
                 },
-                topic_mappings: vec![
-                    broker_connectors::aws_iot::BridgeTopicMapping {
-                        local_topic: "#".to_string(),
-                        remote_topic: "aws/telemetry/${client_id}".to_string(),
-                        direction: broker_connectors::aws_iot::BridgeDirection::LocalToRemote,
-                    }
-                ],
+                topic_mappings: vec![broker_connectors::aws_iot::BridgeTopicMapping {
+                    local_topic: "#".to_string(),
+                    remote_topic: "aws/telemetry/${client_id}".to_string(),
+                    direction: broker_connectors::aws_iot::BridgeDirection::LocalToRemote,
+                }],
                 shadow_sync: None,
                 buffer_capacity: None,
                 batch_size: Some(1),
@@ -1907,22 +2494,42 @@ async fn register_live_sink(
                 max_retries: Some(3),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::aws_iot::TcpAwsIotTransport::new(&endpoint) {
+            if let Ok(transport) = broker_connectors::aws_iot::TcpAwsIotTransport::new(endpoint) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::aws_iot::AwsIotSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("aws_iot:{}", name), sink.clone());
-                    engine.connectors().register(format!("aws_iot_core:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("aws_iot:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("aws_iot_core:{}", name), sink);
                 }
             }
         }
         "azure_blob" | "azure_blob_storage" => {
-            let account_name = body.get("account_name").and_then(|v| v.as_str()).unwrap_or("devstoreaccount1");
-            let container_name = body.get("container_name").or_else(|| body.get("container")).and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let blob_path = body.get("blob_path_template").or_else(|| body.get("path_template")).and_then(|v| v.as_str()).unwrap_or("telemetry/${batch_id}.json");
-            let timeout_ms = body.get("timeout_ms")
+            let account_name = body
+                .get("account_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("devstoreaccount1");
+            let container_name = body
+                .get("container_name")
+                .or_else(|| body.get("container"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let blob_path = body
+                .get("blob_path_template")
+                .or_else(|| body.get("path_template"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry/${batch_id}.json");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -1941,23 +2548,52 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::azure_blob::HttpAzureBlobTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::azure_blob::HttpAzureBlobTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::azure_blob::AzureBlobSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::azure_blob::AzureBlobSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("azure_blob:{}", name), sink.clone());
-                    engine.connectors().register(format!("azure_blob_storage:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("azure_blob:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("azure_blob_storage:{}", name), sink);
                 }
             }
         }
         "azure_eventhubs" | "azure_event_hubs" => {
-            let namespace = body.get("namespace").and_then(|v| v.as_str()).unwrap_or("test-namespace");
-            let event_hub = body.get("event_hub").or_else(|| body.get("hub")).and_then(|v| v.as_str()).unwrap_or("test-hub");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let shared_access_key_name = body.get("shared_access_key_name").or_else(|| body.get("key_name")).and_then(|v| v.as_str()).unwrap_or("SendPolicy");
-            let shared_access_key = body.get("shared_access_key").or_else(|| body.get("key")).and_then(|v| v.as_str()).unwrap_or("dGVzdC1rZXk=");
-            let timeout_ms = body.get("timeout_ms")
+            let namespace = body
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-namespace");
+            let event_hub = body
+                .get("event_hub")
+                .or_else(|| body.get("hub"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-hub");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let shared_access_key_name = body
+                .get("shared_access_key_name")
+                .or_else(|| body.get("key_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("SendPolicy");
+            let shared_access_key = body
+                .get("shared_access_key")
+                .or_else(|| body.get("key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("dGVzdC1rZXk=");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -1978,21 +2614,46 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::azure_eventhubs::HttpAzureEventHubsTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) =
+                broker_connectors::azure_eventhubs::HttpAzureEventHubsTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::azure_eventhubs::AzureEventHubsSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::azure_eventhubs::AzureEventHubsSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("azure_eventhubs:{}", name), sink.clone());
-                    engine.connectors().register(format!("azure_event_hubs:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("azure_eventhubs:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("azure_event_hubs:{}", name), sink);
                 }
             }
         }
         "azure_iot" | "azure_iot_hub" => {
-            let hub_name = body.get("iot_hub_name").or_else(|| body.get("hub_name")).or_else(|| body.get("server")).or_else(|| body.get("endpoint")).and_then(|v| v.as_str()).unwrap_or("127.0.0.1:8883");
-            let device_id = body.get("device_id").and_then(|v| v.as_str()).unwrap_or("device-01");
-            let shared_access_key = body.get("shared_access_key").or_else(|| body.get("key")).and_then(|v| v.as_str()).unwrap_or("dGVzdC1rZXk=");
-            let timeout_ms = body.get("timeout_ms")
+            let hub_name = body
+                .get("iot_hub_name")
+                .or_else(|| body.get("hub_name"))
+                .or_else(|| body.get("server"))
+                .or_else(|| body.get("endpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:8883");
+            let device_id = body
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("device-01");
+            let shared_access_key = body
+                .get("shared_access_key")
+                .or_else(|| body.get("key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("dGVzdC1rZXk=");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2013,21 +2674,40 @@ async fn register_live_sink(
                 max_retries: Some(3),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::azure_iot::TcpAzureIotTransport::new(hub_name) {
+            if let Ok(transport) = broker_connectors::azure_iot::TcpAzureIotTransport::new(hub_name)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::azure_iot::AzureIotSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::azure_iot::AzureIotSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("azure_iot:{}", name), sink.clone());
-                    engine.connectors().register(format!("azure_iot_hub:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("azure_iot:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("azure_iot_hub:{}", name), sink);
                 }
             }
         }
         "gcp_pubsub" | "pubsub" => {
-            let project_id = body.get("project_id").or_else(|| body.get("project")).and_then(|v| v.as_str()).unwrap_or("test-project");
-            let topic_id = body.get("topic_id").or_else(|| body.get("topic")).and_then(|v| v.as_str()).unwrap_or("test-topic");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let project_id = body
+                .get("project_id")
+                .or_else(|| body.get("project"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-project");
+            let topic_id = body
+                .get("topic_id")
+                .or_else(|| body.get("topic"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-topic");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2046,22 +2726,48 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::gcp_pubsub::HttpGcpPubSubTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::gcp_pubsub::HttpGcpPubSubTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::gcp_pubsub::GcpPubSubSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::gcp_pubsub::GcpPubSubSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("gcp_pubsub:{}", name), sink.clone());
-                    engine.connectors().register(format!("pubsub:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("gcp_pubsub:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("pubsub:{}", name), sink);
                 }
             }
         }
         "bigquery" => {
-            let project_id = body.get("project_id").or_else(|| body.get("project")).and_then(|v| v.as_str()).unwrap_or("test-project");
-            let dataset_id = body.get("dataset_id").or_else(|| body.get("dataset")).and_then(|v| v.as_str()).unwrap_or("test-dataset");
-            let table = body.get("table").or_else(|| body.get("table_template")).and_then(|v| v.as_str()).unwrap_or("telemetry");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let timeout_ms = body.get("timeout_ms")
+            let project_id = body
+                .get("project_id")
+                .or_else(|| body.get("project"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-project");
+            let dataset_id = body
+                .get("dataset_id")
+                .or_else(|| body.get("dataset"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-dataset");
+            let table = body
+                .get("table")
+                .or_else(|| body.get("table_template"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2082,25 +2788,62 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::bigquery::HttpBigQueryTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::bigquery::HttpBigQueryTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::bigquery::BigQuerySink::new(config, transport) {
+                if let Ok(sink) = broker_connectors::bigquery::BigQuerySink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("bigquery:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("bigquery:{}", name), sink);
                 }
             }
         }
         "gcp_iot" | "gcp_iot_core" => {
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).or_else(|| body.get("server")).and_then(|v| v.as_str()).unwrap_or("127.0.0.1:8883");
-            let project_id = body.get("project_id").or_else(|| body.get("project")).and_then(|v| v.as_str()).unwrap_or("my-iot-project");
-            let cloud_region = body.get("cloud_region").or_else(|| body.get("region")).and_then(|v| v.as_str()).unwrap_or("us-central1");
-            let registry_id = body.get("registry_id").or_else(|| body.get("registry")).and_then(|v| v.as_str()).unwrap_or("telemetry-registry");
-            let device_id = body.get("device_id").or_else(|| body.get("device")).and_then(|v| v.as_str()).unwrap_or("edge-7");
-            let private_key_pem = body.get("private_key_pem").or_else(|| body.get("private_key")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_RSA_PEM);
-            let timeout_ms = body.get("timeout_ms")
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .or_else(|| body.get("server"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:8883");
+            let project_id = body
+                .get("project_id")
+                .or_else(|| body.get("project"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("my-iot-project");
+            let cloud_region = body
+                .get("cloud_region")
+                .or_else(|| body.get("region"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("us-central1");
+            let registry_id = body
+                .get("registry_id")
+                .or_else(|| body.get("registry"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("telemetry-registry");
+            let device_id = body
+                .get("device_id")
+                .or_else(|| body.get("device"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("edge-7");
+            let private_key_pem = body
+                .get("private_key_pem")
+                .or_else(|| body.get("private_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_RSA_PEM);
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+
+            let algorithm = match body.get("algorithm").and_then(|v| v.as_str()) {
+                Some("ES256") | Some("es256") => broker_connectors::gcp_iot::GcpIotAlgorithm::Es256,
+                _ => broker_connectors::gcp_iot::GcpIotAlgorithm::Rs256,
+            };
 
             let config = broker_connectors::gcp_iot::GcpIotConfig {
                 project_id: project_id.to_string(),
@@ -2108,7 +2851,7 @@ async fn register_live_sink(
                 registry_id: registry_id.to_string(),
                 device_id: device_id.to_string(),
                 private_key_pem: private_key_pem.to_string(),
-                algorithm: broker_connectors::gcp_iot::GcpIotAlgorithm::Rs256,
+                algorithm,
                 token_lifetime_secs: 3600,
                 endpoint: endpoint.to_string(),
                 batch_size: Some(1),
@@ -2122,18 +2865,42 @@ async fn register_live_sink(
                 if let Ok(sink) = broker_connectors::gcp_iot::GcpIotSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("gcp_iot:{}", name), sink.clone());
-                    engine.connectors().register(format!("gcp_iot_core:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("gcp_iot:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("gcp_iot_core:{}", name), sink);
                 }
             }
         }
         "databricks" | "delta_lake" => {
-            let host = body.get("host").or_else(|| body.get("server")).or_else(|| body.get("endpoint")).and_then(|v| v.as_str()).unwrap_or("127.0.0.1:18096");
-            let token = body.get("token").or_else(|| body.get("api_key")).and_then(|v| v.as_str()).unwrap_or("dapi-mock-token");
-            let catalog = body.get("catalog").and_then(|v| v.as_str()).unwrap_or("main");
-            let schema = body.get("schema").and_then(|v| v.as_str()).unwrap_or("default");
-            let table = body.get("table").or_else(|| body.get("table_template")).and_then(|v| v.as_str()).unwrap_or("events");
-            let timeout_ms = body.get("timeout_ms")
+            let host = body
+                .get("host")
+                .or_else(|| body.get("server"))
+                .or_else(|| body.get("endpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:18096");
+            let token = body
+                .get("token")
+                .or_else(|| body.get("api_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("dapi-mock-token");
+            let catalog = body
+                .get("catalog")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main");
+            let schema = body
+                .get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            let table = body
+                .get("table")
+                .or_else(|| body.get("table_template"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("events");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2154,25 +2921,60 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::databricks::HttpDatabricksTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::databricks::HttpDatabricksTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::databricks::DatabricksSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::databricks::DatabricksSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("databricks:{}", name), sink.clone());
-                    engine.connectors().register(format!("delta_lake:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("databricks:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("delta_lake:{}", name), sink);
                 }
             }
         }
         "snowflake" => {
-            let account = body.get("account").and_then(|v| v.as_str()).unwrap_or("test-account");
-            let user = body.get("user").or_else(|| body.get("username")).and_then(|v| v.as_str()).unwrap_or("test-user");
-            let database = body.get("database").and_then(|v| v.as_str()).unwrap_or("test-db");
-            let schema = body.get("schema").and_then(|v| v.as_str()).unwrap_or("PUBLIC");
-            let table = body.get("table").or_else(|| body.get("table_template")).and_then(|v| v.as_str()).unwrap_or("TELEMETRY");
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let private_key_pem = body.get("private_key_pem").or_else(|| body.get("private_key")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_RSA_PEM);
-            let timeout_ms = body.get("timeout_ms")
+            let account = body
+                .get("account")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-account");
+            let user = body
+                .get("user")
+                .or_else(|| body.get("username"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-user");
+            let database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-db");
+            let schema = body
+                .get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("PUBLIC");
+            let table = body
+                .get("table")
+                .or_else(|| body.get("table_template"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("TELEMETRY");
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let private_key_pem = body
+                .get("private_key_pem")
+                .or_else(|| body.get("private_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_RSA_PEM);
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2195,22 +2997,50 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::snowflake::HttpSnowflakeTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::snowflake::HttpSnowflakeTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::snowflake::SnowflakeSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::snowflake::SnowflakeSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("snowflake:{}", name), sink);
+                    engine
+                        .connectors()
+                        .register(format!("snowflake:{}", name), sink);
                 }
             }
         }
         "tablestore" | "ots" => {
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).unwrap_or("http://127.0.0.1:18098");
-            let instance_name = body.get("instance_name").or_else(|| body.get("instance")).and_then(|v| v.as_str()).unwrap_or("test-instance");
-            let table_name = body.get("table_name").or_else(|| body.get("table")).and_then(|v| v.as_str()).unwrap_or("sensor_data");
-            let access_key_id = body.get("access_key_id").or_else(|| body.get("ak")).and_then(|v| v.as_str()).unwrap_or("test-ak");
-            let access_key_secret = body.get("access_key_secret").or_else(|| body.get("sk")).and_then(|v| v.as_str()).unwrap_or("test-sk");
-            let timeout_ms = body.get("timeout_ms")
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://127.0.0.1:18098");
+            let instance_name = body
+                .get("instance_name")
+                .or_else(|| body.get("instance"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-instance");
+            let table_name = body
+                .get("table_name")
+                .or_else(|| body.get("table"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("sensor_data");
+            let access_key_id = body
+                .get("access_key_id")
+                .or_else(|| body.get("ak"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-ak");
+            let access_key_secret = body
+                .get("access_key_secret")
+                .or_else(|| body.get("sk"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("test-sk");
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
@@ -2235,29 +3065,61 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::tablestore::HttpTablestoreTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::tablestore::HttpTablestoreTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::tablestore::TablestoreSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::tablestore::TablestoreSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("tablestore:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("tablestore:{}", name), sink.clone());
                     engine.connectors().register(format!("ots:{}", name), sink);
                 }
             }
         }
         "oci_streaming" | "oci" => {
-            let endpoint = body.get("endpoint").or_else(|| body.get("url")).and_then(|v| v.as_str()).unwrap_or("http://127.0.0.1:18099");
-            let stream_pool_id = body.get("stream_pool_id").and_then(|v| v.as_str()).unwrap_or("ocid1.streampool.oc1..teststreampool");
-            let stream_id = body.get("stream_id").and_then(|v| v.as_str()).unwrap_or("ocid1.stream.oc1..teststream");
-            let tenancy_ocid = body.get("tenancy_ocid").and_then(|v| v.as_str()).unwrap_or("ocid1.tenancy.oc1..testtenancy");
-            let user_ocid = body.get("user_ocid").and_then(|v| v.as_str()).unwrap_or("ocid1.user.oc1..testuser");
-            let fingerprint = body.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("20:3b:97:13:55:1c:5b:0d:d3:37:d8:50:4e:c9:42:01");
-            let private_key_pem = body.get("private_key_pem").or_else(|| body.get("private_key")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_RSA_PEM);
-            let timeout_ms = body.get("timeout_ms")
+            let endpoint = body
+                .get("endpoint")
+                .or_else(|| body.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://127.0.0.1:18099");
+            let stream_pool_id = body
+                .get("stream_pool_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ocid1.streampool.oc1..teststreampool");
+            let stream_id = body
+                .get("stream_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ocid1.stream.oc1..teststream");
+            let tenancy_ocid = body
+                .get("tenancy_ocid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ocid1.tenancy.oc1..testtenancy");
+            let user_ocid = body
+                .get("user_ocid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ocid1.user.oc1..testuser");
+            let fingerprint = body
+                .get("fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("20:3b:97:13:55:1c:5b:0d:d3:37:d8:50:4e:c9:42:01");
+            let private_key_pem = body
+                .get("private_key_pem")
+                .or_else(|| body.get("private_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_RSA_PEM);
+            let timeout_ms = body
+                .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let partition_key_template = body.get("partition_key_template")
+            let partition_key_template = body
+                .get("partition_key_template")
                 .or_else(|| body.get("partition_key"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("${topic}");
@@ -2280,12 +3142,19 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::oci_streaming::HttpOciStreamingTransport::new(&config, reqwest::Client::new()) {
+            if let Ok(transport) = broker_connectors::oci_streaming::HttpOciStreamingTransport::new(
+                &config,
+                reqwest::Client::new(),
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::oci_streaming::OciStreamingSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors::oci_streaming::OciStreamingSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
-                    engine.connectors().register(format!("oci_streaming:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("oci_streaming:{}", name), sink.clone());
                     engine.connectors().register(format!("oci:{}", name), sink);
                 }
             }
@@ -2303,15 +3172,18 @@ pub async fn create_connector(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("connector-{}", rand::random::<u16>()));
-    let raw_type = body
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let raw_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let conn_type = if !raw_type.is_empty() && raw_type != "http" {
         raw_type.to_string()
     } else if body.get("bootstrap_hosts").is_some() || name.contains("kafka") {
         "kafka".to_string()
-    } else if (body.get("server").is_some() && body.get("database").is_some() && !body.get("server").and_then(|s| s.as_str()).unwrap_or("").contains("3306"))
+    } else if (body.get("server").is_some()
+        && body.get("database").is_some()
+        && !body
+            .get("server")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .contains("3306"))
         || name.contains("postgres")
         || name.contains("pgsql")
     {
@@ -2343,12 +3215,19 @@ pub async fn create_connector(
     } else {
         true
     };
-    let status_str = if is_reachable { "connected" } else { "disconnected" };
+    let status_str = if is_reachable {
+        "connected"
+    } else {
+        "disconnected"
+    };
 
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(name.clone()));
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
-        obj.insert("type".to_string(), serde_json::Value::String(conn_type.clone()));
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(conn_type.clone()),
+        );
         obj.insert(
             "status".to_string(),
             serde_json::Value::String(status_str.to_string()),
@@ -2370,7 +3249,10 @@ pub async fn create_connector(
 
     let action_id = format!("{}:{}", conn_type, name);
     let mut actions = ACTIONS.write().unwrap();
-    if !actions.iter().any(|a| a.get("id").and_then(|v| v.as_str()) == Some(&action_id)) {
+    if !actions
+        .iter()
+        .any(|a| a.get("id").and_then(|v| v.as_str()) == Some(&action_id))
+    {
         actions.push(serde_json::json!({
             "id": action_id,
             "name": name,
@@ -2393,9 +3275,12 @@ pub async fn update_connector(
     Path(id): Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("id".to_string(), serde_json::Value::String(clean_id.to_string()));
+        obj.insert(
+            "id".to_string(),
+            serde_json::Value::String(clean_id.to_string()),
+        );
     }
     let conn_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("http");
     register_live_sink(&state.engine, conn_type, clean_id, &body).await;
@@ -2414,74 +3299,254 @@ pub async fn update_connector(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-pub async fn delete_connector(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     state.engine.connectors().unregister(&id);
     state.engine.connectors().unregister(clean_id);
-    state.engine.connectors().unregister(&format!("redis:{}", clean_id));
-    state.engine.connectors().unregister(&format!("http:{}", clean_id));
-    state.engine.connectors().unregister(&format!("kafka:{}", clean_id));
-    state.engine.connectors().unregister(&format!("pgsql:{}", clean_id));
-    state.engine.connectors().unregister(&format!("mysql:{}", clean_id));
-    state.engine.connectors().unregister(&format!("rabbitmq:{}", clean_id));
-    state.engine.connectors().unregister(&format!("clickhouse:{}", clean_id));
-    state.engine.connectors().unregister(&format!("influxdb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("mongodb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("cassandra:{}", clean_id));
-    state.engine.connectors().unregister(&format!("cockroachdb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("couchbase:{}", clean_id));
-    state.engine.connectors().unregister(&format!("mssql:{}", clean_id));
-    state.engine.connectors().unregister(&format!("oracle:{}", clean_id));
-    state.engine.connectors().unregister(&format!("alloydb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("tdengine:{}", clean_id));
-    state.engine.connectors().unregister(&format!("greptimedb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("greptime:{}", clean_id));
-    state.engine.connectors().unregister(&format!("iotdb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("opentsdb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("doris:{}", clean_id));
-    state.engine.connectors().unregister(&format!("datalayers:{}", clean_id));
-    state.engine.connectors().unregister(&format!("elasticsearch:{}", clean_id));
-    state.engine.connectors().unregister(&format!("opensearch:{}", clean_id));
-    state.engine.connectors().unregister(&format!("pulsar:{}", clean_id));
-    state.engine.connectors().unregister(&format!("rocketmq:{}", clean_id));
-    state.engine.connectors().unregister(&format!("confluent:{}", clean_id));
-    state.engine.connectors().unregister(&format!("disk_log:{}", clean_id));
-    state.engine.connectors().unregister(&format!("disk:{}", clean_id));
-    state.engine.connectors().unregister(&format!("opc_ua:{}", clean_id));
-    state.engine.connectors().unregister(&format!("opcua:{}", clean_id));
-    state.engine.connectors().unregister(&format!("sparkplug_b:{}", clean_id));
-    state.engine.connectors().unregister(&format!("sparkplug:{}", clean_id));
-    state.engine.connectors().unregister(&format!("s3:{}", clean_id));
-    state.engine.connectors().unregister(&format!("minio:{}", clean_id));
-    state.engine.connectors().unregister(&format!("s3_tables:{}", clean_id));
-    state.engine.connectors().unregister(&format!("s3tables:{}", clean_id));
-    state.engine.connectors().unregister(&format!("kinesis:{}", clean_id));
-    state.engine.connectors().unregister(&format!("dynamodb:{}", clean_id));
-    state.engine.connectors().unregister(&format!("timestream:{}", clean_id));
-    state.engine.connectors().unregister(&format!("redshift:{}", clean_id));
-    state.engine.connectors().unregister(&format!("aws_iot:{}", clean_id));
-    state.engine.connectors().unregister(&format!("aws_iot_core:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_blob:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_blob_storage:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_eventhubs:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_event_hubs:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_iot:{}", clean_id));
-    state.engine.connectors().unregister(&format!("azure_iot_hub:{}", clean_id));
-    state.engine.connectors().unregister(&format!("gcp_pubsub:{}", clean_id));
-    state.engine.connectors().unregister(&format!("pubsub:{}", clean_id));
-    state.engine.connectors().unregister(&format!("bigquery:{}", clean_id));
-    state.engine.connectors().unregister(&format!("gcp_iot:{}", clean_id));
-    state.engine.connectors().unregister(&format!("gcp_iot_core:{}", clean_id));
-    state.engine.connectors().unregister(&format!("databricks:{}", clean_id));
-    state.engine.connectors().unregister(&format!("delta_lake:{}", clean_id));
-    state.engine.connectors().unregister(&format!("snowflake:{}", clean_id));
-    state.engine.connectors().unregister(&format!("tablestore:{}", clean_id));
-    state.engine.connectors().unregister(&format!("ots:{}", clean_id));
-    state.engine.connectors().unregister(&format!("oci_streaming:{}", clean_id));
-    state.engine.connectors().unregister(&format!("oci:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("redis:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("http:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("kafka:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("pgsql:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("mysql:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("rabbitmq:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("clickhouse:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("influxdb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("mongodb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("cassandra:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("cockroachdb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("couchbase:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("mssql:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("oracle:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("alloydb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("tdengine:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("greptimedb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("greptime:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("iotdb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("opentsdb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("doris:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("datalayers:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("elasticsearch:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("opensearch:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("pulsar:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("rocketmq:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("confluent:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("disk_log:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("disk:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("opc_ua:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("opcua:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("sparkplug_b:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("sparkplug:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("s3:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("minio:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("s3_tables:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("s3tables:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("kinesis:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("dynamodb:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("timestream:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("redshift:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("aws_iot:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("aws_iot_core:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_blob:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_blob_storage:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_eventhubs:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_event_hubs:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_iot:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("azure_iot_hub:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("gcp_pubsub:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("pubsub:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("bigquery:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("gcp_iot:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("gcp_iot_core:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("databricks:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("delta_lake:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("snowflake:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("tablestore:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("ots:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("oci_streaming:{}", clean_id));
+    state
+        .engine
+        .connectors()
+        .unregister(&format!("oci:{}", clean_id));
 
     let mut connectors = CONNECTORS.write().unwrap();
     connectors.retain(|c| {
@@ -2494,7 +3559,7 @@ pub async fn delete_connector(
 }
 
 pub async fn start_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let mut connectors = CONNECTORS.write().unwrap();
     for c in connectors.iter_mut() {
         if c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -2515,7 +3580,7 @@ pub async fn start_connector(Path(id): Path<String>) -> Response {
 }
 
 pub async fn enable_connector(Path((id, enable)): Path<(String, bool)>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let mut connectors = CONNECTORS.write().unwrap();
     for c in connectors.iter_mut() {
         if c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -2542,7 +3607,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if !host_port.is_empty() {
             return Some(host_port.to_string());
         }
@@ -2553,7 +3627,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if !host_port.is_empty() {
             return Some(host_port.to_string());
         }
@@ -2563,7 +3646,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if !host_port.is_empty() {
             return Some(host_port.to_string());
         }
@@ -2573,7 +3665,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if !host_port.is_empty() {
             return Some(host_port.to_string());
         }
@@ -2589,7 +3690,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if !host_port.is_empty() {
             return Some(host_port.to_string());
         }
@@ -2606,7 +3716,16 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
-        let host_port = clean.split('@').last().unwrap_or(clean).split('/').next().unwrap_or(clean).split('?').next().unwrap_or(clean);
+        let host_port = clean
+            .split('@')
+            .next_back()
+            .unwrap_or(clean)
+            .split('/')
+            .next()
+            .unwrap_or(clean)
+            .split('?')
+            .next()
+            .unwrap_or(clean);
         if host_port.contains(':') {
             return Some(host_port.to_string());
         }
@@ -2683,7 +3802,8 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 // ---------------------------------------------------------------------------
 // Action Sinks (Flow Designer & Rule Actions)
 // ---------------------------------------------------------------------------
-static ACTIONS: LazyLock<RwLock<Vec<serde_json::Value>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+static ACTIONS: LazyLock<RwLock<Vec<serde_json::Value>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 pub async fn list_actions() -> Response {
     let list = ACTIONS.read().unwrap().clone();
@@ -2709,7 +3829,10 @@ pub async fn get_actions_summary() -> Response {
 
 pub async fn get_action(Path(id): Path<String>) -> Response {
     let actions = ACTIONS.read().unwrap();
-    if let Some(act) = actions.iter().find(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id)) {
+    if let Some(act) = actions
+        .iter()
+        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id))
+    {
         return (StatusCode::OK, Json(act.clone())).into_response();
     }
     let clean_id = id
@@ -2786,7 +3909,10 @@ pub async fn get_action(Path(id): Path<String>) -> Response {
 pub async fn create_action(Json(mut body): Json<serde_json::Value>) -> Response {
     if let Some(obj) = body.as_object_mut() {
         if !obj.contains_key("status") {
-            obj.insert("status".to_string(), serde_json::Value::String("connected".to_string()));
+            obj.insert(
+                "status".to_string(),
+                serde_json::Value::String("connected".to_string()),
+            );
         }
         if !obj.contains_key("node_status") {
             obj.insert(
@@ -2799,12 +3925,18 @@ pub async fn create_action(Json(mut body): Json<serde_json::Value>) -> Response 
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
-pub async fn update_action(Path(id): Path<String>, Json(mut body): Json<serde_json::Value>) -> Response {
+pub async fn update_action(
+    Path(id): Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
     }
     let mut actions = ACTIONS.write().unwrap();
-    if let Some(pos) = actions.iter().position(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id)) {
+    if let Some(pos) = actions
+        .iter()
+        .position(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id))
+    {
         actions[pos] = body.clone();
     } else {
         actions.push(body.clone());
@@ -2823,7 +3955,10 @@ pub async fn start_action(Path(id): Path<String>) -> Response {
     for a in actions.iter_mut() {
         if a.get("id").and_then(|v| v.as_str()) == Some(&id) {
             if let Some(obj) = a.as_object_mut() {
-                obj.insert("status".to_string(), serde_json::Value::String("connected".to_string()));
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String("connected".to_string()),
+                );
                 obj.insert("enable".to_string(), serde_json::Value::Bool(true));
             }
         }
@@ -2838,7 +3973,10 @@ pub async fn enable_action(Path((id, enable)): Path<(String, bool)>) -> Response
             if let Some(obj) = a.as_object_mut() {
                 obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
                 let status_str = if enable { "connected" } else { "stopped" };
-                obj.insert("status".to_string(), serde_json::Value::String(status_str.to_string()));
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status_str.to_string()),
+                );
             }
         }
     }
@@ -2857,7 +3995,8 @@ pub async fn get_action_metrics(Path(id): Path<String>) -> Response {
                 "rate": 0.0
             }
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn reset_action_metrics(Path(_id): Path<String>) -> Response {
@@ -2867,8 +4006,18 @@ pub async fn reset_action_metrics(Path(_id): Path<String>) -> Response {
 pub async fn get_action_types() -> Response {
     (
         StatusCode::OK,
-        Json(serde_json::json!(["kafka", "pgsql", "mysql", "redis", "mongodb", "clickhouse", "s3", "http"])),
-    ).into_response()
+        Json(serde_json::json!([
+            "kafka",
+            "pgsql",
+            "mysql",
+            "redis",
+            "mongodb",
+            "clickhouse",
+            "s3",
+            "http"
+        ])),
+    )
+        .into_response()
 }
 
 pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
@@ -2886,7 +4035,11 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
             }
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({ "result": "ok", "status": "connected" }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "result": "ok", "status": "connected" })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2894,21 +4047,19 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
 // ---------------------------------------------------------------------------
 
 static SOURCES: LazyLock<RwLock<Vec<serde_json::Value>>> = LazyLock::new(|| {
-    RwLock::new(vec![
-        serde_json::json!({
-            "id": "mqtt:telemetry-ingress",
-            "name": "telemetry-ingress",
-            "type": "mqtt",
-            "enable": true,
-            "status": "connected",
-            "rules": ["rule-1", "rule-3"],
-            "parameters": {
-                "topic": "sensors/#"
-            },
-            "description": "MQTT Ingress for IoT sensors",
-            "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
-        }),
-    ])
+    RwLock::new(vec![serde_json::json!({
+        "id": "mqtt:telemetry-ingress",
+        "name": "telemetry-ingress",
+        "type": "mqtt",
+        "enable": true,
+        "status": "connected",
+        "rules": ["rule-1", "rule-3"],
+        "parameters": {
+            "topic": "sensors/#"
+        },
+        "description": "MQTT Ingress for IoT sensors",
+        "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
+    })])
 });
 
 pub async fn list_sources() -> Response {
@@ -2935,7 +4086,10 @@ pub async fn get_sources_summary() -> Response {
 
 pub async fn get_source(Path(id): Path<String>) -> Response {
     let sources = SOURCES.read().unwrap();
-    if let Some(src) = sources.iter().find(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id)) {
+    if let Some(src) = sources
+        .iter()
+        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id))
+    {
         return (StatusCode::OK, Json(src.clone())).into_response();
     }
     (
@@ -2960,7 +4114,10 @@ pub async fn get_source(Path(id): Path<String>) -> Response {
 pub async fn create_source(Json(mut body): Json<serde_json::Value>) -> Response {
     if let Some(obj) = body.as_object_mut() {
         if !obj.contains_key("status") {
-            obj.insert("status".to_string(), serde_json::Value::String("connected".to_string()));
+            obj.insert(
+                "status".to_string(),
+                serde_json::Value::String("connected".to_string()),
+            );
         }
         if !obj.contains_key("node_status") {
             obj.insert(
@@ -2973,12 +4130,18 @@ pub async fn create_source(Json(mut body): Json<serde_json::Value>) -> Response 
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
-pub async fn update_source(Path(id): Path<String>, Json(mut body): Json<serde_json::Value>) -> Response {
+pub async fn update_source(
+    Path(id): Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
     }
     let mut sources = SOURCES.write().unwrap();
-    if let Some(pos) = sources.iter().position(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id)) {
+    if let Some(pos) = sources
+        .iter()
+        .position(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id))
+    {
         sources[pos] = body.clone();
     } else {
         sources.push(body.clone());
@@ -2999,7 +4162,10 @@ pub async fn enable_source(Path((id, enable)): Path<(String, bool)>) -> Response
             if let Some(obj) = s.as_object_mut() {
                 obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
                 let status_str = if enable { "connected" } else { "stopped" };
-                obj.insert("status".to_string(), serde_json::Value::String(status_str.to_string()));
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status_str.to_string()),
+                );
             }
         }
     }
@@ -3017,7 +4183,8 @@ pub async fn get_source_metrics(Path(id): Path<String>) -> Response {
                 "rate": 0.0
             }
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn reset_source_metrics(Path(_id): Path<String>) -> Response {
@@ -3025,10 +4192,7 @@ pub async fn reset_source_metrics(Path(_id): Path<String>) -> Response {
 }
 
 pub async fn probe_source() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "result": "ok" })),
-    ).into_response()
+    (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3065,7 +4229,10 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
     ).into_response()
 }
 
-pub async fn update_schema(Path(name): Path<String>, Json(body): Json<serde_json::Value>) -> Response {
+pub async fn update_schema(
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let mut resp = body;
     if let Some(obj) = resp.as_object_mut() {
         obj.insert("name".to_string(), serde_json::Value::String(name));
@@ -3090,7 +4257,8 @@ pub async fn list_schema_validations() -> Response {
                 "action": "drop"
             }
         ])),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn create_schema_validation(Json(body): Json<serde_json::Value>) -> Response {
@@ -3112,7 +4280,8 @@ pub async fn get_schema_validation(Path(name): Path<String>) -> Response {
             "description": "Validates inbound sensor JSON against Avro schema",
             "action": "drop"
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn delete_schema_validation(Path(_name): Path<String>) -> Response {
@@ -3126,7 +4295,8 @@ pub async fn enable_schema_validation(Path((name, enable)): Path<(String, bool)>
             "name": name,
             "enable": enable
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn get_schema_validation_metrics(Path(_name): Path<String>) -> Response {
@@ -3137,7 +4307,8 @@ pub async fn get_schema_validation_metrics(Path(_name): Path<String>) -> Respons
             "fail": 0,
             "rate": 0.0
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 pub async fn reset_schema_validation_metrics(Path(_name): Path<String>) -> Response {

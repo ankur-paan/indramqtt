@@ -975,6 +975,7 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             max_retries: Some(4),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_500),
+            timeout_ms: None,
         }
     }
 

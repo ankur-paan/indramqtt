@@ -926,13 +926,10 @@ impl NativeMongoDbTransport {
             ));
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let stream = tokio::time::timeout(
-            self.timeout,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("mongodb connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("mongodb connect failed: {e}")))?;
+        let stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("mongodb connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("mongodb connect failed: {e}")))?;
         *self.stream.lock().await = Some(stream);
         // Hello (maxWireVersion selects the command surface).
         let mut hello = BsonDocument::new();

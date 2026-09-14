@@ -847,6 +847,7 @@ mod tests {
             buffer_capacity: None,
             linger_ms: Some(50),
             max_retries: Some(5),
+            timeout_ms: None,
         }
     }
 

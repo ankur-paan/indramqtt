@@ -50,10 +50,11 @@ connect_forwards_credentials_in_bind_test() ->
         ?assertEqual(<<"dev-auth">>, maps:get(client_id, Bind)),
         ?assertEqual(<<"alice">>, maps:get(username, Bind)),
         ?assertEqual(<<"s3cret">>, maps:get(password, Bind)),
-        %% Auth rejection (RC 0x86) still yields CONNACK-then-close.
+        %% Auth rejection (kernel RC 0x86) still yields CONNACK-then-close,
+        %% with the MQTT 3.1.1 code 4 (bad user name or password).
         Binding = indra_brokerlink:encode_session_binding_meta(0, false, 16#86),
         ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
-        ?assertEqual(<<16#20, 16#02, 16#00, 16#86>>,
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#04>>,
                      recv_exact(Client, 4)),
         ?assertEqual({error, closed}, gen_tcp:recv(Client, 0, ?RECV_TIMEOUT))
     after

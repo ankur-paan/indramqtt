@@ -353,7 +353,8 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
         {ok, #{session_id := SessionId,
                session_present := Present,
                return_code := RC}} ->
-            Connack = indra_mqtt_codec:encode_connack(Present, RC),
+            Connack = indra_mqtt_codec:encode_connack(
+                        Present, indra_mqtt_codec:connack_return_code(RC)),
             case sock_send(Mod, Sock, Connack) of
                 ok when RC =:= 0 ->
                     Pending = maps:get(pending, Data, #{client_id => <<>>,

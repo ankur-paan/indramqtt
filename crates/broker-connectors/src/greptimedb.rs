@@ -213,6 +213,22 @@ pub fn value_to_sql_literal(val: &GreptimeValue) -> String {
     }
 }
 
+/// Quote a SQL identifier (table or column name).
+///
+/// Names matching `^[a-z_][a-z0-9_]*$` are returned unchanged. Every other
+/// name is wrapped in double quotes, with any `"` inside doubled.
+pub fn quote_sql_ident(name: &str) -> String {
+    if !name.is_empty() {
+        let mut bytes = name.bytes();
+        let first = bytes.next().unwrap_or(b' ');
+        let first_ok = first == b'_' || first.is_ascii_lowercase();
+        if first_ok && bytes.all(|b| b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return name.to_string();
+        }
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Build batch SQL insert statement for a group of records sharing the same table.
 pub fn build_greptime_sql_insert(table: &str, records: &[GreptimeRecord]) -> Result<String> {
     if records.is_empty() {
@@ -220,10 +236,30 @@ pub fn build_greptime_sql_insert(table: &str, records: &[GreptimeRecord]) -> Res
             "cannot build sql insert for 0 records".into(),
         ));
     }
+    if table.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "greptimedb table name cannot be empty".into(),
+        ));
+    }
 
-    let cols: Vec<String> = records[0].fields.iter().map(|(c, _)| c.clone()).collect();
-    let mut col_list = vec!["ts".to_string()];
-    col_list.extend(cols.clone());
+    let mut cols: Vec<String> = Vec::new();
+    for rec in records {
+        for (c, _) in &rec.fields {
+            // Defensive second line: unreachable from `send()`, which rejects empty names at extract time.
+            if c.is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "greptimedb column name cannot be empty".into(),
+                ));
+            }
+            if !cols.iter().any(|existing| existing == c) {
+                cols.push(c.clone());
+            }
+        }
+    }
+    let mut col_list = vec![quote_sql_ident("ts")];
+    for col in &cols {
+        col_list.push(quote_sql_ident(col));
+    }
 
     let mut row_values = Vec::with_capacity(records.len());
     for rec in records {
@@ -242,27 +278,55 @@ pub fn build_greptime_sql_insert(table: &str, records: &[GreptimeRecord]) -> Res
 
     Ok(format!(
         "INSERT INTO {} ({}) VALUES {}",
-        table,
+        quote_sql_ident(table),
         col_list.join(", "),
         row_values.join(", ")
     ))
+}
+
+/// Escape an InfluxDB line protocol measurement (` ,` and space).
+fn escape_influx_measurement(s: &str) -> String {
+    s.replace(',', "\\,").replace(' ', "\\ ")
+}
+
+/// Escape an InfluxDB line protocol field key (`,`, `=` and space).
+fn escape_influx_field_key(s: &str) -> String {
+    s.replace(',', "\\,")
+        .replace('=', "\\=")
+        .replace(' ', "\\ ")
+}
+
+/// Escape an InfluxDB line protocol string field value.
+fn escape_influx_string_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Build Influx line protocol body from records.
 pub fn build_influx_line_protocol(records: &[GreptimeRecord]) -> String {
     let mut out = String::new();
     for rec in records {
-        out.push_str(&rec.table);
+        out.push_str(&escape_influx_measurement(&rec.table));
 
         // Fields
         let mut field_strings = Vec::new();
         for (k, v) in &rec.fields {
+            let ek = escape_influx_field_key(k);
             match v {
                 GreptimeValue::Null => continue,
-                GreptimeValue::Boolean(b) => field_strings.push(format!("{k}={b}")),
-                GreptimeValue::Integer(i) => field_strings.push(format!("{k}={i}i")),
-                GreptimeValue::Number(f) => field_strings.push(format!("{k}={f}")),
-                GreptimeValue::String(s) => field_strings.push(format!("{k}=\"{s}\"")),
+                GreptimeValue::Boolean(b) => field_strings.push(format!("{ek}={b}")),
+                GreptimeValue::Integer(i) => field_strings.push(format!("{ek}={i}i")),
+                GreptimeValue::Number(f) => {
+                    if !f.is_finite() {
+                        continue;
+                    }
+                    field_strings.push(format!("{ek}={f}"));
+                }
+                GreptimeValue::String(s) => {
+                    field_strings.push(format!("{ek}=\"{}\"", escape_influx_string_value(s)))
+                }
             }
         }
 
@@ -298,10 +362,20 @@ pub fn extract_greptime_record(
             if k == "payload" && v.is_object() {
                 if let serde_json::Value::Object(submap) = v {
                     for (sk, sv) in submap {
+                        if sk.is_empty() {
+                            return Err(ConnectorError::Dispatch(
+                                "greptimedb payload has an empty field name".into(),
+                            ));
+                        }
                         fields.push((sk, json_to_greptime_value(&sv)));
                     }
                 }
             } else {
+                if k.is_empty() {
+                    return Err(ConnectorError::Dispatch(
+                        "greptimedb payload has an empty field name".into(),
+                    ));
+                }
                 fields.push((k, json_to_greptime_value(&v)));
             }
         }
@@ -441,6 +515,8 @@ pub struct MockGreptimeDbTransport {
     pub captured_influx: Mutex<Vec<(String, String)>>,
     pub fail_count: Mutex<usize>,
     pub is_terminal: Mutex<bool>,
+    pub fail_sql_on_call: Mutex<Option<usize>>,
+    pub sql_call_count: Mutex<usize>,
 }
 
 impl MockGreptimeDbTransport {
@@ -450,6 +526,8 @@ impl MockGreptimeDbTransport {
             captured_influx: Mutex::new(Vec::new()),
             fail_count: Mutex::new(0),
             is_terminal: Mutex::new(false),
+            fail_sql_on_call: Mutex::new(None),
+            sql_call_count: Mutex::new(0),
         }
     }
 
@@ -459,6 +537,8 @@ impl MockGreptimeDbTransport {
             captured_influx: Mutex::new(Vec::new()),
             fail_count: Mutex::new(failures),
             is_terminal: Mutex::new(false),
+            fail_sql_on_call: Mutex::new(None),
+            sql_call_count: Mutex::new(0),
         }
     }
 
@@ -468,6 +548,20 @@ impl MockGreptimeDbTransport {
             captured_influx: Mutex::new(Vec::new()),
             fail_count: Mutex::new(1),
             is_terminal: Mutex::new(true),
+            fail_sql_on_call: Mutex::new(None),
+            sql_call_count: Mutex::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_fail_sql_on_call(call_no: usize) -> Self {
+        Self {
+            captured_sqls: Mutex::new(Vec::new()),
+            captured_influx: Mutex::new(Vec::new()),
+            fail_count: Mutex::new(0),
+            is_terminal: Mutex::new(false),
+            fail_sql_on_call: Mutex::new(Some(call_no)),
+            sql_call_count: Mutex::new(0),
         }
     }
 }
@@ -482,6 +576,19 @@ impl Default for MockGreptimeDbTransport {
 impl GreptimeDbTransport for MockGreptimeDbTransport {
     async fn post_sql(&self, sql: &str) -> Result<()> {
         self.captured_sqls.lock().push(sql.to_string());
+
+        let call_no = {
+            let mut count = self.sql_call_count.lock();
+            *count += 1;
+            *count
+        };
+        if let Some(want) = *self.fail_sql_on_call.lock() {
+            if call_no == want {
+                return Err(ConnectorError::Connection(
+                    "mock greptimedb transient 500 error".into(),
+                ));
+            }
+        }
 
         let mut fails = self.fail_count.lock();
         if *fails > 0 {
@@ -553,7 +660,13 @@ impl GreptimeDbSink {
         self.sent.load(Ordering::Relaxed)
     }
 
+    pub fn buffered_rows(&self) -> usize {
+        self.queue.lock().len()
+    }
+
     pub async fn flush(&self) -> Result<()> {
+        self.backoff.lock().check()?;
+
         let (records, oldest) = {
             let mut q = self.queue.lock();
             if q.is_empty() {
@@ -566,24 +679,52 @@ impl GreptimeDbSink {
             return Ok(());
         }
 
-        self.backoff.lock().check()?;
-
         match self.config.format {
             GreptimeFormat::SqlInsert => {
-                let table = records[0].table.clone();
-                let sql = build_greptime_sql_insert(&table, &records)?;
-                match self.transport.post_sql(&sql).await {
-                    Ok(_) => {
-                        self.backoff.lock().success();
-                        self.sent.fetch_add(records.len() as u64, Ordering::Relaxed);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        self.backoff.lock().failure();
-                        self.queue.lock().restore(records, oldest);
-                        Err(e)
+                let mut tables: Vec<String> = Vec::new();
+                let mut groups: Vec<Vec<GreptimeRecord>> = Vec::new();
+                let mut index: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for rec in records {
+                    if let Some(&pos) = index.get(&rec.table) {
+                        groups[pos].push(rec);
+                    } else {
+                        index.insert(rec.table.clone(), groups.len());
+                        tables.push(rec.table.clone());
+                        groups.push(vec![rec]);
                     }
                 }
+                for idx in 0..tables.len() {
+                    let sql = match build_greptime_sql_insert(&tables[idx], &groups[idx]) {
+                        Ok(sql) => sql,
+                        Err(e) => {
+                            self.backoff.lock().failure();
+                            let mut remaining = Vec::new();
+                            for g in groups.into_iter().skip(idx) {
+                                remaining.extend(g);
+                            }
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        }
+                    };
+                    match self.transport.post_sql(&sql).await {
+                        Ok(_) => {
+                            self.sent
+                                .fetch_add(groups[idx].len() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            self.backoff.lock().failure();
+                            let mut remaining = Vec::new();
+                            for g in groups.into_iter().skip(idx) {
+                                remaining.extend(g);
+                            }
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        }
+                    }
+                }
+                self.backoff.lock().success();
+                Ok(())
             }
             GreptimeFormat::InfluxLineProtocol => {
                 let lines = build_influx_line_protocol(&records);
@@ -840,5 +981,225 @@ mod tests {
             term_res.err().unwrap(),
             ConnectorError::Dispatch(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_backoff_keeps_buffered_rows() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockGreptimeDbTransport::with_transient_failures(1));
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload1 = Bytes::from_static(br#"{"val": 99.0}"#);
+        let payload2 = Bytes::from_static(br#"{"val": 100.0}"#);
+
+        sink.send(&topic, &payload1, QoS::AtLeastOnce)
+            .await
+            .expect("buffer first row");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // First flush fails transiently, restores the batch and enters backoff.
+        let first = sink.flush().await;
+        assert!(first.is_err());
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Still inside the backoff window: flush must fail without dropping rows.
+        sink.send(&topic, &payload2, QoS::AtLeastOnce)
+            .await
+            .expect("buffer second row");
+        let second = sink.flush().await;
+        assert!(second.is_err());
+        assert_eq!(sink.buffered_rows(), 2);
+
+        // After the backoff resets, one flush delivers both rows exactly once.
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry flush succeeds");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 2);
+        let sqls = transport.captured_sqls.lock();
+        assert_eq!(sqls.len(), 2);
+        assert_eq!(sqls[1].matches("), (").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sql_mixed_tables_one_insert_per_table() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(10);
+        cfg.table_template = "metrics_${topic_segment_1}".to_string();
+        let transport = Arc::new(MockGreptimeDbTransport::new());
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic_a = Topic::new("plant/a").unwrap();
+        let topic_b = Topic::new("plant/b").unwrap();
+        sink.send(
+            &topic_a,
+            &Bytes::from_static(br#"{"v": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer a1");
+        sink.send(
+            &topic_b,
+            &Bytes::from_static(br#"{"v": 2}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer b");
+        sink.send(
+            &topic_a,
+            &Bytes::from_static(br#"{"v": 3}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer a2");
+        sink.flush().await.expect("flush succeeds");
+
+        let sqls = transport.captured_sqls.lock();
+        assert_eq!(sqls.len(), 2);
+        assert!(sqls[0].starts_with("INSERT INTO metrics_a "));
+        assert_eq!(sqls[0].matches("), (").count(), 1);
+        assert!(sqls[1].starts_with("INSERT INTO metrics_b "));
+        assert_eq!(sqls[1].matches("), (").count(), 0);
+    }
+
+    #[test]
+    fn test_sql_union_of_columns() {
+        let records = vec![
+            GreptimeRecord {
+                table: "t".to_string(),
+                timestamp: 1000,
+                fields: vec![("a".to_string(), GreptimeValue::Integer(1))],
+            },
+            GreptimeRecord {
+                table: "t".to_string(),
+                timestamp: 2000,
+                fields: vec![
+                    ("a".to_string(), GreptimeValue::Integer(2)),
+                    ("b".to_string(), GreptimeValue::Integer(3)),
+                ],
+            },
+        ];
+        let sql = build_greptime_sql_insert("t", &records).expect("valid sql");
+        assert!(sql.starts_with("INSERT INTO t (ts, a, b) VALUES "));
+        assert!(sql.contains("(1000, 1, NULL)"));
+        assert!(sql.contains("(2000, 2, 3)"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_failed_second_table_restores_only_unsent() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(10);
+        cfg.table_template = "metrics_${topic_segment_1}".to_string();
+        let transport = Arc::new(MockGreptimeDbTransport::with_fail_sql_on_call(2));
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic_a = Topic::new("plant/a").unwrap();
+        let topic_b = Topic::new("plant/b").unwrap();
+        sink.send(
+            &topic_a,
+            &Bytes::from_static(br#"{"v": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer a");
+        sink.send(
+            &topic_b,
+            &Bytes::from_static(br#"{"v": 2}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer b");
+
+        let res = sink.flush().await;
+        assert!(res.is_err());
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(sink.buffered_rows(), 1);
+
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry succeeds");
+        assert_eq!(sink.sent_count(), 2);
+        assert_eq!(sink.buffered_rows(), 0);
+        let sqls = transport.captured_sqls.lock();
+        assert_eq!(sqls.len(), 3);
+        assert!(sqls[0].starts_with("INSERT INTO metrics_a "));
+        assert!(sqls[1].starts_with("INSERT INTO metrics_b "));
+        assert!(sqls[2].starts_with("INSERT INTO metrics_b "));
+        assert_eq!(sqls[2].matches("), (").count(), 0);
+    }
+
+    #[test]
+    fn test_sql_hostile_column_name_is_quoted() {
+        let hostile = "a) VALUES (1); DROP TABLE t; --".to_string();
+        let records = vec![GreptimeRecord {
+            table: "metrics".to_string(),
+            timestamp: 1700000000,
+            fields: vec![(hostile.clone(), GreptimeValue::Integer(1))],
+        }];
+        let sql = build_greptime_sql_insert("metrics", &records).expect("valid sql");
+        assert!(sql.contains(&format!("\"{hostile}\"")));
+        assert_eq!(sql.matches("INSERT INTO").count(), 1);
+    }
+
+    #[test]
+    fn test_sql_mixed_case_and_quote_identifiers() {
+        let records = vec![GreptimeRecord {
+            table: "metrics".to_string(),
+            timestamp: 1700000000,
+            fields: vec![
+                ("Temp\"x".to_string(), GreptimeValue::Integer(1)),
+                ("temp_c".to_string(), GreptimeValue::Integer(2)),
+            ],
+        }];
+        let sql = build_greptime_sql_insert("metrics", &records).expect("valid sql");
+        assert!(sql.contains("\"Temp\"\"x\""));
+        assert!(sql.contains("temp_c"));
+        assert!(!sql.contains("\"temp_c\""));
+    }
+
+    #[test]
+    fn test_influx_escaping_keeps_one_line_per_record() {
+        let records = vec![GreptimeRecord {
+            table: "device_telemetry".to_string(),
+            timestamp: 1700000000000000000,
+            fields: vec![
+                (
+                    "my key,x=1".to_string(),
+                    GreptimeValue::String("a\"b\\c\nd".to_string()),
+                ),
+                ("nanf".to_string(), GreptimeValue::Number(f64::NAN)),
+            ],
+        }];
+        let lines = build_influx_line_protocol(&records);
+        assert!(lines.ends_with('\n'));
+        assert_eq!(lines.matches('\n').count(), 1);
+        assert!(!lines[..lines.len() - 1].contains('\n'));
+        assert!(lines.contains("my\\ key\\,x\\=1="));
+        assert!(lines.contains("a\\\"b\\\\c\\nd"));
+        assert!(!lines.contains("nanf"));
+    }
+
+    #[tokio::test]
+    async fn test_empty_field_name_rejected_at_send() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockGreptimeDbTransport::new());
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let bad = Bytes::from_static(br#"{"": 1}"#);
+        let res = sink.send(&topic, &bad, QoS::AtLeastOnce).await;
+        assert!(matches!(res, Err(ConnectorError::Dispatch(_))));
+        assert_eq!(sink.buffered_rows(), 0);
+
+        let good = Bytes::from_static(br#"{"val": 1}"#);
+        sink.send(&topic, &good, QoS::AtLeastOnce)
+            .await
+            .expect("valid message buffers");
+        assert_eq!(sink.buffered_rows(), 1);
+        sink.flush().await.expect("flush succeeds");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(transport.captured_sqls.lock().len(), 1);
     }
 }

@@ -438,7 +438,10 @@ pub fn decode_response(frame: &[u8]) -> Result<KvResponse> {
 }
 
 /// Read one response packet from the stream.
-async fn read_response(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<KvResponse> {
+async fn read_response(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+) -> Result<KvResponse> {
     let mut header = [0u8; 24];
     tokio::time::timeout(timeout, stream.read_exact(&mut header))
         .await
@@ -650,13 +653,10 @@ impl NativeCouchbaseTransport {
             ));
         }
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("couchbase connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("couchbase connect failed: {e}")))?;
+        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| ConnectorError::Connection(format!("couchbase connect timeout: {addr}")))?
+            .map_err(|e| ConnectorError::Connection(format!("couchbase connect failed: {e}")))?;
         let token = encode_plain_token(&self.username, &self.password);
         let opaque = self.opaque.fetch_add(1, Ordering::SeqCst) as u32;
         let auth = encode_request(opcode::SASL_AUTH, b"PLAIN", &[], &token, opaque);

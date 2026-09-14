@@ -13,6 +13,7 @@
          encode_remaining_length/1,
          decode_connect/1,
          encode_connack/2,
+         connack_return_code/1,
          decode_subscribe/1,
          encode_suback/2,
          decode_publish/2,
@@ -147,6 +148,19 @@ encode_connack(SessionPresent, ReturnCode)
        is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255 ->
     SP = case SessionPresent of true -> 1; false -> 0 end,
     <<16#20, 16#02, SP:8, ReturnCode:8>>.
+
+%% @doc Map a kernel bind return code to an MQTT 3.1.1 CONNACK return
+%% code. The kernel answers with MQTT 5 reason codes (e.g. 16#86 bad
+%% user name or password), but 3.1.1 only defines 0..5 and reserves the
+%% rest, so reason codes fold into their closest 3.1.1 equivalent.
+-spec connack_return_code(0..255) -> 0..5.
+connack_return_code(RC) when is_integer(RC), RC >= 0, RC =< 5 -> RC;
+connack_return_code(16#84) -> 1;   %% unsupported protocol version
+connack_return_code(16#85) -> 2;   %% client identifier not valid
+connack_return_code(16#86) -> 4;   %% bad user name or password
+connack_return_code(16#87) -> 5;   %% not authorized
+connack_return_code(16#8A) -> 5;   %% banned
+connack_return_code(_) -> 3.       %% server unavailable, busy or over quota
 
 %% @doc Decode an MQTT SUBSCRIBE payload (packet id + filter list).
 %%

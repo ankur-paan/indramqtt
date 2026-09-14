@@ -288,7 +288,10 @@ impl Shared {
         let _ = engine.create_rule(
             "telemetry-to-postgres".to_string(),
             TopicFilter::new("sensors/+/telemetry").unwrap(),
-            Some("SELECT payload.temperature as temp, clientid FROM \"sensors/+/telemetry\"".to_string()),
+            Some(
+                "SELECT payload.temperature as temp, clientid FROM \"sensors/+/telemetry\""
+                    .to_string(),
+            ),
             true,
             vec![broker_rules::RuleAction::ForwardConnector {
                 connector_id: "pgsql:postgres-analytics".to_string(),

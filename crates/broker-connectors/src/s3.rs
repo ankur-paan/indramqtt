@@ -202,7 +202,7 @@ fn sanitize_topic(topic: &str) -> String {
 }
 
 /// One buffered ndjson line plus the topic it arrived on (the flush
-/// key partitions on the first row's topic).
+/// key is resolved per row and rows sharing a key share one object).
 #[derive(Debug, Clone)]
 struct S3Row {
     topic: String,
@@ -475,57 +475,134 @@ impl S3Sink {
         self.buffer.lock().bytes
     }
 
-    /// Flush buffered rows as one object (no-op when empty). While
-    /// backing off, fails fast without touching the transport. Any
-    /// failure restores rows + byte count, engages backoff, propagates.
+    /// Flush buffered rows as one object per key group (no-op when
+    /// empty). Rows share an object only when their key renders
+    /// identically under the same `key_seq`/`now`. While backing off,
+    /// fails fast without touching the transport. Any failure restores
+    /// the failed group plus every unsent group, engages backoff,
+    /// propagates.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
-        let (rows, oldest, taken_bytes) = {
+        let (rows, oldest) = {
             let mut buffer = self.buffer.lock();
             let (rows, oldest) = buffer.queue.take_batch();
-            let taken = std::mem::replace(&mut buffer.bytes, 0);
-            (rows, oldest, taken)
+            buffer.bytes = 0;
+            (rows, oldest)
         };
         if rows.is_empty() {
             return Ok(());
         }
         let key_seq = self.key_seq.fetch_add(1, Ordering::SeqCst);
-        let key = self
-            .config
-            .resolve_key(&rows[0].topic, key_seq, now_millis())
-            .unwrap_or_else(|_| format!("unkeyed/{key_seq}.ndjson"));
-        let mut raw = String::new();
+        let now = now_millis();
+        // Group by the key rendered with the same `key_seq`/`now`,
+        // keeping first-seen group order. Rows whose key fails to
+        // resolve share one `unkeyed/{key_seq}.ndjson` group so no row
+        // overwrites another; one warn per flush names the count.
+        let unkeyed_key = format!("unkeyed/{key_seq}.ndjson");
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut group_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut row_group: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut unkeyed_count = 0usize;
+        let mut first_unkeyed_error: Option<String> = None;
         for row in &rows {
-            raw.push_str(&row.line);
-            raw.push('\n');
-        }
-        let (body, content_encoding) = match self.config.compression {
-            S3Compression::None => (raw.into_bytes(), None),
-            S3Compression::Gzip => (gzip_bytes(raw.as_bytes())?, Some("gzip")),
-        };
-        let put = S3Put {
-            bucket: self.config.bucket.clone(),
-            key,
-            body,
-            content_type: "application/x-ndjson",
-            content_encoding,
-        };
-        let record_count = rows.len() as u64;
-        match self.transport.put_object(&put).await {
-            Ok(()) => {
-                self.backoff.lock().success();
-                self.sent_objects.fetch_add(1, Ordering::Relaxed);
-                self.sent_records.fetch_add(record_count, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                let mut buffer = self.buffer.lock();
-                buffer.queue.restore(rows, oldest);
-                buffer.bytes = buffer.bytes.saturating_add(taken_bytes);
-                self.backoff.lock().failure();
-                Err(e)
+            match self.config.resolve_key(&row.topic, key_seq, now) {
+                Ok(key) => {
+                    if let Some(&gi) = group_index.get(&key) {
+                        row_group.push(gi);
+                    } else {
+                        let gi = group_keys.len();
+                        group_keys.push(key.clone());
+                        group_index.insert(key, gi);
+                        row_group.push(gi);
+                    }
+                }
+                Err(e) => {
+                    unkeyed_count += 1;
+                    if first_unkeyed_error.is_none() {
+                        first_unkeyed_error = Some(e.to_string());
+                    }
+                    if let Some(&gi) = group_index.get(&unkeyed_key) {
+                        row_group.push(gi);
+                    } else {
+                        let gi = group_keys.len();
+                        group_keys.push(unkeyed_key.clone());
+                        group_index.insert(unkeyed_key.clone(), gi);
+                        row_group.push(gi);
+                    }
+                }
             }
         }
+        if unkeyed_count > 0 {
+            tracing::warn!(
+                unkeyed_count,
+                error = %first_unkeyed_error.unwrap_or_default(),
+                "s3 key resolution failed; using unkeyed fallback"
+            );
+        }
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_keys.len()];
+        for (ri, gi) in row_group.iter().enumerate() {
+            members[*gi].push(ri);
+        }
+        for (gi, key) in group_keys.iter().enumerate() {
+            let mut raw = String::new();
+            for &ri in &members[gi] {
+                raw.push_str(&rows[ri].line);
+                raw.push('\n');
+            }
+            let (body, content_encoding) = match self.config.compression {
+                S3Compression::None => (raw.into_bytes(), None),
+                S3Compression::Gzip => match gzip_bytes(raw.as_bytes()) {
+                    Ok(body) => (body, Some("gzip")),
+                    Err(e) => {
+                        let mut unsent = Vec::new();
+                        let mut unsent_bytes = 0usize;
+                        for (ri, row) in rows.into_iter().enumerate() {
+                            if row_group[ri] >= gi {
+                                unsent_bytes = unsent_bytes.saturating_add(row.line.len() + 1);
+                                unsent.push(row);
+                            }
+                        }
+                        let mut buffer = self.buffer.lock();
+                        buffer.queue.restore(unsent, oldest);
+                        buffer.bytes = buffer.bytes.saturating_add(unsent_bytes);
+                        self.backoff.lock().failure();
+                        return Err(e);
+                    }
+                },
+            };
+            let put = S3Put {
+                bucket: self.config.bucket.clone(),
+                key: key.clone(),
+                body,
+                content_type: "application/x-ndjson",
+                content_encoding,
+            };
+            let record_count = members[gi].len() as u64;
+            match self.transport.put_object(&put).await {
+                Ok(()) => {
+                    self.sent_objects.fetch_add(1, Ordering::Relaxed);
+                    self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let mut unsent = Vec::new();
+                    let mut unsent_bytes = 0usize;
+                    for (ri, row) in rows.into_iter().enumerate() {
+                        if row_group[ri] >= gi {
+                            unsent_bytes = unsent_bytes.saturating_add(row.line.len() + 1);
+                            unsent.push(row);
+                        }
+                    }
+                    let mut buffer = self.buffer.lock();
+                    buffer.queue.restore(unsent, oldest);
+                    buffer.bytes = buffer.bytes.saturating_add(unsent_bytes);
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
+            }
+        }
+        self.backoff.lock().success();
+        Ok(())
     }
 
     /// Validate + buffer one event. Returns true when the batch is
@@ -604,6 +681,7 @@ mod tests {
             batch_size: 1_000,
             batch_bytes: 5 * 1024 * 1024,
             batch_timeout_ms: 60_000,
+            timeout_ms: None,
         }
     }
 
@@ -804,5 +882,176 @@ mod tests {
              SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
              Signature=54b9cbdbd7a85d624f7dfa9adad6e1ba873e991b117d420451f1cc4dac8e5331"
         );
+    }
+
+    /// Test-only transport failing exactly one call number (1-indexed).
+    struct FailNthTransport {
+        puts: parking_lot::Mutex<Vec<S3Put>>,
+        calls: AtomicU64,
+        fail_on_call: u64,
+    }
+
+    impl FailNthTransport {
+        fn new(fail_on_call: u64) -> Self {
+            Self {
+                puts: parking_lot::Mutex::new(Vec::new()),
+                calls: AtomicU64::new(0),
+                fail_on_call,
+            }
+        }
+
+        fn puts(&self) -> Vec<S3Put> {
+            self.puts.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl S3Transport for FailNthTransport {
+        async fn put_object(&self, put: &S3Put) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_call {
+                return Err(ConnectorError::Connection("mock s3 down".to_string()));
+            }
+            self.puts.lock().push(put.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mixed_topics_write_one_object_per_topic() {
+        let transport = Arc::new(MockS3Transport::new());
+        let mut config = test_config();
+        config.key_template = "keys/${topic}-${seq}.ndjson".to_string();
+        config.batch_size = 1_000;
+        let sink = S3Sink::new(config, transport.clone()).unwrap();
+
+        for topic in ["a/x", "b/y", "a/x"] {
+            sink.send(
+                &Topic::new(topic).unwrap(),
+                &Bytes::from("{}"),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 3);
+        sink.flush().await.unwrap();
+
+        let puts = transport.puts();
+        assert_eq!(puts.len(), 2, "one object per topic, got {puts:?}");
+        assert_eq!(puts[0].key, "keys/a/x-0.ndjson");
+        assert_eq!(puts[1].key, "keys/b/y-0.ndjson");
+        let first_body = String::from_utf8(puts[0].body.clone()).unwrap();
+        let second_body = String::from_utf8(puts[1].body.clone()).unwrap();
+        assert_eq!(first_body.lines().count(), 2);
+        assert_eq!(second_body.lines().count(), 1);
+        for line in first_body.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["topic"], "a/x");
+        }
+        let row: serde_json::Value =
+            serde_json::from_str(second_body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["topic"], "b/y");
+        assert_eq!(sink.sent_objects(), 2);
+        assert_eq!(sink.sent_records(), 3);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_second_object_restores_only_unsent() {
+        let transport = Arc::new(FailNthTransport::new(2));
+        let mut config = test_config();
+        config.key_template = "keys/${topic}-${seq}.ndjson".to_string();
+        config.batch_size = 1_000;
+        let sink = S3Sink::new(config, transport.clone()).unwrap();
+
+        sink.send(
+            &Topic::new("a/x").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("b/y").unwrap(),
+            &Bytes::from("{}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        let err = sink.flush().await.expect_err("second put must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        // First group uploaded, second group restored.
+        assert_eq!(sink.sent_objects(), 1);
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.buffered_rows(), 1);
+        let puts = transport.puts();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].key, "keys/a/x-0.ndjson");
+        assert!(sink.buffered_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_unkeyed_rows_share_one_object() {
+        // `resolve_key` fails when the sanitized topic leaves a key
+        // starting with '/': template `${topic}-${seq}.ndjson` with a
+        // leading-slash topic such as `/a` renders `/a-0.ndjson`.
+        let transport = Arc::new(MockS3Transport::new());
+        let mut config = test_config();
+        config.key_template = "${topic}-${seq}.ndjson".to_string();
+        config.batch_size = 1_000;
+        let sink = S3Sink::new(config, transport.clone()).unwrap();
+
+        for topic in ["/a", "/b", "ok/topic"] {
+            sink.send(
+                &Topic::new(topic).unwrap(),
+                &Bytes::from("{}"),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 3);
+        sink.flush().await.unwrap();
+
+        let puts = transport.puts();
+        assert_eq!(
+            puts.len(),
+            2,
+            "one unkeyed object + one normal, got {puts:?}"
+        );
+        let unkeyed: Vec<&S3Put> = puts
+            .iter()
+            .filter(|put| put.key.starts_with("unkeyed/"))
+            .collect();
+        assert_eq!(unkeyed.len(), 1, "unkeyed rows must share one object");
+        assert_eq!(unkeyed[0].key, "unkeyed/0.ndjson");
+        let body = String::from_utf8(unkeyed[0].body.clone()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "both unkeyed rows in one body");
+        let mut topics: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["topic"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        topics.sort();
+        assert_eq!(topics, vec!["/a".to_string(), "/b".to_string()]);
+        let normal: Vec<&S3Put> = puts
+            .iter()
+            .filter(|put| !put.key.starts_with("unkeyed/"))
+            .collect();
+        assert_eq!(normal.len(), 1);
+        let normal_body = String::from_utf8(normal[0].body.clone()).unwrap();
+        assert_eq!(normal_body.lines().count(), 1);
+        let row: serde_json::Value =
+            serde_json::from_str(normal_body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["topic"], "ok/topic");
+        assert_eq!(sink.sent_objects(), 2);
+        assert_eq!(sink.sent_records(), 3);
+        assert_eq!(sink.buffered_rows(), 0);
     }
 }

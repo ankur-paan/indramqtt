@@ -18,6 +18,15 @@ use super::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const PG_MAX_BIND_PARAMS: usize = 65535;
+
+fn rows_per_statement(columns: usize, max_params: usize) -> usize {
+    if columns == 0 {
+        return 1;
+    }
+    std::cmp::max(1, max_params / columns)
+}
+
 fn default_batch_size() -> Option<usize> {
     Some(500)
 }
@@ -129,6 +138,27 @@ pub fn classify_cockroach_sqlstate(sqlstate_or_msg: &str) -> CockroachErrorClass
     }
 }
 
+/// Quote a PostgreSQL identifier if needed.
+///
+/// Names matching `^[a-z_][a-z0-9_]*$` are returned unchanged so existing
+/// lower-case schemas behave exactly as today; any other non-empty name is
+/// wrapped in double quotes with embedded `"` doubled.
+fn quote_pg_ident(name: &str) -> Result<String> {
+    if name.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "cannot quote empty identifier".into(),
+        ));
+    }
+    let mut bytes = name.bytes();
+    let first = bytes.next().expect("non-empty checked above");
+    let first_ok = first == b'_' || first.is_ascii_lowercase();
+    let rest_ok = bytes.all(|b| b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit());
+    if first_ok && rest_ok {
+        return Ok(name.to_string());
+    }
+    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
 /// Build a native CockroachDB `UPSERT INTO` query with multi-row parameter renumbering.
 pub fn build_native_upsert_query(
     table: &str,
@@ -146,7 +176,11 @@ pub fn build_native_upsert_query(
         ));
     }
 
-    let cols_joined = columns.join(", ");
+    let mut quoted = Vec::with_capacity(columns.len());
+    for c in columns {
+        quoted.push(quote_pg_ident(c)?);
+    }
+    let cols_joined = quoted.join(", ");
     let mut row_placeholders = Vec::with_capacity(row_count);
 
     for r in 0..row_count {
@@ -187,7 +221,11 @@ pub fn build_on_conflict_upsert_query(
         ));
     }
 
-    let cols_joined = columns.join(", ");
+    let mut quoted_cols = Vec::with_capacity(columns.len());
+    for c in columns {
+        quoted_cols.push(quote_pg_ident(c)?);
+    }
+    let cols_joined = quoted_cols.join(", ");
     let mut row_placeholders = Vec::with_capacity(row_count);
 
     for r in 0..row_count {
@@ -197,18 +235,24 @@ pub fn build_on_conflict_upsert_query(
         row_placeholders.push(format!("({})", placeholders.join(", ")));
     }
 
-    let update_sets: Vec<String> = columns
-        .iter()
-        .filter(|c| !conflict_keys.contains(c))
-        .map(|c| format!("{} = EXCLUDED.{}", c, c))
-        .collect();
+    let mut update_sets: Vec<String> = Vec::new();
+    for c in columns {
+        if !conflict_keys.contains(c) {
+            let q = quote_pg_ident(c)?;
+            update_sets.push(format!("{q} = EXCLUDED.{q}"));
+        }
+    }
 
+    let mut quoted_conflicts = Vec::with_capacity(conflict_keys.len());
+    for k in conflict_keys {
+        quoted_conflicts.push(quote_pg_ident(k)?);
+    }
     let on_conflict_clause = if update_sets.is_empty() {
-        format!("ON CONFLICT ({}) DO NOTHING", conflict_keys.join(", "))
+        format!("ON CONFLICT ({}) DO NOTHING", quoted_conflicts.join(", "))
     } else {
         format!(
             "ON CONFLICT ({}) DO UPDATE SET {}",
-            conflict_keys.join(", "),
+            quoted_conflicts.join(", "),
             update_sets.join(", ")
         )
     };
@@ -255,7 +299,17 @@ pub fn extract_cockroach_row(payload: &[u8], topic: &str) -> Result<CockroachRow
 
     let mut columns = Vec::new();
     if let serde_json::Value::Object(map) = json_val {
+        if map.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "cockroachdb payload object has no keys".into(),
+            ));
+        }
         for (k, v) in map {
+            if k.is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "cockroachdb payload contains an empty column name".into(),
+                ));
+            }
             columns.push((k, json_to_cockroach_value(&v)));
         }
     } else {
@@ -278,7 +332,13 @@ pub trait CockroachDbTransport: Send + Sync {
 fn format_cockroach_value(v: &CockroachValue) -> String {
     match v {
         CockroachValue::Null => "NULL".to_string(),
-        CockroachValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        CockroachValue::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
         CockroachValue::Integer(i) => i.to_string(),
         CockroachValue::Number(n) => n.to_string(),
         CockroachValue::String(s) => format!("'{}'", s.replace('\'', "''")),
@@ -287,7 +347,10 @@ fn format_cockroach_value(v: &CockroachValue) -> String {
 
 fn parse_cr_conn_str(conn_str: &str) -> (String, u16, String, String) {
     let mut s = conn_str.trim();
-    if let Some(rest) = s.strip_prefix("postgresql://").or_else(|| s.strip_prefix("postgres://")) {
+    if let Some(rest) = s
+        .strip_prefix("postgresql://")
+        .or_else(|| s.strip_prefix("postgres://"))
+    {
         s = rest;
     }
     if let Some((before_q, _)) = s.split_once('?') {
@@ -318,9 +381,21 @@ fn parse_cr_conn_str(conn_str: &str) -> (String, u16, String, String) {
     } else {
         (host_port.to_string(), 26257)
     };
-    let host = if host.is_empty() { "127.0.0.1".to_string() } else { host };
-    let db = if db.is_empty() { "defaultdb".to_string() } else { db };
-    let user = if user.is_empty() { "root".to_string() } else { user };
+    let host = if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    let db = if db.is_empty() {
+        "defaultdb".to_string()
+    } else {
+        db
+    };
+    let user = if user.is_empty() {
+        "root".to_string()
+    } else {
+        user
+    };
     (host, port, user, db)
 }
 
@@ -381,7 +456,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         let addr = format!("{host}:{port}");
         let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| ConnectorError::Connection(format!("cockroachdb connect timeout: {addr}")))?
+            .map_err(|_| {
+                ConnectorError::Connection(format!("cockroachdb connect timeout: {addr}"))
+            })?
             .map_err(|e| ConnectorError::Connection(format!("cockroachdb connect failed: {e}")))?;
 
         // Send StartupMessage
@@ -401,10 +478,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         let mut startup_msg = Vec::new();
         startup_msg.extend_from_slice(&len.to_be_bytes());
         startup_msg.extend_from_slice(&startup_body);
-        stream
-            .write_all(&startup_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("cockroachdb startup write failed: {e}")))?;
+        stream.write_all(&startup_msg).await.map_err(|e| {
+            ConnectorError::Connection(format!("cockroachdb startup write failed: {e}"))
+        })?;
 
         // Drain until 'Z'
         loop {
@@ -413,7 +489,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
                 break;
             } else if tag == b'E' {
                 let msg = String::from_utf8_lossy(&body).into_owned();
-                return Err(ConnectorError::Connection(format!("cockroachdb startup error: {msg}")));
+                return Err(ConnectorError::Connection(format!(
+                    "cockroachdb startup error: {msg}"
+                )));
             }
         }
 
@@ -425,10 +503,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
         q_msg.extend_from_slice(&q_len.to_be_bytes());
         q_msg.extend_from_slice(sql_bytes);
         q_msg.push(0);
-        stream
-            .write_all(&q_msg)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("cockroachdb query write failed: {e}")))?;
+        stream.write_all(&q_msg).await.map_err(|e| {
+            ConnectorError::Connection(format!("cockroachdb query write failed: {e}"))
+        })?;
 
         let mut rows_affected = 1;
         let mut error_msg = None;
@@ -449,7 +526,9 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
             }
         }
         if let Some(err) = error_msg {
-            return Err(ConnectorError::Dispatch(format!("cockroachdb query failed: {err}")));
+            return Err(ConnectorError::Dispatch(format!(
+                "cockroachdb query failed: {err}"
+            )));
         }
 
         Ok(CockroachQueryResult {
@@ -473,6 +552,7 @@ pub struct MockCockroachDbTransport {
     pub executions: Mutex<Vec<CapturedCockroachExecution>>,
     pub fail_count: Mutex<usize>,
     pub sqlstate_outcome: Mutex<Option<String>>,
+    pub fail_at: Mutex<Option<usize>>,
 }
 
 impl MockCockroachDbTransport {
@@ -481,6 +561,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(0),
             sqlstate_outcome: Mutex::new(None),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -489,6 +570,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(failures),
             sqlstate_outcome: Mutex::new(Some("40001".to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 
@@ -497,6 +579,7 @@ impl MockCockroachDbTransport {
             executions: Mutex::new(Vec::new()),
             fail_count: Mutex::new(1),
             sqlstate_outcome: Mutex::new(Some(sqlstate.to_string())),
+            fail_at: Mutex::new(None),
         }
     }
 }
@@ -518,6 +601,35 @@ impl CockroachDbTransport for MockCockroachDbTransport {
             query: query.to_string(),
             params: params.to_vec(),
         });
+
+        let call_idx = self.executions.lock().len().saturating_sub(1);
+        if let Some(fail_idx) = *self.fail_at.lock() {
+            if call_idx == fail_idx {
+                if let Some(code) = self.sqlstate_outcome.lock().clone() {
+                    let class = classify_cockroach_sqlstate(&code);
+                    match class {
+                        CockroachErrorClassification::SerializationFailure => {
+                            return Err(ConnectorError::Connection(format!(
+                                "cockroachdb serialization failure: sqlstate={code}"
+                            )));
+                        }
+                        CockroachErrorClassification::ConnectionFailure => {
+                            return Err(ConnectorError::Connection(format!(
+                                "cockroachdb connection failure: sqlstate={code}"
+                            )));
+                        }
+                        _ => {
+                            return Err(ConnectorError::Dispatch(format!(
+                                "cockroachdb terminal failure: sqlstate={code}"
+                            )));
+                        }
+                    }
+                }
+                return Err(ConnectorError::Dispatch(format!(
+                    "cockroachdb mock failure at call {call_idx}"
+                )));
+            }
+        }
 
         let mut fails = self.fail_count.lock();
         if *fails > 0 {
@@ -589,7 +701,17 @@ impl CockroachDbSink {
         self.sent.load(Ordering::Relaxed)
     }
 
+    pub fn buffered_rows(&self) -> usize {
+        self.queue.lock().len()
+    }
+
     pub async fn flush(&self) -> Result<()> {
+        self.flush_with_limit(PG_MAX_BIND_PARAMS).await
+    }
+
+    async fn flush_with_limit(&self, max_params: usize) -> Result<()> {
+        self.backoff.lock().check()?;
+
         let (rows, oldest) = {
             let mut q = self.queue.lock();
             if q.is_empty() {
@@ -602,70 +724,120 @@ impl CockroachDbSink {
             return Ok(());
         }
 
-        self.backoff.lock().check()?;
-
-        // Aggregate unique columns from first row
-        let columns: Vec<String> = rows[0].columns.iter().map(|(c, _)| c.clone()).collect();
-        let query = if !self.config.upsert_conflict_columns.is_empty() {
-            build_on_conflict_upsert_query(
-                &self.config.table,
-                &columns,
-                &self.config.upsert_conflict_columns,
-                rows.len(),
-            )?
-        } else {
-            build_native_upsert_query(&self.config.table, &columns, rows.len())?
-        };
-
-        let mut params = Vec::new();
+        // Aggregate unique columns across the batch in first-seen order.
+        let mut columns: Vec<String> = Vec::new();
         for row in &rows {
-            for (_, val) in &row.columns {
-                params.push(val.clone());
+            for (c, _) in &row.columns {
+                if !columns.iter().any(|e| e == c) {
+                    columns.push(c.clone());
+                }
             }
         }
-
-        // Retry loop for transaction serialization failure (SQLSTATE 40001)
-        let max_attempts = self.config.max_retry_attempts.max(1);
-        let mut attempts = 0;
-        let mut last_err = None;
-
-        while attempts < max_attempts {
-            attempts += 1;
-            match self.transport.execute(&query, &params).await {
-                Ok(_) => {
-                    self.backoff.lock().success();
-                    self.sent.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                    return Ok(());
-                }
+        if columns.len() > max_params {
+            tracing::warn!(
+                rows = rows.len(),
+                columns = columns.len(),
+                max_params = max_params,
+                "cockroachdb dropping batch that exceeds bind parameter limit"
+            );
+            return Err(ConnectorError::Dispatch(
+                "cockroachdb batch exceeds bind parameter limit".into(),
+            ));
+        }
+        let mut rows = rows;
+        let per_statement = rows_per_statement(columns.len(), max_params).max(1);
+        let total = rows.len();
+        let mut idx = 0;
+        while idx < total {
+            let end = (idx + per_statement).min(total);
+            let chunk_len = end - idx;
+            let query_result = if !self.config.upsert_conflict_columns.is_empty() {
+                build_on_conflict_upsert_query(
+                    &self.config.table,
+                    &columns,
+                    &self.config.upsert_conflict_columns,
+                    chunk_len,
+                )
+            } else {
+                build_native_upsert_query(&self.config.table, &columns, chunk_len)
+            };
+            let query = match query_result {
+                Ok(q) => q,
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    let classification = classify_cockroach_sqlstate(&err_msg);
+                    // Query build errors are permanent (payload-derived), so the batch is dropped, not restored.
+                    tracing::warn!(error = %e, rows = chunk_len, "cockroachdb dropping unbuildable batch");
+                    return Err(e);
+                }
+            };
 
-                    if classification == CockroachErrorClassification::SerializationFailure {
-                        // Retry transaction with brief pause
-                        tokio::time::sleep(Duration::from_millis(5 * attempts as u64)).await;
-                        last_err = Some(e);
-                        continue;
-                    } else if classification == CockroachErrorClassification::ConnectionFailure {
-                        self.backoff.lock().failure();
-                        self.queue.lock().restore(rows, oldest);
-                        return Err(e);
-                    } else {
-                        // Terminal error - do not retry
-                        self.backoff.lock().failure();
-                        self.queue.lock().restore(rows, oldest);
-                        return Err(e);
+            let mut params = Vec::with_capacity(chunk_len * columns.len());
+            for row in &rows[idx..end] {
+                for col in &columns {
+                    let val = row
+                        .columns
+                        .iter()
+                        .find(|(c, _)| c == col)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(CockroachValue::Null);
+                    params.push(val);
+                }
+            }
+
+            // Retry loop for transaction serialization failure (SQLSTATE 40001),
+            // applied per chunk so a large batch still makes progress.
+            let max_attempts = self.config.max_retry_attempts.max(1);
+            let mut attempts = 0;
+            let mut last_err = None;
+            let mut chunk_ok = false;
+
+            while attempts < max_attempts {
+                attempts += 1;
+                match self.transport.execute(&query, &params).await {
+                    Ok(_) => {
+                        self.sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                        chunk_ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        let classification = classify_cockroach_sqlstate(&err_msg);
+
+                        if classification == CockroachErrorClassification::SerializationFailure {
+                            // Retry transaction with brief pause
+                            tokio::time::sleep(Duration::from_millis(5 * attempts as u64)).await;
+                            last_err = Some(e);
+                            continue;
+                        } else if classification == CockroachErrorClassification::ConnectionFailure
+                        {
+                            self.backoff.lock().failure();
+                            let remaining = rows.split_off(idx);
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        } else {
+                            // Terminal error - do not retry
+                            self.backoff.lock().failure();
+                            let remaining = rows.split_off(idx);
+                            self.queue.lock().restore(remaining, oldest);
+                            return Err(e);
+                        }
                     }
                 }
             }
+
+            if !chunk_ok {
+                // Exhausted retries
+                self.backoff.lock().failure();
+                let remaining = rows.split_off(idx);
+                self.queue.lock().restore(remaining, oldest);
+                return Err(last_err.unwrap_or_else(|| {
+                    ConnectorError::Dispatch("cockroachdb max retry attempts exhausted".into())
+                }));
+            }
+            idx = end;
         }
 
-        // Exhausted retries
-        self.backoff.lock().failure();
-        self.queue.lock().restore(rows, oldest);
-        Err(last_err.unwrap_or_else(|| {
-            ConnectorError::Dispatch("cockroachdb max retry attempts exhausted".into())
-        }))
+        self.backoff.lock().success();
+        Ok(())
     }
 }
 
@@ -887,5 +1059,234 @@ mod tests {
         assert!(res.is_err());
         let execs = transport.executions.lock();
         assert_eq!(execs.len(), 1); // zero retries
+    }
+
+    #[tokio::test]
+    async fn test_backoff_keeps_buffered_rows() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::with_terminal_error(
+            "42P01: undefined table",
+        ));
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload1 = Bytes::from_static(br#"{"device_id": "cr-10", "temp": 70.0}"#);
+        let payload2 = Bytes::from_static(br#"{"device_id": "cr-11", "temp": 71.0}"#);
+
+        sink.send(&topic, &payload1, QoS::AtLeastOnce)
+            .await
+            .expect("buffer first row");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // First flush fails, restores the batch and enters backoff.
+        let first = sink.flush().await;
+        assert!(first.is_err());
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Still inside the backoff window: flush must fail without dropping rows.
+        sink.send(&topic, &payload2, QoS::AtLeastOnce)
+            .await
+            .expect("buffer second row");
+        let second = sink.flush().await;
+        assert!(second.is_err());
+        assert_eq!(sink.buffered_rows(), 2);
+
+        // After the backoff resets, one flush delivers both rows exactly once.
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry flush succeeds");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 2);
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 2);
+        assert_eq!(execs[1].params.len(), 4);
+    }
+
+    fn strip_quoted_idents(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        let mut in_quotes = false;
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+            } else if c == '"' {
+                in_quotes = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_mixed_keys_batch_params_aligned() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/mixed").unwrap();
+        sink.send(&topic, &Bytes::from_static(br#"{"a":1}"#), QoS::AtLeastOnce)
+            .await
+            .expect("buffer row 1");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"b":2,"a":3}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer row 2");
+        sink.flush().await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 1);
+        assert!(execs[0].query.contains("(a, b)"));
+        assert_eq!(
+            execs[0].params,
+            vec![
+                CockroachValue::Integer(1),
+                CockroachValue::Null,
+                CockroachValue::Integer(3),
+                CockroachValue::Integer(2),
+            ]
+        );
+        assert_eq!(execs[0].query.matches('$').count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_hostile_key_is_quoted() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/hostile").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"x) VALUES (1); DROP TABLE t; --": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer hostile row");
+        sink.flush().await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 1);
+        let hostile = "x) VALUES (1); DROP TABLE t; --";
+        let quoted = format!("\"{hostile}\"");
+        assert!(execs[0].query.contains(&quoted));
+        let stripped = strip_quoted_idents(&execs[0].query);
+        assert!(!stripped.contains(hostile));
+        assert!(!stripped.contains(';'));
+    }
+
+    #[test]
+    fn test_on_conflict_quotes_update_columns() {
+        let cols = vec!["id".to_string(), "Temp".to_string()];
+        let keys = vec!["id".to_string()];
+        let q = build_on_conflict_upsert_query("telemetry", &cols, &keys, 1).expect("valid query");
+        assert!(q.contains("\"Temp\" = EXCLUDED.\"Temp\""));
+    }
+
+    #[tokio::test]
+    async fn test_empty_key_rejected_at_send() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/empty-key").unwrap();
+        let res = sink
+            .send(&topic, &Bytes::from_static(br#"{"": 1}"#), QoS::AtLeastOnce)
+            .await;
+        assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
+        assert_eq!(sink.buffered_rows(), 0);
+
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"a": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer valid row");
+        sink.flush().await.expect("flush succeeds");
+        assert_eq!(sink.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_empty_object_rejected_at_send() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/empty-obj").unwrap();
+        let res = sink
+            .send(&topic, &Bytes::from_static(br#"{}"#), QoS::AtLeastOnce)
+            .await;
+        assert!(matches!(res.err().unwrap(), ConnectorError::Dispatch(_)));
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[test]
+    fn test_rows_per_statement() {
+        assert_eq!(rows_per_statement(3, 65535), 21845);
+        assert_eq!(rows_per_statement(70, 65535), 936);
+        assert_eq!(rows_per_statement(70000, 65535), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_splits_into_chunks() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        sink.flush_with_limit(4).await.expect("flush succeeds");
+
+        let execs = transport.executions.lock();
+        assert_eq!(execs.len(), 3);
+        assert_eq!(execs[0].params.len(), 4);
+        assert_eq!(execs[1].params.len(), 4);
+        assert_eq!(execs[2].params.len(), 2);
+        assert_eq!(execs[0].query.matches('$').count(), 4);
+        assert_eq!(execs[1].query.matches('$').count(), 4);
+        assert_eq!(execs[2].query.matches('$').count(), 2);
+        assert_eq!(sink.sent_count(), 5);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_chunk_restores_only_unsent() {
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockCockroachDbTransport::new());
+        *transport.fail_at.lock() = Some(1);
+        let sink = CockroachDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/chunks").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":{i}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        let res = sink.flush_with_limit(4).await;
+        assert!(res.is_err());
+        assert_eq!(sink.sent_count(), 2);
+        assert_eq!(sink.buffered_rows(), 3);
     }
 }

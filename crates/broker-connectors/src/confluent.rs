@@ -713,21 +713,17 @@ impl TcpConfluentTransport {
     }
 
     async fn dial(&self) -> Result<TcpConfluentConn> {
-        let stream =
-            tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
-                .await
-                .map_err(|_| {
-                    ConnectorError::Connection(format!(
-                        "confluent connect timeout: {}",
-                        self.endpoint
-                    ))
-                })?
-                .map_err(|e| {
-                    ConnectorError::Connection(format!(
-                        "confluent connect to {} failed: {e}",
-                        self.endpoint
-                    ))
-                })?;
+        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!("confluent connect timeout: {}", self.endpoint))
+            })?
+            .map_err(|e| {
+                ConnectorError::Connection(format!(
+                    "confluent connect to {} failed: {e}",
+                    self.endpoint
+                ))
+            })?;
         let mut conn = TcpConfluentConn {
             stream,
             correlation: 1,

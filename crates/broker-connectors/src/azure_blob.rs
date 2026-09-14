@@ -777,6 +777,7 @@ mod tests {
             max_bytes_per_blob: Some(10_485_760),
             flush_interval_secs: 60,
             buffer_capacity: None,
+            timeout_ms: None,
         }
     }
 
