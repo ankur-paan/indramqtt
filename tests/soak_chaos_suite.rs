@@ -1051,7 +1051,7 @@ async fn test_e2e_sequential_all_free_targets_with_rule_engine_and_zero_disk_res
         let records = kafka_transport.records_flat();
         let mut actual_kafka_records = Vec::new();
         for record in &records {
-            assert!(record.topic.starts_with("kafka-events-sensors/line-"));
+            assert!(record.topic.starts_with("kafka-events-sensors.line-"));
             assert!((0..8).contains(&record.partition));
             assert!(record.key.is_some());
             let parsed: serde_json::Value = serde_json::from_slice(&record.value).expect("json");

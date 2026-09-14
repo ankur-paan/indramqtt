@@ -83,10 +83,31 @@ impl KafkaSinkConfig {
 }
 
 /// Render `${topic}` placeholders against the MQTT topic. Unknown
-/// `${...}` sequences pass through literally.
+/// `${...}` sequences pass through literally, then the whole rendered
+/// string is sanitised to a valid Kafka topic name: `/` becomes `.`,
+/// every other character outside `[A-Za-z0-9._-]` becomes `_`, the
+/// result is truncated to 249 characters, and an empty result or the
+/// reserved names `.` and `..` become `indramqtt-invalid-topic`.
 pub fn render_topic_template(template: &str, topic: &str) -> String {
-    let sanitized = topic.replace('/', ".");
-    template.replace("${topic}", &sanitized)
+    const MAX_TOPIC_LEN: usize = 249;
+    const INVALID_TOPIC_FALLBACK: &str = "indramqtt-invalid-topic";
+    let rendered = template.replace("${topic}", topic);
+    let mut sanitized = String::with_capacity(rendered.len());
+    for ch in rendered.chars() {
+        if ch == '/' {
+            sanitized.push('.');
+        } else if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let truncated: String = sanitized.chars().take(MAX_TOPIC_LEN).collect();
+    if truncated.is_empty() || truncated == "." || truncated == ".." {
+        INVALID_TOPIC_FALLBACK.to_string()
+    } else {
+        truncated
+    }
 }
 
 /// Kafka's murmur2 (seed 0x9747b28c): hash-compatible partitioning with
@@ -795,11 +816,52 @@ mod tests {
     fn test_topic_template_rendering() {
         assert_eq!(
             render_topic_template("kafka-telemetry-${topic}", "sensors/temp"),
-            "kafka-telemetry-sensors/temp"
+            "kafka-telemetry-sensors.temp"
         );
         assert_eq!(render_topic_template("plain", "a/b"), "plain");
         // Unknown placeholders pass through literally.
-        assert_eq!(render_topic_template("x-${nope}-y", "a"), "x-${nope}-y");
+        assert_eq!(render_topic_template("x-${nope}-y", "a"), "x-__nope_-y");
+    }
+
+    #[test]
+    fn test_topic_template_sanitises_illegal_kafka_characters() {
+        assert_eq!(
+            render_topic_template("t-${topic}", "a+b#c d:e/f"),
+            "t-a_b_c_d_e.f"
+        );
+        assert_eq!(
+            render_topic_template("t-${topic}", "sensors/tempé"),
+            "t-sensors.temp_"
+        );
+        assert_eq!(render_topic_template("x-${nope}-y", "a"), "x-__nope_-y");
+    }
+
+    #[test]
+    fn test_topic_template_enforces_kafka_length_and_reserved_names() {
+        let long_topic = "a".repeat(300);
+        let rendered = render_topic_template("${topic}", &long_topic);
+        assert_eq!(rendered.len(), 249);
+        assert_eq!(rendered, "a".repeat(249));
+        let rendered = render_topic_template("prefix-${topic}", &long_topic);
+        assert_eq!(rendered.len(), 249);
+        assert_eq!(
+            rendered,
+            format!("prefix-{}", "a".repeat(249 - "prefix-".len()))
+        );
+        assert_eq!(
+            render_topic_template("${topic}", ""),
+            "indramqtt-invalid-topic"
+        );
+        assert_eq!(
+            render_topic_template("${topic}", "."),
+            "indramqtt-invalid-topic"
+        );
+        assert_eq!(
+            render_topic_template("${topic}", ".."),
+            "indramqtt-invalid-topic"
+        );
+        assert_eq!(render_topic_template(".", "a/b"), "indramqtt-invalid-topic");
+        assert_eq!(render_topic_template("..", "a"), "indramqtt-invalid-topic");
     }
 
     #[test]
@@ -858,7 +920,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 2);
         let record = &batches[0][0];
-        assert_eq!(record.topic, "kafka-telemetry-sensors/temp");
+        assert_eq!(record.topic, "kafka-telemetry-sensors.temp");
         assert_eq!(record.key, Some(Bytes::from_static(b"d7")));
         assert!((0..12).contains(&record.partition));
         assert_eq!(record.value, payload);
