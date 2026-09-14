@@ -469,3 +469,14 @@ encode_puback_vector_test() ->
                  indra_mqtt_codec:encode_puback(42)),
     ?assertEqual(<<16#40, 16#02, 16#FF, 16#FF>>,
                  indra_mqtt_codec:encode_puback(65535)).
+
+connack_return_code_maps_kernel_reason_codes_test() ->
+    %% MQTT 3.1.1 return codes pass through unchanged.
+    lists:foreach(fun(RC) ->
+                          ?assertEqual(RC, indra_mqtt_codec:connack_return_code(RC))
+                  end, lists:seq(0, 5)),
+    %% MQTT 5 reason codes from the kernel fold into 3.1.1 codes.
+    ?assertEqual(2, indra_mqtt_codec:connack_return_code(16#85)),
+    ?assertEqual(4, indra_mqtt_codec:connack_return_code(16#86)),
+    ?assertEqual(5, indra_mqtt_codec:connack_return_code(16#87)),
+    ?assertEqual(3, indra_mqtt_codec:connack_return_code(16#8B)).
