@@ -488,46 +488,46 @@ impl ElasticsearchSink {
         self.buffer.lock().len()
     }
 
-    /// Render one `_bulk` body for already-taken rows.
-    fn render_bulk(&self, rows: &[EsRow], index: &str) -> Result<Vec<u8>> {
+    /// Render one `_bulk` action/source pair for a single row with its
+    /// own already-resolved index. Any failure is permanent for that
+    /// row (caller counts it as rejected and never retries it).
+    fn render_row(&self, row: &EsRow, index: &str, now: i64) -> Result<Vec<u8>> {
         let mut body = Vec::new();
-        for row in rows {
-            let action = match &self.config.doc_id_template {
-                Some(template) => {
-                    let id =
-                        self.config
-                            .resolve_doc_id(template, &row.topic, &row.payload, row.seq)?;
-                    serde_json::json!({"index": {"_index": index, "_id": id}})
-                }
-                None => serde_json::json!({"index": {"_index": index}}),
-            };
-            body.extend_from_slice(
-                serde_json::to_vec(&action)
-                    .map_err(|e| {
-                        ConnectorError::Dispatch(format!("elasticsearch action encode failed: {e}"))
-                    })?
-                    .as_slice(),
-            );
-            body.push(b'\n');
-            let payload: serde_json::Value =
-                serde_json::from_slice(&row.payload).unwrap_or_else(|_| {
-                    serde_json::Value::String(String::from_utf8_lossy(&row.payload).into_owned())
-                });
-            let doc = serde_json::json!({
-                "topic": row.topic,
-                "qos": row.qos,
-                "payload": payload,
-                "timestamp": rfc3339_millis(now_millis()),
+        let action = match &self.config.doc_id_template {
+            Some(template) => {
+                let id = self
+                    .config
+                    .resolve_doc_id(template, &row.topic, &row.payload, row.seq)?;
+                serde_json::json!({"index": {"_index": index, "_id": id}})
+            }
+            None => serde_json::json!({"index": {"_index": index}}),
+        };
+        body.extend_from_slice(
+            serde_json::to_vec(&action)
+                .map_err(|e| {
+                    ConnectorError::Dispatch(format!("elasticsearch action encode failed: {e}"))
+                })?
+                .as_slice(),
+        );
+        body.push(b'\n');
+        let payload: serde_json::Value =
+            serde_json::from_slice(&row.payload).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&row.payload).into_owned())
             });
-            body.extend_from_slice(
-                serde_json::to_vec(&doc)
-                    .map_err(|e| {
-                        ConnectorError::Dispatch(format!("elasticsearch doc encode failed: {e}"))
-                    })?
-                    .as_slice(),
-            );
-            body.push(b'\n');
-        }
+        let doc = serde_json::json!({
+            "topic": row.topic,
+            "qos": row.qos,
+            "payload": payload,
+            "timestamp": rfc3339_millis(now),
+        });
+        body.extend_from_slice(
+            serde_json::to_vec(&doc)
+                .map_err(|e| {
+                    ConnectorError::Dispatch(format!("elasticsearch doc encode failed: {e}"))
+                })?
+                .as_slice(),
+        );
+        body.push(b'\n');
         Ok(body)
     }
 }
@@ -688,14 +688,70 @@ impl ElasticsearchSink {
     /// successful documents are already stored).
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
+        let auth = self.config.auth.header_value()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
         if rows.is_empty() {
             return Ok(());
         }
-        let index = self.config.resolve_index(&rows[0].topic, now_millis())?;
-        let body = self.render_bulk(&rows, &index)?;
-        let auth = self.config.auth.header_value()?;
-        let record_count = rows.len() as u64;
+        let now = now_millis();
+        let total = rows.len() as u64;
+        let mut sendable: Vec<EsRow> = Vec::with_capacity(rows.len());
+        let mut body = Vec::new();
+        let mut rejected: u64 = 0;
+        let mut first_reason: Option<String> = None;
+        for (position, row) in rows.into_iter().enumerate() {
+            let index = match self.config.resolve_index(&row.topic, now) {
+                Ok(index) => index,
+                Err(e) => {
+                    let reason = e.to_string();
+                    tracing::warn!(
+                        position,
+                        topic = row.topic.as_str(),
+                        reason = truncate_reason(&reason).as_str(),
+                        "elasticsearch document could not be rendered"
+                    );
+                    rejected += 1;
+                    if first_reason.is_none() {
+                        first_reason = Some(reason);
+                    }
+                    continue;
+                }
+            };
+            match self.render_row(&row, &index, now) {
+                Ok(pair) => {
+                    body.extend_from_slice(&pair);
+                    sendable.push(row);
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    tracing::warn!(
+                        position,
+                        topic = row.topic.as_str(),
+                        reason = truncate_reason(&reason).as_str(),
+                        "elasticsearch document could not be rendered"
+                    );
+                    rejected += 1;
+                    if first_reason.is_none() {
+                        first_reason = Some(reason);
+                    }
+                }
+            }
+        }
+        if rejected > 0 {
+            self.rejected_docs.fetch_add(rejected, Ordering::Relaxed);
+        }
+        if sendable.is_empty() {
+            let reason = first_reason.unwrap_or_else(|| "no documents".to_string());
+            return Err(ConnectorError::Dispatch(format!(
+                "elasticsearch: {rejected} of {total} documents could not be rendered: {reason}"
+            )));
+        }
+        let render_error = first_reason.map(|reason| {
+            ConnectorError::Dispatch(format!(
+                "elasticsearch: {rejected} of {total} documents could not be rendered: {reason}"
+            ))
+        });
+        let record_count = sendable.len() as u64;
         let mut attempt = 0usize;
         loop {
             match self.transport.bulk_post(body.clone(), auth.clone()).await {
@@ -707,6 +763,9 @@ impl ElasticsearchSink {
                             self.backoff.lock().success();
                             self.sent_batches.fetch_add(1, Ordering::Relaxed);
                             self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                            if let Some(render_error) = render_error {
+                                return Err(render_error);
+                            }
                             return Ok(());
                         }
                         Err(e) => {
@@ -744,21 +803,21 @@ impl ElasticsearchSink {
                     );
                 }
                 Ok(BulkOutcome::Retryable(status)) => {
-                    self.buffer.lock().restore(rows, oldest);
+                    self.buffer.lock().restore(sendable, oldest);
                     self.backoff.lock().failure();
                     return Err(ConnectorError::Connection(format!(
                         "elasticsearch bulk backpressure ({status}) after {attempt} retries"
                     )));
                 }
                 Ok(BulkOutcome::Failed(status)) => {
-                    self.buffer.lock().restore(rows, oldest);
+                    self.buffer.lock().restore(sendable, oldest);
                     self.backoff.lock().failure();
                     return Err(ConnectorError::Dispatch(format!(
                         "elasticsearch bulk failed with {status}"
                     )));
                 }
                 Err(e) => {
-                    self.buffer.lock().restore(rows, oldest);
+                    self.buffer.lock().restore(sendable, oldest);
                     self.backoff.lock().failure();
                     return Err(e);
                 }
@@ -1188,6 +1247,129 @@ mod tests {
         }
         assert_eq!(sink.inserted_docs(), 2);
         assert_eq!(sink.rejected_docs(), 0);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_topic_batch_uses_index_per_document() {
+        let mut config = test_config();
+        config.index_template = "iot-${topic}".to_string();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config.clone());
+
+        sink.send(
+            &Topic::new("sensors/a").unwrap(),
+            &Bytes::from(r#"{"v":1}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("sensors/b").unwrap(),
+            &Bytes::from(r#"{"v":2}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        let body = String::from_utf8(captured[0].body.clone()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        let first_index = first["index"]["_index"].as_str().unwrap().to_string();
+        let second_index = second["index"]["_index"].as_str().unwrap().to_string();
+        assert_ne!(first_index, second_index);
+        assert_eq!(
+            first_index,
+            config.resolve_index("sensors/a", now_millis()).unwrap()
+        );
+        assert_eq!(
+            second_index,
+            config.resolve_index("sensors/b", now_millis()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unrenderable_row_is_rejected_and_rest_is_sent() {
+        let mut config = test_config();
+        config.index_template = "${topic}".to_string();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        let response = serde_json::json!({
+            "took": 5,
+            "errors": false,
+            "items": [
+                {"index": {"_index": "sensors-a", "status": 201}},
+                {"index": {"_index": "sensors-b", "status": 201}}
+            ]
+        });
+        transport.script_responses(vec![(200, serde_json::to_vec(&response).unwrap())]);
+
+        sink.send(
+            &Topic::new("sensors/a").unwrap(),
+            &Bytes::from(r#"{"v":1}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        // Resolves to `_bad`, which `resolve_index` rejects as an invalid index.
+        sink.send(
+            &Topic::new("_bad").unwrap(),
+            &Bytes::from(r#"{"v":2}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("sensors/b").unwrap(),
+            &Bytes::from(r#"{"v":3}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        let err = sink.flush().await.expect_err("one bad row must err");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("1 of 3"),
+                "dispatch must state 1 of 3, got: {message}"
+            ),
+            other => panic!("expected Dispatch, got: {other:?}"),
+        }
+        assert_eq!(transport.calls(), 1);
+        let body = String::from_utf8(transport.captured()[0].body.clone()).unwrap();
+        assert_eq!(body.lines().count(), 4);
+        assert_eq!(sink.rejected_docs(), 1);
+        assert_eq!(sink.inserted_docs(), 2);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_all_rows_unrenderable_skips_transport() {
+        let mut config = test_config();
+        config.index_template = "${topic}".to_string();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+
+        for topic in ["_bad-a", "_bad-b"] {
+            sink.send(
+                &Topic::new(topic).unwrap(),
+                &Bytes::from(r#"{"v":1}"#),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        }
+        let err = sink.flush().await.expect_err("all bad rows must err");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "expected Dispatch, got: {err:?}"
+        );
+        assert_eq!(transport.calls(), 0);
+        assert_eq!(sink.rejected_docs(), 2);
         assert_eq!(sink.buffered_rows(), 0);
     }
 }
