@@ -327,7 +327,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         padded[..key.len()].copy_from_slice(key);
     }
     let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5eu8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
     for i in 0..BLOCK {
         ipad[i] ^= padded[i];
         opad[i] ^= padded[i];
@@ -355,6 +355,30 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
         }
     }
     result
+}
+
+/// Pure SCRAM-SHA-256 proof/signature derivation shared by the live
+/// exchange and the RFC vector test: salted password, client proof
+/// and server signature for one `auth_message`.
+fn scram_proof_and_server_signature(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    auth_message: &str,
+) -> ([u8; 32], [u8; 32]) {
+    let salted = pbkdf2_sha256(password, salt, iterations);
+    let client_key = hmac_sha256(&salted, b"Client Key");
+    let mut hasher = Sha256::new();
+    hasher.update(client_key);
+    let stored_key: [u8; 32] = hasher.finalize().into();
+    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+    let mut proof = client_key;
+    for (slot, byte) in proof.iter_mut().zip(client_signature.iter()) {
+        *slot ^= *byte;
+    }
+    let server_key = hmac_sha256(&salted, b"Server Key");
+    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
+    (proof, server_signature)
 }
 
 fn escape_scram_name(name: &str) -> String {
@@ -628,18 +652,10 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
         .decode(&salt_b64)
         .map_err(|_| ConnectorError::Connection("bad SASL salt".to_string()))?;
 
-    let salted = pbkdf2_sha256(password, &salt, iterations);
-    let client_key = hmac_sha256(&salted, b"Client Key");
-    let mut hasher = Sha256::new();
-    hasher.update(client_key);
-    let stored_key: [u8; 32] = hasher.finalize().into();
     let client_final_without_proof = format!("c=biws,r={combined_nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-    let mut proof = client_key;
-    for (slot, byte) in proof.iter_mut().zip(client_signature.iter()) {
-        *slot ^= *byte;
-    }
+    let (proof, expected_server_signature) =
+        scram_proof_and_server_signature(password, &salt, iterations, &auth_message);
     let client_final = format!(
         "{client_final_without_proof},p={}",
         base64::engine::general_purpose::STANDARD.encode(proof)
@@ -667,9 +683,7 @@ async fn scram_exchange(user: &str, password: &[u8], stream: &mut TcpStream) -> 
     let server_signature = server_final
         .strip_prefix("v=")
         .ok_or_else(|| ConnectorError::Connection("malformed SASL final".to_string()))?;
-    let server_key = hmac_sha256(&salted, b"Server Key");
-    let expected = hmac_sha256(&server_key, auth_message.as_bytes());
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected);
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_server_signature);
     if expected_b64 != server_signature {
         return Err(ConnectorError::Connection(
             "postgres server signature mismatch".to_string(),
@@ -1039,6 +1053,33 @@ mod tests {
             .expect_err("backoff fails fast");
         assert_eq!(transport.calls(), 1, "backoff must skip the transport");
         assert_eq!(sink.buffered_rows(), 2);
+    }
+
+    /// RFC 7677 section 3 SCRAM-SHA-256 vector: pure computation through
+    /// the same helper the live exchange uses (no fake server involved).
+    #[test]
+    fn test_scram_sha256_rfc7677_vector() {
+        use base64::Engine;
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let server_first =
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let client_final_without_proof =
+            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
+            .expect("vector salt decodes");
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
+        let (proof, server_signature) =
+            scram_proof_and_server_signature(b"pencil", &salt, 4096, &auth_message);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(proof),
+            "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(server_signature),
+            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+        );
     }
 
     // -- Fake PostgreSQL server helpers ----------------------------------
