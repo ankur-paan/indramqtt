@@ -429,8 +429,9 @@ impl OpenTsdbTransport for NetworkOpenTsdbTransport {
     }
 
     async fn put_telnet(&self, _telnet_data: &str) -> Result<()> {
-        // TCP socket write implementation
-        Ok(())
+        Err(ConnectorError::Dispatch(
+            "opentsdb protocol \"telnet\" is not supported yet; use \"http\"".into(),
+        ))
     }
 }
 
@@ -543,7 +544,13 @@ impl OpenTsdbSink {
         self.sent.load(Ordering::Relaxed)
     }
 
+    pub fn buffered_rows(&self) -> usize {
+        self.queue.lock().len()
+    }
+
     pub async fn flush(&self) -> Result<()> {
+        self.backoff.lock().check()?;
+
         let (points, oldest) = {
             let mut q = self.queue.lock();
             if q.is_empty() {
@@ -555,8 +562,6 @@ impl OpenTsdbSink {
         if points.is_empty() {
             return Ok(());
         }
-
-        self.backoff.lock().check()?;
 
         match self.config.protocol {
             OpenTsdbProtocol::Http => {
@@ -825,5 +830,61 @@ mod tests {
             term_res.err().unwrap(),
             ConnectorError::Dispatch(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_network_telnet_transport_does_not_claim_success() {
+        let cfg = sample_http_config();
+        let transport = NetworkOpenTsdbTransport::new(&cfg);
+        let err = transport
+            .put_telnet("put sys.cpu 1726000000 42.5 host=server01\n")
+            .await
+            .expect_err("production telnet put must not claim success");
+        match err {
+            ConnectorError::Dispatch(msg) => assert_eq!(
+                msg,
+                "opentsdb protocol \"telnet\" is not supported yet; use \"http\""
+            ),
+            other => panic!("expected Dispatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backoff_keeps_buffered_rows() {
+        let mut cfg = sample_http_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockOpenTsdbTransport::with_transient_failures(1));
+        let sink = OpenTsdbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload1 = Bytes::from_static(br#"{"host": "edge-10", "temperature": 75.0}"#);
+        let payload2 = Bytes::from_static(br#"{"host": "edge-11", "temperature": 76.5}"#);
+
+        sink.send(&topic, &payload1, QoS::AtLeastOnce)
+            .await
+            .expect("buffer first row");
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // First flush fails transiently, restores the batch and enters backoff.
+        let first = sink.flush().await;
+        assert!(first.is_err());
+        assert_eq!(sink.buffered_rows(), 1);
+
+        // Still inside the backoff window: flush must fail without dropping rows.
+        sink.send(&topic, &payload2, QoS::AtLeastOnce)
+            .await
+            .expect("buffer second row");
+        let second = sink.flush().await;
+        assert!(second.is_err());
+        assert_eq!(sink.buffered_rows(), 2);
+
+        // After the backoff resets, one flush delivers both rows exactly once.
+        *sink.backoff.lock() = BackoffState::default();
+        let before = transport.captured_points.lock().len();
+        sink.flush().await.expect("retry flush succeeds");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 2);
+        let captured = transport.captured_points.lock();
+        assert_eq!(captured.len() - before, 2);
     }
 }
