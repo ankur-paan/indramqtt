@@ -54,13 +54,13 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         opad[i] ^= k[i];
     }
     let mut inner = Sha256::new();
-    inner.update(&ipad);
+    inner.update(ipad);
     inner.update(data);
     let inner_hash = inner.finalize();
 
     let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
+    outer.update(opad);
+    outer.update(inner_hash);
     outer.finalize().into()
 }
 
@@ -205,12 +205,10 @@ pub async fn scram_verify(
         }
     };
 
-    // Stored credentials: check memory auth; default admin/public fallback
-    let password = if ch.username == "admin" {
-        "public".to_string()
-    } else {
-        "public".to_string()
-    };
+    // SCRAM needs the plaintext (or salted) password, but the auth store
+    // keeps only SHA-256 digests, so the built-in dashboard password is the
+    // only one that can be verified here. The username is not consulted.
+    let password = "public".to_string();
 
     // RFC 5802 SCRAM proof derivation
     let salted_password = pbkdf2_hmac_sha256(password.as_bytes(), &ch.salt, ch.iterations);
@@ -255,7 +253,7 @@ pub async fn scram_verify(
     rand::thread_rng().fill_bytes(&mut token_bytes);
     let token = format!(
         "indra_{}",
-        BASE64.encode(token_bytes).replace('+', "").replace('/', "")
+        BASE64.encode(token_bytes).replace(['+', '/'], "")
     );
 
     active_tokens()
@@ -324,7 +322,7 @@ pub async fn direct_login(
     rand::thread_rng().fill_bytes(&mut token_bytes);
     let token = format!(
         "indra_{}",
-        BASE64.encode(token_bytes).replace('+', "").replace('/', "")
+        BASE64.encode(token_bytes).replace(['+', '/'], "")
     );
 
     active_tokens()

@@ -860,6 +860,7 @@ mod tests {
             max_backup_files: None,
             max_retention_days: None,
             sync_mode: DiskSyncMode::EveryBatch,
+            timeout_ms: None,
         }
     }
 

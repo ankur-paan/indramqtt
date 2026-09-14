@@ -992,6 +992,7 @@ mod tests {
             batch_size: Some(200),
             buffer_capacity: None,
             linger_ms: Some(100),
+            timeout_ms: None,
         }
     }
 

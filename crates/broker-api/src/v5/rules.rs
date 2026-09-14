@@ -243,7 +243,7 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
 }
 
 pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
     let (matched, passed, failed) = if let Some(r) = rules
         .iter()
@@ -287,7 +287,7 @@ pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<Stri
 }
 
 pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
     if let Some(r) = rules
         .iter()
@@ -398,7 +398,7 @@ pub async fn list_connectors() -> Response {
 }
 
 pub async fn get_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let connectors = CONNECTORS.read().unwrap();
     if let Some(conn) = connectors.iter().find(|c| {
         c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -2475,7 +2475,7 @@ async fn register_live_sink(
                 max_retries: Some(3),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::aws_iot::TcpAwsIotTransport::new(&endpoint) {
+            if let Ok(transport) = broker_connectors::aws_iot::TcpAwsIotTransport::new(endpoint) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::aws_iot::AwsIotSink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -2821,13 +2821,18 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
+            let algorithm = match body.get("algorithm").and_then(|v| v.as_str()) {
+                Some("ES256") | Some("es256") => broker_connectors::gcp_iot::GcpIotAlgorithm::Es256,
+                _ => broker_connectors::gcp_iot::GcpIotAlgorithm::Rs256,
+            };
+
             let config = broker_connectors::gcp_iot::GcpIotConfig {
                 project_id: project_id.to_string(),
                 cloud_region: cloud_region.to_string(),
                 registry_id: registry_id.to_string(),
                 device_id: device_id.to_string(),
                 private_key_pem: private_key_pem.to_string(),
-                algorithm: broker_connectors::gcp_iot::GcpIotAlgorithm::Rs256,
+                algorithm,
                 token_lifetime_secs: 3600,
                 endpoint: endpoint.to_string(),
                 batch_size: Some(1),
@@ -3251,7 +3256,7 @@ pub async fn update_connector(
     Path(id): Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
             "id".to_string(),
@@ -3276,7 +3281,7 @@ pub async fn update_connector(
 }
 
 pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     state.engine.connectors().unregister(&id);
     state.engine.connectors().unregister(clean_id);
     state
@@ -3535,7 +3540,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 }
 
 pub async fn start_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let mut connectors = CONNECTORS.write().unwrap();
     for c in connectors.iter_mut() {
         if c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -3556,7 +3561,7 @@ pub async fn start_connector(Path(id): Path<String>) -> Response {
 }
 
 pub async fn enable_connector(Path((id, enable)): Path<(String, bool)>) -> Response {
-    let clean_id = id.split(':').last().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let mut connectors = CONNECTORS.write().unwrap();
     for c in connectors.iter_mut() {
         if c.get("id").and_then(|v| v.as_str()) == Some(&id)
@@ -3585,7 +3590,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()
@@ -3605,7 +3610,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()
@@ -3624,7 +3629,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()
@@ -3643,7 +3648,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()
@@ -3668,7 +3673,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()
@@ -3694,7 +3699,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
         let host_port = clean
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or(clean)
             .split('/')
             .next()

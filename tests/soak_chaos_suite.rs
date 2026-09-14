@@ -569,6 +569,7 @@ async fn test_soak_sensor_ingest_sql_transform_to_disk_and_storage() {
         max_backup_files: Some(50),
         max_retention_days: None,
         sync_mode: DiskSyncMode::EveryBatch,
+        timeout_ms: None,
     };
 
     let writer = Arc::new(
@@ -1160,6 +1161,7 @@ async fn test_e2e_sequential_all_free_targets_with_rule_engine_and_zero_disk_res
             max_backup_files: Some(10),
             max_retention_days: None,
             sync_mode: DiskSyncMode::EveryBatch,
+            timeout_ms: None,
         };
 
         let writer = Arc::new(

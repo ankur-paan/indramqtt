@@ -1692,6 +1692,7 @@ mod tests {
             tier: "community".to_string(),
             batch_size: Some(100),
             linger_ms: Some(50),
+            timeout_ms: None,
         };
         assert!(config.validate().is_err());
         config.tier = "enterprise".to_string();
@@ -1705,6 +1706,7 @@ mod tests {
             tier: "enterprise".to_string(),
             batch_size: Some(100),
             linger_ms: Some(50),
+            timeout_ms: None,
         };
         assert!(config.validate().is_ok());
         config.topic_prefix = Some("spBv1.0/plant1/+".to_string());
@@ -1727,6 +1729,7 @@ mod tests {
                 tier: "enterprise".to_string(),
                 batch_size: Some(10),
                 linger_ms: Some(50),
+                timeout_ms: None,
             },
             transport.clone(),
         )

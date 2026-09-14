@@ -3102,6 +3102,7 @@ mod tests {
                     batch_size: 1,
                     batch_bytes: 5 * 1024 * 1024,
                     batch_timeout_ms: 60_000,
+                    timeout_ms: None,
                 },
                 s3_transport.clone(),
             )
@@ -3123,6 +3124,7 @@ mod tests {
                     batch_size: 1,
                     batch_timeout_ms: 100,
                     max_retries: 3,
+                    request_timeout_ms: None,
                 },
                 es_transport.clone(),
             )
@@ -3342,6 +3344,7 @@ mod tests {
                 max_backup_files: None,
                 max_retention_days: None,
                 sync_mode: broker_connectors::DiskSyncMode::OsDefault,
+                timeout_ms: None,
             })
             .expect("valid writer"),
         );
@@ -3358,6 +3361,7 @@ mod tests {
                     max_backup_files: None,
                     max_retention_days: None,
                     sync_mode: broker_connectors::DiskSyncMode::OsDefault,
+                    timeout_ms: None,
                 },
                 disk_writer.clone(),
             )
@@ -3374,6 +3378,7 @@ mod tests {
                     tier: "enterprise".to_string(),
                     batch_size: Some(1),
                     linger_ms: Some(50),
+                    timeout_ms: None,
                 },
                 spb_transport.clone(),
             )
@@ -3507,6 +3512,7 @@ mod tests {
                     max_retries: Some(5),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 kinesis_transport.clone(),
             )
@@ -3531,6 +3537,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 gcp_transport.clone(),
             )
@@ -3557,6 +3564,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 azure_transport.clone(),
             )
@@ -3584,6 +3592,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 pulsar_transport.clone(),
             )
@@ -3752,6 +3761,7 @@ mod tests {
                     max_retries: Some(5),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 oci_transport.clone(),
             )
@@ -3782,6 +3792,7 @@ mod tests {
                     buffer_capacity: None,
                     linger_ms: Some(10),
                     max_retries: Some(5),
+                    timeout_ms: None,
                 },
                 aws_transport.clone(),
             )
@@ -3808,6 +3819,7 @@ mod tests {
                     buffer_capacity: None,
                     linger_ms: Some(10),
                     max_retries: Some(5),
+                    timeout_ms: None,
                 },
                 azure_transport.clone(),
             )
@@ -3834,6 +3846,7 @@ mod tests {
                     buffer_capacity: None,
                     linger_ms: Some(10),
                     max_retries: Some(5),
+                    timeout_ms: None,
                 },
                 gcp_transport.clone(),
             )
@@ -3860,6 +3873,7 @@ mod tests {
                     buffer_capacity: None,
                     batch_size: Some(1),
                     linger_ms: Some(10),
+                    timeout_ms: None,
                 },
                 opcua_transport.clone(),
             )
@@ -4028,6 +4042,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 mongo_transport.clone(),
             )
@@ -4053,6 +4068,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 mssql_transport.clone(),
             )
@@ -4079,6 +4095,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 cassandra_transport.clone(),
             )
@@ -4111,6 +4128,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 couchbase_transport.clone(),
             )
@@ -4274,6 +4292,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 tdengine_transport.clone(),
             )
@@ -4307,6 +4326,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 iotdb_transport.clone(),
             )
@@ -4342,6 +4362,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 timestream_transport.clone(),
             )
@@ -4380,6 +4401,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 dynamodb_transport.clone(),
             )
@@ -4525,6 +4547,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 snowflake_transport.clone(),
             )
@@ -4559,6 +4582,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 databricks_transport.clone(),
             )
@@ -4591,6 +4615,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 doris_transport.clone(),
             )
@@ -4617,6 +4642,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 bigquery_transport.clone(),
             )
@@ -4648,6 +4674,7 @@ mod tests {
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    timeout_ms: None,
                 },
                 redshift_transport.clone(),
             )
@@ -4926,6 +4953,7 @@ mod tests {
                     max_bytes_per_blob: None,
                     flush_interval_secs: 60,
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 blob_transport.clone(),
             )
@@ -4956,6 +4984,7 @@ mod tests {
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),
+                    timeout_ms: None,
                 },
                 ots_transport.clone(),
             )
@@ -4992,6 +5021,7 @@ mod tests {
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),
+                    timeout_ms: None,
                 },
                 tables_transport.clone(),
             )
@@ -5018,6 +5048,7 @@ mod tests {
                     partitions: 12,
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 confluent_transport.clone(),
             )
@@ -5042,6 +5073,7 @@ mod tests {
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),
+                    timeout_ms: None,
                 },
                 rmq_transport.clone(),
             )
@@ -5183,6 +5215,7 @@ mod tests {
                     key_columns: vec!["device_id".to_string()],
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 oracle_transport.clone(),
             )
@@ -5201,6 +5234,7 @@ mod tests {
                     batch_size: Some(1),
                     max_retry_attempts: 5,
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 cockroach_transport.clone(),
             )
@@ -5237,6 +5271,7 @@ mod tests {
                     ],
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 alloydb_transport.clone(),
             )
@@ -5262,6 +5297,7 @@ mod tests {
                     compression: OpenTsdbCompression::None,
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 opentsdb_transport.clone(),
             )
@@ -5284,6 +5320,7 @@ mod tests {
                     timestamp_precision: GreptimePrecision::Millisecond,
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 greptimedb_transport.clone(),
             )
@@ -5307,6 +5344,7 @@ mod tests {
                     field_columns: vec!["temp".to_string()],
                     batch_size: Some(1),
                     buffer_capacity: None,
+                    timeout_ms: None,
                 },
                 datalayers_transport.clone(),
             )

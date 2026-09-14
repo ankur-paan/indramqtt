@@ -928,6 +928,7 @@ mod tests {
             max_retries: Some(3),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_000),
+            timeout_ms: None,
         }
     }
 
