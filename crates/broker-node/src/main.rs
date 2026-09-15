@@ -49,6 +49,10 @@ struct Args {
     /// Unique cluster node identity. Defaults to "indra-node-1".
     #[arg(long, default_value = "indra-node-1")]
     node_id: String,
+
+    /// Accept MQTT connections without credentials even when users are configured.
+    #[arg(long)]
+    allow_anonymous: bool,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -125,7 +129,11 @@ fn session_binding_reply(
 /// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
-        if req.username.is_some() {
+        if req.username.is_none() {
+            if shared.auth.user_count() > 0 && !shared.allow_anonymous {
+                return Some(session_binding_reply(frame, 0, false, 0x87));
+            }
+        } else {
             let password = req.password.as_deref();
             if shared
                 .auth
@@ -246,6 +254,7 @@ struct Shared {
     cluster: Option<Arc<dyn RoutingPlane>>,
     metrics: Arc<Metrics>,
     auth: Arc<MemoryAuth>,
+    allow_anonymous: bool,
 }
 
 impl Shared {
@@ -307,6 +316,7 @@ impl Shared {
             cluster: None,
             metrics,
             auth: Arc::new(MemoryAuth::new()),
+            allow_anonymous: false,
         }
     }
 }
@@ -1166,7 +1176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("BrokerLink IPC protocol initialized");
     info!("Clean-room architecture ready");
 
-    let shared = Shared::new();
+    let mut shared = Shared::new();
+    shared.allow_anonymous = args.allow_anonymous;
 
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
@@ -2376,10 +2387,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_auth_accepts_valid_and_anonymous() {
+    async fn bind_auth_rejects_anonymous_when_users_exist() {
         let shared = test_shared();
         shared.auth.add_user("alice", b"s3cret");
 
+        // Anonymous bind is rejected with 0x87 and creates no session.
+        let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "anonymous bind must yield return code 0x87");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-z").is_none());
+
+        // A valid credentialed bind in the same store still gets rc 0.
         let frame = bind_frame(
             82,
             1,
@@ -2388,8 +2408,24 @@ mod tests {
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
 
-        // Anonymous binds stay open even with users configured.
+    #[tokio::test]
+    async fn bind_auth_accepts_anonymous_when_no_users() {
+        let shared = test_shared();
+
+        let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_auth_accepts_anonymous_with_allow_flag() {
+        let mut shared = test_shared();
+        shared.allow_anonymous = true;
+        shared.auth.add_user("alice", b"s3cret");
+
         let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
