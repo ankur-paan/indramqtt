@@ -577,6 +577,10 @@ struct HttpRow {
     millis: i64,
 }
 
+/// Rendered batch-array target: URL, rendered template headers, and the
+/// row indices belonging to that target in flush order.
+type HttpBatchGroup = (String, Vec<(String, String)>, Vec<usize>);
+
 struct HttpBuffer {
     queue: BatchQueue<HttpRow>,
     bytes: usize,
@@ -635,22 +639,45 @@ impl HttpSink {
     }
 
     /// Build the requests for taken rows: one per row for RawJson and
-    /// FormUrlEncoded, a single array request for JsonBatchArray.
+    /// FormUrlEncoded, one array request per rendered (url, headers)
+    /// group for JsonBatchArray.
     fn render_requests(&self, rows: &[HttpRow]) -> Result<Vec<HttpRequest>> {
         match self.config.body_format {
             HttpBodyFormat::JsonBatchArray => {
-                let mut documents = Vec::with_capacity(rows.len());
-                for row in rows {
-                    documents.push(Self::event_document(row)?);
+                if rows.is_empty() {
+                    return Ok(Vec::new());
                 }
-                let body = serde_json::to_vec(&documents).map_err(|e| {
-                    ConnectorError::Dispatch(format!("webhook batch encode failed: {e}"))
-                })?;
-                Ok(vec![self.request_for(
-                    rows[0].clone(),
-                    body,
-                    "application/json",
-                )?])
+                // Group document indices by rendered (url, template
+                // headers) in first-seen order so per-event variables
+                // in `url` or headers send each event to its own
+                // target instead of the first row's target.
+                let mut groups: Vec<HttpBatchGroup> = Vec::new();
+                for (index, row) in rows.iter().enumerate() {
+                    let (url, rendered) = self.render_target(row)?;
+                    match groups.iter_mut().find(|(group_url, group_headers, _)| {
+                        *group_url == url && *group_headers == rendered
+                    }) {
+                        Some((_, _, indices)) => indices.push(index),
+                        None => groups.push((url, rendered, vec![index])),
+                    }
+                }
+                let mut requests = Vec::with_capacity(groups.len());
+                for (url, rendered, indices) in &groups {
+                    let mut documents = Vec::with_capacity(indices.len());
+                    for index in indices {
+                        documents.push(Self::event_document(&rows[*index])?);
+                    }
+                    let body = serde_json::to_vec(&documents).map_err(|e| {
+                        ConnectorError::Dispatch(format!("webhook batch encode failed: {e}"))
+                    })?;
+                    requests.push(self.request_with_target(
+                        url.clone(),
+                        rendered.clone(),
+                        body,
+                        "application/json",
+                    )?);
+                }
+                Ok(requests)
             }
             HttpBodyFormat::RawJson => {
                 let mut requests = Vec::with_capacity(rows.len());
@@ -689,23 +716,32 @@ impl HttpSink {
         }
     }
 
-    /// Assemble one request: method, templated URL/headers, auth,
-    /// content type, and the HMAC signature over the exact body.
-    fn request_for(
-        &self,
-        row: HttpRow,
-        body: Vec<u8>,
-        content_type: &'static str,
-    ) -> Result<HttpRequest> {
+    /// Render the URL and template headers for one row without a body.
+    fn render_target(&self, row: &HttpRow) -> Result<(String, Vec<(String, String)>)> {
         let vars =
             HttpSinkConfig::event_vars(&row.topic, &row.payload, qos_from(row.qos), row.millis);
         let borrowed: Vec<(&str, String)> =
             vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         let url = render_template(&self.config.url, &borrowed)?;
-        let mut headers = vec![("Content-Type".to_string(), content_type.to_string())];
+        let mut rendered = Vec::with_capacity(self.config.headers.len());
         for (name, template) in &self.config.headers {
-            headers.push((name.clone(), render_template(template, &borrowed)?));
+            rendered.push((name.clone(), render_template(template, &borrowed)?));
         }
+        Ok((url, rendered))
+    }
+
+    /// Assemble one request from an already-rendered target: method,
+    /// content type, rendered headers, auth, and the HMAC signature
+    /// over the exact body.
+    fn request_with_target(
+        &self,
+        url: String,
+        rendered_headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> Result<HttpRequest> {
+        let mut headers = vec![("Content-Type".to_string(), content_type.to_string())];
+        headers.extend(rendered_headers);
         headers.extend(self.config.auth.headers()?);
         if let Some(signature) = &self.config.signature {
             let tag = signature.sign(&body);
@@ -717,6 +753,18 @@ impl HttpSink {
             headers,
             body,
         })
+    }
+
+    /// Assemble one request: method, templated URL/headers, auth,
+    /// content type, and the HMAC signature over the exact body.
+    fn request_for(
+        &self,
+        row: HttpRow,
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> Result<HttpRequest> {
+        let (url, rendered) = self.render_target(&row)?;
+        self.request_with_target(url, rendered, body, content_type)
     }
 
     /// Classify a status: success, retryable (429/500..=504), or
@@ -1091,6 +1139,67 @@ mod tests {
             encoding: HmacEncoding::Hex,
         };
         assert_eq!(signed.1, expected.sign(&captured[0].body));
+    }
+
+    #[tokio::test]
+    async fn test_batch_array_groups_by_rendered_url() {
+        let mut config = test_config("http://hook/${topic}");
+        config.body_format = HttpBodyFormat::JsonBatchArray;
+        config.batch_size = Some(100);
+        let (sink, transport) = test_sink(config);
+        sink.send(
+            &Topic::new("a/1").unwrap(),
+            &Bytes::from("{\"n\":1}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("b/2").unwrap(),
+            &Bytes::from("{\"n\":2}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("a/1").unwrap(),
+            &Bytes::from("{\"n\":3}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].url.ends_with("a/1"), "url: {}", captured[0].url);
+        assert!(captured[1].url.ends_with("b/2"), "url: {}", captured[1].url);
+        let first: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&captured[1].body).unwrap();
+        assert_eq!(first, serde_json::json!([{"n": 1}, {"n": 3}]));
+        assert_eq!(second, serde_json::json!([{"n": 2}]));
+    }
+
+    #[tokio::test]
+    async fn test_batch_array_single_group_unchanged() {
+        let mut config = test_config("http://127.0.0.1:1/hook");
+        config.body_format = HttpBodyFormat::JsonBatchArray;
+        config.batch_size = Some(100);
+        let (sink, transport) = test_sink(config);
+        let topic = Topic::new("t").unwrap();
+        for v in [1, 2, 3] {
+            sink.send(
+                &topic,
+                &Bytes::from(format!("{{\"v\":{v}}}")),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        }
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+        assert_eq!(body, serde_json::json!([{"v": 1}, {"v": 2}, {"v": 3}]));
     }
 
     #[tokio::test]
