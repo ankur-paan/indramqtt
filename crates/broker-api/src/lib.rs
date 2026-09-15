@@ -6,10 +6,11 @@ use axum::{
     Json, Router,
 };
 use broker_auth::{AclAction, AclRule, MemoryAuth};
+use broker_config::ConfigRegistry;
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router as SubscriptionRouter};
-use broker_rules::{Rule, RuleAction, RuleEngine};
+use broker_rules::{Rule, RuleAction, RuleEngine, RuleEngineError};
 use broker_session::SessionManager;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,10 +44,19 @@ pub struct ApiState {
     pub conns: Arc<ConnTable>,
     pub admin_users: Arc<AdminUsers>,
     pub tokens: Arc<ApiTokens>,
+    /// Kernel-owned configuration registry: lock-free snapshots of admin
+    /// users, MQTT users/ACLs, rules and connectors.
+    pub config: Arc<ConfigRegistry>,
+    /// Local node name (`--node-id`): used by the node-scope helper for
+    /// `/nodes/{node}/...` routes. Stored only until W1 wires it in.
+    pub node_id: String,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
 impl ApiState {
+    // One handle per subsystem plus the config registry and node name;
+    // bundling them would hide the construction sites without helping.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Arc<RuleEngine>,
         sessions: Arc<SessionManager>,
@@ -54,7 +64,28 @@ impl ApiState {
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
         conns: Arc<ConnTable>,
+        config: Arc<ConfigRegistry>,
+        node_id: String,
     ) -> Self {
+        // Boot seeding (W0-21): route the loaded MQTT users/ACLs into the
+        // very instance the caller shares (the kernel passes its BrokerLink
+        // `MemoryAuth` here), so no second copy can diverge. An empty
+        // snapshot is a no-op (today's empty behaviour).
+        auth.seed_from_registry(&config);
+        // Boot replay (W0-22): route the loaded rules into the very engine
+        // instance the caller shares, through the same validated create
+        // path as `RuleEngine::create_rule`. An empty snapshot is a no-op
+        // (today's empty behaviour); an invalid stored rule fails boot
+        // loudly instead of being skipped silently.
+        if let Err(error) = engine.seed_from_registry(&config) {
+            panic!("invalid stored rules snapshot: {error}");
+        }
+        // Boot replay (W0-23): merge the persisted connectors into the
+        // v5 store and re-register every live sink through the same path
+        // `create_connector` uses. An empty snapshot is a no-op (today's
+        // empty behaviour); an invalid snapshot fails boot loudly
+        // instead of being skipped silently.
+        crate::v5::rules::seed_connectors_from_registry(&config, &engine);
         Self {
             engine,
             sessions,
@@ -62,13 +93,16 @@ impl ApiState {
             metrics,
             auth,
             conns,
-            admin_users: Arc::new(AdminUsers::with_default_admin()),
+            admin_users: Arc::new(AdminUsers::from_registry(&config)),
             tokens: Arc::new(ApiTokens::new()),
+            config,
+            node_id,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
 
     /// Standalone state for tests and tools (empty sessions/router).
+    /// Uses validated defaults without touching the kernel data dir.
     pub fn standalone(engine: Arc<RuleEngine>) -> Self {
         Self {
             engine,
@@ -79,6 +113,8 @@ impl ApiState {
             conns: Arc::new(ConnTable::default()),
             admin_users: Arc::new(AdminUsers::with_default_admin()),
             tokens: Arc::new(ApiTokens::new()),
+            config: defaults_registry(),
+            node_id: "indra-node-1".to_string(),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -88,6 +124,25 @@ impl ApiState {
     pub fn next_ws_conn_id(&self) -> u64 {
         self.ws_conn_counter.fetch_add(1, Ordering::SeqCst)
     }
+}
+
+/// Defaults-only registry for standalone state (tests and tools).
+///
+/// Loads from a unique scratch path that is never created, so `load`
+/// yields validated empty roots with no filesystem writes and the
+/// standalone state can never observe the kernel data dir.
+fn defaults_registry() -> Arc<ConfigRegistry> {
+    static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let slot = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "indramqtt-standalone-{nanos}-{}-{slot}",
+        std::process::id()
+    ));
+    Arc::new(ConfigRegistry::load(&dir).expect("validated defaults always load"))
 }
 
 /// Public routes (dashboard assets, health, login, MQTT-over-WebSocket)
@@ -334,6 +389,34 @@ fn not_found(id: &str) -> Response {
         .into_response()
 }
 
+/// A registry commit or atomic save failed after the in-memory MQTT
+/// user/ACL mutation applied: the loss must never be silent, so the
+/// caller gets a 500 (mirrors the admin-users `Persist` mapping).
+fn persist_error(error: broker_config::ConfigError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: format!("cannot persist MQTT users: {error}"),
+        }),
+    )
+        .into_response()
+}
+
+/// A registry commit or atomic save failed after the in-memory rule
+/// mutation applied: the loss must never be silent, so the caller gets
+/// a 500. [`RuleEngineError::Persist`] already renders as
+/// `cannot persist rules: ...`, so its display is reused verbatim
+/// (never re-prefixed).
+fn rule_persist_error(error: RuleEngineError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 async fn create_rule(
     State(state): State<ApiState>,
     Json(req): Json<CreateRuleRequest>,
@@ -375,6 +458,9 @@ async fn create_rule(
             .create_rule(req.name, topic_filter, req.sql_query, req.enabled, actions)
         {
             Ok(rule) => rule,
+            // A persist failure is a 500 (the in-memory rule stays but the
+            // disk save failed); validation failures stay 400.
+            Err(error @ RuleEngineError::Persist(_)) => return rule_persist_error(error),
             Err(e) => return bad_request(format!("invalid sql_query: {e}")),
         };
     (StatusCode::CREATED, Json(rule)).into_response()
@@ -393,8 +479,9 @@ async fn get_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Resp
 
 async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     match state.engine.remove_rule(&id) {
-        true => StatusCode::NO_CONTENT.into_response(),
-        false => not_found(&id),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found(&id),
+        Err(error) => rule_persist_error(error),
     }
 }
 
@@ -478,9 +565,12 @@ async fn create_user(
     if req.password.is_empty() {
         return bad_request("password must not be empty");
     }
-    state
+    if let Err(error) = state
         .auth
-        .add_user(req.username.clone(), req.password.as_bytes());
+        .add_user(req.username.clone(), req.password.as_bytes())
+    {
+        return persist_error(error);
+    }
     if let Some(quotas) = req.quotas.map(|dto| broker_auth::UserQuotas {
         max_connections: dto.max_connections,
         max_publish_rate: dto.max_publish_rate,
@@ -524,12 +614,14 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
     if TopicFilter::new(req.topic_pattern.clone()).is_err() {
         return bad_request("topic_pattern must be a valid MQTT filter");
     }
-    state.auth.add_rule(AclRule::new(
+    if let Err(error) = state.auth.add_rule(AclRule::new(
         req.client_pattern.clone(),
         action,
         req.topic_pattern.clone(),
         req.allow,
-    ));
+    )) {
+        return persist_error(error);
+    }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -545,10 +637,10 @@ async fn delete_user(
     State(state): State<ApiState>,
     axum::extract::Path(username): axum::extract::Path<String>,
 ) -> Response {
-    if state.auth.remove_user(&username) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match state.auth.remove_user(&username) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => persist_error(error),
     }
 }
 
@@ -556,10 +648,10 @@ async fn delete_acl(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> Response {
-    if state.auth.remove_rule(id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match state.auth.remove_rule(id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => persist_error(error),
     }
 }
 
@@ -1472,6 +1564,12 @@ mod tests {
 
     impl TestServer {
         async fn start() -> (Self, TestState) {
+            Self::start_with_registry(defaults_registry()).await
+        }
+
+        /// Start serving `ApiState` built on `registry`: pass a registry
+        /// loaded from a temp `--data-dir` to simulate kernel restarts.
+        async fn start_with_registry(registry: Arc<ConfigRegistry>) -> (Self, TestState) {
             let engine = Arc::new(RuleEngine::new(
                 16,
                 broker_rules::BackpressurePolicy::DropOldest,
@@ -1488,6 +1586,8 @@ mod tests {
                 metrics.clone(),
                 auth.clone(),
                 conns,
+                registry,
+                "indra-node-1".to_string(),
             );
             let state = TestState {
                 engine: engine.clone(),
@@ -1708,6 +1808,26 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    #[test]
+    fn standalone_needs_no_filesystem() {
+        let engine = Arc::new(RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        assert_eq!(
+            *state.config.snapshot(),
+            broker_config::FullSnapshot::default(),
+            "standalone exposes validated defaults"
+        );
+        assert_eq!(state.node_id, "indra-node-1");
+        assert!(
+            !state.config.dir().exists(),
+            "standalone must not create any directory, found: {}",
+            state.config.dir().display()
+        );
     }
 
     #[tokio::test]
@@ -2622,6 +2742,291 @@ mod tests {
         let (status, body) = server.get_auth("/api/v5/current_user", &v_token).await;
         assert_eq!(status, 401);
         assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    /// Unique scratch data dir under the OS temp dir (no dev-dependency).
+    fn unique_data_dir(prefix: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let slot = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "indramqtt-w020-datadir-{prefix}-{}-{nanos}-{slot}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn admin_users_survive_restart() {
+        let dir = unique_data_dir("survive");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let admin_token = server.login_as_admin().await;
+
+        // Create `w0keep` through the API, then change its password.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "w0keep", "password": "W0keep-pass1", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/users/w0keep/change_pwd",
+                json!({"new_pwd": "W0keep-new-pass2"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+
+        // Simulate a kernel restart: rebuild state from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+
+        // The new password logs in; the old one is rejected.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w0keep", "password": "W0keep-new-pass2"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["role"], json!("viewer"));
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w0keep", "password": "W0keep-pass1"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("NAME_PWD_ERROR"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn admin_users_delete_survives_restart() {
+        let dir = unique_data_dir("delete");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin_token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "w0keep", "password": "W0keep-pass1", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Sanity: the user logs in before the delete.
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w0keep", "password": "W0keep-pass1"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .delete_auth("/api/v5/users/w0keep", &admin_token)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+
+        // Simulate a kernel restart: rebuild state from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+
+        // The deleted user can no longer log in ...
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w0keep", "password": "W0keep-pass1"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        // ... and the reloaded list has no `w0keep`. The admin password
+        // persisted too, so the rebooted node logs in with it.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let admin_token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users array")
+            .iter()
+            .map(|u| u["username"].as_str().expect("username"))
+            .collect();
+        assert!(
+            !names.contains(&"w0keep"),
+            "deleted user must stay deleted, got: {names:?}"
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn connectors_survive_restart() {
+        let dir = unique_data_dir("w023-conn-survive");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // No `server`/`url` target: no probe runs, status is `connected`
+        // and the create path registers a live `http` sink.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w023-http-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(
+            state.engine.connectors().get("w023-http-conn").is_some(),
+            "create must register a live sink"
+        );
+        drop(server);
+        drop(registry);
+
+        // Simulate a kernel restart: rebuild state from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted too, so the rebooted node logs in
+        // with the changed password (`login_as_admin` only fits fresh
+        // servers still on the default password).
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+
+        // The identical stored entry is back ...
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w023-http-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body, created,
+            "restored connector must return the identical stored entry"
+        );
+        // ... and the restored connector actually connects, not just lists:
+        // the live sink is re-registered through the same path create uses.
+        assert!(
+            state.engine.connectors().get("w023-http-conn").is_some(),
+            "restored connector must re-register its live sink"
+        );
+        let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.as_array()
+                .expect("connectors array")
+                .iter()
+                .any(|c| c["id"] == json!("w023-http-conn")),
+            "restored connector must be live, got: {body}"
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn connector_delete_survives_restart() {
+        let dir = unique_data_dir("w023-conn-delete");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        for name in ["w023-del-conn", "w023-kept-conn"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"name": name, "type": "http"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201);
+        }
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/w023-del-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/w023-del-conn", &token)
+            .await;
+        assert_eq!(status, 404);
+        // The delete must reach the snapshot on disk: the kept connector
+        // is stored, the deleted one is gone.
+        let snapshot = ConfigRegistry::load(&dir)
+            .expect("reload data dir")
+            .snapshot();
+        let ids: Vec<&str> = snapshot
+            .connectors
+            .connectors
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"w023-kept-conn"),
+            "kept connector must be persisted, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"w023-del-conn"),
+            "deleted connector must stay deleted, got: {ids:?}"
+        );
+        drop(server);
+        drop(registry);
+
+        // Simulate a kernel restart: rebuild state from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted too, so the rebooted node logs in
+        // with the changed password.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+
+        // The deleted connector stays deleted, and no sink comes back,
+        // while the kept connector is back with its live sink.
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w023-del-conn", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(
+            state.engine.connectors().get("w023-del-conn").is_none(),
+            "deleted connector must not re-register any sink"
+        );
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w023-kept-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w023-kept-conn"));
+        assert!(
+            state.engine.connectors().get("w023-kept-conn").is_some(),
+            "kept connector must re-register its live sink"
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn fill_pending_challenges(tokens: &crate::v5::auth::ApiTokens, count: usize) {
@@ -4734,7 +5139,10 @@ mod tests {
     #[tokio::test]
     async fn test_ws_auth_rejected_with_0x86() {
         let (server, state) = TestServer::start().await;
-        state.auth.add_user("alice", b"s3cret");
+        state
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("test user persists");
 
         let mut client = WsClient::connect(server.port).await;
         client
@@ -4751,12 +5159,15 @@ mod tests {
     #[tokio::test]
     async fn test_ws_subscribe_denied_with_0x87() {
         let (server, state) = TestServer::start().await;
-        state.auth.add_rule(broker_auth::AclRule::new(
-            "console-y",
-            broker_auth::AclAction::All,
-            "#",
-            false,
-        ));
+        state
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "console-y",
+                broker_auth::AclAction::All,
+                "#",
+                false,
+            ))
+            .expect("test rule persists");
 
         let mut client = WsClient::connect(server.port).await;
         client

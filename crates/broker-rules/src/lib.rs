@@ -26,6 +26,11 @@ pub enum RuleEngineError {
 
     #[error("Invalid rule: {0}")]
     InvalidRule(String),
+
+    /// The in-memory mutation applied but the registry commit or atomic
+    /// save failed. Callers map this to 500; it is never silent.
+    #[error("cannot persist rules: {0}")]
+    Persist(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +344,12 @@ pub struct RuleEngine {
     window_workers: RwLock<HashMap<String, WindowWorker>>,
     window_channel_depth: usize,
     forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
+    /// Kernel config registry receiving every rule mutation (`None` in
+    /// unit tests and standalone state, which stay memory-only).
+    registry: RwLock<Option<Arc<broker_config::ConfigRegistry>>>,
+    /// Serialises export-commit-save so concurrent mutations cannot
+    /// interleave into a lost update on disk.
+    save_lock: parking_lot::Mutex<()>,
 }
 
 /// Shared flush context: what a window worker needs at flush time. The
@@ -429,6 +440,8 @@ impl RuleEngine {
             window_workers: RwLock::new(HashMap::new()),
             window_channel_depth: window_channel_depth.max(1),
             forward_throttle,
+            registry: RwLock::new(None),
+            save_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -476,9 +489,33 @@ impl RuleEngine {
     /// ([`TopicFilter::new`], [`Topic::new`]) happens at the API boundary.
     /// A present `sql_query` is parsed immediately: invalid SQL fails
     /// creation with [`RuleEngineError::InvalidRule`] so a broken rule
-    /// can never go live.
+    /// can never go live. The mutation commits the exported
+    /// [`broker_config::RulesConf`] root and atomically saves it when a
+    /// registry is attached; a save failure is returned and the in-memory
+    /// rule stays (commit precedes the atomic save).
     pub fn create_rule(
         &self,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
+        actions: Vec<RuleAction>,
+    ) -> Result<Rule, RuleEngineError> {
+        let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        let rule = self.insert_rule_with_id(id, name, topic_filter, sql_query, enabled, actions)?;
+        self.persist()?;
+        Ok(rule)
+    }
+
+    /// Insert a rule under a preserved id (boot replay path). Shares the
+    /// same SQL validation as [`RuleEngine::create_rule`]: invalid SQL
+    /// fails loudly instead of being skipped. A duplicate id fails
+    /// loudly. Advances `next_id` past any numeric `rule-<n>` suffix so
+    /// later creates never collide. Does not persist; callers persist
+    /// once after bulk loads.
+    fn insert_rule_with_id(
+        &self,
+        id: String,
         name: String,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
@@ -521,7 +558,16 @@ impl RuleEngine {
             }
             None => None,
         };
-        let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        if self.rules.read().contains_key(&id) {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "duplicate rule id: {id}"
+            )));
+        }
+        if let Some(suffix) = id.strip_prefix("rule-") {
+            if let Ok(n) = suffix.parse::<u64>() {
+                self.next_id.fetch_max(n + 1, Ordering::SeqCst);
+            }
+        }
         let tier = match &parsed_query {
             Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
             _ => RuleTier::Community,
@@ -551,6 +597,170 @@ impl RuleEngine {
         Ok(rule)
     }
 
+    /// Seed from a validated snapshot root. An empty snapshot yields
+    /// today's empty behaviour (no rules). Memory-only: mutations are
+    /// not persisted.
+    ///
+    /// Boot replays the snapshot through the same validated create path
+    /// as [`RuleEngine::create_rule`]: an invalid topic filter, action,
+    /// or SQL fails loudly instead of being skipped silently.
+    ///
+    /// Rule metric counters (`matched_cnt` etc.) are deliberately NOT
+    /// persisted: they are monotonic runtime counters that reset to zero
+    /// on every rebuild.
+    pub fn from_snapshot(conf: &broker_config::RulesConf) -> Result<Self, RuleEngineError> {
+        let engine = Self::new(1024, BackpressurePolicy::DropOldest);
+        engine.seed_from_snapshot(conf)?;
+        Ok(engine)
+    }
+
+    /// Seed from the registry's current snapshot and persist every later
+    /// rule mutation back through it. This is the kernel boot path: an
+    /// empty snapshot yields today's empty behaviour, and an invalid
+    /// stored rule fails boot loudly.
+    pub fn from_registry(
+        registry: &Arc<broker_config::ConfigRegistry>,
+    ) -> Result<Self, RuleEngineError> {
+        let engine = Self::from_snapshot(&registry.snapshot().rules)?;
+        *engine.registry.write() = Some(Arc::clone(registry));
+        Ok(engine)
+    }
+
+    /// Attach the registry and replace the current contents with its
+    /// snapshot, in place on the same instance. Invalid stored rules
+    /// fail loudly; metric counters reset to zero (see
+    /// [`RuleEngine::from_snapshot`]).
+    pub fn seed_from_registry(
+        &self,
+        registry: &Arc<broker_config::ConfigRegistry>,
+    ) -> Result<(), RuleEngineError> {
+        self.seed_from_snapshot(&registry.snapshot().rules)?;
+        *self.registry.write() = Some(Arc::clone(registry));
+        Ok(())
+    }
+
+    /// Replace all rules with the snapshot contents through the validated
+    /// create path. Existing window workers are aborted first so no
+    /// orphan task survives its rule; `next_id` restarts at 1 and
+    /// advances past every restored numeric suffix.
+    fn seed_from_snapshot(&self, conf: &broker_config::RulesConf) -> Result<(), RuleEngineError> {
+        conf.validate()
+            .map_err(|e| RuleEngineError::InvalidRule(format!("invalid rules snapshot: {e}")))?;
+        for (_, worker) in self.window_workers.write().drain() {
+            worker.handle.abort();
+        }
+        self.rules.write().clear();
+        self.next_id.store(1, Ordering::SeqCst);
+        for entry in &conf.rules {
+            let topic_filter = TopicFilter::new(&entry.topic_filter).map_err(|e| {
+                RuleEngineError::InvalidRule(format!("invalid topic_filter for {}: {e}", entry.id))
+            })?;
+            let mut actions = Vec::with_capacity(entry.actions.len());
+            for action in &entry.actions {
+                actions.push(Self::action_from_entry(&entry.id, action)?);
+            }
+            self.insert_rule_with_id(
+                entry.id.clone(),
+                entry.name.clone(),
+                topic_filter,
+                entry.sql_query.clone(),
+                entry.enabled,
+                actions,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Export the current contents as a validated config root: rules
+    /// sorted by id so the persisted file is deterministic, with the
+    /// full action list (every variant field, no display coercion).
+    /// Metric counters are runtime-only and are never exported.
+    fn export_conf(&self) -> broker_config::RulesConf {
+        let mut rules: Vec<Rule> = self.rules.read().values().cloned().collect();
+        rules.sort_by(|a, b| a.id.cmp(&b.id));
+        let entries = rules
+            .iter()
+            .map(|rule| broker_config::RuleEntry {
+                id: rule.id.clone(),
+                name: rule.name.clone(),
+                topic_filter: rule.topic_filter.as_str().to_string(),
+                sql_query: rule.sql_query.clone(),
+                enabled: rule.enabled,
+                actions: rule.actions.iter().map(Self::action_to_entry).collect(),
+            })
+            .collect();
+        broker_config::RulesConf { rules: entries }
+    }
+
+    /// Commit the exported root and atomically save it. A no-op without
+    /// a registry; any commit or save failure surfaces as
+    /// [`RuleEngineError::Persist`] so callers answer 500 and the loss
+    /// is never silent.
+    fn persist(&self) -> Result<(), RuleEngineError> {
+        let Some(registry) = self.registry.read().clone() else {
+            return Ok(());
+        };
+        let _guard = self.save_lock.lock();
+        let conf = self.export_conf();
+        registry
+            .commit_rules(conf)
+            .map_err(|e| RuleEngineError::Persist(e.to_string()))?;
+        registry
+            .save()
+            .map_err(|e| RuleEngineError::Persist(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Map one live action to its lossless persisted form.
+    fn action_to_entry(action: &RuleAction) -> broker_config::RuleActionEntry {
+        match action {
+            RuleAction::Republish { topic, qos } => broker_config::RuleActionEntry::Republish {
+                topic: topic.as_str().to_string(),
+                qos: (*qos).into(),
+            },
+            RuleAction::Log => broker_config::RuleActionEntry::Log,
+            RuleAction::ForwardConnector { connector_id } => {
+                broker_config::RuleActionEntry::ForwardConnector {
+                    connector_id: connector_id.clone(),
+                }
+            }
+        }
+    }
+
+    /// Map one persisted action back to its live form through the same
+    /// validation the API applies: invalid topics or QoS fail loudly.
+    fn action_from_entry(
+        rule_id: &str,
+        entry: &broker_config::RuleActionEntry,
+    ) -> Result<RuleAction, RuleEngineError> {
+        match entry {
+            broker_config::RuleActionEntry::Republish { topic, qos } => {
+                let topic = Topic::new(topic).map_err(|e| {
+                    RuleEngineError::InvalidRule(format!(
+                        "invalid republish topic for {rule_id}: {e}"
+                    ))
+                })?;
+                let qos = QoS::try_from(*qos).map_err(|e| {
+                    RuleEngineError::InvalidRule(format!(
+                        "invalid republish qos for {rule_id}: {e}"
+                    ))
+                })?;
+                Ok(RuleAction::Republish { topic, qos })
+            }
+            broker_config::RuleActionEntry::Log => Ok(RuleAction::Log),
+            broker_config::RuleActionEntry::ForwardConnector { connector_id } => {
+                if connector_id.trim().is_empty() {
+                    return Err(RuleEngineError::InvalidRule(format!(
+                        "invalid connector_id for {rule_id}: must not be empty (field `connector_id`)"
+                    )));
+                }
+                Ok(RuleAction::ForwardConnector {
+                    connector_id: connector_id.clone(),
+                })
+            }
+        }
+    }
+
     pub fn get_rule(&self, id: &str) -> Option<Rule> {
         self.rules.read().get(id).cloned()
     }
@@ -561,21 +771,35 @@ impl RuleEngine {
         rules
     }
 
-    pub fn remove_rule(&self, id: &str) -> bool {
+    /// Remove a rule (false when unknown; unknown ids persist nothing).
+    /// Persists through the registry when one is attached; a save
+    /// failure is returned and the in-memory removal stays (commit
+    /// precedes the atomic save).
+    pub fn remove_rule(&self, id: &str) -> Result<bool, RuleEngineError> {
         // Abort the window worker first so no orphan task survives its rule.
         if let Some(worker) = self.window_workers.write().remove(id) {
             worker.handle.abort();
         }
-        self.rules.write().remove(id).is_some()
+        let removed = self.rules.write().remove(id).is_some();
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
     }
 
-    pub fn set_rule_enabled(&self, id: &str, enabled: bool) -> bool {
-        if let Some(rule) = self.rules.write().get_mut(id) {
+    /// Enable or disable a rule (false when unknown; unknown ids persist
+    /// nothing). Persists through the registry when one is attached.
+    pub fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<bool, RuleEngineError> {
+        let found = if let Some(rule) = self.rules.write().get_mut(id) {
             rule.enabled = enabled;
             true
         } else {
             false
+        };
+        if found {
+            self.persist()?;
         }
+        Ok(found)
     }
 
     /// Route one matching record into an Enterprise window worker: parse
@@ -1603,8 +1827,12 @@ mod tests {
         assert!(engine.get_rule("rule-1").is_some());
         assert!(engine.get_rule("rule-999").is_none());
         assert_eq!(engine.list_rules().len(), 1);
-        assert!(engine.remove_rule("rule-1"));
-        assert!(!engine.remove_rule("rule-1"));
+        assert!(engine
+            .remove_rule("rule-1")
+            .expect("memory-only remove cannot fail"));
+        assert!(!engine
+            .remove_rule("rule-1")
+            .expect("memory-only remove cannot fail"));
         assert!(engine.list_rules().is_empty());
     }
 
@@ -2386,10 +2614,16 @@ mod tests {
             .expect("rule creates");
         assert_eq!(engine.window_worker_count(), 1);
         // Re-creating is per-rule; removing aborts the worker.
-        assert!(engine.remove_rule(&rule.id));
+        assert!(engine
+            .remove_rule(&rule.id)
+            .expect("memory-only remove cannot fail"));
         assert_eq!(engine.window_worker_count(), 0);
-        assert!(!engine.remove_rule(&rule.id));
-        assert!(!engine.remove_rule("rule-999"));
+        assert!(!engine
+            .remove_rule(&rule.id)
+            .expect("memory-only remove cannot fail"));
+        assert!(!engine
+            .remove_rule("rule-999")
+            .expect("memory-only remove cannot fail"));
     }
 
     #[tokio::test]
@@ -2745,7 +2979,9 @@ mod tests {
         for _ in 0..5 {
             ingress(&engine, &sink_obj, br#"{ "temperature": 1.0 }"#).await;
         }
-        assert!(engine.remove_rule(&rule.id));
+        assert!(engine
+            .remove_rule(&rule.id)
+            .expect("memory-only remove cannot fail"));
         assert_eq!(engine.window_worker_count(), 0);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
@@ -5699,5 +5935,216 @@ mod tests {
         assert_eq!(rule.actions_total_cnt.load(Ordering::Relaxed), 5);
         assert_eq!(rule.actions_success_cnt.load(Ordering::Relaxed), 5);
         assert_eq!(rule.actions_failed_cnt.load(Ordering::Relaxed), 0);
+    }
+
+    /// Unique scratch data dir under the OS temp dir (no dev-dependency).
+    fn unique_rules_data_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "broker-rules-{prefix}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn persisted_rule_snapshot(rule: &Rule) -> (String, String, String, Option<String>, bool) {
+        (
+            rule.id.clone(),
+            rule.name.clone(),
+            rule.topic_filter.as_str().to_string(),
+            rule.sql_query.clone(),
+            rule.enabled,
+        )
+    }
+
+    fn persisted_actions_value(rule: &Rule) -> serde_json::Value {
+        serde_json::to_value(&rule.actions).expect("actions serialise")
+    }
+
+    #[tokio::test]
+    async fn rules_survive_restart() {
+        let dir = unique_rules_data_dir("restart");
+        let registry =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let engine = RuleEngine::from_registry(&registry).expect("empty snapshot boots");
+        // All three action variants; the republish rule stays disabled.
+        engine
+            .create_rule(
+                "republish-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(r#"SELECT temperature FROM "sensors/+" WHERE temperature > 0"#.to_string()),
+                false,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("alerts/hot").unwrap(),
+                    qos: QoS::AtLeastOnce,
+                }],
+            )
+            .expect("republish rule persists");
+        engine
+            .create_rule(
+                "log-rule".to_string(),
+                TopicFilter::new("logs/#").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect("log rule persists");
+        engine
+            .create_rule(
+                "forward-rule".to_string(),
+                TopicFilter::new("factory/#").unwrap(),
+                Some(r#"SELECT * FROM "factory/#""#.to_string()),
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "webhook".to_string(),
+                }],
+            )
+            .expect("forward rule persists");
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        let before = engine.list_rules();
+        assert_eq!(before.len(), 3);
+
+        // Rebuild from the same data dir (simulating a kernel restart).
+        let reloaded =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = RuleEngine::from_registry(&reloaded).expect("snapshot replays");
+        let after = restarted.list_rules();
+        assert_eq!(after.len(), 3);
+        for (before_rule, after_rule) in before.iter().zip(after.iter()) {
+            assert_eq!(
+                persisted_rule_snapshot(before_rule),
+                persisted_rule_snapshot(after_rule),
+                "id/name/filter/sql/enable must round-trip"
+            );
+            assert_eq!(
+                persisted_actions_value(before_rule),
+                persisted_actions_value(after_rule),
+                "full action list must round-trip without loss"
+            );
+            // Metric counters are runtime-only and reset to zero.
+            assert_eq!(after_rule.matched_cnt.load(Ordering::Relaxed), 0);
+        }
+        let disabled = restarted
+            .get_rule(&before[0].id)
+            .expect("disabled rule reloads");
+        assert!(!disabled.enabled, "disabled rule stays disabled");
+        assert!(
+            restarted
+                .get_rule(&before[1].id)
+                .expect("log rule reloads")
+                .enabled
+        );
+        // The republish variant kept every field (topic + qos).
+        let republished = restarted
+            .get_rule(&before[0].id)
+            .expect("republish rule reloads");
+        assert!(matches!(
+            &republished.actions[..],
+            [RuleAction::Republish { topic, qos }]
+                if topic.as_str() == "alerts/hot" && *qos == QoS::AtLeastOnce
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rule_delete_survives_restart() {
+        let dir = unique_rules_data_dir("delete");
+        let registry =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let engine = RuleEngine::from_registry(&registry).expect("empty snapshot boots");
+        let rule = engine
+            .create_rule(
+                "temp".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("alerts/all").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule persists");
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn BrokerSink> = recorder.clone();
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(b"21.5C"),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+        assert_eq!(recorder.published.lock().unwrap().len(), 1);
+        assert!(engine.remove_rule(&rule.id).expect("persist rule delete"));
+
+        // Rebuild from the same data dir: the deleted rule stays gone and
+        // routing no longer matches it.
+        let reloaded =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = RuleEngine::from_registry(&reloaded).expect("snapshot replays");
+        assert!(restarted.get_rule(&rule.id).is_none());
+        assert!(restarted.list_rules().is_empty());
+        let recorder_after = Arc::new(RecordingSink::default());
+        let sink_after: Arc<dyn BrokerSink> = recorder_after.clone();
+        let matched = restarted
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(b"21.5C"),
+                QoS::AtMostOnce,
+                &sink_after,
+            )
+            .await;
+        assert_eq!(matched, 0);
+        assert!(recorder_after.published.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_rule_fails_boot_loudly() {
+        // An empty connector id passes TOML parsing but must fail boot
+        // loudly (never skipped silently).
+        let bad_connector = broker_config::RulesConf {
+            rules: vec![broker_config::RuleEntry {
+                id: "rule-1".to_string(),
+                name: "bad".to_string(),
+                topic_filter: "sensors/#".to_string(),
+                sql_query: None,
+                enabled: true,
+                actions: vec![broker_config::RuleActionEntry::ForwardConnector {
+                    connector_id: String::new(),
+                }],
+            }],
+        };
+        let err = match RuleEngine::from_snapshot(&bad_connector) {
+            Ok(_) => panic!("empty connector must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("connector_id"),
+            "error must name the field, got: {err}"
+        );
+        // Invalid stored SQL fails boot loudly as well.
+        let bad_sql = broker_config::RulesConf {
+            rules: vec![broker_config::RuleEntry {
+                id: "rule-1".to_string(),
+                name: "bad".to_string(),
+                topic_filter: "sensors/#".to_string(),
+                sql_query: Some("SELECT FROM WHERE".to_string()),
+                enabled: true,
+                actions: Vec::new(),
+            }],
+        };
+        let err = match RuleEngine::from_snapshot(&bad_sql) {
+            Ok(_) => panic!("invalid SQL must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid"),
+            "error must fail loudly, got: {err}"
+        );
     }
 }
