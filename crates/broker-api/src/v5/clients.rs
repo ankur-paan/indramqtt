@@ -300,25 +300,6 @@ pub async fn get_client_mqueue(
         .into_response()
 }
 
-pub async fn get_client_inflight(
-    State(_state): State<ApiState>,
-    Path(_client_id): Path<String>,
-) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": [],
-            "meta": {
-                "page": 1,
-                "limit": 20,
-                "count": 0,
-                "hasnext": false
-            }
-        })),
-    )
-        .into_response()
-}
-
 pub async fn list_subscriptions(State(state): State<ApiState>) -> Response {
     let mut data = Vec::new();
     for cid in state.sessions.active_client_ids() {
