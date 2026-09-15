@@ -2259,11 +2259,33 @@ mod tests {
     }
 
     async fn http_get_text(port: u16, path: &str) -> (u16, String) {
+        http_request_text(port, "GET", path, None, None).await
+    }
+
+    /// Raw HTTP/1.0 request with optional JSON body and bearer token.
+    async fn http_request_text(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        token: Option<&str>,
+    ) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect api");
-        let req = format!("GET {path} HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n");
+        let mut req = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+        if let Some(token) = token {
+            req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        if let Some(body) = body {
+            req.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ));
+        } else {
+            req.push_str("Connection: close\r\n\r\n");
+        }
         stream
             .write_all(req.as_bytes())
             .await
@@ -2279,6 +2301,40 @@ mod tests {
             .parse()
             .expect("status code");
         (status, body.to_string())
+    }
+
+    /// Log in as the default admin, clear the default-password flag and
+    /// return a fully-privileged bearer token.
+    async fn http_admin_token(port: u16) -> String {
+        let login = serde_json::json!({"username": "admin", "password": "public"}).to_string();
+        let (status, body) =
+            http_request_text(port, "POST", "/api/v5/login", Some(&login), None).await;
+        assert_eq!(status, 200);
+        let token: String = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("login is JSON")["token"]
+            .as_str()
+            .expect("login token")
+            .to_string();
+        let change =
+            serde_json::json!({"old_pwd": "public", "new_pwd": "Adm1n-test-pass!"}).to_string();
+        let (status, _) = http_request_text(
+            port,
+            "PUT",
+            "/api/v5/users/admin/change_pwd",
+            Some(&change),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let login =
+            serde_json::json!({"username": "admin", "password": "Adm1n-test-pass!"}).to_string();
+        let (status, body) =
+            http_request_text(port, "POST", "/api/v5/login", Some(&login), None).await;
+        assert_eq!(status, 200);
+        serde_json::from_str::<serde_json::Value>(&body).expect("login is JSON")["token"]
+            .as_str()
+            .expect("login token")
+            .to_string()
     }
 
     #[tokio::test]
@@ -2350,13 +2406,16 @@ mod tests {
         let delivered = client.recv().await.expect("recv delivery");
         assert_eq!(delivered.header.opcode, OpCode::PublishOut);
 
-        let (status, body) = http_get_text(api_port, "/api/v1/metrics").await;
+        let token = http_admin_token(api_port).await;
+        let (status, body) =
+            http_request_text(api_port, "GET", "/api/v1/metrics", None, Some(&token)).await;
         assert_eq!(status, 200);
         assert!(body.contains("indramqtt_messages_received_total 1\n"));
         assert!(body.contains("indramqtt_messages_forwarded_total 1\n"));
         assert!(body.contains("indramqtt_connections_active 1\n"));
 
-        let (status, body) = http_get_text(api_port, "/api/v1/clients").await;
+        let (status, body) =
+            http_request_text(api_port, "GET", "/api/v1/clients", None, Some(&token)).await;
         assert_eq!(status, 200);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).expect("clients is JSON"),
