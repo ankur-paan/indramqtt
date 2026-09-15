@@ -13,6 +13,7 @@ members = [
     "crates/broker-observability",
     "crates/broker-node",
     "crates/broker-gateway",
+    "crates/broker-config",
 ]
 resolver = "2"
 
@@ -52,6 +53,8 @@ rand = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 clap = { version = "4.5", features = ["derive"] }
+arc-swap = "1.7"
+toml = "0.8"
 
 # Internal workspace crates
 brokerlink = { path = "crates/brokerlink" }
@@ -66,6 +69,7 @@ broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
 broker-observability = { path = "crates/broker-observability" }
 broker-gateway = { path = "crates/broker-gateway" }
+broker-config = { path = "crates/broker-config" }
 
 [profile.release]
 opt-level = 3

@@ -201,6 +201,7 @@ fn admin_error(error: AdminUserError) -> Response {
     let (status, code) = match error {
         AdminUserError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         AdminUserError::AlreadyExists => (StatusCode::CONFLICT, "ALREADY_EXISTS"),
+        AdminUserError::Persist(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         AdminUserError::InvalidUsername
         | AdminUserError::WeakPassword
         | AdminUserError::SameAsOld
@@ -209,6 +210,17 @@ fn admin_error(error: AdminUserError) -> Response {
     (
         status,
         Json(serde_json::json!({ "code": code, "message": error.to_string() })),
+    )
+        .into_response()
+}
+
+/// Map an MQTT users/ACL registry failure onto a 500: the in-memory
+/// mutation applied but the commit or atomic save failed, so the loss
+/// must never be silent.
+fn mqtt_persist_error(error: broker_config::ConfigError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "code": "INTERNAL_ERROR", "message": error.to_string() })),
     )
         .into_response()
 }
@@ -750,9 +762,12 @@ pub async fn create_authn_user(
     Path(_id): Path<String>,
     Json(req): Json<CreateAuthnUserReq>,
 ) -> Response {
-    state
+    if let Err(error) = state
         .auth
-        .add_user(req.user_id.clone(), req.password.as_bytes());
+        .add_user(req.user_id.clone(), req.password.as_bytes())
+    {
+        return mqtt_persist_error(error);
+    }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -772,9 +787,12 @@ pub async fn update_authn_user(
     Path((_id, user_id)): Path<(String, String)>,
     Json(req): Json<UpdateAuthnUserReq>,
 ) -> Response {
-    state
+    if let Err(error) = state
         .auth
-        .add_user(user_id.clone(), req.password.as_bytes());
+        .add_user(user_id.clone(), req.password.as_bytes())
+    {
+        return mqtt_persist_error(error);
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -788,7 +806,9 @@ pub async fn delete_authn_user(
     State(state): State<ApiState>,
     Path((_id, user_id)): Path<(String, String)>,
 ) -> Response {
-    state.auth.remove_user(&user_id);
+    if let Err(error) = state.auth.remove_user(&user_id) {
+        return mqtt_persist_error(error);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -854,9 +874,12 @@ pub async fn create_authz_rule(
     };
     let allow = req.permission.to_lowercase() == "allow";
 
-    state
+    if let Err(error) = state
         .auth
-        .add_rule(AclRule::new(client_pattern, action, req.topic, allow));
+        .add_rule(AclRule::new(client_pattern, action, req.topic, allow))
+    {
+        return mqtt_persist_error(error);
+    }
     StatusCode::CREATED.into_response()
 }
 
@@ -864,9 +887,9 @@ pub async fn delete_authz_rule(
     State(state): State<ApiState>,
     Path((_type, index)): Path<(String, usize)>,
 ) -> Response {
-    if state.auth.remove_rule(index) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match state.auth.remove_rule(index) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => mqtt_persist_error(error),
     }
 }

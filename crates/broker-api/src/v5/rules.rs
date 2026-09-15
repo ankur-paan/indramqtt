@@ -73,6 +73,18 @@ fn default_enable() -> bool {
     true
 }
 
+/// Map a rule registry failure onto a 500: the in-memory mutation
+/// applied but the commit or atomic save failed, so the loss must never
+/// be silent. [`broker_rules::RuleEngineError::Persist`] already renders
+/// as `cannot persist rules: ...`, so its display is reused verbatim.
+fn rule_persist_error(error: broker_rules::RuleEngineError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "code": "INTERNAL_ERROR", "message": error.to_string() })),
+    )
+        .into_response()
+}
+
 pub async fn create_rule(
     State(state): State<ApiState>,
     Json(req): Json<CreateRuleV5Request>,
@@ -163,6 +175,9 @@ pub async fn create_rule(
 
     match rule {
         Ok(r) => (StatusCode::CREATED, Json(rule_to_v5(&r))).into_response(),
+        // A persist failure is a 500 (the in-memory rule stays but the
+        // disk save failed); validation failures stay 400.
+        Err(error @ broker_rules::RuleEngineError::Persist(_)) => rule_persist_error(error),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -204,7 +219,11 @@ pub async fn update_rule(
             .into_response();
     }
     if let Some(enable) = body.get("enable").and_then(|v| v.as_bool()) {
-        let _ = state.engine.set_rule_enabled(&id, enable);
+        // A persist failure must surface as a 500, never as a success:
+        // the in-memory flag applied but the disk save failed.
+        if let Err(error) = state.engine.set_rule_enabled(&id, enable) {
+            return rule_persist_error(error);
+        }
     }
     match state.engine.get_rule(&id) {
         Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
@@ -220,8 +239,14 @@ pub async fn update_rule(
 }
 
 pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let _ = state.engine.remove_rule(&id);
-    StatusCode::NO_CONTENT.into_response()
+    match state.engine.remove_rule(&id) {
+        // Preserve the long-standing v5 contract (unconditional 204, even
+        // for unknown ids); only a persist failure surfaces as a 500.
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        // A persist failure must surface as a 500, never as a success:
+        // the in-memory removal applied but the disk save failed.
+        Err(error) => rule_persist_error(error),
+    }
 }
 
 pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
@@ -296,6 +321,195 @@ pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<St
 
 static CONNECTORS: LazyLock<RwLock<Vec<serde_json::Value>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Serialises export-commit-save for connector mutations so concurrent
+/// creates, updates and deletes cannot interleave into a lost update on
+/// disk (mirrors the `save_lock` in `broker-auth` and `broker-rules`).
+static CONNECTORS_SAVE_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// Map a connector registry failure onto a 500: the in-memory mutation
+/// applied but the commit or atomic save failed, so the loss must never
+/// be silent.
+fn connector_persist_error(error: broker_config::ConfigError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "code": "INTERNAL_ERROR",
+            "message": format!("cannot persist connectors: {error}")
+        })),
+    )
+        .into_response()
+}
+
+/// Export the connector store as a validated config root: entries sorted
+/// by id so the persisted file is deterministic. Each entry carries the
+/// id, type, enable flag and the full connector params as a JSON
+/// document (everything `create_connector` accepts, lossless). The
+/// derived `status`/`node_status` display values are stripped: only
+/// inputs are stored, display values are recomputed at read time.
+fn export_connectors_conf() -> broker_config::ConnectorsConf {
+    let store = CONNECTORS.read().unwrap();
+    let mut entries: Vec<broker_config::ConnectorEntry> = store
+        .iter()
+        .map(|body| {
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| body.get("name").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            let connector_type = body
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("http")
+                .to_string();
+            let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut params = body.clone();
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("status");
+                obj.remove("node_status");
+            }
+            broker_config::ConnectorEntry {
+                id,
+                connector_type,
+                enable,
+                config: serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    broker_config::ConnectorsConf {
+        connectors: entries,
+    }
+}
+
+/// Commit the exported connectors root and atomically save it. Any
+/// commit or save failure surfaces as [`broker_config::ConfigError`] so
+/// callers answer 500 and the loss is never silent (the in-memory
+/// mutation stays: commit precedes the atomic save).
+fn persist_connectors(
+    config: &Arc<broker_config::ConfigRegistry>,
+) -> Result<(), broker_config::ConfigError> {
+    let _guard = CONNECTORS_SAVE_LOCK.lock().unwrap();
+    let conf = export_connectors_conf();
+    config.commit_connectors(conf)?;
+    config.save()?;
+    Ok(())
+}
+
+/// Probe the connector target the way `create_connector` does: entries
+/// without a `server`/`url`/… target never probe and count as reachable;
+/// otherwise a 1.5 s TCP connect decides.
+async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
+    match extract_target_host_port(body) {
+        Some(target) => check_tcp_reachable(&target).await.is_ok(),
+        None => true,
+    }
+}
+
+/// Display status derived from reachability (recomputed at read time,
+/// never persisted).
+fn connector_status(reachable: bool) -> &'static str {
+    if reachable {
+        "connected"
+    } else {
+        "disconnected"
+    }
+}
+
+/// Per-node display status for a connector entry (recomputed at read
+/// time, never persisted).
+fn connector_node_status(status: &str) -> serde_json::Value {
+    serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": status }])
+}
+
+/// Boot replay for the connector store: merge the persisted snapshot
+/// into the process-global store and re-register every live sink through
+/// [`register_live_sink`], the same path `create_connector` uses, so a
+/// restored connector actually connects instead of merely being listed.
+///
+/// Entries merge by id without clearing: on a fresh boot the store is
+/// empty and the merge is a full load; on an in-process rebuild (tests)
+/// entries created after the snapshot was taken are kept, which keeps
+/// parallel test servers sharing the process-global store deterministic.
+/// Stored `status`/`node_status` display values are recomputed with the
+/// same probe `create_connector` runs; only the persisted inputs
+/// round-trip.
+///
+/// An invalid snapshot or an unparsable stored params document fails boot
+/// loudly instead of being skipped silently.
+pub fn seed_connectors_from_registry(
+    config: &Arc<broker_config::ConfigRegistry>,
+    engine: &broker_rules::RuleEngine,
+) {
+    let snapshot = config.snapshot();
+    if snapshot.connectors.connectors.is_empty() {
+        return;
+    }
+    if let Err(error) = snapshot.connectors.validate() {
+        panic!("invalid stored connectors snapshot: {error}");
+    }
+    let mut restored = Vec::with_capacity(snapshot.connectors.connectors.len());
+    for entry in &snapshot.connectors.connectors {
+        let params: serde_json::Value = serde_json::from_str(&entry.config).unwrap_or_else(|_| {
+            panic!(
+                "invalid stored connector params for {}: not a JSON document",
+                entry.id
+            )
+        });
+        restored.push((entry.id.clone(), entry.connector_type.clone(), params));
+    }
+    // `register_live_sink` is async (the `disk_log` arm opens its
+    // directory) while boot callers are sync (`ApiState::new`), so the
+    // replay runs on a dedicated thread with its own current-thread
+    // runtime. The thread is joined: boot never completes with sinks
+    // half restored.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("connector boot runtime");
+                runtime.block_on(async {
+                    for (id, conn_type, mut params) in restored {
+                        let reachable = probe_connector_reachable(&params).await;
+                        let status = connector_status(reachable);
+                        if let Some(obj) = params.as_object_mut() {
+                            obj.insert(
+                                "status".to_string(),
+                                serde_json::Value::String(status.to_string()),
+                            );
+                            obj.insert("node_status".to_string(), connector_node_status(status));
+                        }
+                        let live_name = params
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
+                        {
+                            let mut store = CONNECTORS.write().unwrap();
+                            if let Some(pos) = store.iter().position(|c| {
+                                c.get("id").and_then(|v| v.as_str()) == Some(live_name.as_str())
+                                    || c.get("name").and_then(|v| v.as_str())
+                                        == Some(live_name.as_str())
+                            }) {
+                                store[pos] = params.clone();
+                            } else {
+                                store.push(params.clone());
+                            }
+                        }
+                        if reachable {
+                            register_live_sink(engine, &conn_type, &live_name, &params).await;
+                        }
+                    }
+                });
+            })
+            .join()
+            .expect("connector boot thread");
+    });
+}
 
 pub async fn list_connectors() -> Response {
     let list = CONNECTORS.read().unwrap().clone();
@@ -3070,17 +3284,8 @@ pub async fn create_connector(
         "http".to_string()
     };
 
-    let target_opt = extract_target_host_port(&body);
-    let is_reachable = if let Some(ref target) = target_opt {
-        check_tcp_reachable(target).await.is_ok()
-    } else {
-        true
-    };
-    let status_str = if is_reachable {
-        "connected"
-    } else {
-        "disconnected"
-    };
+    let is_reachable = probe_connector_reachable(&body).await;
+    let status_str = connector_status(is_reachable);
 
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(name.clone()));
@@ -3096,10 +3301,7 @@ pub async fn create_connector(
         if !obj.contains_key("enable") {
             obj.insert("enable".to_string(), serde_json::Value::Bool(true));
         }
-        obj.insert(
-            "node_status".to_string(),
-            serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": status_str }]),
-        );
+        obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
 
     if is_reachable {
@@ -3107,6 +3309,12 @@ pub async fn create_connector(
     }
 
     CONNECTORS.write().unwrap().push(body.clone());
+
+    // A persist failure is a 500 (the in-memory entry stays but the disk
+    // save failed); the loss must never be silent.
+    if let Err(error) = persist_connectors(&state.config) {
+        return connector_persist_error(error);
+    }
 
     (StatusCode::CREATED, Json(body)).into_response()
 }
@@ -3159,6 +3367,11 @@ pub async fn update_connector(
         }) {
             connectors[pos] = body.clone();
         }
+    }
+    // A persist failure is a 500 (the in-memory replacement stays but the
+    // disk save failed); the loss must never be silent.
+    if let Err(error) = persist_connectors(&state.config) {
+        return connector_persist_error(error);
     }
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -3412,13 +3625,24 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
         .connectors()
         .unregister(&format!("oci:{}", clean_id));
 
-    let mut connectors = CONNECTORS.write().unwrap();
-    connectors.retain(|c| {
-        c.get("id").and_then(|v| v.as_str()) != Some(&id)
-            && c.get("name").and_then(|v| v.as_str()) != Some(&id)
-            && c.get("id").and_then(|v| v.as_str()) != Some(clean_id)
-            && c.get("name").and_then(|v| v.as_str()) != Some(clean_id)
-    });
+    let removed = {
+        let mut connectors = CONNECTORS.write().unwrap();
+        let before = connectors.len();
+        connectors.retain(|c| {
+            c.get("id").and_then(|v| v.as_str()) != Some(&id)
+                && c.get("name").and_then(|v| v.as_str()) != Some(&id)
+                && c.get("id").and_then(|v| v.as_str()) != Some(clean_id)
+                && c.get("name").and_then(|v| v.as_str()) != Some(clean_id)
+        });
+        connectors.len() != before
+    };
+    // Unknown ids persist nothing; a persist failure after a real removal
+    // is a 500 (the in-memory removal stays but the disk save failed).
+    if removed {
+        if let Err(error) = persist_connectors(&state.config) {
+            return connector_persist_error(error);
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 

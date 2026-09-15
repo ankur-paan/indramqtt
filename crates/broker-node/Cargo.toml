@@ -24,6 +24,7 @@ broker-router = { workspace = true }
 broker-session = { workspace = true }
 broker-storage = { workspace = true }
 broker-auth = { workspace = true }
+broker-config = { workspace = true }
 broker-rules = { workspace = true }
 broker-connectors = { workspace = true }
 broker-cluster = { workspace = true }

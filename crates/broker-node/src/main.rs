@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use broker_auth::{Authenticator, Authorizer, MemoryAuth};
 use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
+use broker_config::{ConfigError, ConfigRegistry};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
@@ -10,6 +11,7 @@ use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -33,6 +35,11 @@ struct Args {
     /// (useful for test environments).
     #[arg(long, default_value = "127.0.0.1:18083")]
     api_bind: String,
+
+    /// Directory holding kernel persistent state (`state.toml`).
+    /// Created on boot when missing.
+    #[arg(long, default_value = "./data")]
+    data_dir: String,
 
     /// Enterprise commercial license key for multi-node clustering (or via INDRA_LICENSE_KEY env).
     #[arg(long)]
@@ -255,6 +262,12 @@ struct Shared {
     metrics: Arc<Metrics>,
     auth: Arc<MemoryAuth>,
     allow_anonymous: bool,
+    /// Kernel-owned configuration registry: loaded from `--data-dir` at
+    /// boot; validated defaults in tests and before boot wiring runs.
+    config: Arc<ConfigRegistry>,
+    /// Local node name (`--node-id`), passed into the API layer for the
+    /// node-scope helper. Stored only until W1 wires it in.
+    node_id: String,
 }
 
 impl Shared {
@@ -317,8 +330,43 @@ impl Shared {
             metrics,
             auth: Arc::new(MemoryAuth::new()),
             allow_anonymous: false,
+            config: defaults_registry(),
+            node_id: "indra-node-1".to_string(),
         }
     }
+}
+
+/// Defaults-only registry for fresh `Shared` state (tests and pre-boot).
+///
+/// Loads from a unique scratch path that is never created, so `load`
+/// yields validated empty roots with no filesystem writes and never
+/// observes the kernel data dir.
+fn defaults_registry() -> Arc<ConfigRegistry> {
+    static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let slot = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "indramqtt-kernel-{nanos}-{}-{slot}",
+        std::process::id()
+    ));
+    Arc::new(ConfigRegistry::load(&dir).expect("validated defaults always load"))
+}
+
+/// Load the kernel config registry from `data_dir`.
+///
+/// Creates the directory when missing, then loads `<dir>/state.toml`
+/// (a missing file yields validated defaults). A corrupt file or an
+/// invalid snapshot is a fatal error naming the file and the field;
+/// defaults are never silently substituted.
+fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError> {
+    std::fs::create_dir_all(data_dir).map_err(|err| ConfigError::Load {
+        file: data_dir.to_string(),
+        reason: format!("cannot create data directory: {err}"),
+    })?;
+    ConfigRegistry::load(std::path::Path::new(data_dir))
 }
 
 /// [`BrokerSink`] that forwards rule output directly to local router
@@ -1159,6 +1207,8 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
         shared.metrics.clone(),
         shared.auth.clone(),
         shared.conns.clone(),
+        shared.config.clone(),
+        shared.node_id.clone(),
     );
     broker_api::serve(listener, state).await
 }
@@ -1178,6 +1228,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut shared = Shared::new();
     shared.allow_anonymous = args.allow_anonymous;
+    shared.node_id = args.node_id.clone();
+    // Config registry: create the data dir when missing, then load
+    // `state.toml` (missing file yields validated defaults). A corrupt
+    // file is a fatal boot error naming the file and the field, never a
+    // silent boot with defaults.
+    shared.config = Arc::new(load_data_dir_registry(&args.data_dir)?);
+    // MQTT users/ACLs: seed the shared `MemoryAuth` in place (the same
+    // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
+    // enforces persisted credentials from the first accepted connection.
+    shared.auth.seed_from_registry(&shared.config);
+    // Rules (W0-22): replay the persisted snapshot through the same
+    // validated create path as `RuleEngine::create_rule`. An empty
+    // snapshot yields today's empty behaviour (no rules); an invalid
+    // stored rule fails boot loudly, never skipped silently.
+    shared.engine.seed_from_registry(&shared.config)?;
 
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
@@ -1250,6 +1315,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use broker_auth::{AclAction, AclRule};
+
+    /// Unique scratch data dir under the OS temp dir (no dev-dependency).
+    fn unique_data_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let slot = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "indramqtt-w019-datadir-{}-{nanos}-{slot}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn datadir_boot_creates_and_loads() {
+        let dir = unique_data_dir();
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+        assert!(!dir.exists(), "scratch data dir must start missing");
+
+        // Fresh boot: creates the directory, loads validated defaults.
+        let registry = load_data_dir_registry(&data_dir).expect("fresh data dir boots");
+        assert!(dir.is_dir(), "boot creates the data directory");
+        assert_eq!(
+            *registry.snapshot(),
+            broker_config::FullSnapshot::default(),
+            "fresh boot loads empty defaults"
+        );
+
+        // First save path creates `state.toml`.
+        registry.save().expect("save defaults");
+        assert!(
+            dir.join(broker_config::STATE_FILE_NAME).is_file(),
+            "first save creates state.toml"
+        );
+
+        // A pre-existing valid `state.toml` loads its contents into the
+        // snapshot exposed through the API state.
+        registry
+            .commit_admin_users(broker_config::AdminUsersConf {
+                users: vec![broker_config::AdminUser {
+                    username: "admin".to_string(),
+                    password_hash: "hash-admin".to_string(),
+                    role: "administrator".to_string(),
+                    ..Default::default()
+                }],
+            })
+            .expect("commit admin root");
+        registry.save().expect("save admin root");
+        let reloaded = load_data_dir_registry(&data_dir).expect("reload data dir");
+        let api = broker_api::ApiState::new(
+            Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest)),
+            Arc::new(SessionManager::new()),
+            Arc::new(Router::new()),
+            Arc::new(Metrics::new()),
+            Arc::new(MemoryAuth::new()),
+            Arc::new(ConnTable::default()),
+            Arc::new(reloaded),
+            "indra-node-1".to_string(),
+        );
+        let snapshot = api.config.snapshot();
+        assert_eq!(snapshot.admin_users.users.len(), 1);
+        assert_eq!(snapshot.admin_users.users[0].username, "admin");
+        assert_eq!(api.node_id, "indra-node-1");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Encode `BindConnection` metadata (test mirror of the BEAM
     /// `indra_brokerlink:encode_bind_meta/3` contract).
@@ -2429,7 +2562,10 @@ mod tests {
     #[tokio::test]
     async fn bind_auth_rejects_bad_password_with_0x86() {
         let shared = test_shared();
-        shared.auth.add_user("alice", b"s3cret");
+        shared
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("memory-only persist cannot fail");
 
         let frame = bind_frame(
             81,
@@ -2448,7 +2584,10 @@ mod tests {
     #[tokio::test]
     async fn bind_auth_rejects_anonymous_when_users_exist() {
         let shared = test_shared();
-        shared.auth.add_user("alice", b"s3cret");
+        shared
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("memory-only persist cannot fail");
 
         // Anonymous bind is rejected with 0x87 and creates no session.
         let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
@@ -2483,7 +2622,10 @@ mod tests {
     async fn bind_auth_accepts_anonymous_with_allow_flag() {
         let mut shared = test_shared();
         shared.allow_anonymous = true;
-        shared.auth.add_user("alice", b"s3cret");
+        shared
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("memory-only persist cannot fail");
 
         let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
@@ -2496,7 +2638,10 @@ mod tests {
         use broker_auth::UserQuotas;
 
         let shared = test_shared();
-        shared.auth.add_user("capped-user", b"pw");
+        shared
+            .auth
+            .add_user("capped-user", b"pw")
+            .expect("memory-only persist cannot fail");
         assert!(shared.auth.set_quotas(
             "capped-user",
             UserQuotas {
@@ -2556,7 +2701,10 @@ mod tests {
         use broker_auth::UserQuotas;
 
         let shared = test_shared();
-        shared.auth.add_user("fast-user", b"pw");
+        shared
+            .auth
+            .add_user("fast-user", b"pw")
+            .expect("memory-only persist cannot fail");
         assert!(shared.auth.set_quotas(
             "fast-user",
             UserQuotas {
@@ -2606,7 +2754,8 @@ mod tests {
         let shared = test_shared();
         shared
             .auth
-            .add_rule(AclRule::new("boxed", AclAction::All, "#", false));
+            .add_rule(AclRule::new("boxed", AclAction::All, "#", false))
+            .expect("memory-only persist cannot fail");
 
         let frame = subscribe_frame(91, 1, encode_subscribe_meta(1, "boxed", &[("t", 0)]));
         let (reply, retained) = apply_subscribe(&frame, &shared).await;
@@ -2631,7 +2780,8 @@ mod tests {
         *muted.conn_id.write() = Some(92);
         shared
             .auth
-            .add_rule(AclRule::new("muted", AclAction::Publish, "#", false));
+            .add_rule(AclRule::new("muted", AclAction::Publish, "#", false))
+            .expect("memory-only persist cannot fail");
 
         let (meta, payload) = encode_publish_meta("t", 5, 1, false, b"shh");
         let (ack, deliveries) = apply_publish(&publish_frame(92, 1, meta, payload), &shared).await;
@@ -2643,7 +2793,10 @@ mod tests {
     #[tokio::test]
     async fn bind_auth_failure_over_tcp_returns_0x86() {
         let shared = Shared::new();
-        shared.auth.add_user("alice", b"s3cret");
+        shared
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("memory-only persist cannot fail");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
