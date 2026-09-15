@@ -164,27 +164,70 @@ pub struct AlloydbQueryResult {
 pub enum AlloydbErrorClassification {
     /// Read-pool failover, connection drop, or server restart (`57P01`, `57P03`, `08006`).
     FailoverRetryable,
-    /// Terminal error (e.g. `42703` column missing, `42P01` table missing, `28P01` bad creds).
+    /// A single row the database refuses (SQLSTATE class `22`/`23`, `42703`, `42804`).
+    DataRejected,
+    /// Terminal error (e.g. `42P01` table missing, `28P01` bad creds).
     Terminal,
     /// Unknown or generic error.
     Unknown,
 }
 
+fn contains_sqlstate_token(haystack_upper: &str, token_upper: &str) -> bool {
+    let h = haystack_upper.as_bytes();
+    let n = token_upper.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    for i in 0..=h.len() - n.len() {
+        if &h[i..i + n.len()] == n {
+            let before_ok = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+            let after_ok = i + n.len() == h.len() || !h[i + n.len()].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn contains_sqlstate_class(haystack_upper: &str, class_prefix: &str) -> bool {
+    let h = haystack_upper.as_bytes();
+    let p = class_prefix.as_bytes();
+    if h.len() < 5 || p.len() != 2 {
+        return false;
+    }
+    for i in 0..=h.len() - 5 {
+        if &h[i..i + 2] == p && h[i..i + 5].iter().all(|b| b.is_ascii_alphanumeric()) {
+            let before_ok = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+            let after_ok = i + 5 == h.len() || !h[i + 5].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Classify PostgreSQL error code / SQLSTATE for AlloyDB.
 pub fn classify_alloydb_error(err_msg: &str) -> AlloydbErrorClassification {
     let s = err_msg.to_ascii_uppercase();
-    if s.contains("57P01")
-        || s.contains("57P03")
-        || s.contains("08006")
-        || s.contains("08001")
+    if contains_sqlstate_token(&s, "57P01")
+        || contains_sqlstate_token(&s, "57P03")
+        || contains_sqlstate_token(&s, "08006")
+        || contains_sqlstate_token(&s, "08001")
         || s.contains("CONNECTION REFUSED")
         || s.contains("READ POOL FAILOVER")
         || s.contains("CANNOT_CONNECT_NOW")
     {
         AlloydbErrorClassification::FailoverRetryable
-    } else if s.contains("42703")
-        || s.contains("42P01")
-        || s.contains("28P01")
+    } else if contains_sqlstate_class(&s, "22")
+        || contains_sqlstate_class(&s, "23")
+        || contains_sqlstate_token(&s, "42703")
+        || contains_sqlstate_token(&s, "42804")
+    {
+        AlloydbErrorClassification::DataRejected
+    } else if contains_sqlstate_token(&s, "42P01")
+        || contains_sqlstate_token(&s, "28P01")
         || s.contains("UNDEFINED COLUMN")
         || s.contains("UNDEFINED TABLE")
         || s.contains("PASSWORD AUTHENTICATION FAILED")
@@ -545,6 +588,8 @@ pub struct MockAlloydbTransport {
     pub fail_count: Mutex<usize>,
     pub outcome_code: Mutex<Option<String>>,
     pub fail_at: Mutex<Option<usize>>,
+    pub fail_on_value: Mutex<Option<AlloydbValue>>,
+    pub fail_on_message: Mutex<Option<String>>,
 }
 
 impl MockAlloydbTransport {
@@ -554,6 +599,8 @@ impl MockAlloydbTransport {
             fail_count: Mutex::new(0),
             outcome_code: Mutex::new(None),
             fail_at: Mutex::new(None),
+            fail_on_value: Mutex::new(None),
+            fail_on_message: Mutex::new(None),
         }
     }
 
@@ -563,6 +610,8 @@ impl MockAlloydbTransport {
             fail_count: Mutex::new(failures),
             outcome_code: Mutex::new(Some("57P01: read pool failover in progress".to_string())),
             fail_at: Mutex::new(None),
+            fail_on_value: Mutex::new(None),
+            fail_on_message: Mutex::new(None),
         }
     }
 
@@ -572,6 +621,19 @@ impl MockAlloydbTransport {
             fail_count: Mutex::new(1),
             outcome_code: Mutex::new(Some(sqlstate.to_string())),
             fail_at: Mutex::new(None),
+            fail_on_value: Mutex::new(None),
+            fail_on_message: Mutex::new(None),
+        }
+    }
+
+    pub fn with_value_failure(value: AlloydbValue, message: &str) -> Self {
+        Self {
+            executions: Mutex::new(Vec::new()),
+            fail_count: Mutex::new(0),
+            outcome_code: Mutex::new(None),
+            fail_at: Mutex::new(None),
+            fail_on_value: Mutex::new(Some(value)),
+            fail_on_message: Mutex::new(Some(message.to_string())),
         }
     }
 }
@@ -630,6 +692,26 @@ impl AlloydbTransport for MockAlloydbTransport {
             }
         }
 
+        if let Some(want) = self.fail_on_value.lock().clone() {
+            if params.contains(&want) {
+                let code = self
+                    .fail_on_message
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "23514: check constraint violated".into());
+                let class = classify_alloydb_error(&code);
+                if class == AlloydbErrorClassification::FailoverRetryable {
+                    return Err(ConnectorError::Connection(format!(
+                        "alloydb transient failover: {code}"
+                    )));
+                } else {
+                    return Err(ConnectorError::Dispatch(format!(
+                        "alloydb terminal error: {code}"
+                    )));
+                }
+            }
+        }
+
         Ok(AlloydbQueryResult {
             rows_affected: params.len().max(1),
             status: "SUCCESS".into(),
@@ -646,6 +728,7 @@ pub struct AlloydbSink {
     queue: Mutex<BatchQueue<AlloydbRow>>,
     backoff: Mutex<BackoffState>,
     sent: AtomicU64,
+    rejected_rows: AtomicU64,
 }
 
 impl AlloydbSink {
@@ -658,6 +741,7 @@ impl AlloydbSink {
             queue: Mutex::new(BatchQueue::new(batch_size, Duration::from_millis(50))),
             backoff: Mutex::new(BackoffState::default()),
             sent: AtomicU64::new(0),
+            rejected_rows: AtomicU64::new(0),
         })
     }
 
@@ -667,6 +751,10 @@ impl AlloydbSink {
 
     pub fn sent_count(&self) -> u64 {
         self.sent.load(Ordering::Relaxed)
+    }
+
+    pub fn rejected_rows(&self) -> u64 {
+        self.rejected_rows.load(Ordering::Relaxed)
     }
 
     pub fn buffered_rows(&self) -> usize {
@@ -715,6 +803,8 @@ impl AlloydbSink {
         let per_statement = rows_per_statement(columns.len(), max_params).max(1);
         let total = rows.len();
         let mut idx = 0;
+        let mut rejected: u64 = 0;
+        let mut first_reject_msg: Option<String> = None;
         while idx < total {
             let end = (idx + per_statement).min(total);
             let chunk_len = end - idx;
@@ -746,12 +836,82 @@ impl AlloydbSink {
                     idx = end;
                 }
                 Err(e) => {
-                    self.backoff.lock().failure();
-                    let remaining = rows.split_off(idx);
-                    self.queue.lock().restore(remaining, oldest);
-                    return Err(e);
+                    let msg = e.to_string();
+                    if classify_alloydb_error(&msg) != AlloydbErrorClassification::DataRejected {
+                        self.backoff.lock().failure();
+                        let remaining = rows.split_off(idx);
+                        self.queue.lock().restore(remaining, oldest);
+                        return Err(e);
+                    }
+                    if chunk_len == 1 {
+                        rejected += 1;
+                        self.rejected_rows.fetch_add(1, Ordering::Relaxed);
+                        if first_reject_msg.is_none() {
+                            first_reject_msg = Some(msg);
+                        }
+                        idx = end;
+                        continue;
+                    }
+                    let mut row_idx = idx;
+                    while row_idx < end {
+                        let single_query =
+                            match build_alloydb_insert_query(&self.config.table, &columns, 1) {
+                                Ok(q) => q,
+                                Err(build_err) => {
+                                    rejected += 1;
+                                    self.rejected_rows.fetch_add(1, Ordering::Relaxed);
+                                    if first_reject_msg.is_none() {
+                                        first_reject_msg = Some(build_err.to_string());
+                                    }
+                                    row_idx += 1;
+                                    continue;
+                                }
+                            };
+                        let mut single_params = Vec::with_capacity(columns.len());
+                        for col in &columns {
+                            let val = rows[row_idx]
+                                .columns
+                                .iter()
+                                .find(|(c, _)| c == col)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(AlloydbValue::Null);
+                            single_params.push(val);
+                        }
+                        match self.transport.execute(&single_query, &single_params).await {
+                            Ok(_) => {
+                                self.sent.fetch_add(1, Ordering::Relaxed);
+                                row_idx += 1;
+                            }
+                            Err(row_err) => {
+                                let row_msg = row_err.to_string();
+                                if classify_alloydb_error(&row_msg)
+                                    == AlloydbErrorClassification::DataRejected
+                                {
+                                    rejected += 1;
+                                    self.rejected_rows.fetch_add(1, Ordering::Relaxed);
+                                    if first_reject_msg.is_none() {
+                                        first_reject_msg = Some(row_msg);
+                                    }
+                                    row_idx += 1;
+                                } else {
+                                    self.backoff.lock().failure();
+                                    let remaining = rows.split_off(row_idx);
+                                    self.queue.lock().restore(remaining, oldest);
+                                    return Err(row_err);
+                                }
+                            }
+                        }
+                    }
+                    idx = end;
                 }
             }
+        }
+        if rejected > 0 {
+            tracing::warn!(
+                rejected = rejected,
+                error = first_reject_msg.as_deref().unwrap_or("unknown"),
+                "alloydb rejected rows the database refused"
+            );
         }
         self.backoff.lock().success();
         Ok(())
@@ -924,7 +1084,7 @@ mod tests {
         );
         assert_eq!(
             classify_alloydb_error("42703: column \"unknown_col\" does not exist"),
-            AlloydbErrorClassification::Terminal
+            AlloydbErrorClassification::DataRejected
         );
         assert_eq!(
             classify_alloydb_error("28P01: password authentication failed for user"),
@@ -1237,5 +1397,70 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(sink.sent_count(), 2);
         assert_eq!(sink.buffered_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_bad_row_rejected_rest_sent() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::with_value_failure(
+            AlloydbValue::Integer(13),
+            "23514: new row violates check constraint",
+        ));
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/bad-row").unwrap();
+        for v in [0, 1, 13, 3, 4] {
+            let payload = Bytes::from(format!(r#"{{"a":{v},"b":0}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        sink.flush().await.expect("flush succeeds with rejection");
+        assert_eq!(sink.sent_count(), 4);
+        assert_eq!(sink.rejected_rows(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_during_row_retry_restores_rest() {
+        let mut cfg = sample_iam_config();
+        cfg.batch_size = Some(10);
+        let transport = Arc::new(MockAlloydbTransport::new());
+        *transport.fail_count.lock() = 1;
+        *transport.outcome_code.lock() =
+            Some("23514: new row violates check constraint".to_string());
+        *transport.fail_on_value.lock() = Some(AlloydbValue::Integer(1));
+        *transport.fail_on_message.lock() = Some("08006: connection failure".to_string());
+        let sink = AlloydbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/row-retry").unwrap();
+        for i in 0..5 {
+            let payload = Bytes::from(format!(r#"{{"a":{i},"b":0}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("buffer row");
+        }
+        let res = sink.flush().await;
+        assert!(res.is_err());
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(sink.buffered_rows(), 4);
+        assert_eq!(sink.rejected_rows(), 0);
+    }
+
+    #[test]
+    fn test_sqlstate_token_matching() {
+        assert_ne!(
+            classify_alloydb_error("value 1423514x"),
+            AlloydbErrorClassification::DataRejected
+        );
+        assert_eq!(
+            classify_alloydb_error("ERROR: 23514: check"),
+            AlloydbErrorClassification::DataRejected
+        );
+        assert_eq!(
+            classify_alloydb_error("42P01"),
+            AlloydbErrorClassification::Terminal
+        );
     }
 }
