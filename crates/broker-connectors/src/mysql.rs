@@ -1780,6 +1780,13 @@ mod tests {
     }
 
     /// Simple test subscriber that captures log lines.
+    // `set_default` installs a thread-local subscriber, but tracing caches
+    // each callsite's interest globally: a parallel test reaching the same
+    // `warn!`/`info!` callsite first with no interested subscriber can cache
+    // it as disabled. `register_callsite` returning `sometimes` forces a
+    // per-event `enabled()` check, and each test calls
+    // `rebuild_interest_cache()` after `set_default` so an already-cached
+    // "never" is recomputed with the capture subscriber present.
     struct TestSubscriber {
         logs: parking_lot::Mutex<Vec<String>>,
     }
@@ -1803,6 +1810,13 @@ mod tests {
     impl tracing::Subscriber for TestSubscriber {
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
             true
+        }
+
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
         }
 
         fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1847,6 +1861,7 @@ mod tests {
     async fn test_linger_flush_failure_is_logged_once_per_backoff() {
         let subscriber = Arc::new(TestSubscriber::new());
         let _guard = tracing::subscriber::set_default(subscriber.clone());
+        tracing::callsite::rebuild_interest_cache();
 
         let transport = Arc::new(AlwaysFailTransport::new(
             "mock connection error".to_string(),
@@ -1893,6 +1908,7 @@ mod tests {
     async fn test_linger_flush_logs_recovery_on_success() {
         let subscriber = Arc::new(TestSubscriber::new());
         let _guard = tracing::subscriber::set_default(subscriber.clone());
+        tracing::callsite::rebuild_interest_cache();
 
         // The first linger flush fails; the retry after the 2s backoff
         // window succeeds.
