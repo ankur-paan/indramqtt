@@ -17,13 +17,20 @@ use axum::{
     Router,
 };
 
-/// Build the Axum router for all `/api/v5/*` endpoints.
-pub fn router() -> Router<ApiState> {
+/// Public `/api/v5/*` endpoints: login only. These stay outside the
+/// authentication middleware; everything else requires a bearer token.
+pub fn public_router() -> Router<ApiState> {
     Router::new()
-        // Auth & Identity
         .route("/login/challenge", post(auth::scram_challenge))
         .route("/login/verify", post(auth::scram_verify))
         .route("/login", post(auth::direct_login))
+}
+
+/// Authenticated `/api/v5/*` endpoints. Served behind the
+/// [`crate::api_auth::require_api_auth`] middleware.
+pub fn protected_router() -> Router<ApiState> {
+    Router::new()
+        // Auth & Identity
         .route("/logout", post(auth::logout))
         .route("/current_user", get(auth::current_user))
         .route("/user_scopes", get(auth::user_scopes))
@@ -31,6 +38,10 @@ pub fn router() -> Router<ApiState> {
         .route(
             "/users/:username",
             delete(auth::delete_user).put(auth::update_user),
+        )
+        .route(
+            "/users/:username/change_pwd",
+            put(auth::change_user_password).post(auth::change_user_password),
         )
         // Authentication (AuthN) Providers & Built-in DB Users
         .route(

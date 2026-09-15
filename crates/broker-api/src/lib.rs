@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::admin_users::AdminUsers;
+use crate::v5::auth::ApiTokens;
+
+pub mod admin_users;
+pub mod api_auth;
 pub mod dashboard;
 pub mod swagger;
 pub mod v5;
@@ -33,6 +38,8 @@ pub struct ApiState {
     pub metrics: Arc<Metrics>,
     pub auth: Arc<MemoryAuth>,
     pub conns: Arc<ConnTable>,
+    pub admin_users: Arc<AdminUsers>,
+    pub tokens: Arc<ApiTokens>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -52,6 +59,8 @@ impl ApiState {
             metrics,
             auth,
             conns,
+            admin_users: Arc::new(AdminUsers::with_default_admin()),
+            tokens: Arc::new(ApiTokens::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -65,6 +74,8 @@ impl ApiState {
             metrics: Arc::new(Metrics::new()),
             auth: Arc::new(MemoryAuth::new()),
             conns: Arc::new(ConnTable::default()),
+            admin_users: Arc::new(AdminUsers::with_default_admin()),
+            tokens: Arc::new(ApiTokens::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -76,22 +87,14 @@ impl ApiState {
     }
 }
 
+/// Public routes (dashboard assets, health, login, MQTT-over-WebSocket)
+/// stay outside the authentication layer; every other route requires a
+/// bearer token enforced by [`api_auth::require_api_auth`].
 pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/", get(redirect_to_dashboard))
-        .route("/dashboard", get(get_dashboard))
-        .route("/ui", get(get_modern_ui))
-        .route("/swagger", get(get_swagger_ui))
-        .route("/api-docs/openapi.json", get(get_openapi_spec))
-        .route("/assets/*path", get(get_dashboard_asset))
-        .route("/static/*path", get(get_dashboard_static_asset))
-        .route("/favicon.ico", get(get_dashboard_favicon))
-        .route("/version", get(get_dashboard_version))
-        .route("/ws/mqtt", get(ws::ws_mqtt_handler))
-        .route("/healthz", get(|| async { "OK" }))
+    let protected: Router<ApiState> = Router::new()
         .route("/schemas", get(v5::schemas::list_schemas))
         .route("/schemas/:name", get(v5::schemas::get_schema))
-        .nest("/api/v5", v5::router())
+        .nest("/api/v5", v5::protected_router())
         .route("/api/v1/nodes", get(get_nodes))
         .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/clients/:id", get(get_client))
@@ -108,7 +111,25 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
         .route("/api/v1/rules/:id", get(get_rule).delete(delete_rule))
-        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api_auth::require_api_auth,
+        ));
+    let public: Router<ApiState> = Router::new()
+        .route("/", get(redirect_to_dashboard))
+        .route("/dashboard", get(get_dashboard))
+        .route("/ui", get(get_modern_ui))
+        .route("/swagger", get(get_swagger_ui))
+        .route("/api-docs/openapi.json", get(get_openapi_spec))
+        .route("/assets/*path", get(get_dashboard_asset))
+        .route("/static/*path", get(get_dashboard_static_asset))
+        .route("/favicon.ico", get(get_dashboard_favicon))
+        .route("/version", get(get_dashboard_version))
+        .route("/ws/mqtt", get(ws::ws_mqtt_handler))
+        .route("/healthz", get(|| async { "OK" }))
+        .nest("/api/v5", v5::public_router())
+        .merge(protected);
+    public.with_state(state)
 }
 
 /// Serve the management API on an already-bound listener.
@@ -1442,6 +1463,8 @@ mod tests {
         sessions: Arc<SessionManager>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
+        admin_users: Arc<crate::admin_users::AdminUsers>,
+        tokens: Arc<crate::v5::auth::ApiTokens>,
     }
 
     impl TestServer {
@@ -1455,15 +1478,23 @@ mod tests {
             let metrics = Arc::new(Metrics::new());
             let auth = Arc::new(MemoryAuth::new());
             let conns = Arc::new(broker_router::ConnTable::default());
+            let api_state = ApiState::new(
+                engine.clone(),
+                sessions.clone(),
+                sub_router,
+                metrics.clone(),
+                auth.clone(),
+                conns,
+            );
             let state = TestState {
                 engine: engine.clone(),
                 sessions: sessions.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
+                admin_users: api_state.admin_users.clone(),
+                tokens: api_state.tokens.clone(),
             };
-            let app = router(ApiState::new(
-                engine, sessions, sub_router, metrics, auth, conns,
-            ));
+            let app = router(api_state);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind test server");
@@ -1503,28 +1534,171 @@ mod tests {
             (status, body.to_string())
         }
 
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<Value>,
+            token: Option<&str>,
+        ) -> (u16, Value) {
+            let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+            if let Some(token) = token {
+                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            if let Some(body) = body {
+                let raw_body = serde_json::to_string(&body).expect("encode body");
+                head.push_str(&format!(
+                    "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw_body}",
+                    raw_body.len()
+                ));
+            } else {
+                head.push_str("Connection: close\r\n\r\n");
+            }
+            self.request(&head).await
+        }
+
         async fn post(&self, path: &str, body: Value) -> (u16, Value) {
-            let raw_body = serde_json::to_string(&body).expect("encode body");
-            self.request(&format!(
-                "POST {path} HTTP/1.0\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw_body}",
-                raw_body.len()
-            ))
-            .await
+            self.send("POST", path, Some(body), None).await
+        }
+
+        async fn post_auth(&self, path: &str, body: Value, token: &str) -> (u16, Value) {
+            self.send("POST", path, Some(body), Some(token)).await
         }
 
         async fn get(&self, path: &str) -> (u16, Value) {
-            self.request(&format!(
-                "GET {path} HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n"
-            ))
-            .await
+            self.send("GET", path, None, None).await
         }
 
-        async fn delete(&self, path: &str) -> (u16, Value) {
-            self.request(&format!(
-                "DELETE {path} HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n"
-            ))
-            .await
+        async fn get_auth(&self, path: &str, token: &str) -> (u16, Value) {
+            self.send("GET", path, None, Some(token)).await
         }
+
+        async fn put_auth(&self, path: &str, body: Value, token: &str) -> (u16, Value) {
+            self.send("PUT", path, Some(body), Some(token)).await
+        }
+
+        async fn delete_auth(&self, path: &str, token: &str) -> (u16, Value) {
+            self.send("DELETE", path, None, Some(token)).await
+        }
+
+        /// Log in with the default admin and return its bearer token.
+        /// The token still carries `must_change_password`; it only opens
+        /// the login, logout, current_user and own-password-change routes.
+        async fn admin_token(&self) -> String {
+            let (status, body) = self
+                .post(
+                    "/api/v5/login",
+                    json!({"username": "admin", "password": "public"}),
+                )
+                .await;
+            assert_eq!(status, 200);
+            body["token"].as_str().expect("login token").to_string()
+        }
+
+        /// Log in as `admin`, clear the default-password flag, log in
+        /// again and return a fully-privileged bearer token for tests
+        /// that call authenticated routes.
+        async fn login_as_admin(&self) -> String {
+            let fresh = self.admin_token().await;
+            let (status, _) = self
+                .put_auth(
+                    "/api/v5/users/admin/change_pwd",
+                    json!({"old_pwd": "public", "new_pwd": "Adm1n-test-pass!"}),
+                    &fresh,
+                )
+                .await;
+            assert_eq!(status, 200);
+            let (status, body) = self
+                .post(
+                    "/api/v5/login",
+                    json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+                )
+                .await;
+            assert_eq!(status, 200);
+            assert_eq!(body["must_change_password"], json!(false));
+            body["token"].as_str().expect("login token").to_string()
+        }
+    }
+
+    /// Minimal SCRAM-SHA-256 client for the login tests (independent of the
+    /// server's credential store).
+    mod scram_client {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+            let mut padded = [0u8; 64];
+            if key.len() > 64 {
+                let hash = Sha256::digest(key);
+                padded[..32].copy_from_slice(&hash);
+            } else {
+                padded[..key.len()].copy_from_slice(key);
+            }
+            let mut ipad = [0x36u8; 64];
+            let mut opad = [0x5cu8; 64];
+            for i in 0..64 {
+                ipad[i] ^= padded[i];
+                opad[i] ^= padded[i];
+            }
+            let mut inner = Sha256::new();
+            inner.update(ipad);
+            inner.update(data);
+            let inner_hash = inner.finalize();
+            let mut outer = Sha256::new();
+            outer.update(opad);
+            outer.update(inner_hash);
+            outer.finalize().into()
+        }
+
+        fn salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+            let mut block = Vec::with_capacity(salt.len() + 4);
+            block.extend_from_slice(salt);
+            block.extend_from_slice(&1u32.to_be_bytes());
+            let mut u = hmac(password.as_bytes(), &block);
+            let mut result = u;
+            for _ in 1..iterations {
+                u = hmac(password.as_bytes(), &u);
+                for (r, v) in result.iter_mut().zip(u.iter()) {
+                    *r ^= *v;
+                }
+            }
+            result
+        }
+
+        /// Returns `(client_proof_b64, server_signature_b64)`.
+        pub(super) fn proof(
+            password: &str,
+            salt_b64: &str,
+            iterations: u32,
+            auth_message: &str,
+        ) -> (String, String) {
+            let salt = BASE64.decode(salt_b64).expect("challenge salt");
+            let salted = salted_password(password, &salt, iterations);
+            let client_key = hmac(&salted, b"Client Key");
+            let stored_key: [u8; 32] = Sha256::digest(client_key).into();
+            let client_sig = hmac(&stored_key, auth_message.as_bytes());
+            let mut proof = [0u8; 32];
+            for i in 0..32 {
+                proof[i] = client_key[i] ^ client_sig[i];
+            }
+            let server_key = hmac(&salted, b"Server Key");
+            let server_sig = hmac(&server_key, auth_message.as_bytes());
+            (BASE64.encode(proof), BASE64.encode(server_sig))
+        }
+    }
+
+    fn scram_auth_message(
+        username: &str,
+        client_nonce: &str,
+        combined_nonce: &str,
+        salt_b64: &str,
+        iterations: u32,
+    ) -> String {
+        let escaped = username.replace('=', "=3D").replace(',', "=2C");
+        format!(
+            "n={escaped},r={client_nonce},r={combined_nonce},s={salt_b64},i={iterations},c=biws,r={combined_nonce}"
+        )
     }
 
     impl Drop for TestServer {
@@ -1546,15 +1720,16 @@ mod tests {
     #[tokio::test]
     async fn test_rules_crud_lifecycle() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Empty at first.
-        let (status, body) = server.get("/api/v1/rules").await;
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
 
         // Create.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({
                     "name": "republish-temp",
@@ -1562,6 +1737,7 @@ mod tests {
                     "enabled": true,
                     "actions": [{"type": "republish", "topic": "alerts/critical", "qos": 1}]
                 }),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1575,40 +1751,50 @@ mod tests {
             .to_string();
 
         // List shows it.
-        let (status, body) = server.get("/api/v1/rules").await;
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("list").len(), 1);
 
         // Fetch it directly.
-        let (status, fetched) = server.get(&format!("/api/v1/rules/{id}")).await;
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
         assert_eq!(status, 200);
         assert_eq!(fetched, created);
 
         // Unknown id is a 404.
-        let (status, body) = server.get("/api/v1/rules/rule-999").await;
+        let (status, body) = server.get_auth("/api/v1/rules/rule-999", &token).await;
         assert_eq!(status, 404);
         assert!(body["error"].as_str().unwrap().contains("rule-999"));
 
         // Delete it.
-        let (status, _) = server.delete(&format!("/api/v1/rules/{id}")).await;
+        let (status, _) = server
+            .delete_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
         assert_eq!(status, 204);
 
         // Gone afterwards; second delete is a 404.
-        let (status, _) = server.get(&format!("/api/v1/rules/{id}")).await;
+        let (status, _) = server
+            .get_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
         assert_eq!(status, 404);
-        let (status, _) = server.delete(&format!("/api/v1/rules/{id}")).await;
+        let (status, _) = server
+            .delete_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
     async fn test_rules_create_rejects_invalid_input() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Bad topic filter.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "bad", "topic_filter": "sport/#/bogus", "actions": []}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
@@ -1616,10 +1802,11 @@ mod tests {
 
         // Bad republish QoS.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "bad", "topic_filter": "a/#",
                        "actions": [{"type": "republish", "topic": "b", "qos": 7}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
@@ -1627,10 +1814,11 @@ mod tests {
 
         // Wildcard republish target is not a concrete topic.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "bad", "topic_filter": "a/#",
                        "actions": [{"type": "republish", "topic": "b/#", "qos": 0}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
@@ -1638,15 +1826,16 @@ mod tests {
 
         // Empty name.
         let (status, _) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "  ", "topic_filter": "a/#", "actions": []}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
 
         // Nothing was stored by the failed creates.
-        let (status, body) = server.get("/api/v1/rules").await;
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
     }
@@ -1654,16 +1843,18 @@ mod tests {
     #[tokio::test]
     async fn test_rules_create_with_sql_query() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Valid streaming SQL is accepted and echoed back verbatim.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "hot-temp",
                        "topic_filter": "sensors/+",
                        "sql_query": "SELECT * FROM \"sensors/+\" WHERE temperature > 50.0",
                        "enabled": true,
                        "actions": [{"type": "republish", "topic": "alerts/hot", "qos": 0}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1675,23 +1866,26 @@ mod tests {
             .as_str()
             .expect("created rule has id")
             .to_string();
-        let (status, _) = server.get(&format!("/api/v1/rules/{id}")).await;
+        let (status, _) = server
+            .get_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
         assert_eq!(status, 200);
 
         // Broken SQL is a 400 and stores nothing.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "broken",
                        "topic_filter": "sensors/+",
                        "sql_query": "SELECT WHERE WHERE",
                        "actions": []}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
         assert!(body["error"].as_str().unwrap().contains("sql_query"));
 
-        let (status, body) = server.get("/api/v1/rules").await;
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("list").len(), 1);
     }
@@ -1699,9 +1893,10 @@ mod tests {
     #[tokio::test]
     async fn test_nodes_reports_status_version_connections() {
         let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
         state.metrics.set_active_connections(3);
 
-        let (status, body) = server.get("/api/v1/nodes").await;
+        let (status, body) = server.get_auth("/api/v1/nodes", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["status"], json!("running"));
         assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
@@ -1712,14 +1907,15 @@ mod tests {
     #[tokio::test]
     async fn test_clients_lists_connected_ids() {
         let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
-        let (status, body) = server.get("/api/v1/clients").await;
+        let (status, body) = server.get_auth("/api/v1/clients", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
 
         state.sessions.get_or_create("client-b", true);
         state.sessions.get_or_create("client-a", true);
-        let (status, body) = server.get("/api/v1/clients").await;
+        let (status, body) = server.get_auth("/api/v1/clients", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!(["client-a", "client-b"]));
     }
@@ -1727,13 +1923,16 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_exposes_prometheus_counters() {
         let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
         state.metrics.inc_messages_received();
         state.metrics.inc_messages_forwarded_by(2);
         state.metrics.inc_rules_executed();
         state.metrics.set_active_connections(1);
 
         let (status, text) = server
-            .request_raw("GET /api/v1/metrics HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .request_raw(&format!(
+                "GET /api/v1/metrics HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ))
             .await;
         assert_eq!(status, 200);
         assert!(text.contains("indramqtt_messages_received_total 1\n"));
@@ -1745,14 +1944,16 @@ mod tests {
     #[tokio::test]
     async fn test_rules_create_with_forward_connector() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "to-webhook",
                        "topic_filter": "sensors/+",
                        "sql_query": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
                        "actions": [{"type": "forwardconnector", "connector_id": "webhook-1"}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1761,11 +1962,12 @@ mod tests {
 
         // Empty connector id is rejected.
         let (status, _) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules",
                 json!({"name": "bad",
                        "topic_filter": "sensors/+",
                        "actions": [{"type": "forwardconnector", "connector_id": "  "}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
@@ -1774,12 +1976,14 @@ mod tests {
     #[tokio::test]
     async fn test_auth_users_and_acls() {
         let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Create a user.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "alice", "password": "s3cret"}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1790,28 +1994,31 @@ mod tests {
 
         // Empty username or password is rejected.
         let (status, _) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "", "password": "x"}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
         let (status, _) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "bob", "password": ""}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
 
         // Create an ACL rule.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/acls",
                 json!({"client_pattern": "alice",
                        "action": "publish",
                        "topic_pattern": "sensors/#",
                        "allow": true}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1823,7 +2030,7 @@ mod tests {
             json!({"client_pattern": "*", "action": "publish", "topic_pattern": "a/#/b", "allow": true}),
             json!({"client_pattern": "", "action": "all", "topic_pattern": "#", "allow": false}),
         ] {
-            let (status, _) = server.post("/api/v1/auth/acls", body).await;
+            let (status, _) = server.post_auth("/api/v1/auth/acls", body, &token).await;
             assert_eq!(status, 400);
         }
     }
@@ -1831,37 +2038,40 @@ mod tests {
     #[tokio::test]
     async fn test_auth_lists_users_and_acls() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
-        let (status, body) = server.get("/api/v1/auth/users").await;
+        let (status, body) = server.get_auth("/api/v1/auth/users", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
-        let (status, body) = server.get("/api/v1/auth/acls").await;
+        let (status, body) = server.get_auth("/api/v1/auth/acls", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
 
         server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "alice", "password": "s3cret"}),
+                &token,
             )
             .await;
         server
-            .post(
+            .post_auth(
                 "/api/v1/auth/acls",
                 json!({"client_pattern": "alice",
                        "action": "subscribe",
                        "topic_pattern": "sensors/#",
                        "allow": true}),
+                &token,
             )
             .await;
 
-        let (status, body) = server.get("/api/v1/auth/users").await;
+        let (status, body) = server.get_auth("/api/v1/auth/users", &token).await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
             json!([{"username": "alice", "quotas": {"max_connections": null, "max_publish_rate": null, "max_publish_burst": null}}])
         );
-        let (status, body) = server.get("/api/v1/auth/acls").await;
+        let (status, body) = server.get_auth("/api/v1/auth/acls", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("acls").len(), 1);
         assert_eq!(body[0]["client_pattern"], json!("alice"));
@@ -1872,16 +2082,18 @@ mod tests {
     #[tokio::test]
     async fn test_auth_users_quotas_roundtrip() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Create with quotas: every bound echoes back.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "capped",
                        "password": "pw",
                        "quotas": {"max_connections": 100,
                                   "max_publish_rate": 50,
                                   "max_publish_burst": 10}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1892,9 +2104,10 @@ mod tests {
 
         // Without quotas: all-null bounds object.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/auth/users",
                 json!({"username": "plain", "password": "pw"}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -1904,7 +2117,7 @@ mod tests {
         );
 
         // Listing shows both shapes side by side.
-        let (status, body) = server.get("/api/v1/auth/users").await;
+        let (status, body) = server.get_auth("/api/v1/auth/users", &token).await;
         assert_eq!(status, 200);
         let users = body.as_array().expect("users list");
         assert_eq!(users.len(), 2);
@@ -1915,6 +2128,538 @@ mod tests {
             users[1]["quotas"]["max_publish_rate"],
             serde_json::Value::Null
         );
+    }
+
+    #[tokio::test]
+    async fn login_default_admin_requires_password_change() {
+        let (server, _state) = TestServer::start().await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "public"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["token"].as_str().is_some_and(|t| !t.is_empty()));
+        assert_eq!(body["role"], json!("administrator"));
+        assert_eq!(body["must_change_password"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn login_wrong_password_is_rejected_and_creates_nothing() {
+        let (server, state) = TestServer::start().await;
+
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "wrong-password"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("NAME_PWD_ERROR"));
+
+        // An unknown user is rejected and appears in neither store.
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "ghost", "password": "whatever-123"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert!(state.admin_users.get("ghost").is_none());
+        assert_eq!(state.auth.user_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scram_login_end_to_end() {
+        let (server, _state) = TestServer::start().await;
+        let client_nonce = "testclientnonce123";
+
+        // Correct password: challenge, proof, verify.
+        let (status, challenge) = server
+            .post(
+                "/api/v5/login/challenge",
+                json!({"username": "admin", "client_nonce": client_nonce}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let challenge_id = challenge["challenge_id"].as_str().expect("challenge id");
+        let server_nonce = challenge["server_nonce"].as_str().expect("server nonce");
+        let salt_b64 = challenge["salt"].as_str().expect("salt");
+        let iterations = challenge["iterations"].as_u64().expect("iterations") as u32;
+        let combined = format!("{client_nonce}{server_nonce}");
+        let auth_message =
+            scram_auth_message("admin", client_nonce, &combined, salt_b64, iterations);
+        let (proof_b64, server_sig_b64) =
+            scram_client::proof("public", salt_b64, iterations, &auth_message);
+
+        let (status, body) = server
+            .post(
+                "/api/v5/login/verify",
+                json!({
+                    "challenge_id": challenge_id,
+                    "combined_nonce": combined,
+                    "client_proof": proof_b64,
+                }),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["token"].as_str().is_some_and(|t| !t.is_empty()));
+        assert_eq!(body["server_signature"], json!(server_sig_b64));
+
+        // Wrong password: a fresh challenge, then the proof is rejected.
+        let (status, challenge) = server
+            .post(
+                "/api/v5/login/challenge",
+                json!({"username": "admin", "client_nonce": client_nonce}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let challenge_id = challenge["challenge_id"].as_str().expect("challenge id");
+        let salt_b64 = challenge["salt"].as_str().expect("salt");
+        let iterations = challenge["iterations"].as_u64().expect("iterations") as u32;
+        let auth_message =
+            scram_auth_message("admin", client_nonce, &combined, salt_b64, iterations);
+        let (bad_proof, _) =
+            scram_client::proof("wrong-password", salt_b64, iterations, &auth_message);
+        let (status, body) = server
+            .post(
+                "/api/v5/login/verify",
+                json!({
+                    "challenge_id": challenge_id,
+                    "combined_nonce": combined,
+                    "client_proof": bad_proof,
+                }),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("NAME_PWD_ERROR"));
+    }
+
+    #[tokio::test]
+    async fn current_user_reflects_token() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        // Create a viewer through the admin API.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "watcher", "password": "W4tcher-pass", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "watcher", "password": "W4tcher-pass"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["role"], json!("viewer"));
+        let viewer_token = body["token"].as_str().expect("viewer token").to_string();
+
+        let (status, body) = server.get_auth("/api/v5/current_user", &viewer_token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["username"], json!("watcher"));
+        assert_eq!(body["role"], json!("viewer"));
+
+        // No token is a 401.
+        let (status, body) = server.get("/api/v5/current_user").await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    #[tokio::test]
+    async fn change_pwd_flow() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.admin_token().await;
+        // A second admin token that must die on password change.
+        let (status, other) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "public"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let other_token = other["token"].as_str().expect("second token").to_string();
+        assert_ne!(admin_token, other_token);
+
+        // Admin changes their own password from the default.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "public", "new_pwd": "N3w-passw0rd!"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Flag cleared on the caller's surviving token.
+        let (status, body) = server.get_auth("/api/v5/current_user", &admin_token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["must_change_password"], json!(false));
+
+        // Old password no longer logs in; the other token is revoked.
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "public"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_auth("/api/v5/current_user", &other_token).await;
+        assert_eq!(status, 401);
+
+        // A viewer cannot change another user's password.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "watcher", "password": "W4tcher-pass", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "watcher", "password": "W4tcher-pass"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_token = body["token"].as_str().expect("viewer token").to_string();
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "N3w-passw0rd!", "new_pwd": "An0ther-pass!"}),
+                &viewer_token,
+            )
+            .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+    }
+
+    #[tokio::test]
+    async fn change_pwd_accepts_post() {
+        let (server, _state) = TestServer::start().await;
+        let fresh = server.admin_token().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "public", "new_pwd": "N3w-post-passw0rd!"}),
+                &fresh,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v1/clients", &fresh).await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn lowercase_bearer_scheme_is_accepted() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .request(&format!(
+                "GET /api/v5/current_user HTTP/1.0\r\nHost: test\r\nAuthorization: bearer {token}\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["username"].is_string());
+    }
+
+    #[tokio::test]
+    async fn bare_token_without_scheme_is_rejected() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .request(&format!(
+                "GET /api/v5/current_user HTTP/1.0\r\nHost: test\r\nAuthorization: {token}\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    #[test]
+    fn is_own_change_pwd_percent_decodes_username() {
+        use crate::api_auth::is_own_change_pwd;
+        let post = axum::http::Method::POST;
+        assert!(is_own_change_pwd(
+            &post,
+            "/api/v5/users/ops.team-1%40site/change_pwd",
+            "ops.team-1@site"
+        ));
+        assert!(!is_own_change_pwd(
+            &post,
+            "/api/v5/users/ops.team-1%4/change_pwd",
+            "ops.team-1@site"
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_users_api_does_not_touch_mqtt_store() {
+        let (server, state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "ops", "password": "Ops-passw0rd", "role": "viewer",
+                       "description": "read-only"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["username"], json!("ops"));
+        assert_eq!(created["role"], json!("viewer"));
+        assert_eq!(created["description"], json!("read-only"));
+        assert_eq!(state.auth.user_count(), 0);
+
+        // Listing serves the admin store with roles, sorted by username.
+        let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("users array")
+            .iter()
+            .map(|u| u["username"].as_str().expect("username"))
+            .collect();
+        assert_eq!(names, vec!["admin", "ops"]);
+
+        // Role/description update and delete stay out of the MQTT store.
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/users/ops",
+                json!({"role": "administrator", "description": "on-call"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(updated["role"], json!("administrator"));
+        assert_eq!(updated["description"], json!("on-call"));
+        let (status, _) = server.delete_auth("/api/v5/users/ops", &admin_token).await;
+        assert_eq!(status, 204);
+        assert_eq!(state.auth.user_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn demoted_admin_token_loses_admin_rights() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "b-admin", "password": "B-passw0rd!", "role": "administrator"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "b-admin", "password": "B-passw0rd!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let b_token = body["token"].as_str().expect("b token").to_string();
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "probe", "password": "Probe-pass1", "role": "viewer"}),
+                &b_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/users/b-admin",
+                json!({"role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "probe2", "password": "Probe-pass1", "role": "viewer"}),
+                &b_token,
+            )
+            .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+    }
+
+    #[tokio::test]
+    async fn deleted_user_token_is_rejected() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "viewer-v", "password": "V-passw0rd!", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "viewer-v", "password": "V-passw0rd!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let v_token = body["token"].as_str().expect("viewer token").to_string();
+
+        let (status, _) = server.get_auth("/api/v5/current_user", &v_token).await;
+        assert_eq!(status, 200);
+
+        let (status, _) = server
+            .delete_auth("/api/v5/users/viewer-v", &admin_token)
+            .await;
+        assert_eq!(status, 204);
+
+        let (status, body) = server.get_auth("/api/v5/current_user", &v_token).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    fn fill_pending_challenges(tokens: &crate::v5::auth::ApiTokens, count: usize) {
+        for i in 0..count {
+            let inserted = tokens.insert_challenge(
+                format!("fill-{i}"),
+                crate::v5::auth::ScramChallengeState::for_test("admin"),
+            );
+            assert!(inserted, "insert {i} should succeed");
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_cap_returns_429() {
+        use crate::v5::auth::{ScramChallengeState, MAX_PENDING_CHALLENGES};
+        let (server, state) = TestServer::start().await;
+        fill_pending_challenges(&state.tokens, MAX_PENDING_CHALLENGES);
+        assert!(
+            !state.tokens.insert_challenge(
+                "one-more".to_string(),
+                ScramChallengeState::for_test("admin")
+            ),
+            "insert past the cap should fail"
+        );
+        let (status, body) = server
+            .post(
+                "/api/v5/login/challenge",
+                json!({"username": "admin", "client_nonce": "nonce-123"}),
+            )
+            .await;
+        assert_eq!(status, 429);
+        assert_eq!(body["code"], json!("TOO_MANY_REQUESTS"));
+    }
+
+    #[tokio::test]
+    async fn api_rejects_requests_without_token() {
+        let (server, _state) = TestServer::start().await;
+
+        // Authenticated routes refuse anonymous callers.
+        let (status, body) = server.get("/api/v1/clients").await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+        let (status, body) = server.get("/api/v5/rules").await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+
+        // Public routes stay open.
+        let (status, _) = server
+            .request_raw("GET /healthz HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .request_raw("GET /dashboard HTTP/1.0\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn default_admin_must_change_password_first() {
+        let (server, _state) = TestServer::start().await;
+        let fresh = server.admin_token().await;
+
+        // The default-password token is gated everywhere but the
+        // password change, logout and current_user.
+        let (status, body) = server.get_auth("/api/v1/clients", &fresh).await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], json!("PASSWORD_CHANGE_REQUIRED"));
+        let (status, _) = server.get_auth("/api/v5/current_user", &fresh).await;
+        assert_eq!(status, 200);
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "public", "new_pwd": "Adm1n-test-pass!"}),
+                &fresh,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // After the change the same token opens the API.
+        let (status, _) = server.get_auth("/api/v1/clients", &fresh).await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn viewer_is_read_only() {
+        let (server, _state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "ro-view", "password": "R0-viewer-pass", "role": "viewer"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "ro-view", "password": "R0-viewer-pass"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer = body["token"].as_str().expect("viewer token").to_string();
+
+        // Reads work; writes are forbidden.
+        let (status, _) = server.get_auth("/api/v5/rules", &viewer).await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({"name": "x", "topic_filter": "a/#", "actions": []}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_rejected() {
+        let (server, state) = TestServer::start().await;
+        let stale = state
+            .tokens
+            .issue_expired("admin", crate::admin_users::AdminRole::Administrator);
+        let (status, body) = server.get_auth("/api/v1/clients", &stale).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
     }
 
     #[tokio::test]
@@ -2073,6 +2818,7 @@ mod tests {
     #[tokio::test]
     async fn test_clients_detail_endpoint() {
         let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         let (session, _) = state.sessions.get_or_create("detail-1", false);
         *session.conn_id.write() = Some(4242);
@@ -2083,7 +2829,7 @@ mod tests {
             QoS::AtLeastOnce,
         );
 
-        let (status, body) = server.get("/api/v1/clients/detail-1").await;
+        let (status, body) = server.get_auth("/api/v1/clients/detail-1", &token).await;
         assert_eq!(status, 200);
         let info: broker_session::ClientInfo =
             serde_json::from_value(body).expect("detail row decodes");
@@ -2094,7 +2840,7 @@ mod tests {
         assert!(info.connected);
         assert_eq!(info.subscriptions, vec!["sensors/+".to_string()]);
 
-        let (status, _) = server.get("/api/v1/clients/ghost").await;
+        let (status, _) = server.get_auth("/api/v1/clients/ghost", &token).await;
         assert_eq!(status, 404);
     }
 
@@ -2120,7 +2866,8 @@ mod tests {
         }
 
         let (server, state) = TestServer::start().await;
-        let (status, body) = server.get("/api/v1/connectors").await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!([]));
 
@@ -2128,7 +2875,7 @@ mod tests {
             .engine
             .connectors()
             .register("webhook-1", Arc::new(NullSink));
-        let (status, body) = server.get("/api/v1/connectors").await;
+        let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
@@ -2139,6 +2886,7 @@ mod tests {
     #[tokio::test]
     async fn test_connectors_create_kafka_rabbitmq_logger() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Per-test RSA key for the OCI + GCP-IoT creation legs below
         // (1024-bit, in-memory, never deployed).
@@ -2154,7 +2902,7 @@ mod tests {
 
         // Kafka sink: validated, lazily connected, listed with its kind.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "kafka-sink-1",
                        "kind": "kafka",
@@ -2164,6 +2912,7 @@ mod tests {
                                   "partitions": 4,
                                   "client_id": "indra",
                                   "acks": "all"}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2172,7 +2921,7 @@ mod tests {
 
         // RabbitMQ sink: slash translation config accepted.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "rabbit-sink-1",
                        "kind": "rabbitmq",
@@ -2180,6 +2929,7 @@ mod tests {
                                   "exchange": "telemetry",
                                   "routing_key_template": "sensor.${topic}",
                                   "delivery_mode": 2}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2187,9 +2937,10 @@ mod tests {
 
         // Logger sink needs no config at all.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "diag", "kind": "logger", "config": {}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2197,7 +2948,7 @@ mod tests {
 
         // Postgres sink: validated without touching any database.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "pg-sink-1",
                        "kind": "postgres",
@@ -2206,6 +2957,7 @@ mod tests {
                                   "pool_size": 2,
                                   "batch_size": 50,
                                   "batch_timeout_ms": 25}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2213,7 +2965,7 @@ mod tests {
 
         // Redis sink: XADD stream config accepted (command is flat).
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "redis-sink-1",
                        "kind": "redis",
@@ -2221,6 +2973,7 @@ mod tests {
                                   "command": "xadd",
                                   "stream_template": "events",
                                   "maxlen": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2228,7 +2981,7 @@ mod tests {
 
         // MySQL sink: validated without touching any database.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "mysql-sink-1",
                        "kind": "mysql",
@@ -2237,6 +2990,7 @@ mod tests {
                                   "pool_size": 2,
                                   "batch_size": 50,
                                   "batch_timeout_ms": 25}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2244,7 +2998,7 @@ mod tests {
 
         // ClickHouse sink: validated without touching any server.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "ch-sink-1",
                        "kind": "clickhouse",
@@ -2254,6 +3008,7 @@ mod tests {
                                   "format": "JSONEachRow",
                                   "batch_size": 100,
                                   "batch_timeout_ms": 50}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2261,7 +3016,7 @@ mod tests {
 
         // InfluxDB sink: validated without touching any server.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "influx-sink-1",
                        "kind": "influxdb",
@@ -2273,6 +3028,7 @@ mod tests {
                                   "precision": "ms",
                                   "batch_size": 100,
                                   "batch_timeout_ms": 50}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2280,7 +3036,7 @@ mod tests {
 
         // S3 sink: validated without touching any object store.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "s3-sink-1",
                        "kind": "s3",
@@ -2292,6 +3048,7 @@ mod tests {
                                   "batch_size": 100,
                                   "batch_bytes": 65536,
                                   "batch_timeout_ms": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2299,7 +3056,7 @@ mod tests {
 
         // Elasticsearch sink: validated without touching any cluster.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "es-sink-1",
                        "kind": "elasticsearch",
@@ -2309,6 +3066,7 @@ mod tests {
                                   "batch_size": 100,
                                   "batch_timeout_ms": 50,
                                   "max_retries": 3}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2316,7 +3074,7 @@ mod tests {
 
         // TimescaleDB sink: validated without touching any database.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "ts-sink-1",
                        "kind": "timescaledb",
@@ -2327,6 +3085,7 @@ mod tests {
                                   "pool_size": 2,
                                   "batch_size": 50,
                                   "batch_timeout_ms": 25}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2334,7 +3093,7 @@ mod tests {
 
         // Webhook sink: validated without sending any request.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "hook-1",
                        "kind": "webhook",
@@ -2350,6 +3109,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2357,7 +3117,7 @@ mod tests {
 
         // MQTT bridge sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "bridge-1",
                        "kind": "mqtt_bridge",
@@ -2369,6 +3129,7 @@ mod tests {
                                   "max_batch_size": 50,
                                   "linger_ms": 10,
                                   "protocol": "v311"}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2377,7 +3138,7 @@ mod tests {
         // Disk log sink: validated against an isolated temp directory.
         let disk_dir = std::env::temp_dir().join(format!("indra-test-disk-{}", std::process::id()));
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "disk-1",
                        "kind": "disk_log",
@@ -2387,6 +3148,7 @@ mod tests {
                                   "format": "ndjson",
                                   "compression": "none",
                                   "sync_mode": {"mode": "osdefault"}}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2395,7 +3157,7 @@ mod tests {
 
         // Sparkplug B sink: enterprise tier validated without any broker.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "spb-1",
                        "kind": "sparkplug_b",
@@ -2403,6 +3165,7 @@ mod tests {
                                   "tier": "enterprise",
                                   "batch_size": 50,
                                   "linger_ms": 25}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2410,7 +3173,7 @@ mod tests {
 
         // Kinesis sink: validated without touching AWS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "kinesis-1",
                        "kind": "kinesis",
@@ -2425,6 +3188,7 @@ mod tests {
                                   "max_retries": 3,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2432,7 +3196,7 @@ mod tests {
 
         // GCP Pub/Sub sink: validated without touching Google.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "gcp-1",
                        "kind": "gcp_pubsub",
@@ -2445,6 +3209,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2452,7 +3217,7 @@ mod tests {
 
         // Azure Event Hubs sink: validated without touching Azure.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "azure-1",
                        "kind": "azure_eventhubs",
@@ -2467,6 +3232,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2474,7 +3240,7 @@ mod tests {
 
         // Pulsar sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "pulsar-1",
                        "kind": "pulsar",
@@ -2489,6 +3255,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2496,7 +3263,7 @@ mod tests {
 
         // MongoDB sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "mongo-1",
                        "kind": "mongodb",
@@ -2510,6 +3277,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2517,7 +3285,7 @@ mod tests {
 
         // MSSQL sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "mssql-1",
                        "kind": "mssql",
@@ -2533,6 +3301,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2540,7 +3309,7 @@ mod tests {
 
         // Cassandra sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "cassandra-1",
                        "kind": "cassandra",
@@ -2557,6 +3326,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2564,7 +3334,7 @@ mod tests {
 
         // Couchbase sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "couchbase-1",
                        "kind": "couchbase",
@@ -2579,6 +3349,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2586,7 +3357,7 @@ mod tests {
 
         // TDengine sink: validated without touching any server.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "tdengine-1",
                        "kind": "tdengine",
@@ -2603,6 +3374,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2610,7 +3382,7 @@ mod tests {
 
         // IoTDB sink: validated without touching any server.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "iotdb-1",
                        "kind": "iotdb",
@@ -2626,6 +3398,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2633,7 +3406,7 @@ mod tests {
 
         // Timestream sink: validated without touching AWS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "timestream-1",
                        "kind": "timestream",
@@ -2651,6 +3424,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2658,7 +3432,7 @@ mod tests {
 
         // DynamoDB sink: validated without touching AWS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "dynamodb-1",
                        "kind": "dynamodb",
@@ -2674,6 +3448,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2683,7 +3458,7 @@ mod tests {
         // Test-only RSA key (openssl-generated, never deployed).
         const SNOWFLAKE_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "snowflake-1",
                        "kind": "snowflake",
@@ -2700,6 +3475,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2707,7 +3483,7 @@ mod tests {
 
         // Databricks sink: validated without touching any workspace.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "databricks-1",
                        "kind": "databricks",
@@ -2722,6 +3498,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2729,7 +3506,7 @@ mod tests {
 
         // Doris sink: validated without touching any cluster.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "doris-1",
                        "kind": "doris",
@@ -2746,6 +3523,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2753,7 +3531,7 @@ mod tests {
 
         // BigQuery sink: validated without touching Google.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "bigquery-1",
                        "kind": "bigquery",
@@ -2769,6 +3547,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2776,7 +3555,7 @@ mod tests {
 
         // Redshift sink: validated without touching AWS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "redshift-1",
                        "kind": "redshift",
@@ -2792,6 +3571,7 @@ mod tests {
                                   "max_retries": 2,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2799,7 +3579,7 @@ mod tests {
 
         // OCI Streaming sink: Cavage-signed, validated without touching OCI.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "oci-1",
                        "kind": "oci_streaming",
@@ -2817,6 +3597,7 @@ mod tests {
                                   "max_retries": 5,
                                   "initial_backoff_ms": 10,
                                   "max_backoff_ms": 100}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2824,7 +3605,7 @@ mod tests {
 
         // AWS IoT Core sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "aws-iot-1",
                        "kind": "aws_iot",
@@ -2841,6 +3622,7 @@ mod tests {
                                   "batch_size": 200,
                                   "linger_ms": 50,
                                   "max_retries": 5}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2848,7 +3630,7 @@ mod tests {
 
         // Azure IoT Hub sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "azure-iot-1",
                        "kind": "azure_iot",
@@ -2864,6 +3646,7 @@ mod tests {
                                   "batch_size": 200,
                                   "linger_ms": 50,
                                   "max_retries": 5}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2871,7 +3654,7 @@ mod tests {
 
         // GCP IoT Core sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "gcp-iot-1",
                        "kind": "gcp_iot",
@@ -2886,6 +3669,7 @@ mod tests {
                                   "batch_size": 200,
                                   "linger_ms": 50,
                                   "max_retries": 5}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2893,7 +3677,7 @@ mod tests {
 
         // OPC-UA sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "opcua-1",
                        "kind": "opc_ua",
@@ -2906,6 +3690,7 @@ mod tests {
                                                           "publish_topic_template": "opcua/temperature"}],
                                   "batch_size": 200,
                                   "linger_ms": 50}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2913,7 +3698,7 @@ mod tests {
 
         // Azure Blob sink: validated without touching Azure.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "azblob-1",
                        "kind": "azure_blob",
@@ -2926,6 +3711,7 @@ mod tests {
                                   "max_records_per_blob": 10000,
                                   "max_bytes_per_blob": 10485760,
                                   "flush_interval_secs": 60}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2933,7 +3719,7 @@ mod tests {
 
         // Tablestore sink: validated without touching Alibaba Cloud.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "ots-1",
                        "kind": "tablestore",
@@ -2949,6 +3735,7 @@ mod tests {
                                                          "source": "${payload.temperature}",
                                                          "data_type": "double"}],
                                   "batch_size": 200}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2956,7 +3743,7 @@ mod tests {
 
         // S3 Tables sink: validated without touching AWS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "s3t-1",
                        "kind": "s3_tables",
@@ -2969,6 +3756,7 @@ mod tests {
                                   "partition_spec": [{"source_name": "date", "transform": "day"}],
                                   "target_format": "ndjsoncompressed",
                                   "batch_size": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2976,7 +3764,7 @@ mod tests {
 
         // Confluent Cloud sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "confluent-1",
                        "kind": "confluent",
@@ -2988,6 +3776,7 @@ mod tests {
                                   "partition_key_template": "${client_id}",
                                   "partitions": 12,
                                   "batch_size": 500}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -2995,7 +3784,7 @@ mod tests {
 
         // RocketMQ sink: validated without opening any socket.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "rmq-1",
                        "kind": "rocketmq",
@@ -3005,6 +3794,7 @@ mod tests {
                                   "access_key": "rocket-key",
                                   "secret_key": "rocket-secret",
                                   "batch_size": 128}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3012,7 +3802,7 @@ mod tests {
 
         // Oracle sink: validated without touching ORDS.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "oracle-1",
                        "kind": "oracle",
@@ -3023,6 +3813,7 @@ mod tests {
                                   "password": "secret",
                                   "key_columns": ["device_id"],
                                   "batch_size": 500}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3030,7 +3821,7 @@ mod tests {
 
         // CockroachDB sink: validated without touching CockroachDB.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "cockroach-1",
                        "kind": "cockroachdb",
@@ -3039,6 +3830,7 @@ mod tests {
                                   "upsert_conflict_columns": ["device_id"],
                                   "batch_size": 500,
                                   "max_retry_attempts": 5}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3046,7 +3838,7 @@ mod tests {
 
         // AlloyDB sink: validated without touching AlloyDB.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "alloydb-1",
                        "kind": "alloydb",
@@ -3057,6 +3849,7 @@ mod tests {
                                   "auth": {"type": "password", "password": "secret"},
                                   "table": "readings",
                                   "batch_size": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3064,7 +3857,7 @@ mod tests {
 
         // OpenTSDB sink: validated without touching OpenTSDB.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "opentsdb-1",
                        "kind": "opentsdb",
@@ -3075,6 +3868,7 @@ mod tests {
                                   "summary": true,
                                   "compression": "none",
                                   "batch_size": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3082,7 +3876,7 @@ mod tests {
 
         // GreptimeDB sink: validated without touching GreptimeDB.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "greptimedb-1",
                        "kind": "greptimedb",
@@ -3092,6 +3886,7 @@ mod tests {
                                   "table_template": "sensor_readings",
                                   "timestamp_precision": "millisecond",
                                   "batch_size": 1000}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
@@ -3099,7 +3894,7 @@ mod tests {
 
         // Datalayers sink: validated without touching Datalayers.
         let (status, created) = server
-            .post(
+            .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "datalayers-1",
                        "kind": "datalayers",
@@ -3108,12 +3903,13 @@ mod tests {
                                   "table": "metrics",
                                   "auth_token": "secret-token",
                                   "batch_size": 500}}),
+                &token,
             )
             .await;
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("datalayers"));
 
-        let (status, body) = server.get("/api/v1/connectors").await;
+        let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
         assert_eq!(
             body,
@@ -3370,10 +4166,12 @@ mod tests {
                               "database": "telemetry",
                               "table": "metrics"}}),
         ] {
-            let (status, _) = server.post("/api/v1/connectors", payload).await;
+            let (status, _) = server
+                .post_auth("/api/v1/connectors", payload, &token)
+                .await;
             assert_eq!(status, 400);
         }
-        let (status, body) = server.get("/api/v1/connectors").await;
+        let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("list").len(), 48);
     }
@@ -3381,15 +4179,17 @@ mod tests {
     #[tokio::test]
     async fn test_rules_test_endpoint() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // SQL match with projection.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"sql_query": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
                        "topic_filter": "sensors/+",
                        "topic": "sensors/kitchen",
                        "payload": {"temperature": 72.5, "secret": "x"}}),
+                &token,
             )
             .await;
         assert_eq!(status, 200);
@@ -3398,11 +4198,12 @@ mod tests {
 
         // Predicate false.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"sql_query": "SELECT * FROM \"sensors/+\" WHERE temperature > 100.0",
                        "topic": "sensors/kitchen",
                        "payload": {"temperature": 72.5}}),
+                &token,
             )
             .await;
         assert_eq!(status, 200);
@@ -3410,9 +4211,10 @@ mod tests {
 
         // No SQL: passthrough.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"topic": "a/b", "payload": {"v": 1}}),
+                &token,
             )
             .await;
         assert_eq!(status, 200);
@@ -3421,11 +4223,12 @@ mod tests {
 
         // Broken SQL is a 400.
         let (status, _) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"sql_query": "SELECT WHERE WHERE",
                        "topic": "a/b",
                        "payload": {}}),
+                &token,
             )
             .await;
         assert_eq!(status, 400);
@@ -3434,16 +4237,18 @@ mod tests {
     #[tokio::test]
     async fn test_rules_test_endpoint_batch() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
         // Array payloads aggregate as one batch: one row per group.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"sql_query": "SELECT sensor_id, avg(temperature) AS avg_temp FROM \"sensors/+\" GROUP BY sensor_id",
                        "topic": "sensors/kitchen",
                        "payload": [{"sensor_id": "a", "temperature": 10.0},
                                    {"sensor_id": "b", "temperature": 30.0},
                                    {"sensor_id": "a", "temperature": 20.0}]}),
+                &token,
             )
             .await;
         assert_eq!(status, 200);
@@ -3457,11 +4262,12 @@ mod tests {
 
         // Empty batches match nothing.
         let (status, body) = server
-            .post(
+            .post_auth(
                 "/api/v1/rules/test",
                 json!({"sql_query": "SELECT avg(temperature) AS a FROM \"sensors/+\"",
                        "topic": "sensors/kitchen",
                        "payload": []}),
+                &token,
             )
             .await;
         assert_eq!(status, 200);
@@ -3472,8 +4278,9 @@ mod tests {
     #[tokio::test]
     async fn test_rules_functions_catalog() {
         let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
 
-        let (status, body) = server.get("/api/v1/rules/functions").await;
+        let (status, body) = server.get_auth("/api/v1/rules/functions", &token).await;
         assert_eq!(status, 200);
         let catalog = body.as_array().expect("function array");
         assert_eq!(catalog.len(), 185);
