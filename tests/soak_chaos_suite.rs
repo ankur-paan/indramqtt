@@ -382,7 +382,8 @@ async fn test_chaos_swim_cluster_partition_and_self_refutation() {
 #[tokio::test]
 async fn test_chaos_quota_and_token_bucket_saturation() {
     let auth = MemoryAuth::new();
-    auth.add_user("tenant-prod", b"secret");
+    auth.add_user("tenant-prod", b"secret")
+        .expect("memory-only persist cannot fail");
 
     // Authenticate successfully
     assert!(auth
@@ -1278,7 +1279,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     let auth = MemoryAuth::new();
 
     // Tenant Alpha admin with multi-tenant quota bounds
-    auth.add_user("alpha_admin", b"alpha_secret_pass_2026");
+    auth.add_user("alpha_admin", b"alpha_secret_pass_2026")
+        .expect("memory-only persist cannot fail");
     assert!(auth.set_quotas(
         "alpha_admin",
         UserQuotas {
@@ -1289,7 +1291,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     ));
 
     // Tenant Beta admin with different quota bounds
-    auth.add_user("beta_admin", b"beta_secret_pass_2026");
+    auth.add_user("beta_admin", b"beta_secret_pass_2026")
+        .expect("memory-only persist cannot fail");
     assert!(auth.set_quotas(
         "beta_admin",
         UserQuotas {
@@ -1300,7 +1303,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     ));
 
     // Temporary user without explicit quotas
-    auth.add_user("guest_temp", b"guest_initial_pass");
+    auth.add_user("guest_temp", b"guest_initial_pass")
+        .expect("memory-only persist cannot fail");
 
     assert_eq!(auth.user_count(), 3);
     assert_eq!(
@@ -1327,7 +1331,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     assert_eq!(guest_quotas, UserQuotas::default());
 
     // User credential update (password rotation)
-    auth.add_user("guest_temp", b"guest_rotated_pass");
+    auth.add_user("guest_temp", b"guest_rotated_pass")
+        .expect("memory-only persist cannot fail");
     // Old password now fails
     assert!(auth
         .authenticate("client-g", Some("guest_temp"), Some(b"guest_initial_pass"))
@@ -1340,8 +1345,12 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
         .is_ok());
 
     // User removal
-    assert!(auth.remove_user("guest_temp"));
-    assert!(!auth.remove_user("guest_temp")); // Second removal returns false
+    assert!(auth
+        .remove_user("guest_temp")
+        .expect("memory-only persist cannot fail"));
+    assert!(!auth
+        .remove_user("guest_temp")
+        .expect("memory-only persist cannot fail")); // Second removal returns false
     assert_eq!(auth.user_count(), 2);
     assert!(!auth.usernames().contains(&"guest_temp".to_string()));
     assert!(auth
@@ -1406,7 +1415,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
         AclAction::All,
         "tenants/alpha/#",
         true,
-    ));
+    ))
+    .expect("memory-only persist cannot fail");
 
     // Rule 2: Tenant Beta clients have All access under tenants/beta/#
     auth.add_rule(AclRule::new(
@@ -1414,7 +1424,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
         AclAction::All,
         "tenants/beta/#",
         true,
-    ));
+    ))
+    .expect("memory-only persist cannot fail");
 
     // Rule 3: Read-only sensor client for Tenant Alpha can only subscribe to telemetry
     auth.add_rule(AclRule::new(
@@ -1422,7 +1433,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
         AclAction::Subscribe,
         "tenants/alpha/telemetry",
         true,
-    ));
+    ))
+    .expect("memory-only persist cannot fail");
 
     // Rule 4: Publish-only client for Tenant Alpha can only publish to commands
     auth.add_rule(AclRule::new(
@@ -1430,10 +1442,12 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
         AclAction::Publish,
         "tenants/alpha/commands",
         true,
-    ));
+    ))
+    .expect("memory-only persist cannot fail");
 
     // Rule 5: Fallback deny-all rule
-    auth.add_rule(AclRule::new("*", AclAction::All, "#", false));
+    auth.add_rule(AclRule::new("*", AclAction::All, "#", false))
+        .expect("memory-only persist cannot fail");
 
     assert_eq!(auth.acl_rules().len(), 5);
 
@@ -1796,7 +1810,7 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     // ------------------------------------------------------------------------
     engine.connectors().unregister("sink_tenant_alpha");
     engine.connectors().unregister("sink_tenant_beta");
-    auth.clear_rules();
+    auth.clear_rules().expect("memory-only persist cannot fail");
     assert_eq!(auth.acl_rules().len(), 0);
     drop(alpha_sink);
     drop(beta_sink);
