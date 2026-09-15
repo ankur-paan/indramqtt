@@ -196,6 +196,8 @@ pub struct MemoryPgTransport {
     batches: parking_lot::Mutex<Vec<PgBatch>>,
     failures_left: parking_lot::Mutex<usize>,
     calls: AtomicU64,
+    fail_dispatch: parking_lot::Mutex<Vec<(Vec<u8>, String)>>,
+    fail_connection: parking_lot::Mutex<Vec<(Vec<u8>, String)>>,
 }
 
 impl MemoryPgTransport {
@@ -208,6 +210,22 @@ impl MemoryPgTransport {
         *self.failures_left.lock() = n;
     }
 
+    /// Fail any batch holding a row column that contains `needle` with a
+    /// server (`Dispatch`) error carrying `message` (bad-row tests).
+    pub fn fail_batches_containing(&self, needle: &[u8], message: impl Into<String>) {
+        self.fail_dispatch
+            .lock()
+            .push((needle.to_vec(), message.into()));
+    }
+
+    /// Fail any batch holding a row column that contains `needle` with an
+    /// I/O (`Connection`) error carrying `message` (retry-restore tests).
+    pub fn fail_connection_batches_containing(&self, needle: &[u8], message: impl Into<String>) {
+        self.fail_connection
+            .lock()
+            .push((needle.to_vec(), message.into()));
+    }
+
     pub fn batches(&self) -> Vec<PgBatch> {
         self.batches.lock().clone()
     }
@@ -217,10 +235,32 @@ impl MemoryPgTransport {
     }
 }
 
+fn batch_contains(batch: &PgBatch, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    batch.rows.iter().any(|row| {
+        row.iter().any(|column| {
+            column.len() >= needle.len()
+                && column.windows(needle.len()).any(|window| window == needle)
+        })
+    })
+}
+
 #[async_trait]
 impl PgTransport for MemoryPgTransport {
     async fn execute_batch(&self, batch: &PgBatch) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        for (needle, message) in self.fail_dispatch.lock().iter() {
+            if batch_contains(batch, needle) {
+                return Err(ConnectorError::Dispatch(message.clone()));
+            }
+        }
+        for (needle, message) in self.fail_connection.lock().iter() {
+            if batch_contains(batch, needle) {
+                return Err(ConnectorError::Connection(message.clone()));
+            }
+        }
         let mut failures = self.failures_left.lock();
         if *failures > 0 {
             *failures -= 1;
@@ -435,11 +475,14 @@ async fn write_msg(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Extract the human message (`M` field) from an ErrorResponse body.
+/// Extract the human message from an ErrorResponse body, prefixed with
+/// the SQLSTATE (`C` field) when the server sent one.
 fn error_message(body: &[u8]) -> String {
+    let mut code: Option<String> = None;
+    let mut message: Option<String> = None;
     let mut cursor = body;
     while cursor.len() >= 2 {
-        let code = cursor[0];
+        let field = cursor[0];
         cursor = &cursor[1..];
         let end = cursor.iter().position(|&b| b == 0).unwrap_or(cursor.len());
         let value = String::from_utf8_lossy(&cursor[..end]).to_string();
@@ -447,11 +490,47 @@ fn error_message(body: &[u8]) -> String {
         if !cursor.is_empty() {
             cursor = &cursor[1..];
         }
-        if code == b'M' && !value.is_empty() {
-            return value;
+        match field {
+            b'C' if code.is_none() && !value.is_empty() => code = Some(value),
+            b'M' if message.is_none() && !value.is_empty() => message = Some(value),
+            _ => {}
         }
     }
-    "postgres error (no message field)".to_string()
+    match (code, message) {
+        (Some(code), Some(message)) => format!("SQLSTATE {code}: {message}"),
+        (None, Some(message)) => message,
+        _ => "postgres error (no message field)".to_string(),
+    }
+}
+
+/// True when `message` carries a data-rejection SQLSTATE: class `22` or
+/// `23`, or `42703` (undefined column) / `42804` (datatype mismatch),
+/// matched as a whole 5-character token (bounded by a non-alphanumeric
+/// character or the string edge).
+fn is_pg_data_error(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    if bytes.len() < 5 {
+        return false;
+    }
+    for start in 0..=(bytes.len() - 5) {
+        let window = &bytes[start..start + 5];
+        if !window.iter().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = start + 5 == bytes.len() || !bytes[start + 5].is_ascii_alphanumeric();
+        if !(before_ok && after_ok) {
+            continue;
+        }
+        if window.starts_with(b"22")
+            || window.starts_with(b"23")
+            || window == b"42703"
+            || window == b"42804"
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Drain server messages until ReadyForQuery, surfacing the first error.
@@ -731,10 +810,13 @@ impl PgTransport for TcpPgTransport {
         if batch.rows.is_empty() {
             return Ok(());
         }
-        // Round-robin checkout with reconnect-once: a poisoned slot is
-        // dropped and the batch retried on a fresh connection.
+        // Round-robin checkout with reconnect-once for I/O failures. A
+        // server data error (Dispatch: ErrorResponse then ReadyForQuery)
+        // leaves the connection healthy, so it is returned immediately
+        // with the connection kept and nothing replayed.
         let slot = (self.cursor.fetch_add(1, Ordering::SeqCst) as usize) % self.pool.len();
         let mut guard = self.pool[slot].lock().await;
+        let mut last_error: Option<ConnectorError> = None;
         for _ in 0..2 {
             if guard.is_none() {
                 *guard = Some(self.dial().await?);
@@ -742,14 +824,20 @@ impl PgTransport for TcpPgTransport {
             let stream = &mut guard.as_mut().expect("connected").stream;
             match execute_extended(stream, batch).await {
                 Ok(()) => return Ok(()),
-                Err(_) => {
+                Err(ConnectorError::Connection(message)) => {
                     *guard = None;
+                    last_error = Some(ConnectorError::Connection(message));
                 }
+                Err(other) => return Err(other),
             }
         }
-        Err(ConnectorError::Connection(
-            "postgres batch failed after reconnect".to_string(),
-        ))
+        Err(match last_error {
+            Some(ConnectorError::Connection(message)) => ConnectorError::Connection(format!(
+                "postgres batch failed after reconnect: {message}"
+            )),
+            Some(other) => other,
+            None => ConnectorError::Connection("postgres batch failed after reconnect".to_string()),
+        })
     }
 }
 
@@ -833,6 +921,7 @@ pub struct PostgreSqlSink {
     buffer: parking_lot::Mutex<super::BatchQueue<Vec<Vec<u8>>>>,
     backoff: parking_lot::Mutex<super::BackoffState>,
     sent_batches: AtomicU64,
+    rejected_rows: AtomicU64,
 }
 
 impl PostgreSqlSink {
@@ -845,6 +934,7 @@ impl PostgreSqlSink {
             transport,
             backoff: parking_lot::Mutex::new(super::BackoffState::default()),
             sent_batches: AtomicU64::new(0),
+            rejected_rows: AtomicU64::new(0),
         })
     }
 
@@ -856,20 +946,29 @@ impl PostgreSqlSink {
         self.sent_batches.load(Ordering::Relaxed)
     }
 
+    /// Rows the server refused with a data error and the sink dropped.
+    pub fn rejected_rows(&self) -> u64 {
+        self.rejected_rows.load(Ordering::Relaxed)
+    }
+
     pub fn buffered_rows(&self) -> usize {
         self.buffer.lock().len()
     }
 
     /// Flush buffered rows as one batch (no-op when empty). While
-    /// backing off, fails fast without touching the transport.
+    /// backing off, fails fast without touching the transport. A batch
+    /// the server rejects with a data error (bad row) is retried row by
+    /// row so one bad row cannot block the rows behind it; rejected rows
+    /// are counted and dropped, never restored.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
         if rows.is_empty() {
             return Ok(());
         }
+        let sql = self.config.sql_template.clone();
         let batch = PgBatch {
-            sql: self.config.sql_template.clone(),
+            sql: sql.clone(),
             rows,
         };
         match self.transport.execute_batch(&batch).await {
@@ -879,9 +978,55 @@ impl PostgreSqlSink {
                 Ok(())
             }
             Err(e) => {
-                self.buffer.lock().restore(batch.rows, oldest);
-                self.backoff.lock().failure();
-                Err(e)
+                let data_error = match &e {
+                    ConnectorError::Dispatch(message) => is_pg_data_error(message),
+                    _ => false,
+                };
+                if !data_error {
+                    self.buffer.lock().restore(batch.rows, oldest);
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
+                if batch.rows.len() == 1 {
+                    self.rejected_rows.fetch_add(1, Ordering::Relaxed);
+                    self.backoff.lock().success();
+                    self.sent_batches.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(rejected = 1, error = %e, "postgres rejected bad row");
+                    return Ok(());
+                }
+                let first_error = e.to_string();
+                let mut rejected = 0u64;
+                let mut index = 0;
+                while index < batch.rows.len() {
+                    let single = PgBatch {
+                        sql: sql.clone(),
+                        rows: vec![batch.rows[index].clone()],
+                    };
+                    match self.transport.execute_batch(&single).await {
+                        Ok(()) => index += 1,
+                        Err(row_error) => {
+                            let row_data_error = match &row_error {
+                                ConnectorError::Dispatch(message) => is_pg_data_error(message),
+                                _ => false,
+                            };
+                            if row_data_error {
+                                rejected += 1;
+                                index += 1;
+                            } else {
+                                let rest: Vec<Vec<Vec<u8>>> =
+                                    batch.rows.into_iter().skip(index).collect();
+                                self.buffer.lock().restore(rest, oldest);
+                                self.backoff.lock().failure();
+                                return Err(row_error);
+                            }
+                        }
+                    }
+                }
+                self.rejected_rows.fetch_add(rejected, Ordering::Relaxed);
+                self.backoff.lock().success();
+                self.sent_batches.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(rejected = rejected, error = %first_error, "postgres rejected bad rows");
+                Ok(())
             }
         }
     }
@@ -1434,5 +1579,167 @@ mod tests {
             .await
             .expect("fake broker finishes")
             .expect("fake broker task");
+    }
+
+    #[test]
+    fn test_error_message_includes_sqlstate() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"SERROR\0");
+        body.extend_from_slice(b"C23514\0");
+        body.extend_from_slice(b"Mnew row violates check constraint\0");
+        body.push(0);
+        assert_eq!(
+            error_message(&body),
+            "SQLSTATE 23514: new row violates check constraint"
+        );
+        // No SQLSTATE: bare message, as before.
+        let mut bare = Vec::new();
+        bare.extend_from_slice(b"Mjust the message\0");
+        bare.push(0);
+        assert_eq!(error_message(&bare), "just the message");
+        // No message field: existing fallback.
+        let mut empty = Vec::new();
+        empty.extend_from_slice(b"C23514\0");
+        empty.push(0);
+        assert_eq!(error_message(&empty), "postgres error (no message field)");
+    }
+
+    #[tokio::test]
+    async fn test_bad_row_rejected_rest_written() {
+        let transport = Arc::new(MemoryPgTransport::new());
+        transport.fail_batches_containing(
+            b"__BAD_ROW_MARKER__",
+            "postgres: SQLSTATE 23514: new row violates check constraint",
+        );
+        let sink = PostgreSqlSink::new(test_config(), transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payloads = ["good-0", "good-1", "__BAD_ROW_MARKER__", "good-3", "good-4"];
+        for payload in payloads {
+            sink.send(&topic, &Bytes::from(payload.to_string()), QoS::AtLeastOnce)
+                .await
+                .expect("buffered");
+        }
+        assert_eq!(sink.buffered_rows(), 5);
+        sink.flush().await.expect("bad row must not fail flush");
+        assert_eq!(sink.rejected_rows(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        let batches = transport.batches();
+        assert_eq!(batches.len(), 4, "four retried single-row batches");
+        let recorded: Vec<Vec<u8>> = batches
+            .iter()
+            .flat_map(|batch| {
+                assert_eq!(batch.rows.len(), 1, "retries are single-row");
+                batch
+                    .rows
+                    .iter()
+                    .map(|row| row[2].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(recorded, vec![b"good-0", b"good-1", b"good-3", b"good-4"]);
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_during_row_retry_restores_rest() {
+        let transport = Arc::new(MemoryPgTransport::new());
+        transport.fail_batches_containing(
+            b"T3-DATA-BAD",
+            "postgres: SQLSTATE 23514: new row violates check constraint",
+        );
+        transport.fail_connection_batches_containing(b"T3-CONN-BAD", "mock connection reset");
+        let sink = PostgreSqlSink::new(test_config(), transport.clone()).expect("valid sink");
+        let topic = Topic::new("t").unwrap();
+        for payload in [
+            "t3-r0-good",
+            "t3-r1-T3-CONN-BAD",
+            "t3-r2-T3-DATA-BAD",
+            "t3-r3-good",
+            "t3-r4-good",
+        ] {
+            sink.send(&topic, &Bytes::from(payload.to_string()), QoS::AtMostOnce)
+                .await
+                .expect("buffered");
+        }
+        let err = sink.flush().await.expect_err("connection error must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "must surface the connection error, got: {err}"
+        );
+        assert_eq!(sink.rejected_rows(), 0);
+        assert_eq!(sink.buffered_rows(), 4);
+        let batches = transport.batches();
+        assert_eq!(batches.len(), 1, "only the first retried row was written");
+        assert_eq!(batches[0].rows.len(), 1);
+        assert_eq!(batches[0].rows[0][2], b"t3-r0-good");
+    }
+
+    /// A data error (ErrorResponse + ReadyForQuery) must not trigger a
+    /// reconnect: the connection is healthy and the server text (with
+    /// SQLSTATE) must surface.
+    #[tokio::test]
+    async fn test_tcp_data_error_keeps_connection_and_surfaces_sqlstate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let connections = Arc::new(AtomicU64::new(0));
+        let connections_rx = connections.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            connections_rx.fetch_add(1, Ordering::SeqCst);
+            // SSLRequest -> 'N' (cleartext).
+            let mut probe = [0u8; 8];
+            stream.read_exact(&mut probe).await.expect("ssl probe");
+            stream.write_all(b"N").await.expect("ssl deny");
+            let _params = read_startup(&mut stream).await;
+            write_pg_msg(&mut stream, b'R', &0i32.to_be_bytes()).await;
+            send_ready(&mut stream).await;
+            // Read the pipelined batch up to Sync, then answer with a
+            // check-violation ErrorResponse followed by ReadyForQuery.
+            loop {
+                let (tag, _) = read_pg_msg(&mut stream).await;
+                if tag == b'S' {
+                    break;
+                }
+            }
+            let mut err_body = Vec::new();
+            err_body.extend_from_slice(b"SERROR\0");
+            err_body.extend_from_slice(b"C23514\0");
+            err_body.extend_from_slice(b"Mnew row violates check constraint\0");
+            err_body.push(0);
+            write_pg_msg(&mut stream, b'E', &err_body).await;
+            send_ready(&mut stream).await;
+            // The client must keep this connection: a second accept
+            // (a reconnect) must never arrive.
+            let second = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            assert!(second.is_err(), "client reconnected after a data error");
+        });
+
+        let transport = TcpPgTransport::new(&format!("postgresql://u:pwd@127.0.0.1:{port}/db"), 1)
+            .expect("valid transport");
+        let batch = PgBatch {
+            sql: "INSERT INTO t (payload) VALUES ($1, $2, $3)".to_string(),
+            rows: vec![vec![b"t".to_vec(), b"0".to_vec(), b"{}".to_vec()]],
+        };
+        let err = transport
+            .execute_batch(&batch)
+            .await
+            .expect_err("data error must fail");
+        let text = format!("{err}");
+        assert!(text.contains("23514"), "SQLSTATE must surface, got: {text}");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "data error must not become a connection error, got: {text}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("fake broker finishes")
+            .expect("fake broker task");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "no reconnect after a data error"
+        );
     }
 }
