@@ -65,22 +65,6 @@ pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<Strin
         .into_response()
 }
 
-pub async fn get_cluster() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "name": "indramqtt-cluster",
-            "nodes": [
-                {
-                    "node": "indramqtt@127.0.0.1",
-                    "status": "running"
-                }
-            ]
-        })),
-    )
-        .into_response()
-}
-
 fn chrono_iso() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

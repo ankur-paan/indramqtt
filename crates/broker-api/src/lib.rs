@@ -21,6 +21,9 @@ use crate::v5::auth::ApiTokens;
 pub mod admin_users;
 pub mod api_auth;
 pub mod dashboard;
+pub mod errors;
+pub mod node_scope;
+pub mod pagination;
 pub mod swagger;
 pub mod v5;
 pub mod ws;
@@ -1974,6 +1977,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_list_echoes_stored_actions_only() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "no-actions",
+                       "sql": "SELECT * FROM \"t/#\"",
+                       "enable": true,
+                       "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["actions"], json!([]));
+        assert!(created.get("description").is_none());
+        assert!(created.get("created_at").is_none());
+
+        let (status, body) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        let text = serde_json::to_string(&body).expect("encode list body");
+        assert!(
+            !text.contains("kafka:kafka-prod"),
+            "list must not inject fallback actions, got: {text}"
+        );
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["actions"], json!([]));
+        assert!(data[0].get("description").is_none());
+        assert!(data[0].get("created_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn rules_create_rejects_bad_filter() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Spec-literal invalid filter: `FROM "t/["` must be 400 (previously
+        // silently coerced to `t/#`).
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "bad-filter",
+                       "sql": "SELECT * FROM \"t/[\"",
+                       "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // A misplaced `#` (mid-filter) is likewise rejected, not coerced.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "bad-filter-hash",
+                       "sql": "SELECT * FROM \"t/#/bogus\"",
+                       "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"sql": "SELECT * FROM \"t/#\"", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn rules_update_unknown_is_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .put_auth("/api/v5/rules/nope", json!({"enable": false}), &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
     async fn test_auth_users_and_acls() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -2563,6 +2654,27 @@ mod tests {
             .await;
         assert_eq!(status, 429);
         assert_eq!(body["code"], json!("TOO_MANY_REQUESTS"));
+    }
+
+    #[tokio::test]
+    async fn removed_authchain_authz_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for (method, path) in [
+            ("GET", "/api/v5/authentication"),
+            ("GET", "/api/v5/authentication/x"),
+            ("GET", "/api/v5/authorization/sources"),
+            ("GET", "/api/v5/authorization/settings"),
+            ("DELETE", "/api/v5/authorization/cache"),
+        ] {
+            let (status, _) = server
+                .request_raw(&format!(
+                    "{method} {path} HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                ))
+                .await;
+            assert_eq!(status, 404, "{method} {path} must be gone");
+        }
     }
 
     #[tokio::test]
@@ -4177,6 +4289,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_metrics_unknown_is_404_and_honest() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .get_auth("/api/v5/rules/w0-13-no-such-rule/metrics", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/rules/w0-13-no-such-rule/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "w0-13-metrics",
+                       "sql": "SELECT * FROM \"t/w013\"",
+                       "enable": true,
+                       "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = created["id"].as_str().expect("rule id").to_string();
+
+        let (status, body) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}/metrics"), &token)
+            .await;
+        assert_eq!(status, 200);
+        let metrics = body["metrics"].as_object().expect("metrics object");
+        let mut keys: Vec<&str> = metrics.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "actions.failed",
+                "actions.success",
+                "actions.total",
+                "failed",
+                "matched",
+                "passed"
+            ]
+        );
+        assert!(body.get("node_metrics").is_none());
+        assert!(metrics.get("rate").is_none());
+        assert!(metrics.get("rate_max").is_none());
+        assert!(metrics.get("rate_last5m").is_none());
+    }
+
+    #[tokio::test]
+    async fn connector_unknown_is_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w0-13-no-such-connector", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn removed_connector_operation_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/x/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        let (status, _) = server
+            .send("POST", "/api/v5/connectors/x/start", None, Some(&token))
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
     async fn test_rules_test_endpoint() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -4566,5 +4769,264 @@ mod tests {
         let suback = client.recv_msg().await.expect("suback");
         assert_eq!(mqtt_packet_type(&suback), 9);
         assert_eq!(&suback[4..], &[0x87], "denied filter must yield 0x87");
+    }
+
+    #[tokio::test]
+    async fn removed_gateway_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/gateways",
+            "/api/v5/gateways/stomp",
+            "/api/v5/gateways/stomp/clients/c1",
+            "/api/v5/gateway",
+        ] {
+            let (status, _) = server
+                .request_raw(&format!(
+                    "GET {path} HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                ))
+                .await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_listeners_banned_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for raw in [
+            "GET /api/v5/listeners HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
+            "GET /api/v5/listeners/tcp:default HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
+            "POST /api/v5/listeners/x/stop HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "GET /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
+            "POST /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "DELETE /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
+        ] {
+            let raw = raw.replace("TOKEN", &token);
+            let (status, _) = server.request_raw(&raw).await;
+            assert_eq!(status, 404, "removed route must be 404: {raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_trace_slowsub_topicmetrics_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/trace",
+            "/api/v5/trace/x/log",
+            "/api/v5/slow_subscriptions",
+            "/api/v5/slow_subscriptions/settings",
+            "/api/v5/mqtt/topic_metrics",
+        ] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+        let (status, _) = server.post_auth("/api/v5/trace", json!({}), &token).await;
+        assert_eq!(status, 404, "removed route POST /api/v5/trace must be 404");
+    }
+
+    #[tokio::test]
+    async fn removed_action_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/actions",
+            "/api/v5/actions/x",
+            "/api/v5/actions/x/metrics",
+            "/api/v5/actions_summary",
+        ] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+        let (status, _) = server.post_auth("/api/v5/actions", json!({}), &token).await;
+        assert_eq!(
+            status, 404,
+            "removed route POST /api/v5/actions must be 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_sources_rulenotest_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in ["/api/v5/sources", "/api/v5/rule_events"] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+        for path in [
+            "/api/v5/sources_probe",
+            "/api/v5/rule_test",
+            "/api/v5/rules/abc/test",
+        ] {
+            let (status, _) = server.post_auth(path, json!({}), &token).await;
+            assert_eq!(status, 404, "removed route POST {path} must be 404");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_schema_registry_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/schema_registry",
+            "/api/v5/schema_registry/x",
+            "/api/v5/schema_validations",
+            "/api/v5/schema_validations/validation/x/metrics",
+        ] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_unsupported_retained_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/mqtt/retained",
+            "/api/v5/mqtt/delayed/messages",
+            "/api/v5/ai/providers",
+            "/api/v5/configs/a2a_registry",
+            "/api/v5/indra/extra_features",
+        ] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+        let (status, _) = server.delete_auth("/api/v5/mqtt/retained", &token).await;
+        assert_eq!(
+            status, 404,
+            "removed route DELETE /api/v5/mqtt/retained must be 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_system_fake_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in [
+            "/api/v5/license",
+            "/api/v5/license/setting",
+            "/api/v5/configs",
+            "/api/v5/sso",
+            "/api/v5/telemetry/status",
+            "/api/v5/api_key",
+        ] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route {path} must be 404");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_cluster_inflight_routes_return_404() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in ["/api/v5/cluster", "/api/v5/clients/any/inflight_messages"] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route GET {path} must be 404");
+        }
+        let (status, _) = server.get_auth("/api/v5/nodes", &token).await;
+        assert_eq!(status, 200, "kept route GET /api/v5/nodes must be 200");
+        state.sessions.get_or_create("mqueue-kept-1", true);
+        let (status, _) = server
+            .get_auth("/api/v5/clients/mqueue-kept-1/mqueue_messages", &token)
+            .await;
+        assert_eq!(
+            status, 200,
+            "kept route GET /api/v5/clients/:clientid/mqueue_messages must be 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_monitoring_fake_routes_return_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in ["/api/v5/metrics", "/api/v5/monitor", "/api/v5/alarms"] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route GET {path} must be 404");
+        }
+        for path in ["/api/v5/monitor", "/api/v5/alarms"] {
+            let (status, _) = server.delete_auth(path, &token).await;
+            assert_eq!(status, 404, "removed route DELETE {path} must be 404");
+        }
+        let (status, _) = server
+            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .await;
+        assert_eq!(
+            status, 404,
+            "removed route POST /api/v5/alarms/force_deactivate must be 404"
+        );
+        for path in ["/api/v5/monitor_current", "/api/v5/stats"] {
+            let (status, _) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "kept route GET {path} must be 200");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_response_has_no_invented_fields() {
+        let (server, _state) = TestServer::start().await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "public"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["token"].as_str().is_some_and(|t| !t.is_empty()));
+        assert_eq!(body["role"], json!("administrator"));
+        assert_eq!(body["must_change_password"], json!(true));
+        assert!(
+            body.get("version").is_none(),
+            "login must not invent version"
+        );
+        assert!(
+            body.get("license").is_none(),
+            "login must not invent license"
+        );
+    }
+
+    #[tokio::test]
+    async fn authn_users_list_has_no_invented_fields() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                json!({"user_id": "mqtt-alice", "password": "s3cret"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created, json!({"user_id": "mqtt-alice"}));
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0], json!({"user_id": "mqtt-alice"}));
+    }
+
+    #[tokio::test]
+    async fn ui_schema_unknown_is_404() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server.get_auth("/api/v5/schemas/hotconf", &token).await;
+        assert_eq!(status, 404, "unserved schema must be 404");
+        let (status, _) = server.get_auth("/api/v5/schemas/sources", &token).await;
+        assert_eq!(status, 404, "sources alias must be 404");
+        for name in ["actions", "connectors"] {
+            let (status, body) = server
+                .get_auth(&format!("/api/v5/schemas/{name}"), &token)
+                .await;
+            assert_eq!(status, 200, "served schema {name} must be 200");
+            assert!(body["components"]["schemas"].is_object());
+        }
+        let (status, body) = server.get_auth("/api/v5/schemas", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!(["actions", "connectors"]));
     }
 }

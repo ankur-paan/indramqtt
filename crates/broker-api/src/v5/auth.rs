@@ -343,10 +343,8 @@ pub struct ScramVerifyRequest {
 pub struct LoginResponse {
     pub token: String,
     pub server_signature: String,
-    pub version: &'static str,
     pub role: String,
     pub must_change_password: bool,
-    pub license: serde_json::Value,
 }
 
 pub async fn scram_verify(
@@ -428,14 +426,8 @@ pub async fn scram_verify(
         Json(LoginResponse {
             token,
             server_signature: server_sig_b64,
-            version: "5.8.0",
             role: role_str(&role).to_string(),
             must_change_password,
-            license: serde_json::json!({
-                "edition": "enterprise",
-                "valid": true,
-                "customer_name": "IndraMQTT Core"
-            }),
         }),
     )
         .into_response()
@@ -471,14 +463,8 @@ pub async fn direct_login(
         StatusCode::OK,
         Json(serde_json::json!({
             "token": token,
-            "version": "5.8.0",
             "role": role_str(&role),
-            "must_change_password": must_change_password,
-            "license": {
-                "edition": "enterprise",
-                "valid": true,
-                "customer_name": "IndraMQTT Core"
-            }
+            "must_change_password": must_change_password
         })),
     )
         .into_response()
@@ -724,59 +710,8 @@ pub async fn change_user_password(
 }
 
 // ---------------------------------------------------------------------------
-// Authentication (AuthN) Provider Endpoints
+// Authentication (AuthN) built-in-database users (backed by `MemoryAuth`).
 // ---------------------------------------------------------------------------
-
-pub async fn list_authentication() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            {
-                "id": "password_based:built_in_database",
-                "mechanism": "password_based",
-                "backend": "built_in_database",
-                "user_id_type": "username",
-                "enable": true,
-                "status": "running"
-            }
-        ])),
-    )
-        .into_response()
-}
-
-pub async fn get_authentication(Path(id): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": id,
-            "mechanism": "password_based",
-            "backend": "built_in_database",
-            "user_id_type": "username",
-            "enable": true,
-            "status": "running"
-        })),
-    )
-        .into_response()
-}
-
-pub async fn create_authentication(Json(body): Json<serde_json::Value>) -> Response {
-    (StatusCode::CREATED, Json(body)).into_response()
-}
-
-pub async fn update_authentication(
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let mut resp = body;
-    if let Some(obj) = resp.as_object_mut() {
-        obj.insert("id".to_string(), serde_json::Value::String(id));
-    }
-    (StatusCode::OK, Json(resp)).into_response()
-}
-
-pub async fn delete_authentication(Path(_id): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
 
 pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<String>) -> Response {
     let names = state.auth.usernames();
@@ -784,9 +719,7 @@ pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<Str
         .into_iter()
         .map(|name| {
             serde_json::json!({
-                "user_id": name,
-                "is_superuser": false,
-                "created_at": "2026-09-13T21:00:00Z"
+                "user_id": name
             })
         })
         .collect();
@@ -810,8 +743,6 @@ pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<Str
 pub struct CreateAuthnUserReq {
     pub user_id: String,
     pub password: String,
-    #[serde(default)]
-    pub is_superuser: bool,
 }
 
 pub async fn create_authn_user(
@@ -825,8 +756,7 @@ pub async fn create_authn_user(
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "user_id": req.user_id,
-            "is_superuser": req.is_superuser
+            "user_id": req.user_id
         })),
     )
         .into_response()
@@ -863,48 +793,8 @@ pub async fn delete_authn_user(
 }
 
 // ---------------------------------------------------------------------------
-// Authorization (AuthZ / ACL) Endpoints
+// Authorization (AuthZ / ACL) rules (backed by `MemoryAuth`).
 // ---------------------------------------------------------------------------
-
-pub async fn list_authorization_sources() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "sources": [
-                {
-                    "type": "built_in_database",
-                    "enable": true,
-                    "status": "running"
-                }
-            ]
-        })),
-    )
-        .into_response()
-}
-
-pub async fn get_authorization_settings() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "no_match": "allow",
-            "deny_action": "ignore",
-            "cache": {
-                "enable": true,
-                "max_size": 32768,
-                "ttl": "1m"
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub async fn update_authorization_settings() -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn clear_authorization_cache() -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
 
 pub async fn list_authz_rules(
     State(state): State<ApiState>,

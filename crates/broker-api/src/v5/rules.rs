@@ -15,44 +15,28 @@ use crate::ApiState;
 // Streaming Rules
 // ---------------------------------------------------------------------------
 
+/// Projection of the stored [`broker_rules::Rule`] for `/api/v5/rules`.
+/// Only real engine state: stored actions verbatim (empty stays empty),
+/// no invented `description`/`created_at`, no connector-id coercion.
+fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
+    let topic = rule.topic_filter.as_str().to_string();
+    let sql = rule
+        .sql_query
+        .clone()
+        .unwrap_or_else(|| format!("SELECT * FROM \"{topic}\""));
+    let actions = serde_json::to_value(&rule.actions).unwrap_or_else(|_| serde_json::json!([]));
+    serde_json::json!({
+        "id": rule.id,
+        "name": rule.name,
+        "sql": sql,
+        "from": [topic],
+        "enable": rule.enabled,
+        "actions": actions,
+    })
+}
+
 pub async fn list_rules(State(state): State<ApiState>) -> Response {
-    let rules = state.engine.list_rules();
-    let data: Vec<_> = rules
-        .into_iter()
-        .map(|r| {
-            let topic = r.topic_filter.as_str().to_string();
-            let actions: Vec<String> = if r.actions.is_empty() {
-                vec!["kafka:kafka-prod".to_string()]
-            } else {
-                r.actions
-                    .iter()
-                    .map(|a| match a {
-                        broker_rules::RuleAction::ForwardConnector { connector_id } => {
-                            if connector_id.contains(':') {
-                                connector_id.clone()
-                            } else {
-                                format!("kafka:{}", connector_id)
-                            }
-                        }
-                        broker_rules::RuleAction::Republish { topic, .. } => {
-                            format!("republish:{}", topic.as_str())
-                        }
-                        broker_rules::RuleAction::Log => "console".to_string(),
-                    })
-                    .collect()
-            };
-            serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "sql": r.sql_query.clone().unwrap_or_else(|| format!("SELECT * FROM \"{}\"", topic)),
-                "from": [topic.clone()],
-                "enable": r.enabled,
-                "description": format!("Indra Streaming Rule for {}", topic),
-                "actions": actions,
-                "created_at": "2026-09-13T21:00:00Z"
-            })
-        })
-        .collect();
+    let data: Vec<_> = state.engine.list_rules().iter().map(rule_to_v5).collect();
 
     let count = data.len();
     (
@@ -93,12 +77,30 @@ pub async fn create_rule(
     State(state): State<ApiState>,
     Json(req): Json<CreateRuleV5Request>,
 ) -> Response {
-    let name = req
-        .name
-        .unwrap_or_else(|| req.id.unwrap_or_else(|| "rule-1".to_string()));
-    let topic_str = if req.sql.contains("FROM \"") {
-        req.sql
-            .split("FROM \"")
+    let CreateRuleV5Request {
+        id,
+        name,
+        sql,
+        enable,
+        description: _,
+        actions: raw_actions,
+    } = req;
+    let name = match (name, id) {
+        (Some(name), _) => name,
+        (None, Some(id)) => id,
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": "rule id or name is required"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let topic_str = if sql.contains("FROM \"") {
+        sql.split("FROM \"")
             .nth(1)
             .and_then(|s| s.split('"').next())
             .unwrap_or("t/#")
@@ -107,18 +109,41 @@ pub async fn create_rule(
     };
 
     let topic_filter = match broker_protocol::TopicFilter::new(topic_str) {
-        Ok(f) => f,
-        Err(_) => broker_protocol::TopicFilter::new("t/#").unwrap(),
+        Ok(filter) => {
+            // The v5 rules projection treats bracket characters as invalid
+            // filter characters (the spec's `t/[` example): the shared
+            // `TopicFilter` accepts them, but a rule FROM-target containing
+            // `[` or `]` is rejected here with 400 instead of going live.
+            if topic_str.contains('[') || topic_str.contains(']') {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "code": "BAD_REQUEST",
+                        "message": "invalid topic filter: bracket characters are not allowed",
+                    })),
+                )
+                    .into_response();
+            }
+            filter
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": format!("invalid topic filter: {e}")
+                })),
+            )
+                .into_response();
+        }
     };
 
     let mut actions = Vec::new();
-    let mut resp_actions = Vec::new();
-    for a in &req.actions {
+    for a in &raw_actions {
         if let Some(id_str) = a.as_str() {
             actions.push(broker_rules::RuleAction::ForwardConnector {
                 connector_id: id_str.to_string(),
             });
-            resp_actions.push(id_str.to_string());
         } else if let Some(obj) = a.as_object() {
             if let Some(conn_id) = obj
                 .get("id")
@@ -128,40 +153,16 @@ pub async fn create_rule(
                 actions.push(broker_rules::RuleAction::ForwardConnector {
                     connector_id: conn_id.to_string(),
                 });
-                resp_actions.push(conn_id.to_string());
             }
         }
     }
-    if actions.is_empty() {
-        actions.push(broker_rules::RuleAction::ForwardConnector {
-            connector_id: "kafka:kafka-prod".to_string(),
-        });
-        resp_actions.push("kafka:kafka-prod".to_string());
-    }
 
-    let rule = state.engine.create_rule(
-        name.clone(),
-        topic_filter.clone(),
-        Some(req.sql.clone()),
-        req.enable,
-        actions,
-    );
+    let rule = state
+        .engine
+        .create_rule(name, topic_filter, Some(sql), enable, actions);
 
     match rule {
-        Ok(r) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "sql": req.sql,
-                "from": [topic_filter.as_str()],
-                "enable": r.enabled,
-                "description": req.description.unwrap_or_default(),
-                "actions": resp_actions,
-                "created_at": "2026-09-13T21:00:00Z"
-            })),
-        )
-            .into_response(),
+        Ok(r) => (StatusCode::CREATED, Json(rule_to_v5(&r))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -174,55 +175,16 @@ pub async fn create_rule(
 }
 
 pub async fn get_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let rules = state.engine.list_rules();
-    if let Some(r) = rules
-        .into_iter()
-        .find(|rule| rule.id == id || rule.name == id)
-    {
-        let topic = r.topic_filter.as_str().to_string();
-        let actions: Vec<String> = if r.actions.is_empty() {
-            vec!["kafka:kafka-prod".to_string()]
-        } else {
-            r.actions
-                .iter()
-                .map(|a| match a {
-                    broker_rules::RuleAction::ForwardConnector { connector_id } => {
-                        if connector_id.contains(':') {
-                            connector_id.clone()
-                        } else {
-                            format!("kafka:{}", connector_id)
-                        }
-                    }
-                    broker_rules::RuleAction::Republish { topic, .. } => {
-                        format!("republish:{}", topic.as_str())
-                    }
-                    broker_rules::RuleAction::Log => "console".to_string(),
-                })
-                .collect()
-        };
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "sql": r.sql_query.clone().unwrap_or_else(|| format!("SELECT * FROM \"{}\"", topic)),
-                "from": [topic.clone()],
-                "enable": r.enabled,
-                "description": format!("Indra Streaming Rule for {}", topic),
-                "actions": actions,
-                "created_at": "2026-09-13T21:00:00Z"
-            })),
-        )
-            .into_response()
-    } else {
-        (
+    match state.engine.get_rule(&id) {
+        Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
+        _ => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "code": "NOT_FOUND",
                 "message": "Rule not found"
             })),
         )
-            .into_response()
+            .into_response(),
     }
 }
 
@@ -231,10 +193,30 @@ pub async fn update_rule(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if state.engine.get_rule(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
+        )
+            .into_response();
+    }
     if let Some(enable) = body.get("enable").and_then(|v| v.as_bool()) {
         let _ = state.engine.set_rule_enabled(&id, enable);
     }
-    (StatusCode::OK, Json(body)).into_response()
+    match state.engine.get_rule(&id) {
+        Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
@@ -243,27 +225,29 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
 }
 
 pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
-    let (matched, passed, failed, actions_total, actions_success, actions_failed) = if let Some(r) =
-        rules
-            .iter()
-            .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
-    {
-        (
-            r.matched_cnt.load(std::sync::atomic::Ordering::Relaxed),
-            r.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
-            r.failed_cnt.load(std::sync::atomic::Ordering::Relaxed),
-            r.actions_total_cnt
-                .load(std::sync::atomic::Ordering::Relaxed),
-            r.actions_success_cnt
-                .load(std::sync::atomic::Ordering::Relaxed),
-            r.actions_failed_cnt
-                .load(std::sync::atomic::Ordering::Relaxed),
+    let Some(r) = rules.iter().find(|r| r.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
         )
-    } else {
-        (0, 0, 0, 0, 0, 0)
+            .into_response();
     };
+    let matched = r.matched_cnt.load(std::sync::atomic::Ordering::Relaxed);
+    let passed = r.passed_cnt.load(std::sync::atomic::Ordering::Relaxed);
+    let failed = r.failed_cnt.load(std::sync::atomic::Ordering::Relaxed);
+    let actions_total = r
+        .actions_total_cnt
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let actions_success = r
+        .actions_success_cnt
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let actions_failed = r
+        .actions_failed_cnt
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     (
         StatusCode::OK,
@@ -275,133 +259,35 @@ pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<Stri
                 "failed": failed,
                 "actions.total": actions_total,
                 "actions.success": actions_success,
-                "actions.failed": actions_failed,
-                "rate": 0.0,
-                "rate_max": 0.0,
-                "rate_last5m": 0.0
-            },
-            "node_metrics": [
-                {
-                    "node": "indramqtt@127.0.0.1",
-                    "metrics": {
-                        "matched": matched,
-                        "passed": passed,
-                        "failed": failed,
-                        "actions.total": actions_total,
-                        "actions.success": actions_success,
-                        "actions.failed": actions_failed,
-                        "rate": 0.0
-                    }
-                }
-            ]
+                "actions.failed": actions_failed
+            }
         })),
     )
         .into_response()
 }
 
 pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
     let rules = state.engine.list_rules();
-    if let Some(r) = rules
-        .iter()
-        .find(|r| r.id == id || r.id == clean_id || r.name == id || r.name == clean_id)
-    {
-        r.matched_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
-        r.passed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
-        r.failed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
-        r.actions_total_cnt
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        r.actions_success_cnt
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        r.actions_failed_cnt
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+    let Some(r) = rules.iter().find(|r| r.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
+        )
+            .into_response();
+    };
+    r.matched_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+    r.passed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+    r.failed_cnt.store(0, std::sync::atomic::Ordering::Relaxed);
+    r.actions_total_cnt
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    r.actions_success_cnt
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    r.actions_failed_cnt
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     StatusCode::NO_CONTENT.into_response()
-}
-
-#[derive(Deserialize)]
-pub struct TestSqlRequest {
-    pub sql: String,
-    #[serde(default)]
-    pub context: Option<serde_json::Value>,
-}
-
-pub async fn test_rule_sql(Json(req): Json<TestSqlRequest>) -> Response {
-    let context = req.context.unwrap_or_else(|| {
-        serde_json::json!({
-            "topic": "t/demo",
-            "payload": "{\"temp\": 28.5, \"humidity\": 60}",
-            "clientid": "tester-1",
-            "timestamp": 1757800000
-        })
-    });
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "result": "ok",
-            "sql": req.sql,
-            "output": [context]
-        })),
-    )
-        .into_response()
-}
-
-pub async fn get_rule_events() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            {
-                "event": "$events/client_connected",
-                "title": { "en": "Client Connected", "zh": "客户端连接" },
-                "description": { "en": "Triggered when an MQTT client successfully connects and authenticates", "zh": "MQTT客户端成功连接并认证时触发" },
-                "columns": ["clientid", "username", "keepalive", "clean_start", "proto_ver", "connected_at", "timestamp"],
-                "sql_example": "SELECT clientid, username, timestamp FROM \"$events/client_connected\"",
-                "test_columns": {}
-            },
-            {
-                "event": "$events/client_disconnected",
-                "title": { "en": "Client Disconnected", "zh": "客户端断开连接" },
-                "description": { "en": "Triggered when an MQTT client terminates its connection", "zh": "MQTT客户端断开连接时触发" },
-                "columns": ["clientid", "username", "reason", "disconnected_at", "timestamp"],
-                "sql_example": "SELECT clientid, reason FROM \"$events/client_disconnected\"",
-                "test_columns": {}
-            },
-            {
-                "event": "$events/session_subscribed",
-                "title": { "en": "Session Subscribed", "zh": "会话已订阅" },
-                "description": { "en": "Triggered when an active session registers a new topic filter subscription", "zh": "会话新增主题订阅时触发" },
-                "columns": ["clientid", "topic", "qos", "timestamp"],
-                "sql_example": "SELECT clientid, topic, qos FROM \"$events/session_subscribed\"",
-                "test_columns": {}
-            },
-            {
-                "event": "$events/session_unsubscribed",
-                "title": { "en": "Session Unsubscribed", "zh": "会话取消订阅" },
-                "description": { "en": "Triggered when an active session unsubscribes from a topic filter", "zh": "会话取消主题订阅时触发" },
-                "columns": ["clientid", "topic", "qos", "timestamp"],
-                "sql_example": "SELECT clientid, topic FROM \"$events/session_unsubscribed\"",
-                "test_columns": {}
-            },
-            {
-                "event": "$events/message_delivered",
-                "title": { "en": "Message Delivered", "zh": "消息已投递" },
-                "description": { "en": "Triggered upon transmission of a PUBLISH frame to subscriber", "zh": "向订阅者传输PUBLISH消息时触发" },
-                "columns": ["id", "from_clientid", "from_username", "clientid", "topic", "payload", "qos", "timestamp"],
-                "sql_example": "SELECT clientid, topic, payload FROM \"$events/message_delivered\"",
-                "test_columns": {}
-            },
-            {
-                "event": "$events/message_dropped",
-                "title": { "en": "Message Dropped", "zh": "消息已丢弃" },
-                "description": { "en": "Triggered when a message is dropped due to queue overflow or ACL refusal", "zh": "消息因队列溢出或ACL拒绝被丢弃时触发" },
-                "columns": ["id", "reason", "topic", "payload", "qos", "timestamp"],
-                "sql_example": "SELECT reason, topic FROM \"$events/message_dropped\"",
-                "test_columns": {}
-            }
-        ])),
-    )
-        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -428,36 +314,11 @@ pub async fn get_connector(Path(id): Path<String>) -> Response {
         return (StatusCode::OK, Json(conn.clone())).into_response();
     }
 
-    let conn_type = if id.contains("kafka") {
-        "kafka"
-    } else if id.contains("pgsql") || id.contains("postgres") {
-        "pgsql"
-    } else if id.contains("mysql") {
-        "mysql"
-    } else if id.contains("redis") {
-        "redis"
-    } else if id.contains("clickhouse") {
-        "clickhouse"
-    } else if id.contains("tdengine") {
-        "tdengine"
-    } else if id.contains("greptime") {
-        "greptimedb"
-    } else if id.contains("iotdb") {
-        "iotdb"
-    } else {
-        "http"
-    };
-
     (
-        StatusCode::OK,
+        StatusCode::NOT_FOUND,
         Json(serde_json::json!({
-            "id": clean_id,
-            "name": clean_id,
-            "type": conn_type,
-            "status": "connected",
-            "enable": true,
-            "description": format!("IndraMQTT {} Connector", conn_type),
-            "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
+            "code": "NOT_FOUND",
+            "message": "Connector not found"
         })),
     )
         .into_response()
@@ -3247,26 +3108,6 @@ pub async fn create_connector(
 
     CONNECTORS.write().unwrap().push(body.clone());
 
-    let action_id = format!("{}:{}", conn_type, name);
-    let mut actions = ACTIONS.write().unwrap();
-    if !actions
-        .iter()
-        .any(|a| a.get("id").and_then(|v| v.as_str()) == Some(&action_id))
-    {
-        actions.push(serde_json::json!({
-            "id": action_id,
-            "name": name,
-            "type": conn_type,
-            "connector": name,
-            "enable": true,
-            "status": status_str,
-            "rules": [],
-            "parameters": {},
-            "description": format!("Action sink for connector {}", name),
-            "node_status": [{ "node": "indramqtt@127.0.0.1", "status": status_str }]
-        }));
-    }
-
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
@@ -3275,26 +3116,49 @@ pub async fn update_connector(
     Path(id): Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
+    let clean_id = id.split(':').next_back().unwrap_or(&id).to_string();
+    let found = {
+        let connectors = CONNECTORS.read().unwrap();
+        connectors.iter().any(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("id").and_then(|v| v.as_str()) == Some(clean_id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(clean_id.as_str())
+        })
+    };
+    if !found {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Connector not found"
+            })),
+        )
+            .into_response();
+    }
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
             "id".to_string(),
-            serde_json::Value::String(clean_id.to_string()),
+            serde_json::Value::String(clean_id.clone()),
         );
     }
-    let conn_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("http");
-    register_live_sink(&state.engine, conn_type, clean_id, &body).await;
+    let conn_type = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http")
+        .to_string();
+    register_live_sink(&state.engine, &conn_type, &clean_id, &body).await;
 
-    let mut connectors = CONNECTORS.write().unwrap();
-    if let Some(pos) = connectors.iter().position(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("id").and_then(|v| v.as_str()) == Some(clean_id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(clean_id)
-    }) {
-        connectors[pos] = body.clone();
-    } else {
-        connectors.push(body.clone());
+    {
+        let mut connectors = CONNECTORS.write().unwrap();
+        if let Some(pos) = connectors.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("id").and_then(|v| v.as_str()) == Some(clean_id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(clean_id.as_str())
+        }) {
+            connectors[pos] = body.clone();
+        }
     }
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -3558,49 +3422,6 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn start_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
-    let mut connectors = CONNECTORS.write().unwrap();
-    for c in connectors.iter_mut() {
-        if c.get("id").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("id").and_then(|v| v.as_str()) == Some(clean_id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(clean_id)
-        {
-            if let Some(obj) = c.as_object_mut() {
-                obj.insert("enable".to_string(), serde_json::Value::Bool(true));
-                obj.insert(
-                    "status".to_string(),
-                    serde_json::Value::String("connected".to_string()),
-                );
-            }
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn enable_connector(Path((id, enable)): Path<(String, bool)>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
-    let mut connectors = CONNECTORS.write().unwrap();
-    for c in connectors.iter_mut() {
-        if c.get("id").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("id").and_then(|v| v.as_str()) == Some(clean_id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(clean_id)
-        {
-            if let Some(obj) = c.as_object_mut() {
-                obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-                let status_str = if enable { "connected" } else { "stopped" };
-                obj.insert(
-                    "status".to_string(),
-                    serde_json::Value::String(status_str.to_string()),
-                );
-            }
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
 fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
     if let Some(s) = body.get("server").and_then(|v| v.as_str()) {
         let mut clean = s.trim();
@@ -3800,209 +3621,8 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 }
 
 // ---------------------------------------------------------------------------
-// Action Sinks (Flow Designer & Rule Actions)
+// Action Types & Probe (real catalogue/probe, kept)
 // ---------------------------------------------------------------------------
-static ACTIONS: LazyLock<RwLock<Vec<serde_json::Value>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-
-pub async fn list_actions() -> Response {
-    let list = ACTIONS.read().unwrap().clone();
-    (StatusCode::OK, Json(list)).into_response()
-}
-
-pub async fn get_actions_summary() -> Response {
-    let actions = ACTIONS.read().unwrap();
-    let summary: Vec<_> = actions
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "id": a.get("id").cloned().unwrap_or_default(),
-                "name": a.get("name").cloned().unwrap_or_default(),
-                "type": a.get("type").cloned().unwrap_or_default(),
-                "status": a.get("status").cloned().unwrap_or_else(|| serde_json::Value::String("connected".to_string())),
-                "enable": a.get("enable").cloned().unwrap_or(serde_json::Value::Bool(true))
-            })
-        })
-        .collect();
-    (StatusCode::OK, Json(summary)).into_response()
-}
-
-pub async fn get_action(Path(id): Path<String>) -> Response {
-    let actions = ACTIONS.read().unwrap();
-    if let Some(act) = actions
-        .iter()
-        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id))
-    {
-        return (StatusCode::OK, Json(act.clone())).into_response();
-    }
-    let clean_id = id
-        .strip_prefix("kafka:")
-        .or_else(|| id.strip_prefix("pgsql:"))
-        .or_else(|| id.strip_prefix("http:"))
-        .or_else(|| id.strip_prefix("clickhouse:"))
-        .or_else(|| id.strip_prefix("redis:"))
-        .or_else(|| id.strip_prefix("mysql:"))
-        .or_else(|| id.strip_prefix("tdengine:"))
-        .or_else(|| id.strip_prefix("greptimedb:"))
-        .or_else(|| id.strip_prefix("greptime:"))
-        .or_else(|| id.strip_prefix("iotdb:"))
-        .or_else(|| id.strip_prefix("opentsdb:"))
-        .or_else(|| id.strip_prefix("doris:"))
-        .or_else(|| id.strip_prefix("datalayers:"))
-        .or_else(|| id.strip_prefix("elasticsearch:"))
-        .or_else(|| id.strip_prefix("opensearch:"))
-        .or_else(|| id.strip_prefix("pulsar:"))
-        .or_else(|| id.strip_prefix("rocketmq:"))
-        .or_else(|| id.strip_prefix("confluent:"))
-        .unwrap_or(&id);
-    let act_type = if id.contains("kafka") {
-        "kafka"
-    } else if id.contains("pgsql") {
-        "pgsql"
-    } else if id.contains("clickhouse") {
-        "clickhouse"
-    } else if id.contains("redis") {
-        "redis"
-    } else if id.contains("mysql") {
-        "mysql"
-    } else if id.contains("tdengine") {
-        "tdengine"
-    } else if id.contains("greptime") {
-        "greptimedb"
-    } else if id.contains("iotdb") {
-        "iotdb"
-    } else if id.contains("opentsdb") {
-        "opentsdb"
-    } else if id.contains("doris") {
-        "doris"
-    } else if id.contains("datalayers") {
-        "datalayers"
-    } else if id.contains("elasticsearch") || id.contains("opensearch") {
-        "elasticsearch"
-    } else if id.contains("pulsar") {
-        "pulsar"
-    } else if id.contains("rocketmq") {
-        "rocketmq"
-    } else if id.contains("confluent") {
-        "confluent"
-    } else {
-        "http"
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": id,
-            "name": clean_id,
-            "type": act_type,
-            "connector": clean_id,
-            "enable": true,
-            "status": "connected",
-            "rules": [],
-            "parameters": {},
-            "description": "IndraMQTT Stream Action Sink",
-            "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
-        })),
-    )
-        .into_response()
-}
-
-pub async fn create_action(Json(mut body): Json<serde_json::Value>) -> Response {
-    if let Some(obj) = body.as_object_mut() {
-        if !obj.contains_key("status") {
-            obj.insert(
-                "status".to_string(),
-                serde_json::Value::String("connected".to_string()),
-            );
-        }
-        if !obj.contains_key("node_status") {
-            obj.insert(
-                "node_status".to_string(),
-                serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": "connected" }]),
-            );
-        }
-    }
-    ACTIONS.write().unwrap().push(body.clone());
-    (StatusCode::CREATED, Json(body)).into_response()
-}
-
-pub async fn update_action(
-    Path(id): Path<String>,
-    Json(mut body): Json<serde_json::Value>,
-) -> Response {
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-    }
-    let mut actions = ACTIONS.write().unwrap();
-    if let Some(pos) = actions
-        .iter()
-        .position(|a| a.get("id").and_then(|v| v.as_str()) == Some(&id))
-    {
-        actions[pos] = body.clone();
-    } else {
-        actions.push(body.clone());
-    }
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-pub async fn delete_action(Path(id): Path<String>) -> Response {
-    let mut actions = ACTIONS.write().unwrap();
-    actions.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(&id));
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn start_action(Path(id): Path<String>) -> Response {
-    let mut actions = ACTIONS.write().unwrap();
-    for a in actions.iter_mut() {
-        if a.get("id").and_then(|v| v.as_str()) == Some(&id) {
-            if let Some(obj) = a.as_object_mut() {
-                obj.insert(
-                    "status".to_string(),
-                    serde_json::Value::String("connected".to_string()),
-                );
-                obj.insert("enable".to_string(), serde_json::Value::Bool(true));
-            }
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn enable_action(Path((id, enable)): Path<(String, bool)>) -> Response {
-    let mut actions = ACTIONS.write().unwrap();
-    for a in actions.iter_mut() {
-        if a.get("id").and_then(|v| v.as_str()) == Some(&id) {
-            if let Some(obj) = a.as_object_mut() {
-                obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-                let status_str = if enable { "connected" } else { "stopped" };
-                obj.insert(
-                    "status".to_string(),
-                    serde_json::Value::String(status_str.to_string()),
-                );
-            }
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn get_action_metrics(Path(id): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": id,
-            "metrics": {
-                "success": 0,
-                "failed": 0,
-                "dropped": 0,
-                "rate": 0.0
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub async fn reset_action_metrics(Path(_id): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
 pub async fn get_action_types() -> Response {
     (
         StatusCode::OK,
@@ -4040,277 +3660,4 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
         Json(serde_json::json!({ "result": "ok", "status": "connected" })),
     )
         .into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Ingress Sources
-// ---------------------------------------------------------------------------
-
-static SOURCES: LazyLock<RwLock<Vec<serde_json::Value>>> = LazyLock::new(|| {
-    RwLock::new(vec![serde_json::json!({
-        "id": "mqtt:telemetry-ingress",
-        "name": "telemetry-ingress",
-        "type": "mqtt",
-        "enable": true,
-        "status": "connected",
-        "rules": ["rule-1", "rule-3"],
-        "parameters": {
-            "topic": "sensors/#"
-        },
-        "description": "MQTT Ingress for IoT sensors",
-        "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
-    })])
-});
-
-pub async fn list_sources() -> Response {
-    let list = SOURCES.read().unwrap().clone();
-    (StatusCode::OK, Json(list)).into_response()
-}
-
-pub async fn get_sources_summary() -> Response {
-    let sources = SOURCES.read().unwrap();
-    let summary: Vec<_> = sources
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.get("id").cloned().unwrap_or_default(),
-                "name": s.get("name").cloned().unwrap_or_default(),
-                "type": s.get("type").cloned().unwrap_or_default(),
-                "status": s.get("status").cloned().unwrap_or_else(|| serde_json::Value::String("connected".to_string())),
-                "enable": s.get("enable").cloned().unwrap_or(serde_json::Value::Bool(true))
-            })
-        })
-        .collect();
-    (StatusCode::OK, Json(summary)).into_response()
-}
-
-pub async fn get_source(Path(id): Path<String>) -> Response {
-    let sources = SOURCES.read().unwrap();
-    if let Some(src) = sources
-        .iter()
-        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id))
-    {
-        return (StatusCode::OK, Json(src.clone())).into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": id,
-            "name": "telemetry-ingress",
-            "type": "mqtt",
-            "enable": true,
-            "status": "connected",
-            "rules": ["rule-1"],
-            "parameters": {
-                "topic": "sensors/#"
-            },
-            "description": "MQTT Ingress for IoT sensors",
-            "node_status": [{ "node": "indramqtt@127.0.0.1", "status": "connected" }]
-        })),
-    )
-        .into_response()
-}
-
-pub async fn create_source(Json(mut body): Json<serde_json::Value>) -> Response {
-    if let Some(obj) = body.as_object_mut() {
-        if !obj.contains_key("status") {
-            obj.insert(
-                "status".to_string(),
-                serde_json::Value::String("connected".to_string()),
-            );
-        }
-        if !obj.contains_key("node_status") {
-            obj.insert(
-                "node_status".to_string(),
-                serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": "connected" }]),
-            );
-        }
-    }
-    SOURCES.write().unwrap().push(body.clone());
-    (StatusCode::CREATED, Json(body)).into_response()
-}
-
-pub async fn update_source(
-    Path(id): Path<String>,
-    Json(mut body): Json<serde_json::Value>,
-) -> Response {
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-    }
-    let mut sources = SOURCES.write().unwrap();
-    if let Some(pos) = sources
-        .iter()
-        .position(|s| s.get("id").and_then(|v| v.as_str()) == Some(&id))
-    {
-        sources[pos] = body.clone();
-    } else {
-        sources.push(body.clone());
-    }
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-pub async fn delete_source(Path(id): Path<String>) -> Response {
-    let mut sources = SOURCES.write().unwrap();
-    sources.retain(|s| s.get("id").and_then(|v| v.as_str()) != Some(&id));
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn enable_source(Path((id, enable)): Path<(String, bool)>) -> Response {
-    let mut sources = SOURCES.write().unwrap();
-    for s in sources.iter_mut() {
-        if s.get("id").and_then(|v| v.as_str()) == Some(&id) {
-            if let Some(obj) = s.as_object_mut() {
-                obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-                let status_str = if enable { "connected" } else { "stopped" };
-                obj.insert(
-                    "status".to_string(),
-                    serde_json::Value::String(status_str.to_string()),
-                );
-            }
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn get_source_metrics(Path(id): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "id": id,
-            "metrics": {
-                "success": 0,
-                "failed": 0,
-                "rate": 0.0
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub async fn reset_source_metrics(Path(_id): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn probe_source() -> Response {
-    (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Schema Registry & Schema Validation
-// ---------------------------------------------------------------------------
-
-pub async fn list_schemas() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            {
-                "name": "SensorTelemetryAvro",
-                "type": "avro",
-                "description": "Avro schema definition for smart factory sensor readings",
-                "schema": "{\"type\":\"record\",\"name\":\"SensorTelemetry\",\"fields\":[{\"name\":\"sensor_id\",\"type\":\"string\"},{\"name\":\"temperature\",\"type\":\"double\"},{\"name\":\"timestamp\",\"type\":\"long\"}]}"
-            }
-        ])),
-    ).into_response()
-}
-
-pub async fn create_schema(Json(body): Json<serde_json::Value>) -> Response {
-    (StatusCode::CREATED, Json(body)).into_response()
-}
-
-pub async fn get_schema(Path(name): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "name": name,
-            "type": "avro",
-            "description": "Avro schema definition for smart factory sensor readings",
-            "schema": "{\"type\":\"record\",\"name\":\"SensorTelemetry\",\"fields\":[{\"name\":\"sensor_id\",\"type\":\"string\"},{\"name\":\"temperature\",\"type\":\"double\"},{\"name\":\"timestamp\",\"type\":\"long\"}]}"
-        })),
-    ).into_response()
-}
-
-pub async fn update_schema(
-    Path(name): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let mut resp = body;
-    if let Some(obj) = resp.as_object_mut() {
-        obj.insert("name".to_string(), serde_json::Value::String(name));
-    }
-    (StatusCode::OK, Json(resp)).into_response()
-}
-
-pub async fn delete_schema(Path(_name): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn list_schema_validations() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            {
-                "name": "factory-sensor-validator",
-                "schema_name": "SensorTelemetryAvro",
-                "topic": "sensors/factory/#",
-                "enable": true,
-                "description": "Validates inbound sensor JSON against Avro schema",
-                "action": "drop"
-            }
-        ])),
-    )
-        .into_response()
-}
-
-pub async fn create_schema_validation(Json(body): Json<serde_json::Value>) -> Response {
-    (StatusCode::CREATED, Json(body)).into_response()
-}
-
-pub async fn update_schema_validation(Json(body): Json<serde_json::Value>) -> Response {
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-pub async fn get_schema_validation(Path(name): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "name": name,
-            "schema_name": "SensorTelemetryAvro",
-            "topic": "sensors/factory/#",
-            "enable": true,
-            "description": "Validates inbound sensor JSON against Avro schema",
-            "action": "drop"
-        })),
-    )
-        .into_response()
-}
-
-pub async fn delete_schema_validation(Path(_name): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn enable_schema_validation(Path((name, enable)): Path<(String, bool)>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "name": name,
-            "enable": enable
-        })),
-    )
-        .into_response()
-}
-
-pub async fn get_schema_validation_metrics(Path(_name): Path<String>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "pass": 0,
-            "fail": 0,
-            "rate": 0.0
-        })),
-    )
-        .into_response()
-}
-
-pub async fn reset_schema_validation_metrics(Path(_name): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
 }

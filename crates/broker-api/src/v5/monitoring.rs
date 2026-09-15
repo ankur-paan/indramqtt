@@ -6,7 +6,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ApiState;
 
@@ -56,29 +55,6 @@ pub async fn monitor_current(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
-pub async fn monitor(State(_state): State<ApiState>) -> Response {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let mut data = Vec::with_capacity(16);
-    for i in (0..16).rev() {
-        data.push(serde_json::json!({
-            "time_stamp": now - (i * 5),
-            "received_msg_rate": 0,
-            "sent_msg_rate": 0,
-            "received_bytes_rate": 0,
-            "sent_bytes_rate": 0,
-            "subscriptions": 0,
-            "connections": 0,
-            "topics": 0
-        }));
-    }
-
-    (StatusCode::OK, Json(data)).into_response()
-}
-
 pub async fn get_stats(State(state): State<ApiState>) -> Response {
     let node_name = "indramqtt@127.0.0.1";
     let (conns, subs, topics, _recv, _sent) = gather_stats(&state);
@@ -104,54 +80,4 @@ pub async fn get_stats(State(state): State<ApiState>) -> Response {
         ])),
     )
         .into_response()
-}
-
-pub async fn get_metrics(State(state): State<ApiState>) -> Response {
-    let (conns, subs, _topics, msgs_recv, msgs_sent) = gather_stats(&state);
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "messages.received": msgs_recv,
-            "messages.sent": msgs_sent,
-            "messages.forward": msgs_sent,
-            "messages.publish": msgs_recv,
-            "messages.dropped": 0,
-            "bytes.received": msgs_recv * 64,
-            "bytes.sent": msgs_sent * 64,
-            "packets.connect.received": conns,
-            "packets.connack.sent": conns,
-            "packets.publish.received": msgs_recv,
-            "packets.publish.sent": msgs_sent,
-            "packets.suback.sent": subs,
-            "packets.subscribe.received": subs,
-            "packets.pingreq.received": 0,
-            "packets.pingresp.sent": 0
-        })),
-    )
-        .into_response()
-}
-
-pub async fn get_alarms() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": [],
-            "meta": {
-                "page": 1,
-                "limit": 20,
-                "count": 0,
-                "hasnext": false
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub async fn clear_alarms() -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
-pub async fn deactivate_alarm() -> Response {
-    StatusCode::NO_CONTENT.into_response()
 }

@@ -860,12 +860,9 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
     let body = match name.as_str() {
         "connectors" => CONNECTORS_SCHEMA.clone(),
         "actions" => ACTIONS_SCHEMA.clone(),
-        "sources" => ACTIONS_SCHEMA.clone(),
-        _ => json!({
-            "title": format!("{} Schema", name),
-            "version": "0.2.0",
-            "components": { "schemas": {} }
-        }),
+        _ => {
+            return (StatusCode::NOT_FOUND, Json(json!({ "code": "NOT_FOUND" }))).into_response();
+        }
     };
 
     (
@@ -877,9 +874,5 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
 }
 
 pub async fn list_schemas() -> Response {
-    (
-        StatusCode::OK,
-        Json(json!(["hotconf", "actions", "sources", "connectors"])),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!(["actions", "connectors"]))).into_response()
 }
