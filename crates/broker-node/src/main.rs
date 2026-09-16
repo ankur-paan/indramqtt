@@ -428,9 +428,13 @@ async fn handle_connection(
     // (e.g. PublishOut fan-out). The sender is registered under our
     // conn_id once the edge binds.
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
-    // Identity bound by the last BindConnection on this transport. Used
-    // to detach the session when the socket dies without DISCONNECT.
-    let mut bound: Option<(String, u64)> = None;
+    // Identities bound on this transport. One BrokerLink connection
+    // multiplexes every client of its edge shard, so a single slot only
+    // remembers the last bind and a dead socket would leak the rest as
+    // forever-connected (and their gauge counts). Every bind pushes;
+    // Unbind prunes; death detaches whatever remains. Each entry owns
+    // exactly one `inc_connections`, balanced by its prune or detach.
+    let mut bound: Vec<(String, u64)> = Vec::new();
 
     loop {
         tokio::select! {
@@ -472,16 +476,21 @@ async fn handle_connection(
     }
 }
 
-/// Detach a dead transport: forget its mailbox and mark its session
-/// detached (durable sessions keep subscriptions + offline queue).
-fn detach(bound: &Option<(String, u64)>, shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
+/// Detach a dead transport: forget its mailbox and detach every
+/// session bound on it (durable sessions keep subscriptions + offline
+/// queue). Per-transport work only: each entry touches its own session
+/// plus atomics, so deaths on other transports never block this one.
+fn detach(bound: &[(String, u64)], shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
     shared.conns.prune_sender(tx);
-    if let Some((client_id, conn_id)) = bound {
+    if bound.is_empty() {
+        return;
+    }
+    for (client_id, conn_id) in bound {
         shared.sessions.unbind_connection(client_id, *conn_id);
         let active = shared.metrics.dec_connections();
         shared.stats.set_connections(active.max(0) as u64);
-        refresh_subscription_stats(shared);
     }
+    refresh_subscription_stats(shared);
 }
 
 /// Push subscription/topic gauges into the stats store using the same
@@ -525,7 +534,7 @@ async fn handle_inbound_frame<S>(
     shared: &Shared,
     tx: &UnboundedSender<BrokerFrame>,
     transport: &FramedTransport<S>,
-    bound: &mut Option<(String, u64)>,
+    bound: &mut Vec<(String, u64)>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -545,8 +554,10 @@ where
                 shared.stats.set_connections(active.max(0) as u64);
                 refresh_subscription_stats(shared);
                 // Remember who we serve so a dead socket detaches cleanly.
+                // One entry per bind: this transport multiplexes its whole
+                // shard, and death must detach every client on it.
                 if let Ok(req) = decode_bind_meta(&frame.metadata) {
-                    *bound = Some((req.client_id, frame.header.conn_id));
+                    bound.push((req.client_id, frame.header.conn_id));
                 }
                 let replayed = replay_offline(&frame, shared).await;
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
@@ -608,6 +619,19 @@ where
         }
         OpCode::UnbindConnection => {
             apply_unbind(&frame, shared);
+            // Forget this transport's identities for the connection so a
+            // long-lived shard never accumulates one entry per bind ever.
+            // Each forgotten entry balances its bind's `inc_connections`
+            // here, leaving death to settle whatever remains.
+            let before = bound.len();
+            bound.retain(|(_, conn_id)| *conn_id != frame.header.conn_id);
+            for _ in 0..before - bound.len() {
+                let active = shared.metrics.dec_connections();
+                shared.stats.set_connections(active.max(0) as u64);
+            }
+            if before != bound.len() {
+                refresh_subscription_stats(shared);
+            }
         }
         _ => {
             if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {

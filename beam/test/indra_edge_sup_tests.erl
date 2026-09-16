@@ -20,6 +20,9 @@ connect_reaches_kernel_through_supervisor_test() ->
     Kernel = spawn_link(fun() -> fake_kernel(LSock, Parent) end),
     ok = application:set_env(indra_edge, kernel_port, KernelPort),
     ok = application:set_env(indra_edge, mqtt_port, 0),
+    %% Single fake kernel speaks one BrokerLink connection: pin the
+    %% supervisor to a single shard so the bind always reaches it.
+    ok = application:set_env(indra_edge, brokerlink_shards, 1),
     OldTrap = process_flag(trap_exit, true),
     {ok, Sup} = indra_edge_sup:start_link(),
     try
@@ -50,6 +53,7 @@ connect_reaches_kernel_through_supervisor_test() ->
         gen_tcp:close(LSock),
         application:unset_env(indra_edge, kernel_port),
         application:unset_env(indra_edge, mqtt_port),
+        application:unset_env(indra_edge, brokerlink_shards),
         process_flag(trap_exit, OldTrap)
     end.
 
