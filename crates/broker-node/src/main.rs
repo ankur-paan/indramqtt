@@ -97,7 +97,8 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             let (session, present) = sessions.get_or_create(&req.client_id, req.clean_start);
             // Connection != Session: pin this edge connection to the session
             // so Unbind can later verify ownership before detaching.
-            *session.conn_id.write() = Some(frame.header.conn_id);
+            // Indexed (PERF-04): keeps conn_id -> client_id O(1).
+            sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
             (session.id.0, present, 0u8)
         }
@@ -462,8 +463,28 @@ async fn handle_connection(
             }
             outbound = rx.recv() => {
                 match outbound {
-                    Some(frame) => {
-                        transport.send(frame).await?;
+                    Some(first) => {
+                        // PERF-05: flush once per poll. Coalesce what is
+                        // already queued (non-blocking drain, bounded by
+                        // frames and encoded bytes) into one write_all +
+                        // flush; order is arrival order. No artificial
+                        // delay: a lone frame sends immediately.
+                        let mut batch = vec![first];
+                        let mut batch_bytes =
+                            batch[0].total_frame_len();
+                        while batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
+                            && batch_bytes
+                                < brokerlink::transport::MAX_BATCH_BYTES
+                        {
+                            match rx.try_recv() {
+                                Ok(frame) => {
+                                    batch_bytes += frame.total_frame_len();
+                                    batch.push(frame);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        transport.send_batch(&batch).await?;
                     }
                     None => {
                         // All senders gone; nothing left to deliver.
