@@ -55,7 +55,8 @@ start_link() ->
 %% <li>{@code {certfile, Path}, {keyfile, Path}} — required for
 %% {@code ssl}; PEM-encoded certificate and private key.</li>
 %% <li>{@code {conn, ConnOpts}} — extra options forwarded to every
-%% {@code indra_conn} (must include {@code {broker, pid()}}; pass
+%% {@code indra_conn} (must include {@code {broker, pid() | [pid()]}};
+%% a shard list pins each connection by {@code conn_id rem K}; pass
 %% {@code {transport, ssl}} through for TLS sockets).</li>
 %% </ul>
 -spec start_link([listen_opt()]) -> {ok, pid()} | {error, term()}.
@@ -178,7 +179,10 @@ close_listen(ssl, LSock) -> ssl:close(LSock).
 
 %% @private Block in accept; each success (plus TLS handshake) spawns a
 %% conn and transfers socket ownership before arming it. Ends when the
-%% listen socket closes.
+%% listen socket closes. ConnOpts (including `{broker, Pid | [Pid]}')
+%% is handed to each connection untouched, so a shard list from the
+%% supervisor pins every conn by `conn_id rem K' inside {@link
+%% indra_conn}.
 accept_loop(Transport, LSock, ConnOpts) ->
     case accept_one(Transport, LSock) of
         {ok, Sock} ->

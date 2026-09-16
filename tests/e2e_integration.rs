@@ -1012,3 +1012,347 @@ async fn kicked_mqtt_client_sees_disconnect() {
     }
     let _ = std::fs::remove_file(&edge_log);
 }
+
+/// Bound for every BrokerLink wait in the sharded-transports test: a
+/// regressed kernel fails the test instead of hanging the worker.
+const SHARD_E2E_STEP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Budget for spawning the real kernel binary and waiting for its
+/// BrokerLink listener (a cold debug boot is slower than one step).
+const SHARD_E2E_BOOT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Encode `BindConnection` metadata (`ClientIdLen:16be | ClientId |
+/// Flags:8 | Keepalive:16be`), mirroring the kernel's `decode_bind_meta`.
+fn shard_encode_bind(client_id: &str, clean_start: bool, keepalive: u16) -> bytes::Bytes {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::with_capacity(2 + id.len() + 1 + 2);
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.push(u8::from(clean_start));
+    meta.extend_from_slice(&keepalive.to_be_bytes());
+    bytes::Bytes::from(meta)
+}
+
+/// Decode `SessionBinding` metadata into `(session_id, present, rc)`.
+fn shard_decode_binding(meta: &[u8]) -> (u64, bool, u8) {
+    assert_eq!(meta.len(), 10, "SessionBinding meta must be 10 bytes");
+    let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
+    (session_id, meta[8] != 0, meta[9])
+}
+
+/// Encode `SubscribeMeta` (`PacketId:16be | IdLen:16be | ClientId |
+/// N:16be | (FilterLen:16be | Filter | QoS:8) * N`).
+fn shard_encode_subscribe(packet_id: u16, client_id: &str, subs: &[(&str, u8)]) -> bytes::Bytes {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+    for (filter, qos) in subs {
+        meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        meta.extend_from_slice(filter.as_bytes());
+        meta.push(*qos);
+    }
+    bytes::Bytes::from(meta)
+}
+
+/// Encode `PublishMeta` (`TopicLen:16be | Topic | PacketId:16be |
+/// QoS:8 | Retain:8 | Dup:8`) plus the raw payload.
+fn shard_encode_publish(
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    payload: &[u8],
+) -> (bytes::Bytes, bytes::Bytes) {
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(0u8);
+    (
+        bytes::Bytes::from(meta),
+        bytes::Bytes::from(payload.to_vec()),
+    )
+}
+
+/// Locate the real kernel binary for the sharded-transports test.
+/// `CARGO_BIN_EXE_indramqtt` is set when Cargo builds the test target;
+/// the probe fallback covers binaries built by an earlier explicit
+/// `cargo build -p broker-node` under either target directory.
+fn shard_kernel_binary() -> std::path::PathBuf {
+    if let Some(built) = option_env!("CARGO_BIN_EXE_indramqtt") {
+        return std::path::PathBuf::from(built);
+    }
+    let exe = if cfg!(windows) {
+        "indramqtt.exe"
+    } else {
+        "indramqtt"
+    };
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for candidate in [
+        manifest.join(format!("../target/debug/{exe}")),
+        manifest.join(format!("../target/ci-check/debug/{exe}")),
+    ] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "sharded kernel binary not found: run `cargo build -p broker-node` first \
+         (CARGO_BIN_EXE_indramqtt unset and no binary under target/debug or target/ci-check/debug)"
+    );
+}
+
+/// Bind one client over `transport`, asserting the accepted
+/// `SessionBinding` reply. Returns `(session_id, present)`.
+async fn shard_bind(
+    transport: &brokerlink::FramedTransport<tokio::net::TcpStream>,
+    conn_id: u64,
+    client_id: &str,
+    clean_start: bool,
+) -> (u64, bool) {
+    use brokerlink::{BrokerFrame, BrokerLinkTransport, OpCode};
+    let frame = BrokerFrame::new(
+        OpCode::BindConnection,
+        conn_id,
+        1,
+        shard_encode_bind(client_id, clean_start, 60),
+        bytes::Bytes::new(),
+    )
+    .expect("valid bind frame");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(frame))
+        .await
+        .expect("bind send in time")
+        .expect("bind send");
+    let reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("bind reply in time")
+        .expect("bind reply");
+    assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+    assert_eq!(reply.header.conn_id, conn_id);
+    let (session_id, present, rc) = shard_decode_binding(&reply.metadata);
+    assert_eq!(rc, 0, "bind of {client_id} must be accepted");
+    assert_ne!(session_id, 0);
+    (session_id, present)
+}
+
+/// K parallel BrokerLink transports against one real kernel are
+/// first-class: concurrent publishes from every transport are all
+/// answered and routed (no cross-transport serialization), and a dead
+/// transport detaches every client bound on it (not just the last
+/// bind), so a durable subscriber replays what was published while it
+/// was gone.
+///
+/// Kernel side this exercises the production path end to end: the real
+/// `indramqtt` binary serves `serve_brokerlink`, with one
+/// `handle_connection` task per transport. The single-`bound` snapshot
+/// fails the replay phase: only the last bind on the dropped transport
+/// detaches, the first-bound subscriber leaks as connected, its message
+/// routes into the pruned mailbox and is lost, and the reconnect sees
+/// no replay.
+#[tokio::test]
+async fn sharded_transports_do_not_serialize() {
+    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+
+    // K generic transports; the edge shards by `conn_id rem K`, so the
+    // kernel must treat every transport as independent.
+    const K: usize = 2;
+    const BURST: u16 = 20;
+
+    let scratch = std::env::temp_dir().join(format!(
+        "indramqtt-shard-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let bl_port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        probe.local_addr().expect("port").port()
+    };
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--brokerlink-bind")
+        .arg(format!("127.0.0.1:{bl_port}"))
+        .arg("--api-bind")
+        .arg("")
+        .arg("--data-dir")
+        .arg(&scratch)
+        .arg("--allow-anonymous")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+
+    // Wait for the BrokerLink listener.
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
+    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill().await;
+                    panic!("kernel never opened BrokerLink {bl_port}: {error}");
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("kernel exited during boot: {status}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    // Open K transports against the one kernel.
+    let mut transports = Vec::with_capacity(K);
+    for _ in 0..K {
+        let io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
+            .await
+            .expect("transport dial in time")
+            .expect("transport dial");
+        transports.push(FramedTransport::new(io));
+    }
+    let (t1, t2) = (&transports[0], &transports[1]);
+
+    // Durable subscriber on T1, then a second bind on the same
+    // transport (the multiplexing a shard performs).
+    let (_, present) = shard_bind(t1, 11, "shard-sub", false).await;
+    assert!(!present, "first durable bind reports session_present=false");
+    let sub = BrokerFrame::new(
+        OpCode::SubscribeIn,
+        11,
+        2,
+        shard_encode_subscribe(1, "shard-sub", &[("shard/topic", 1)]),
+        bytes::Bytes::new(),
+    )
+    .expect("valid subscribe frame");
+    tokio::time::timeout(SHARD_E2E_STEP, t1.send(sub))
+        .await
+        .expect("subscribe in time")
+        .expect("subscribe");
+    let suback = tokio::time::timeout(SHARD_E2E_STEP, t1.recv())
+        .await
+        .expect("suback in time")
+        .expect("suback");
+    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+    assert_eq!(&suback.metadata[..], &[0x00, 0x01, 0x01]);
+    shard_bind(t1, 12, "shard-filler", true).await;
+    shard_bind(t2, 21, "shard-pub", true).await;
+
+    // Concurrent publishes from both transports: a burst on T2, one on
+    // T1. Every publish is QoS 1, so each needs its own PubAck, and the
+    // subscriber must see every delivery.
+    for seq in 1..=BURST {
+        let payload = format!("burst-{seq}");
+        let (meta, body) = shard_encode_publish("shard/topic", seq, 1, false, payload.as_bytes());
+        let frame = BrokerFrame::new(OpCode::PublishIn, 21, u64::from(seq) + 100, meta, body)
+            .expect("valid publish frame");
+        tokio::time::timeout(SHARD_E2E_STEP, t2.send(frame))
+            .await
+            .expect("burst send in time")
+            .expect("burst send");
+    }
+    let (meta, body) = shard_encode_publish("shard/topic", 1, 1, false, b"solo");
+    let solo =
+        BrokerFrame::new(OpCode::PublishIn, 12, 200, meta, body).expect("valid publish frame");
+    tokio::time::timeout(SHARD_E2E_STEP, t1.send(solo))
+        .await
+        .expect("solo send in time")
+        .expect("solo send");
+
+    // T1 carries both the subscriber (conn 11) and the solo publisher
+    // (conn 12), so its PublishOut deliveries interleave with the solo
+    // PubAck on the same transport. Drain T1 until the solo ack is seen
+    // and every delivery arrived: T1's answer never stalls behind T2's
+    // burst, and no delivery is lost or duped.
+    let mut solo_acked = false;
+    let mut seen = std::collections::HashSet::new();
+    while !solo_acked || seen.len() < BURST as usize + 1 {
+        let frame = tokio::time::timeout(SHARD_E2E_STEP, t1.recv())
+            .await
+            .expect("T1 frame in time")
+            .expect("T1 frame");
+        match frame.header.opcode {
+            OpCode::PubAckOut => {
+                assert_eq!(frame.header.conn_id, 12);
+                assert_eq!(&frame.metadata[..], &[0x00, 0x01, 0x00]);
+                assert!(!solo_acked, "solo PubAck delivered exactly once");
+                solo_acked = true;
+            }
+            OpCode::PublishOut => {
+                assert_eq!(frame.header.conn_id, 11);
+                assert!(seen.insert(frame.payload.to_vec()), "no duped delivery");
+            }
+            other => panic!("unexpected frame on T1: {other:?}"),
+        }
+    }
+    assert!(seen.contains(b"solo".as_slice()));
+    for seq in 1..=BURST {
+        assert!(seen.contains(&format!("burst-{seq}").into_bytes()));
+    }
+    for seq in 1..=BURST {
+        let ack = tokio::time::timeout(SHARD_E2E_STEP, t2.recv())
+            .await
+            .expect("burst PubAck in time")
+            .expect("burst PubAck");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+        assert_eq!(ack.header.conn_id, 21);
+        assert_eq!(
+            &ack.metadata[..],
+            &[(seq >> 8) as u8, seq as u8, 0x00],
+            "burst PubAck {seq} mirrors its packet id"
+        );
+    }
+
+    // Kill T1 without DISCONNECT: both of its clients must detach.
+    // (Dropping the transport closes its TCP connection; T2 stays live
+    // at index 0 afterwards.)
+    drop(transports.remove(0));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Published while the durable subscriber is detached: queued, not
+    // routed to the dead mailbox.
+    let t2 = &transports[0];
+    let (meta, body) = shard_encode_publish("shard/topic", 101, 1, false, b"replay-me");
+    let frame =
+        BrokerFrame::new(OpCode::PublishIn, 21, 300, meta, body).expect("valid publish frame");
+    tokio::time::timeout(SHARD_E2E_STEP, t2.send(frame))
+        .await
+        .expect("detached publish in time")
+        .expect("detached publish");
+    let ack = tokio::time::timeout(SHARD_E2E_STEP, t2.recv())
+        .await
+        .expect("detached PubAck in time")
+        .expect("detached PubAck");
+    assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+
+    // Reconnect the durable subscriber on a fresh transport: the queued
+    // message replays. On the single-`bound` snapshot this times out:
+    // the first-bound client never detached, so the publish above was
+    // dropped into the pruned mailbox instead of queued.
+    let io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("reconnect in time")
+        .expect("reconnect");
+    let t3 = FramedTransport::new(io);
+    let (_, present) = shard_bind(&t3, 31, "shard-sub", false).await;
+    assert!(present, "resumed session must report session_present=true");
+    let replayed = tokio::time::timeout(SHARD_E2E_STEP, t3.recv())
+        .await
+        .expect("replay arrives: every bind on a dead transport must detach")
+        .expect("replay");
+    assert_eq!(replayed.header.opcode, OpCode::PublishOut);
+    assert_eq!(replayed.header.conn_id, 31);
+    assert_eq!(replayed.payload, bytes::Bytes::from_static(b"replay-me"));
+
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+}

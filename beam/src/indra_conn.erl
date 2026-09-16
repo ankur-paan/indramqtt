@@ -28,7 +28,11 @@
 %% which routes them through {@code indra_conn_registry}; {@link
 %% broker_frame/4} is the same entry point for tests and direct callers.
 %% Core presence arrives as {@code {broker_up, Pid}} /
-%% {@code {broker_down}} casts (broadcast by the brokerlink client).
+%% {@code {broker_down, Pid}} casts (broadcast by the brokerlink client).
+%% The down broadcast carries the shard pid so only connections pinned
+%% to that shard hold; other shards ignore it. The legacy pid-less
+%% {@code {broker_down}} is still honoured as a global hold (single
+%% shard, older callers).
 %%
 %% Broker protocol (also implemented by test mocks): the broker is any
 %% process answering {@code gen_server:call(Broker, {send, Opcode,
@@ -40,7 +44,9 @@
 
 -export([start_link/2,
          stop/1,
-         broker_frame/4]).
+         broker_frame/4,
+         pick_shard/2,
+         shard_index/2]).
 
 %% gen_statem callbacks.
 -export([callback_mode/0,
@@ -62,7 +68,7 @@
 %% connection fails closed instead of ballooning the edge.
 -define(MAX_HOLD_BUFFER_BYTES, 1048576).
 
--type conn_opt() :: {broker, pid()}
+-type conn_opt() :: {broker, pid() | [pid()]}
                   | {conn_id, non_neg_integer()}
                   | {connect_timeout_ms, pos_integer()}
                   | {transport, tcp | ssl}.
@@ -76,7 +82,9 @@
 %% The socket must be in passive mode and owned by the caller; ownership
 %% is transferred here on {@code takeover}. Options:
 %% <ul>
-%% <li>{@code {broker, pid()}} — required BrokerLink client (or mock).</li>
+%% <li>{@code {broker, pid() | [pid()]}} — required BrokerLink shard
+%% client (or mock). A list pins the connection to exactly one shard by
+%% {@code conn_id rem K}; see {@link pick_shard/2}.</li>
 %% <li>{@code {conn_id, N}} — BrokerLink connection id; defaults to a
 %% fresh positive unique integer.</li>
 %% <li>{@code {connect_timeout_ms, Ms}} — first-packet deadline,
@@ -105,34 +113,144 @@ broker_frame(Pid, Header, Meta, Payload) ->
 callback_mode() ->
     handle_event_function.
 
+%% @doc Pin a connection id to one shard pid. The pin is
+%% `conn_id rem K' (0-based index into the shard list) and never
+%% changes for the life of the connection. No session, routing, auth
+%% or retry logic lives here: this is routing only.
+-spec pick_shard(non_neg_integer(), [pid()]) -> pid().
+pick_shard(ConnId, Shards)
+  when is_integer(ConnId), ConnId >= 0, is_list(Shards) ->
+    lists:nth(shard_index(ConnId, length(Shards)) + 1, Shards).
+
+%% @doc 0-based shard index for a connection id and shard count K.
+-spec shard_index(non_neg_integer(), pos_integer()) -> non_neg_integer().
+shard_index(ConnId, K)
+  when is_integer(ConnId), ConnId >= 0, is_integer(K), K >= 1 ->
+    ConnId rem K.
+
 init({Sock, Opts}) ->
     case proplists:get_value(broker, Opts) of
         undefined ->
             {stop, {missing_option, broker}};
+        [] ->
+            {stop, {missing_option, broker}};
         Broker when is_pid(Broker) ->
-            ConnId = proplists:get_value(conn_id, Opts,
-                                         erlang:unique_integer([positive, monotonic])),
-            Timeout = proplists:get_value(connect_timeout_ms, Opts,
-                                          ?DEFAULT_CONNECT_TIMEOUT_MS),
-            Transport = proplists:get_value(transport, Opts, tcp),
-            SockMod = case Transport of ssl -> ssl; _ -> gen_tcp end,
-            Data = #{sock => Sock,
-                     sockmod => SockMod,
-                     broker => Broker,
-                     conn_id => ConnId,
-                     connect_timeout_ms => Timeout,
-                     buffer => <<>>,
-                     seq => 0,
-                     pending => undefined,
-                     client_id => undefined,
-                     keepalive => 0,
-                     session_id => undefined,
-                     subs_pending => #{},
-                     pubs_pending => #{},
-                     subs => #{},
-                     quiet_subs => #{},
-                     rebinding => false},
-            {ok, await_connect, Data}
+            init_shard(Sock, Opts, [Broker]);
+        Brokers when is_list(Brokers) ->
+            case lists:all(fun is_pid/1, Brokers) andalso Brokers =/= [] of
+                true ->
+                    init_shard(Sock, Opts, Brokers);
+                false ->
+                    {stop, {missing_option, broker}}
+            end;
+        _ ->
+            {stop, {missing_option, broker}}
+    end.
+
+%% @private Shared init once the shard list is normalised. The pin is
+%% fixed here and `broker' always holds the pinned pid.
+init_shard(Sock, Opts, Shards) ->
+    ConnId = proplists:get_value(conn_id, Opts,
+                                 erlang:unique_integer([positive, monotonic])),
+    Timeout = proplists:get_value(connect_timeout_ms, Opts,
+                                  ?DEFAULT_CONNECT_TIMEOUT_MS),
+    Transport = proplists:get_value(transport, Opts, tcp),
+    SockMod = case Transport of ssl -> ssl; _ -> gen_tcp end,
+    Broker = pick_shard(ConnId, Shards),
+    Data = #{sock => Sock,
+             sockmod => SockMod,
+             broker => Broker,
+             brokers => Shards,
+             shard => shard_index(ConnId, length(Shards)),
+             conn_id => ConnId,
+             connect_timeout_ms => Timeout,
+             buffer => <<>>,
+             seq => 0,
+             pending => undefined,
+             client_id => undefined,
+             keepalive => 0,
+             session_id => undefined,
+             subs_pending => #{},
+             pubs_pending => #{},
+             subs => #{},
+             quiet_subs => #{},
+             rebinding => false},
+    {ok, await_connect, Data}.
+
+%% @private True when Pid is a known shard other than our pinned one.
+%% Announcements from other shards are ignored: each connection only
+%% follows its own shard.
+is_other_shard(Pid, #{broker := Pinned, brokers := Shards}) when is_pid(Pid) ->
+    Pid =/= Pinned andalso lists:member(Pid, Shards);
+is_other_shard(_, _) ->
+    false.
+
+%% @private Adopt a replacement broker pid (single-shard restart).
+%% The shard list tracks the live pid so later announcements compare
+%% against the current identity.
+adopt_broker(Data, NewBroker) ->
+    case maps:get(brokers, Data, undefined) of
+        [_Old] ->
+            Data#{broker => NewBroker, brokers => [NewBroker]};
+        _ ->
+            Data#{broker => NewBroker}
+    end.
+
+%% @private Adopt the replacement pid for our pinned shard slot
+%% (multi-shard restart). The pin (shard index) never changes: only
+%% the pid at that index is replaced, so sibling shards keep their
+%% own connections.
+replace_shard(#{brokers := Shards, shard := Idx} = Data, NewBroker) ->
+    Data#{broker => NewBroker,
+          brokers => replace_nth(Idx + 1, Shards, NewBroker)}.
+
+%% @private Replace the Nth (1-based) list element.
+replace_nth(1, [_ | _Rest], New) ->
+    [New | _Rest];
+replace_nth(N, [H | Rest], New) when N > 1 ->
+    [H | replace_nth(N - 1, Rest, New)].
+
+%% @private Registered pid for our pinned shard slot, or undefined
+%% when the registry has no entry (unit tests, or the gap between a
+%% restart announcement and the supervisor registering the
+%% replacement). K = 1 keeps the historic `indra_edge_brokerlink'
+%% name; K > 1 uses `indra_edge_sup:shard_name/1'.
+own_shard_pid(#{brokers := Shards, shard := Idx}) ->
+    try
+        Name = case length(Shards) of
+                   1 -> indra_edge_brokerlink;
+                   _ -> indra_edge_sup:shard_name(Idx + 1)
+               end,
+        whereis(Name)
+    catch
+        _:_ -> undefined
+    end.
+
+%% @private Classify an unknown broker_up pid (neither the pinned pid
+%% nor a listed shard) in multi-shard mode:
+%% - pinned alive: ignore, our shard is fine and this is another
+%%   shard's news;
+%% - pinned dead and the registry already names our slot (the
+%%   supervisor registers each restarted shard before announcing it):
+%%   adopt the registered pid, which is NewBroker on the timely path;
+%% - pinned dead but our slot has no registered pid yet (announcement
+%%   arrived before registration): defer. The supervisor emits a
+%%   post-registration announcement per restarted shard, which drives
+%%   the adoption then; adopting blindly here could collapse every
+%%   connection onto the first shard to announce.
+classify_unknown(Data, NewBroker) ->
+    case is_process_alive(maps:get(broker, Data)) of
+        true ->
+            ignore;
+        false ->
+            case own_shard_pid(Data) of
+                NewBroker ->
+                    {adopt, NewBroker};
+                Own when is_pid(Own) ->
+                    {adopt, Own};
+                undefined ->
+                    defer
+            end
     end.
 
 %% --- takeover: claim a transferred socket and arm it -----------------
@@ -149,37 +267,148 @@ handle_event(cast, takeover, await_connect,
 
 %% --- core presence ----------------------------------------------------
 %% Await-connect has no session to hold: adopt a new broker pid so the
-%% pending handshake (if any) can be re-driven on arrival.
-handle_event(cast, {broker_up, NewBroker}, await_connect, #{broker := Broker} = Data)
-  when NewBroker =/= Broker ->
-    Data1 = Data#{broker => NewBroker},
-    case maps:get(pending, Data1, undefined) of
-        undefined ->
-            {keep_state, Data1};
-        _ ->
-            resend_bind(Data1)
+%% pending handshake (if any) can be re-driven on arrival. With
+%% sharding only our pinned shard is followed; announcements from
+%% other shards are ignored.
+handle_event(cast, {broker_up, NewBroker}, await_connect, Data) ->
+    case is_other_shard(NewBroker, Data) of
+        true ->
+            {keep_state, Data};
+        false ->
+            case NewBroker =:= maps:get(broker, Data) of
+                true ->
+                    {keep_state, Data};
+                false ->
+                    case maps:get(brokers, Data, [maps:get(broker, Data)]) of
+                        [_Single] ->
+                            Data1 = adopt_broker(Data, NewBroker),
+                            case maps:get(pending, Data1, undefined) of
+                                undefined ->
+                                    {keep_state, Data1};
+                                _ ->
+                                    resend_bind(Data1)
+                            end;
+                        _ ->
+                            %% Multi-shard restart: adopt the replacement
+                            %% for our pinned slot, if identifiable (see
+                            %% classify_unknown/2); otherwise ignore so
+                            %% connections never collapse onto one shard.
+                            case classify_unknown(Data, NewBroker) of
+                                {adopt, Own} ->
+                                    Data1 = replace_shard(Data, Own),
+                                    case maps:get(pending, Data1, undefined) of
+                                        undefined ->
+                                            {keep_state, Data1};
+                                        _ ->
+                                            resend_bind(Data1)
+                                    end;
+                                _ ->
+                                    {keep_state, Data}
+                            end
+                    end
+            end
     end;
-handle_event(cast, {broker_up, _Same}, await_connect, Data) ->
-    {keep_state, Data};
 handle_event(cast, {broker_down}, await_connect, Data) ->
     {keep_state, Data};
+%% Scoped down: only our pinned shard parks the handshake; other
+%% shards' news is ignored so no hold storm spreads.
+handle_event(cast, {broker_down, Pid}, await_connect, Data) when is_pid(Pid) ->
+    case Pid =:= maps:get(broker, Data) of
+        true ->
+            {keep_state, Data};
+        false ->
+            {keep_state, Data}
+    end;
 %% Connected with a fresh broker identity (restart): hold and rebind.
-handle_event(cast, {broker_up, NewBroker}, connected, #{broker := Broker} = Data)
-  when NewBroker =/= Broker ->
-    start_rebind(Data#{broker => NewBroker});
-handle_event(cast, {broker_up, _Same}, connected, Data) ->
-    {keep_state, Data};
+handle_event(cast, {broker_up, NewBroker}, connected, Data) ->
+    case is_other_shard(NewBroker, Data) of
+        true ->
+            {keep_state, Data};
+        false ->
+            case NewBroker =:= maps:get(broker, Data) of
+                true ->
+                    {keep_state, Data};
+                false ->
+                    case maps:get(brokers, Data, [maps:get(broker, Data)]) of
+                        [_Single] ->
+                            start_rebind(adopt_broker(Data, NewBroker));
+                        _ ->
+                            %% Multi-shard restart: rebind via the
+                            %% replacement for our pinned slot, if
+                            %% identifiable; otherwise hold the pin.
+                            case classify_unknown(Data, NewBroker) of
+                                {adopt, Own} ->
+                                    start_rebind(replace_shard(Data, Own));
+                                _ ->
+                                    {keep_state, Data}
+                            end
+                    end
+            end
+    end;
 handle_event(cast, {broker_down}, connected, Data) ->
     {next_state, await_core, Data};
-%% Already holding: adopt + rebind unless a rebind is already in flight.
-handle_event(cast, {broker_up, NewBroker}, await_core, Data) ->
-    case maps:get(rebinding, Data, false) of
+%% Scoped down: hold only when our pinned shard reports; news from
+%% another shard (or an unknown pid) is ignored so surviving shards
+%% see no hold/rebind storm.
+handle_event(cast, {broker_down, Pid}, connected, Data) when is_pid(Pid) ->
+    case Pid =:= maps:get(broker, Data) of
         true ->
-            {keep_state, Data#{broker => NewBroker}};
+            {next_state, await_core, Data};
         false ->
-            start_rebind(Data#{broker => NewBroker})
+            {keep_state, Data}
+    end;
+%% Already holding: adopt + rebind unless a rebind is already in flight.
+%% Announcements from other shards are ignored so connections never
+%% collapse onto one shard; an unknown pid in a multi-shard setup is
+%% adopted only when it (or the registry) identifies the replacement
+%% for our pinned slot (see classify_unknown/2).
+handle_event(cast, {broker_up, NewBroker}, await_core, Data) ->
+    case is_other_shard(NewBroker, Data) of
+        true ->
+            {keep_state, Data};
+        false ->
+            Pinned = maps:get(broker, Data),
+            Shards = maps:get(brokers, Data, [Pinned]),
+            case NewBroker =:= Pinned of
+                true ->
+                    case maps:get(rebinding, Data, false) of
+                        true ->
+                            {keep_state, Data};
+                        false ->
+                            start_rebind(Data)
+                    end;
+                false ->
+                    case length(Shards) of
+                        1 ->
+                            Data1 = adopt_broker(Data, NewBroker),
+                            case maps:get(rebinding, Data1, false) of
+                                true ->
+                                    {keep_state, Data1};
+                                false ->
+                                    start_rebind(Data1)
+                            end;
+                        _ ->
+                            case classify_unknown(Data, NewBroker) of
+                                {adopt, Own} ->
+                                    Data1 = replace_shard(Data, Own),
+                                    case maps:get(rebinding, Data1, false) of
+                                        true ->
+                                            {keep_state, Data1};
+                                        false ->
+                                            start_rebind(Data1)
+                                    end;
+                                _ ->
+                                    {keep_state, Data}
+                            end
+                    end
+            end
     end;
 handle_event(cast, {broker_down}, await_core, Data) ->
+    {keep_state, Data};
+%% Scoped down while already holding: nothing further to do either
+%% way; the clause exists so other shards' news never disturbs the
+%% pin (it stays on the owning shard until its replacement announces).
+handle_event(cast, {broker_down, Pid}, await_core, Data) when is_pid(Pid) ->
     {keep_state, Data};
 
 %% --- inbound BrokerLink frames ---------------------------------------

@@ -787,13 +787,16 @@ cancel_timer(Timer) ->
     ok.
 
 %% @private Broadcast core presence to every registered connection.
-%% Total when the registry is absent.
+%% Total when the registry is absent. The down broadcast carries our
+%% pid so sharded connections hold only for their pinned shard
+%% (see indra_conn broker_down handling); the legacy pid-less
+%% `{broker_down}' is still honoured by connections as a global hold.
 notify_up() ->
     catch indra_conn_registry:notify_all({broker_up, self()}),
     ok.
 
 notify_down() ->
-    catch indra_conn_registry:notify_all({broker_down}),
+    catch indra_conn_registry:notify_all({broker_down, self()}),
     ok.
 
 %% @private Drain complete frames from the reassembly buffer.
