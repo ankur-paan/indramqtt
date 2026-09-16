@@ -12,9 +12,11 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router as SubscriptionRouter};
 use broker_rules::{Rule, RuleAction, RuleEngine, RuleEngineError};
 use broker_session::SessionManager;
+use brokerlink::BrokerFrame;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::admin_users::AdminUsers;
 use crate::v5::auth::ApiTokens;
@@ -50,12 +52,22 @@ pub struct ApiState {
     /// Local node name (`--node-id`): used by the node-scope helper for
     /// `/nodes/{node}/...` routes. Stored only until W1 wires it in.
     pub node_id: String,
+    /// Kernel→edge close sender (W0-26): the kick path hands `ConnClose`
+    /// frames here before tearing down kernel state. The sender type is
+    /// the same `UnboundedSender<BrokerFrame>` the kernel uses for its
+    /// per-connection edge mailboxes; sends are non-blocking and a
+    /// failed send only warns (edge may already be gone). Guaranteed
+    /// delivery rides the synchronous `ConnTable::route` in the kick
+    /// path; the async `serve_api` forwarder routes this copy after the
+    /// connection is unregistered and drops it by design.
+    pub edge_tx: UnboundedSender<BrokerFrame>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
 impl ApiState {
-    // One handle per subsystem plus the config registry and node name;
-    // bundling them would hide the construction sites without helping.
+    // One handle per subsystem plus the config registry, node name and
+    // the kernel→edge close sender; bundling them would hide the
+    // construction sites without helping.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Arc<RuleEngine>,
@@ -66,6 +78,7 @@ impl ApiState {
         conns: Arc<ConnTable>,
         config: Arc<ConfigRegistry>,
         node_id: String,
+        edge_tx: UnboundedSender<BrokerFrame>,
     ) -> Self {
         // Boot seeding (W0-21): route the loaded MQTT users/ACLs into the
         // very instance the caller shares (the kernel passes its BrokerLink
@@ -97,13 +110,19 @@ impl ApiState {
             tokens: Arc::new(ApiTokens::new()),
             config,
             node_id,
+            edge_tx,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
 
     /// Standalone state for tests and tools (empty sessions/router).
     /// Uses validated defaults without touching the kernel data dir.
+    /// The kernel→edge sender is a throwaway channel whose receiver is
+    /// immediately dropped, so kick sends fail silently there and keep
+    /// today's unbind-only behaviour in unit tests.
     pub fn standalone(engine: Arc<RuleEngine>) -> Self {
+        let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        drop(edge_rx);
         Self {
             engine,
             sessions: Arc::new(SessionManager::new()),
@@ -115,6 +134,7 @@ impl ApiState {
             tokens: Arc::new(ApiTokens::new()),
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
+            edge_tx,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -1560,6 +1580,7 @@ mod tests {
         auth: Arc<MemoryAuth>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
         tokens: Arc<crate::v5::auth::ApiTokens>,
+        edge_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>>>,
     }
 
     impl TestServer {
@@ -1579,15 +1600,17 @@ mod tests {
             let metrics = Arc::new(Metrics::new());
             let auth = Arc::new(MemoryAuth::new());
             let conns = Arc::new(broker_router::ConnTable::default());
+            let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
             let api_state = ApiState::new(
                 engine.clone(),
                 sessions.clone(),
                 sub_router,
                 metrics.clone(),
                 auth.clone(),
-                conns,
+                conns.clone(),
                 registry,
                 "indra-node-1".to_string(),
+                edge_tx,
             );
             let state = TestState {
                 engine: engine.clone(),
@@ -1596,6 +1619,7 @@ mod tests {
                 auth: auth.clone(),
                 admin_users: api_state.admin_users.clone(),
                 tokens: api_state.tokens.clone(),
+                edge_rx: Arc::new(tokio::sync::Mutex::new(edge_rx)),
             };
             let app = router(api_state);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2041,6 +2065,37 @@ mod tests {
         let (status, body) = server.get_auth("/api/v1/clients", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!(["client-a", "client-b"]));
+    }
+
+    #[tokio::test]
+    async fn kick_sends_connclose_frame() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // A connected fake session with kernel state bound.
+        let conn_id = 4242u64;
+        let (session, _) = state.sessions.get_or_create("kick-me", true);
+        *session.conn_id.write() = Some(conn_id);
+        *session.connected.write() = true;
+
+        let (status, _) = server.delete_auth("/api/v5/clients/kick-me", &token).await;
+        assert_eq!(status, 204);
+
+        // The kernel→edge close for that connection arrives on the
+        // channel receiver.
+        let mut edge_rx = state.edge_rx.lock().await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), edge_rx.recv())
+            .await
+            .expect("ConnClose arrives on the channel receiver")
+            .expect("channel stays open");
+        assert_eq!(frame.header.opcode, brokerlink::OpCode::ConnClose);
+        assert_eq!(frame.header.conn_id, conn_id);
+        assert!(frame.metadata.is_empty());
+        assert!(frame.payload.is_empty());
+
+        // Kernel state is torn down as before.
+        assert_eq!(*session.conn_id.read(), None);
+        assert!(!*session.connected.read());
     }
 
     #[tokio::test]

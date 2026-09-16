@@ -152,7 +152,46 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
 
 pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
     if let Some(session) = state.sessions.get(&client_id) {
-        if let Some(conn_id) = *session.conn_id.read() {
+        // Copy the bound connection id first: the read guard must drop
+        // before `unbind_connection` takes the write lock below, or the
+        // handler deadlocks itself on the session lock.
+        let conn_id = *session.conn_id.read();
+        if let Some(conn_id) = conn_id {
+            // Deliver `ConnClose` to the edge BEFORE tearing down kernel
+            // state. The synchronous route hands the frame to the
+            // still-registered connection mailbox, so delivery cannot
+            // lose a race with the `unregister` below: the async
+            // `serve_api` forwarder alone would route only after this
+            // handler already unregistered the connection, and the
+            // close would be dropped while the edge socket stays open.
+            // Both sends are non-blocking and never fail the kick.
+            match brokerlink::BrokerFrame::new(
+                brokerlink::OpCode::ConnClose,
+                conn_id,
+                0,
+                Bytes::new(),
+                Bytes::new(),
+            ) {
+                Ok(frame) => {
+                    state.conns.route(conn_id, frame.clone());
+                    // Specified kernel→edge close handoff. By the time
+                    // the forwarder routes this copy the connection is
+                    // unregistered, so it is dropped there by design; a
+                    // failed send only warns (forwarder already gone).
+                    if state.edge_tx.send(frame).is_err() {
+                        tracing::warn!(
+                            client_id = %client_id,
+                            conn_id,
+                            "kick: edge gone, ConnClose dropped"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    client_id = %client_id,
+                    conn_id,
+                    "kick: cannot build ConnClose frame: {error}"
+                ),
+            }
             state.conns.unregister(conn_id);
             state.sessions.unbind_connection(&client_id, conn_id);
         }
@@ -166,7 +205,37 @@ pub async fn batch_kick_clients(
 ) -> Response {
     for client_id in client_ids {
         if let Some(session) = state.sessions.get(&client_id) {
-            if let Some(conn_id) = *session.conn_id.read() {
+            // Copy first so the read guard drops before `unbind_connection`
+            // takes the write lock (see single kick).
+            let conn_id = *session.conn_id.read();
+            if let Some(conn_id) = conn_id {
+                // Same ordering as the single kick: the close frame is
+                // routed synchronously BEFORE kernel teardown so it
+                // cannot lose a race with `unregister` (see above).
+                // Unknown ids stay silent (204); a dead edge only warns.
+                match brokerlink::BrokerFrame::new(
+                    brokerlink::OpCode::ConnClose,
+                    conn_id,
+                    0,
+                    Bytes::new(),
+                    Bytes::new(),
+                ) {
+                    Ok(frame) => {
+                        state.conns.route(conn_id, frame.clone());
+                        if state.edge_tx.send(frame).is_err() {
+                            tracing::warn!(
+                                client_id = %client_id,
+                                conn_id,
+                                "kick: edge gone, ConnClose dropped"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        client_id = %client_id,
+                        conn_id,
+                        "kick: cannot build ConnClose frame: {error}"
+                    ),
+                }
                 state.conns.unregister(conn_id);
                 state.sessions.unbind_connection(&client_id, conn_id);
             }

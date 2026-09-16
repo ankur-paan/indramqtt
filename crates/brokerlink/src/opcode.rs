@@ -1,3 +1,10 @@
+//! BrokerLink opcode registry.
+//!
+//! Contracts (mirrored in `broker-node/src/main.rs`):
+//! * `ConnClose` carries empty metadata and an empty payload; `conn_id`
+//!   in the header identifies the edge connection to close.
+//! * The kernel sends it and expects no reply.
+//! * An edge that receives it must close the socket (W0-25).
 use crate::error::BrokerLinkError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,6 +38,7 @@ pub enum OpCode {
 
     // Disconnect
     DisconnectIn = 0x0040,
+    ConnClose = 0x0041,
 }
 
 impl TryFrom<u16> for OpCode {
@@ -58,6 +66,7 @@ impl TryFrom<u16> for OpCode {
             0x0032 => Ok(Self::UnsubscribeIn),
             0x0033 => Ok(Self::UnsubAckOut),
             0x0040 => Ok(Self::DisconnectIn),
+            0x0041 => Ok(Self::ConnClose),
             other => Err(BrokerLinkError::UnknownOpcode(other)),
         }
     }

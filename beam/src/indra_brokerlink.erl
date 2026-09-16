@@ -58,6 +58,12 @@
          encode_unbind_meta/1,
          decode_unbind_meta/1]).
 
+%% BrokerLink metadata contract (W0-24/W0-25: kernel -> edge ConnClose).
+%% Empty metadata and empty payload; the header conn_id identifies the
+%% edge connection to close.
+-export([encode_connclose_meta/0,
+         decode_connclose_meta/1]).
+
 %% gen_server lifecycle + IPC API.
 -export([start_link/0,
          start_link/1,
@@ -91,10 +97,10 @@
                 | pubrec_in | pubrec_out
                 | pubrel_in | pubrel_out
                 | pubcomp_in | pubcomp_out
-                | subscribe_in | suback_out
-                | unsubscribe_in | unsuback_out
-                | disconnect_in
-                | non_neg_integer().
+                 | subscribe_in | suback_out
+                 | unsubscribe_in | unsuback_out
+                 | disconnect_in | conn_close
+                 | non_neg_integer().
 -type header_map() :: #{version := 0..255,
                         flags := 0..255,
                         opcode := non_neg_integer(),
@@ -217,6 +223,7 @@ opcode_to_int(suback_out) -> 16#0031;
 opcode_to_int(unsubscribe_in) -> 16#0032;
 opcode_to_int(unsuback_out) -> 16#0033;
 opcode_to_int(disconnect_in) -> 16#0040;
+opcode_to_int(conn_close) -> 16#0041;
 opcode_to_int(N) when is_integer(N), N >= 0, N =< 16#FFFF -> N.
 
 %% @doc Map a wire integer to its opcode atom (unknown ints pass through).
@@ -241,6 +248,7 @@ int_to_opcode(16#0031) -> suback_out;
 int_to_opcode(16#0032) -> unsubscribe_in;
 int_to_opcode(16#0033) -> unsuback_out;
 int_to_opcode(16#0040) -> disconnect_in;
+int_to_opcode(16#0041) -> conn_close;
 int_to_opcode(N) when is_integer(N) -> N.
 
 is_known_opcode(16#0001) -> true;
@@ -263,6 +271,7 @@ is_known_opcode(16#0031) -> true;
 is_known_opcode(16#0032) -> true;
 is_known_opcode(16#0033) -> true;
 is_known_opcode(16#0040) -> true;
+is_known_opcode(16#0041) -> true;
 is_known_opcode(_) -> false.
 
 %%====================================================================
@@ -545,6 +554,18 @@ decode_unbind_meta(<<IdLen:16/big, Rest/binary>>) ->
 decode_unbind_meta(_) ->
     {error, malformed_unbind_meta}.
 
+%% @doc Encode ConnClose metadata (always empty; W0-24 contract).
+-spec encode_connclose_meta() -> binary().
+encode_connclose_meta() ->
+    <<>>.
+
+%% @doc Decode ConnClose metadata (only empty is valid).
+-spec decode_connclose_meta(binary()) -> {ok, #{}} | {error, term()}.
+decode_connclose_meta(<<>>) ->
+    {ok, #{}};
+decode_connclose_meta(_) ->
+    {error, malformed_connclose_meta}.
+
 validate_meta_subs([]) -> erlang:error(badarg);
 validate_meta_subs(Subs) -> validate_meta_subs(Subs, 0).
 
@@ -797,7 +818,7 @@ drain_buffer(State) ->
     end.
 
 %% Opcodes routed to the owning connection process.
--define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0031]).
+-define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0031, 16#0041]).
 
 %% @private Route an inbound Rust frame to its connection process.
 %%

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use broker_auth::{Authenticator, Authorizer, MemoryAuth};
 use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
 use broker_config::{ConfigError, ConfigRegistry};
-use broker_observability::Metrics;
+use broker_observability::{Metrics, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
@@ -138,6 +138,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         if req.username.is_none() {
             if shared.auth.user_count() > 0 && !shared.allow_anonymous {
+                shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87));
             }
         } else {
@@ -148,6 +149,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 .await
                 .is_err()
             {
+                shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x86));
             }
             // Takeover pre-release: a live session for this client means
@@ -260,6 +262,9 @@ struct Shared {
     /// remote node (single forward per node; remotes fan out locally).
     cluster: Option<Arc<dyn RoutingPlane>>,
     metrics: Arc<Metrics>,
+    /// Gauge-plus-high-water-mark store for EMQX `/stats` (W1 reads it;
+    /// lifecycle points below keep it exact).
+    stats: Arc<StatsStore>,
     auth: Arc<MemoryAuth>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
@@ -277,6 +282,7 @@ impl Shared {
         let conns = Arc::new(ConnTable::default());
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         let metrics = Arc::new(Metrics::new());
+        let stats = Arc::new(StatsStore::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
         // serves window-flush republish actions (INDRA-213).
@@ -328,6 +334,7 @@ impl Shared {
             retained: Arc::new(MemoryStore::new()),
             cluster: None,
             metrics,
+            stats,
             auth: Arc::new(MemoryAuth::new()),
             allow_anonymous: false,
             config: defaults_registry(),
@@ -391,6 +398,14 @@ impl BrokerSink for InMemoryBrokerSink {
             build_downlink_frames(&self.router, &self.sessions, &topic, qos, retain, &payload);
         self.metrics
             .inc_messages_forwarded_by(deliveries.len() as u64);
+        self.metrics.inc_publish_sent_by(deliveries.len() as u64);
+        self.metrics.inc_delivered_by(deliveries.len() as u64);
+        self.metrics.inc_bytes_sent_by(
+            deliveries
+                .iter()
+                .map(|(_, frame)| frame.total_frame_len() as u64)
+                .sum(),
+        );
         for (conn_id, frame) in deliveries {
             self.conns.route(conn_id, frame);
         }
@@ -463,7 +478,43 @@ fn detach(bound: &Option<(String, u64)>, shared: &Shared, tx: &UnboundedSender<B
     shared.conns.prune_sender(tx);
     if let Some((client_id, conn_id)) = bound {
         shared.sessions.unbind_connection(client_id, *conn_id);
-        shared.metrics.dec_connections();
+        let active = shared.metrics.dec_connections();
+        shared.stats.set_connections(active.max(0) as u64);
+        refresh_subscription_stats(shared);
+    }
+}
+
+/// Push subscription/topic gauges into the stats store using the same
+/// counting as the management API `gather_stats` (active sessions only,
+/// distinct filters), so `/stats` maxima agree exactly with live reads.
+/// Lifecycle points only (bind, detach, unbind, subscribe): the
+/// per-message publish path performs no session/router scans.
+fn refresh_subscription_stats(shared: &Shared) {
+    let active_ids = shared.sessions.active_client_ids();
+    let mut subs = 0u64;
+    let mut topic_set = std::collections::HashSet::new();
+    for cid in &active_ids {
+        if let Some(s) = shared.sessions.get(cid) {
+            let map = s.subscriptions.read();
+            subs += map.len() as u64;
+            for f in map.keys() {
+                topic_set.insert(f.as_str().to_string());
+            }
+        }
+    }
+    shared.stats.set_subscriptions(subs);
+    shared.stats.set_topics(topic_set.len() as u64);
+}
+
+/// Recount retained topics into the stats store after a successful
+/// insert/remove. Uses the existing `find_matching("#")` read path (no
+/// new store API), so concurrent retained writes self-heal instead of
+/// drifting the way check-then-act deltas would.
+async fn sync_retained_stat(shared: &Shared) {
+    let filter = TopicFilter::new("#").expect("# matches every retained topic");
+    match shared.retained.find_matching(&filter).await {
+        Ok(matched) => shared.stats.set_retained(matched.len() as u64),
+        Err(e) => warn!("Retained recount failed: {}", e),
     }
 }
 
@@ -479,12 +530,20 @@ async fn handle_inbound_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Measured ingress bytes from the real BrokerLink frame length.
+    shared
+        .metrics
+        .inc_bytes_received_by(frame.total_frame_len() as u64);
     match frame.header.opcode {
         OpCode::BindConnection => {
+            shared.metrics.inc_connect_received();
             if let Some(reply) = apply_bind(&frame, shared).await {
+                shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
-                shared.metrics.inc_connections();
+                let active = shared.metrics.inc_connections();
+                shared.stats.set_connections(active.max(0) as u64);
+                refresh_subscription_stats(shared);
                 // Remember who we serve so a dead socket detaches cleanly.
                 if let Ok(req) = decode_bind_meta(&frame.metadata) {
                     *bound = Some((req.client_id, frame.header.conn_id));
@@ -493,8 +552,16 @@ where
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
         }
+        OpCode::Ping => {
+            shared.metrics.inc_pingreq_received();
+            if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
+                shared.metrics.inc_pingresp_sent();
+                transport.send(reply).await?;
+            }
+        }
         OpCode::SubscribeIn => match apply_subscribe(&frame, shared).await {
             (Some(reply), retained) => {
+                shared.metrics.inc_suback_sent();
                 transport.send(reply).await?;
                 // SUBACK first, then retained state, per MQTT ordering.
                 for held in &retained {
@@ -503,6 +570,14 @@ where
                 shared
                     .metrics
                     .inc_messages_forwarded_by(retained.len() as u64);
+                shared.metrics.inc_publish_sent_by(retained.len() as u64);
+                shared.metrics.inc_delivered_by(retained.len() as u64);
+                shared.metrics.inc_bytes_sent_by(
+                    retained
+                        .iter()
+                        .map(|held| held.total_frame_len() as u64)
+                        .sum(),
+                );
             }
             (None, _) => {
                 warn!(
@@ -519,6 +594,14 @@ where
             shared
                 .metrics
                 .inc_messages_forwarded_by(deliveries.len() as u64);
+            shared.metrics.inc_publish_sent_by(deliveries.len() as u64);
+            shared.metrics.inc_delivered_by(deliveries.len() as u64);
+            shared.metrics.inc_bytes_sent_by(
+                deliveries
+                    .iter()
+                    .map(|(_, routed)| routed.total_frame_len() as u64)
+                    .sum(),
+            );
             for (conn_id, routed) in deliveries {
                 shared.conns.route(conn_id, routed);
             }
@@ -552,6 +635,7 @@ async fn apply_subscribe(
     frame: &BrokerFrame,
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<BrokerFrame>) {
+    shared.metrics.inc_subscribe_received();
     let (packet_id, client_id, subs) = match decode_subscribe_meta(&frame.metadata) {
         Some(parts) => parts,
         None => return (None, Vec::new()),
@@ -603,6 +687,9 @@ async fn apply_subscribe(
             .add_subscription(&client_id, filter.clone(), qos);
         granted.push((filter, qos_raw));
         codes.push(qos_raw);
+    }
+    if !granted.is_empty() {
+        refresh_subscription_stats(shared);
     }
 
     let mut meta = Vec::with_capacity(2 + codes.len());
@@ -684,6 +771,7 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
         None => return 0,
     };
     let mut replayed = 0;
+    let mut replayed_bytes: u64 = 0;
     for queued in session.drain_offline() {
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
@@ -705,10 +793,14 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             Bytes::from(meta),
             queued.payload.clone(),
         ) {
+            replayed_bytes += routed.total_frame_len() as u64;
             shared.conns.route(frame.header.conn_id, routed);
             replayed += 1;
         }
     }
+    shared.metrics.inc_publish_sent_by(replayed as u64);
+    shared.metrics.inc_delivered_by(replayed as u64);
+    shared.metrics.inc_bytes_sent_by(replayed_bytes);
     replayed
 }
 
@@ -730,6 +822,7 @@ async fn apply_publish(
     frame: &BrokerFrame,
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
+    shared.metrics.inc_publish_received();
     let (topic_str, packet_id, qos_raw, retain) = match decode_publish_meta(&frame.metadata) {
         Some(parts) => parts,
         None => return (None, Vec::new()),
@@ -742,6 +835,17 @@ async fn apply_publish(
         Ok(qos) => qos,
         Err(_) => return (None, Vec::new()),
     };
+    match qos {
+        QoS::AtMostOnce => {
+            shared.metrics.inc_qos0_received();
+        }
+        QoS::AtLeastOnce => {
+            shared.metrics.inc_qos1_received();
+        }
+        QoS::ExactlyOnce => {
+            shared.metrics.inc_qos2_received();
+        }
+    }
     shared.metrics.inc_messages_received();
 
     // ACL: the publisher is whoever owns this edge connection. Denied
@@ -767,6 +871,7 @@ async fn apply_publish(
     // dropped and counted, QoS 1 gets its PubAck stamped 0x97.
     if !check_publish_quota(frame, shared).await {
         shared.metrics.inc_messages_dropped();
+        shared.metrics.inc_overload_dropped();
         let ack = if qos == QoS::AtLeastOnce {
             pub_ack_reply(frame, packet_id, 0x97)
         } else {
@@ -842,6 +947,14 @@ async fn apply_delayed_publish(
         shared
             .metrics
             .inc_messages_forwarded_by(deliveries.len() as u64);
+        shared.metrics.inc_publish_sent_by(deliveries.len() as u64);
+        shared.metrics.inc_delivered_by(deliveries.len() as u64);
+        shared.metrics.inc_bytes_sent_by(
+            deliveries
+                .iter()
+                .map(|(_, routed)| routed.total_frame_len() as u64)
+                .sum(),
+        );
         for (conn_id, routed) in deliveries {
             shared.conns.route(conn_id, routed);
         }
@@ -866,6 +979,8 @@ async fn ingress_pipeline(
         if payload.is_empty() {
             if let Err(e) = shared.retained.clear_retained(topic).await {
                 warn!("Retained clear failed for {}: {}", topic.as_str(), e);
+            } else {
+                sync_retained_stat(shared).await;
             }
         } else if let Err(e) = shared
             .retained
@@ -873,6 +988,8 @@ async fn ingress_pipeline(
             .await
         {
             warn!("Retained store failed for {}: {}", topic.as_str(), e);
+        } else {
+            sync_retained_stat(shared).await;
         }
     }
 
@@ -1098,6 +1215,7 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
         shared
             .sessions
             .unbind_connection(&client_id, frame.header.conn_id);
+        refresh_subscription_stats(shared);
     }
     shared.conns.unregister(frame.header.conn_id);
 }
@@ -1200,6 +1318,11 @@ async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std:
 
 /// Serve the management REST API on an already-bound listener.
 async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io::Result<()> {
+    // Kernel→edge close channel (W0-26): the API kick sends `ConnClose`
+    // here after teardown; the forwarder below routes each frame through
+    // the connection directory to the owning edge task. The send is
+    // non-blocking and a missing edge only warns in the kick path.
+    let (edge_tx, mut edge_rx) = unbounded_channel::<BrokerFrame>();
     let state = broker_api::ApiState::new(
         shared.engine.clone(),
         shared.sessions.clone(),
@@ -1209,7 +1332,14 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
         shared.conns.clone(),
         shared.config.clone(),
         shared.node_id.clone(),
+        edge_tx,
     );
+    let conns = shared.conns.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = edge_rx.recv().await {
+            conns.route(frame.header.conn_id, frame);
+        }
+    });
     broker_api::serve(listener, state).await
 }
 
@@ -1366,6 +1496,8 @@ mod tests {
             .expect("commit admin root");
         registry.save().expect("save admin root");
         let reloaded = load_data_dir_registry(&data_dir).expect("reload data dir");
+        let (edge_tx, edge_rx) = unbounded_channel::<BrokerFrame>();
+        drop(edge_rx);
         let api = broker_api::ApiState::new(
             Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest)),
             Arc::new(SessionManager::new()),
@@ -1375,6 +1507,7 @@ mod tests {
             Arc::new(ConnTable::default()),
             Arc::new(reloaded),
             "indra-node-1".to_string(),
+            edge_tx,
         );
         let snapshot = api.config.snapshot();
         assert_eq!(snapshot.admin_users.users.len(), 1);
