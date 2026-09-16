@@ -18,7 +18,8 @@
 -export([start_link/0,
          start_link/1,
          stop/1,
-         get_port/1]).
+         get_port/1,
+         listen_sock_opts/0]).
 
 %% gen_server callbacks.
 -export([init/1,
@@ -77,13 +78,22 @@ get_port(Pid) ->
 %% gen_server callbacks
 %%====================================================================
 
+%% @doc Socket options for the client-facing listen socket.
+%% `nodelay' avoids delayed-ACK interaction on small MQTT frames;
+%% 64 KiB buffers bound per-connection memory (1M-session scale)
+%% while giving the bursty accept path headroom.
+-spec listen_sock_opts() -> [term()].
+listen_sock_opts() ->
+    [binary, {packet, raw}, {active, false}, {reuseaddr, true},
+     {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
+
 init(Opts) ->
     process_flag(trap_exit, true),
     Transport = proplists:get_value(transport, Opts, tcp),
     DefaultPort = case Transport of ssl -> ?DEFAULT_TLS_PORT; _ -> ?DEFAULT_PORT end,
     Port = proplists:get_value(port, Opts, DefaultPort),
     ConnOpts = proplists:get_value(conn, Opts, []),
-    SockOpts = [binary, {packet, raw}, {active, false}, {reuseaddr, true}],
+    SockOpts = listen_sock_opts(),
     ListenResult = case Transport of
         ssl ->
             %% TLS needs the ssl application (and its tracker sup) even

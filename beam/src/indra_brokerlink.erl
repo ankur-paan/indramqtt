@@ -69,7 +69,8 @@
          start_link/1,
          stop/1,
          ping/2,
-         send/6]).
+         send/6,
+         brokerlink_sock_opts/0]).
 
 %% gen_server callbacks.
 -export([init/1,
@@ -632,10 +633,24 @@ ping(Pid, ConnId) when is_pid(Pid), is_integer(ConnId), ConnId >= 0 ->
     gen_server:call(Pid, {ping, ConnId}, 5000).
 
 %% @doc Send a generic frame with an explicit sequence number.
+%%
+%% PERF-09 bounded ingress: when the shard server's pending-call queue
+%% is at or past `?SEND_QUEUE_BOUND', the frame is rejected immediately
+%% with `{error, overloaded}' instead of queueing behind the backlog
+%% (where it would sit until the 5 s call timeout killed the calling
+%% connection). Callers shed QoS 0 on this signal and keep any other
+%% failure semantics unchanged. The check-then-call is a soft bound:
+%% concurrent callers may overshoot it slightly, which only delays
+%% shedding, never correctness.
 -spec send(pid(), opcode(), non_neg_integer(), non_neg_integer(),
            binary(), binary()) -> ok | {error, term()}.
 send(Pid, Opcode, ConnId, SeqNo, MetaBin, PayloadBin) ->
-    gen_server:call(Pid, {send, Opcode, ConnId, SeqNo, MetaBin, PayloadBin}, 5000).
+    case ingress_overloaded(Pid) of
+        true ->
+            {error, overloaded};
+        false ->
+            gen_server:call(Pid, {send, Opcode, ConnId, SeqNo, MetaBin, PayloadBin}, 5000)
+    end.
 
 %%====================================================================
 %% gen_server callbacks
@@ -719,8 +734,17 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal helpers
 %%====================================================================
 
+%% @doc Socket options for the BrokerLink TCP connection.
+%% `nodelay' avoids delayed-ACK interaction on small frames;
+%% 64 KiB buffers bound per-connection memory while giving the
+%% edge-kernel burst path headroom.
+-spec brokerlink_sock_opts() -> [term()].
+brokerlink_sock_opts() ->
+    [binary, {packet, raw}, {active, true},
+     {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
+
 connect(tcp, Host, Port, _Path) ->
-    gen_tcp:connect(Host, Port, [binary, {packet, raw}, {active, true}]);
+    gen_tcp:connect(Host, Port, brokerlink_sock_opts());
 connect(uds, _Host, _Port, undefined) ->
     {error, {missing_option, path}};
 connect(uds, _Host, _Port, Path) ->
@@ -730,6 +754,23 @@ transport_send(#{sock := Sock}, Frame) when is_port(Sock) ->
     gen_tcp:send(Sock, Frame);
 transport_send(_State, _Frame) ->
     {error, not_connected}.
+
+%% PERF-09: max queued inbound calls a shard sheds past. Normal depth
+%% stays far below (single digits per shard at 5k paired load); the
+%% pre-shard 5k run peaked at 100 pending on the single client, so 256
+%% only trips under genuine overload, never on a healthy stack.
+-define(SEND_QUEUE_BOUND, 256).
+
+%% @private True when the shard server already holds at least
+%% `?SEND_QUEUE_BOUND' pending calls. Total on dead pids (returns
+%% false) so down shards keep their existing failure path.
+ingress_overloaded(Pid) when is_pid(Pid) ->
+    case catch process_info(Pid, message_queue_len) of
+        {message_queue_len, N} -> N >= ?SEND_QUEUE_BOUND;
+        _ -> false
+    end;
+ingress_overloaded(_) ->
+    false.
 
 %% PERF-05: flush once per poll on the sender. Coalesce the current
 %% frame with already-queued outbound requests (non-blocking drain,

@@ -632,3 +632,196 @@ publish_packet(Topic, PacketId, Flags, Payload) ->
 recv_all(Sock) ->
     {ok, Bin} = gen_tcp:recv(Sock, 0, ?RECV_TIMEOUT),
     Bin.
+
+%%====================================================================
+%% PERF-09 bounded, counted edge ingress
+%%====================================================================
+
+%% @doc QoS 0 shed under saturation: the shard is driven past the
+%% send/6 bound, 50 QoS 0 publishes are blasted, and every one must be
+%% a counted drop — the connection stays up, the counter reads exactly
+%% 50, nothing was forwarded, and post-overload publishes flow again.
+%% Fails before PERF-09 (the first blast blocks to the 5 s call
+%% timeout and the connection dies; there is no counter).
+qos0_overload_sheds_with_counter_test() ->
+    {LSock, Slow, Client, Conn} = setup_slow(9001),
+    try
+        handshake_slow(Client, Slow, <<"dev-shed">>, Conn),
+        BasePub = count_pub_in(slow_sent(Slow)),
+        %% Saturate the shard past the send/6 bound. Fillers use raw
+        %% calls (production overshoot via check-then-call races
+        %% reaches the same state with enough publishers); the
+        %% connection under test always goes through send/6.
+        slow_set_delay(Slow, 400),
+        [spawn(fun() ->
+                   catch gen_server:call(Slow, {send, 16#0001, 1, 1, <<>>, <<"f">>},
+                                         infinity)
+               end) || _ <- lists:seq(1, 400)],
+        ok = wait_queue_full(Slow, 256, 100),
+        [ok = gen_tcp:send(Client, publish_packet(<<"t">>, 0, 16#30, <<"x">>))
+         || _ <- lists:seq(1, 50)],
+        ok = wait_drops(Conn, 50, 100),
+        timer:sleep(200),
+        ?assert(is_process_alive(Conn)),
+        {connected, Data} = sys:get_state(Conn),
+        ?assertEqual(50, maps:get(qos0_dropped, Data)),
+        %% Release the shard: none of the blasts may have been
+        %% recorded, and one post-overload publish flows with the
+        %% counter intact.
+        slow_set_delay(Slow, 0),
+        ok = wait_queue_drained(Slow, 200),
+        ok = gen_tcp:send(Client, publish_packet(<<"t">>, 0, 16#30, <<"again">>)),
+        ok = wait_pub_in(Slow, BasePub + 1, 100),
+        {connected, Data1} = sys:get_state(Conn),
+        ?assertEqual(50, maps:get(qos0_dropped, Data1)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown_slow(LSock, Slow, Client, Conn)
+    end.
+
+%% @doc QoS 1 semantics are unchanged by PERF-09: under the same
+%% saturation a QoS 1 publish still closes the connection (no silent
+%% drop). Passes both before and after; it pins the invariant.
+qos1_overload_still_closes_test() ->
+    {LSock, Slow, Client, Conn} = setup_slow(9002),
+    Ref = monitor(process, Conn),
+    try
+        handshake_slow(Client, Slow, <<"dev-qos1">>, Conn),
+        slow_set_delay(Slow, 400),
+        [spawn(fun() ->
+                   catch gen_server:call(Slow, {send, 16#0001, 1, 1, <<>>, <<"f">>},
+                                         infinity)
+               end) || _ <- lists:seq(1, 400)],
+        ok = wait_queue_full(Slow, 256, 100),
+        ok = gen_tcp:send(Client, publish_packet(<<"t">>, 7, 16#32, <<"q1">>)),
+        ?assertEqual({error, closed}, gen_tcp:recv(Client, 0, ?RECV_TIMEOUT)),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end
+    after
+        teardown_slow(LSock, Slow, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%% @private Listen on loopback and attach an indra_conn to a slow
+%% controllable broker (same call protocol as indra_brokerlink).
+setup_slow(ConnId) ->
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw},
+                                     {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(LSock),
+    Slow = spawn(fun() -> slow_loop(0, []) end),
+    Parent = self(),
+    spawn(fun() ->
+        {ok, Sock} = gen_tcp:accept(LSock, 5000),
+        {ok, Conn} = indra_conn:start_link(Sock, [{broker, Slow},
+                                                 {conn_id, ConnId}]),
+        ok = gen_tcp:controlling_process(Sock, Conn),
+        gen_statem:cast(Conn, takeover),
+        Parent ! {conn_ready, Conn}
+    end),
+    {ok, Client} = gen_tcp:connect("127.0.0.1", Port,
+                                   [binary, {packet, raw}, {active, false}],
+                                   5000),
+    Conn = receive {conn_ready, C} -> C
+           after 5000 -> error(conn_not_ready)
+           end,
+    {LSock, Slow, Client, Conn}.
+
+teardown_slow(LSock, Slow, Client, Conn) ->
+    catch indra_conn:stop(Conn),
+    catch gen_tcp:close(Client),
+    catch gen_tcp:close(LSock),
+    catch exit(Slow, kill),
+    ok.
+
+%% @private Slow broker: sleeps Delay ms per {send, ...} call and
+%% records it. Control messages (set_delay, get_frames) are served
+%% with priority via selective receive so they work even while
+%% hundreds of sends are queued.
+slow_loop(Delay, Frames) ->
+    receive
+        {set_delay, Ms} ->
+            slow_loop(Ms, Frames);
+        {'$gen_call', From, get_frames} ->
+            gen_server:reply(From, lists:reverse(Frames)),
+            slow_loop(Delay, Frames)
+    after 0 ->
+        receive
+            {set_delay, Ms} ->
+                slow_loop(Ms, Frames);
+            {'$gen_call', From, get_frames} ->
+                gen_server:reply(From, lists:reverse(Frames)),
+                slow_loop(Delay, Frames);
+            {'$gen_call', From, {send, Opcode, ConnId, SeqNo, Meta, Payload}} ->
+                timer:sleep(Delay),
+                gen_server:reply(From, ok),
+                slow_loop(Delay, [#{opcode => Opcode, conn_id => ConnId,
+                                    seq_no => SeqNo, meta => Meta,
+                                    payload => Payload} | Frames]);
+            stop ->
+                ok
+        end
+    end.
+
+slow_sent(Slow) ->
+    gen_server:call(Slow, get_frames, 5000).
+
+slow_set_delay(Slow, Ms) ->
+    Slow ! {set_delay, Ms},
+    ok.
+
+%% @private Run CONNECT -> CONNACK against the slow broker.
+handshake_slow(Client, Slow, ClientId, Conn) ->
+    ok = gen_tcp:send(Client, connect_packet(ClientId, true, 60)),
+    ok = wait_slow_count(Slow, 1, 100),
+    Binding = indra_brokerlink:encode_session_binding_meta(1, false, 0),
+    ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+    <<16#20, 16#02, 16#00, 16#00>> = recv_exact(Client, 4),
+    ok.
+
+count_pub_in(Frames) ->
+    length([F || F <- Frames, maps:get(opcode, F) =:= 16#0020]).
+
+wait_slow_count(Slow, N, Tries) ->
+    case length(slow_sent(Slow)) >= N of
+        true -> ok;
+        false when Tries > 0 -> timer:sleep(50), wait_slow_count(Slow, N, Tries - 1);
+        false -> error(slow_frame_timeout)
+    end.
+
+wait_pub_in(_Slow, _N, 0) ->
+    error(slow_pub_timeout);
+wait_pub_in(Slow, N, Tries) ->
+    case count_pub_in(slow_sent(Slow)) >= N of
+        true -> ok;
+        false -> timer:sleep(50), wait_pub_in(Slow, N, Tries - 1)
+    end.
+
+wait_queue_full(_Slow, _Bound, 0) ->
+    error(queue_never_filled);
+wait_queue_full(Slow, Bound, Tries) ->
+    case process_info(Slow, message_queue_len) of
+        {message_queue_len, N} when N >= Bound -> ok;
+        _ -> timer:sleep(50), wait_queue_full(Slow, Bound, Tries - 1)
+    end.
+
+wait_queue_drained(_Slow, 0) ->
+    error(queue_never_drained);
+wait_queue_drained(Slow, Tries) ->
+    case process_info(Slow, message_queue_len) of
+        {message_queue_len, 0} -> ok;
+        _ -> timer:sleep(50), wait_queue_drained(Slow, Tries - 1)
+    end.
+
+wait_drops(_Conn, _N, 0) ->
+    error(drop_counter_timeout);
+wait_drops(Conn, N, Tries) ->
+    case catch sys:get_state(Conn) of
+        {connected, Data} ->
+            case maps:get(qos0_dropped, Data, -1) of
+                C when C >= N -> ok;
+                _ -> timer:sleep(50), wait_drops(Conn, N, Tries - 1)
+            end;
+        _ ->
+            timer:sleep(50), wait_drops(Conn, N, Tries - 1)
+    end.

@@ -1352,6 +1352,10 @@ async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std:
     loop {
         let (stream, addr) = listener.accept().await?;
         debug!("BrokerLink IPC accepted {}", addr);
+        // PERF-08: hot-path socket tuning (`TCP_NODELAY` + 64 KiB
+        // buffers, matching the Erlang edge from PERF-07). Tuning
+        // errors are logged inside and never fail the connection.
+        brokerlink::transport::tune_brokerlink_tcp(&stream);
         let shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, shared).await {
