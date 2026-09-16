@@ -157,6 +157,12 @@ impl TokenBucket {
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     next_session_id: AtomicU64,
+    /// O(1) reverse map `conn_id -> client_id` (PERF-04). Populated by
+    /// [`SessionManager::bind_session`], pruned by `unbind_connection`
+    /// and by `get_or_create` on clean-start replacement. Lookups take a
+    /// short read; bind/unbind a short write; the lock is never held
+    /// across dispatch, routing, or I/O.
+    conn_index: RwLock<HashMap<u64, String>>,
     /// Live connection count per username (INDRA-127 quotas). Anonymous
     /// binds bypass accounting entirely.
     conn_counts: RwLock<HashMap<String, AtomicU32>>,
@@ -187,6 +193,7 @@ impl SessionManager {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            conn_index: RwLock::new(HashMap::new()),
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
@@ -215,12 +222,55 @@ impl SessionManager {
     }
 
     /// Reverse lookup: owner of a live edge connection, if bound.
+    /// O(1) via the `conn_id -> client_id` index; falls back to the
+    /// legacy scan only on a miss so sessions bound through direct
+    /// `conn_id` writes (paths outside the indexed bind hook) still
+    /// resolve exactly as before.
     pub fn client_id_for_conn(&self, conn_id: u64) -> Option<String> {
+        if let Some(owner) = self.conn_index.read().get(&conn_id).cloned() {
+            return Some(owner);
+        }
         self.sessions
             .read()
             .iter()
             .find(|(_, session)| *session.conn_id.read() == Some(conn_id))
             .map(|(client_id, _)| client_id.clone())
+    }
+
+    /// Pin an edge connection to its session and record the reverse
+    /// mapping. Replaces any previous `conn_id` for this client (the
+    /// stale entry is removed) and overwrites a reused `conn_id` left
+    /// by another client. Short locks only: session write, then index
+    /// write; never held across dispatch, routing, or I/O.
+    pub fn bind_session(&self, session: &Arc<Session>, conn_id: u64) {
+        let old = *session.conn_id.read();
+        if old == Some(conn_id) {
+            let present = self
+                .conn_index
+                .read()
+                .get(&conn_id)
+                .map(|owner| owner == &session.client_id)
+                .unwrap_or(false);
+            if present {
+                return;
+            }
+            self.conn_index
+                .write()
+                .insert(conn_id, session.client_id.clone());
+            return;
+        }
+        *session.conn_id.write() = Some(conn_id);
+        let mut index = self.conn_index.write();
+        if let Some(prev) = old {
+            let owned = index
+                .get(&prev)
+                .map(|owner| owner == &session.client_id)
+                .unwrap_or(false);
+            if owned {
+                index.remove(&prev);
+            }
+        }
+        index.insert(conn_id, session.client_id.clone());
     }
 
     /// Sorted ids of currently connected clients (for the management API).
@@ -276,9 +326,24 @@ impl SessionManager {
         let mut map = self.sessions.write();
 
         if clean_start {
+            // A fresh session supersedes any live binding: capture the old
+            // conn_id now so its index entry can be pruned below (after
+            // the map guard drops; index lock never nests inside it).
+            let stale_conn = map.get(client_id).and_then(|s| *s.conn_id.read());
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
             map.insert(client_id.to_string(), session.clone());
+            drop(map);
+            if let Some(stale) = stale_conn {
+                let mut index = self.conn_index.write();
+                if index
+                    .get(&stale)
+                    .map(|owner| owner == client_id)
+                    .unwrap_or(false)
+                {
+                    index.remove(&stale);
+                }
+            }
             (session, false)
         } else if let Some(existing) = map.get(client_id) {
             *existing.connected.write() = true;
@@ -310,6 +375,19 @@ impl SessionManager {
         };
         if let Some(username) = username_to_release {
             self.release_connection_slot(&username);
+        }
+        // Every path that clears `session.conn_id` also prunes the index:
+        // remove only entries owned by this client so a racing teardown
+        // for a superseded conn_id never drops the fresh binding.
+        {
+            let mut index = self.conn_index.write();
+            if index
+                .get(&conn_id)
+                .map(|owner| owner == client_id)
+                .unwrap_or(false)
+            {
+                index.remove(&conn_id);
+            }
         }
         // Reconnects start with a full bucket; abandoned entries vanish.
         self.buckets.write().remove(client_id);
@@ -625,6 +703,55 @@ mod tests {
         assert!(!manager.check_publish_budget("fast", 1000, 1));
         assert!(manager.check_publish_budget("fast", 1000, 50));
         assert!(manager.check_publish_budget("fast", 1000, 50));
+    }
+
+    #[test]
+    fn conn_id_index_tracks_bind_unbind() {
+        let manager = SessionManager::new();
+        let count = 32u64;
+        let mut bound: Vec<(String, u64)> = Vec::new();
+        for i in 0..count {
+            let client_id = format!("perf-client-{i:03}");
+            let (session, _) = manager.get_or_create(&client_id, true);
+            let conn_id = 10_000 + i;
+            manager.bind_session(&session, conn_id);
+            bound.push((client_id, conn_id));
+        }
+
+        // O(1) lookup hits for every bound connection.
+        for (client_id, conn_id) in &bound {
+            assert_eq!(
+                manager.client_id_for_conn(*conn_id),
+                Some(client_id.clone()),
+                "indexed lookup hits for {client_id}"
+            );
+        }
+        // Unknown ids miss exactly like the old scan did.
+        assert_eq!(manager.client_id_for_conn(999_999), None);
+
+        // Unbind one: its entry is gone, the rest are intact.
+        manager.unbind_connection(&bound[0].0, bound[0].1);
+        assert_eq!(manager.client_id_for_conn(bound[0].1), None);
+        for (client_id, conn_id) in bound.iter().skip(1) {
+            assert_eq!(
+                manager.client_id_for_conn(*conn_id),
+                Some(client_id.clone())
+            );
+        }
+
+        // Rebind the same client on a new conn_id: old id misses, new hits.
+        let (session, _) = manager.get_or_create(&bound[0].0, false);
+        manager.bind_session(&session, 77_000);
+        assert_eq!(manager.client_id_for_conn(bound[0].1), None);
+        assert_eq!(manager.client_id_for_conn(77_000), Some(bound[0].0.clone()));
+
+        // Clean-start replacement evicts the stale binding.
+        let stale = 77_000u64;
+        let (fresh, _) = manager.get_or_create(&bound[0].0, true);
+        assert_eq!(*fresh.conn_id.read(), None);
+        assert_eq!(manager.client_id_for_conn(stale), None);
+        manager.bind_session(&fresh, 77_001);
+        assert_eq!(manager.client_id_for_conn(77_001), Some(bound[0].0.clone()));
     }
 
     #[test]

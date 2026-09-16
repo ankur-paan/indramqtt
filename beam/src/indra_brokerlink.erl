@@ -671,22 +671,14 @@ init(Opts) ->
             {stop, Reason}
     end.
 
-handle_call({ping, ConnId}, _From, State) ->
+handle_call({ping, ConnId}, From, State) ->
     Seq = maps:get(seq, State) + 1,
     Frame = encode_frame(ping, ConnId, Seq, <<>>, <<>>),
-    case transport_send(State, Frame) of
-        ok ->
-            {reply, ok, State#{seq => Seq}};
-        {error, Reason} ->
-            {reply, {error, Reason}, State#{seq => Seq}}
-    end;
-handle_call({send, Opcode, ConnId, SeqNo, MetaBin, PayloadBin}, _From, State) ->
+    send_coalesced(State, From, Frame, Seq);
+handle_call({send, Opcode, ConnId, SeqNo, MetaBin, PayloadBin}, From, State) ->
     try encode_frame(Opcode, ConnId, SeqNo, MetaBin, PayloadBin) of
         Frame ->
-            case transport_send(State, Frame) of
-                ok -> {reply, ok, State};
-                {error, Reason} -> {reply, {error, Reason}, State}
-            end
+            send_coalesced(State, From, Frame, maps:get(seq, State))
     catch
         error:badarg -> {reply, {error, frame_too_large}, State}
     end;
@@ -737,6 +729,62 @@ connect(uds, _Host, _Port, Path) ->
 transport_send(#{sock := Sock}, Frame) when is_port(Sock) ->
     gen_tcp:send(Sock, Frame);
 transport_send(_State, _Frame) ->
+    {error, not_connected}.
+
+%% PERF-05: flush once per poll on the sender. Coalesce the current
+%% frame with already-queued outbound requests (non-blocking drain,
+%% bounded by frames and bytes) into a single `gen_tcp:send` iolist.
+%% Order is arrival order; no delayed flush. Each drained caller gets
+%% its own reply.
+-define(SEND_BATCH_MAX_FRAMES, 64).
+-define(SEND_BATCH_MAX_BYTES, 65536).
+
+send_coalesced(State, From, Frame, Seq) ->
+    {Frames, Froms, Seq1} =
+        drain_send_queue([Frame], [From], byte_size(Frame), Seq),
+    Result = case Frames of
+        [Single] -> transport_send(State, Single);
+        Many -> transport_send_batch(State, Many)
+    end,
+    case Result of
+        ok ->
+            lists:foreach(fun(F) -> gen_server:reply(F, ok) end, Froms),
+            {noreply, State#{seq => Seq1}};
+        {error, Reason} ->
+            lists:foreach(fun(F) -> gen_server:reply(F, {error, Reason}) end, Froms),
+            {noreply, State#{seq => Seq1}}
+    end.
+
+drain_send_queue(Frames, Froms, Bytes, Seq) ->
+    case length(Frames) >= ?SEND_BATCH_MAX_FRAMES orelse
+         Bytes >= ?SEND_BATCH_MAX_BYTES of
+        true ->
+            {Frames, Froms, Seq};
+        false ->
+            receive
+                {'$gen_call', From2, {ping, ConnId2}} ->
+                    Seq2 = Seq + 1,
+                    F2 = encode_frame(ping, ConnId2, Seq2, <<>>, <<>>),
+                    drain_send_queue(Frames ++ [F2], Froms ++ [From2],
+                                     Bytes + byte_size(F2), Seq2);
+                {'$gen_call', From2, {send, Op2, C2, S2, M2, P2}} ->
+                    try encode_frame(Op2, C2, S2, M2, P2) of
+                        F2 ->
+                            drain_send_queue(Frames ++ [F2], Froms ++ [From2],
+                                             Bytes + byte_size(F2), Seq)
+                    catch
+                        error:badarg ->
+                            gen_server:reply(From2, {error, frame_too_large}),
+                            drain_send_queue(Frames, Froms, Bytes, Seq)
+                    end
+            after 0 ->
+                {Frames, Froms, Seq}
+            end
+    end.
+
+transport_send_batch(#{sock := Sock}, Frames) when is_port(Sock), is_list(Frames) ->
+    gen_tcp:send(Sock, Frames);
+transport_send_batch(_State, _Frames) ->
     {error, not_connected}.
 
 %% @private The IPC socket died: with `{reconnect, true}` stay alive,

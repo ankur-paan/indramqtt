@@ -414,6 +414,78 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn route_stamps_per_destination_sequence_under_shards() {
+        // Conn ids 0 and 1 land in different buckets
+        // (`conn_id as usize % 16`), so interleaved routes must still
+        // stamp each destination 1, 2, 3, ... independently.
+        let table = ConnTable::default();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        table.register(0, tx_a);
+        table.register(1, tx_b);
+
+        for _ in 0..3 {
+            table.route(0, BrokerFrame::ping(0, 0));
+            table.route(1, BrokerFrame::ping(1, 0));
+        }
+
+        for expected in 1..=3u64 {
+            let frame_a = rx_a.try_recv().expect("conn 0 frame");
+            assert_eq!(frame_a.header.sequence_no, expected);
+            let frame_b = rx_b.try_recv().expect("conn 1 frame");
+            assert_eq!(frame_b.header.sequence_no, expected);
+        }
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+
+        // Unknown destinations keep drop-and-forget semantics.
+        table.route(9999, BrokerFrame::ping(9999, 0));
+    }
+
+    #[test]
+    fn concurrent_routes_do_not_lose_frames() {
+        // Eight connections spread across buckets, hammered from eight
+        // threads at once: every routed frame must arrive exactly once
+        // and each destination's stamps must cover 1..=N with no gaps.
+        const CONNS: u64 = 8;
+        const PER_CONN_PER_THREAD: usize = 100;
+        const THREADS: usize = 8;
+        const PER_CONN: usize = PER_CONN_PER_THREAD * THREADS;
+
+        let table = Arc::new(ConnTable::default());
+        let mut receivers = Vec::new();
+        for conn_id in 0..CONNS {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            table.register(conn_id, tx);
+            receivers.push((conn_id, rx));
+        }
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..PER_CONN_PER_THREAD {
+                        for conn_id in 0..CONNS {
+                            table.route(conn_id, BrokerFrame::ping(conn_id, 0));
+                        }
+                    }
+                });
+            }
+        });
+
+        for (conn_id, mut rx) in receivers {
+            let mut seqs = Vec::with_capacity(PER_CONN);
+            while let Ok(frame) = rx.try_recv() {
+                seqs.push(frame.header.sequence_no);
+            }
+            assert_eq!(seqs.len(), PER_CONN, "conn {conn_id} lost frames");
+            seqs.sort_unstable();
+            let expected: Vec<u64> = (1..=PER_CONN as u64).collect();
+            assert_eq!(seqs, expected, "conn {conn_id} sequence gap");
+            assert!(rx.try_recv().is_err());
+        }
+    }
 }
 
 /// Ephemeral delivery table: edge `conn_id` -> mailbox of the task owning
@@ -421,9 +493,28 @@ mod tests {
 /// Lets any publisher's task deliver `PublishOut` frames to a subscriber
 /// served by a different task. Shared by `broker-node` and `broker-api`
 /// so both transports fan out through one directory.
-#[derive(Debug, Default)]
+///
+/// Sharded into per-bucket locks so fan-out to different connections
+/// does not serialize on one global mutex: each `conn_id` maps to
+/// exactly one bucket and every operation locks only that bucket
+/// (`prune_sender` visits each bucket in turn, never holding more than
+/// one at a time).
+#[derive(Debug)]
 pub struct ConnTable {
-    inner: Mutex<HashMap<u64, ConnSlot>>,
+    shards: [Mutex<HashMap<u64, ConnSlot>>; NUM_SHARDS],
+}
+
+/// Number of `ConnTable` buckets. A power of two so the bucket mapping
+/// stays a cheap modulo; large enough that concurrent fan-out rarely
+/// collides on one bucket.
+const NUM_SHARDS: usize = 16;
+
+impl Default for ConnTable {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -436,8 +527,15 @@ struct ConnSlot {
 }
 
 impl ConnTable {
+    /// Owning bucket for `conn_id`. `conn_id`s are ephemeral edge
+    /// handles that increase over time, so the identity modulo spreads
+    /// neighbours across buckets.
+    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<u64, ConnSlot>> {
+        &self.shards[(conn_id as usize) % NUM_SHARDS]
+    }
+
     pub fn register(&self, conn_id: u64, tx: UnboundedSender<BrokerFrame>) {
-        self.inner.lock().insert(
+        self.shard(conn_id).lock().insert(
             conn_id,
             ConnSlot {
                 tx,
@@ -447,25 +545,32 @@ impl ConnTable {
     }
 
     pub fn unregister(&self, conn_id: u64) {
-        self.inner.lock().remove(&conn_id);
+        self.shard(conn_id).lock().remove(&conn_id);
     }
 
     /// Remove every entry owned by a dead task (its sender is unique per
     /// connection task, so channel identity is a safe ownership test).
+    /// Visits one bucket at a time so concurrent `route` calls to other
+    /// buckets are never blocked on a whole-table lock.
     pub fn prune_sender(&self, tx: &UnboundedSender<BrokerFrame>) {
-        self.inner
-            .lock()
-            .retain(|_, slot| !slot.tx.same_channel(tx));
+        for shard in &self.shards {
+            shard.lock().retain(|_, slot| !slot.tx.same_channel(tx));
+        }
     }
 
     /// Deliver one frame to a connection, stamping a per-destination
-    /// sequence number. Drops (and forgets) dead destinations.
+    /// sequence number. Drops (and forgets) dead destinations. The stamp
+    /// orders frames per destination only, so `Relaxed` is sufficient;
+    /// it is never used for cross-connection synchronization.
     pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) {
-        let tx = self.inner.lock().get(&conn_id).map(|slot| {
-            let seq = slot.next_seq.fetch_add(1, Ordering::SeqCst);
-            frame.header.sequence_no = seq;
-            slot.tx.clone()
-        });
+        let tx = {
+            let shard = self.shard(conn_id).lock();
+            shard.get(&conn_id).map(|slot| {
+                let seq = slot.next_seq.fetch_add(1, Ordering::Relaxed);
+                frame.header.sequence_no = seq;
+                slot.tx.clone()
+            })
+        };
         if let Some(tx) = tx {
             if tx.send(frame).is_err() {
                 self.unregister(conn_id);
