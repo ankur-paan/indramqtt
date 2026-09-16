@@ -56,6 +56,7 @@
 -define(PUBACK_OUT, 16#0023).
 -define(SUBSCRIBE_IN, 16#0030).
 -define(SUBACK_OUT, 16#0031).
+-define(CONN_CLOSE, 16#0041).
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 10000).
 %% Max client bytes buffered while the core is down; beyond this the
 %% connection fails closed instead of ballooning the edge.
@@ -198,6 +199,11 @@ handle_event(cast, {broker_frame, Header, Meta, Payload}, connected, Data) ->
             handle_publish_out(Meta, Payload, Data);
         ?PUBACK_OUT ->
             handle_puback_out(Meta, Data);
+        ?CONN_CLOSE ->
+            %% Kernel-ordered close (W0-25): the kernel already unbound
+            %% session state; the edge only closes the socket. terminate/3
+            %% closes the socket and unregisters the conn id.
+            {stop, normal, Data};
         _ ->
             %% Late duplicates or future opcodes: ignore for now.
             {keep_state, Data}
@@ -206,6 +212,9 @@ handle_event(cast, {broker_frame, Header, Meta, _Payload}, await_core, Data) ->
     case maps:get(opcode, Header, undefined) of
         ?SESSION_BINDING ->
             handle_rebind_binding(Meta, Data);
+        ?CONN_CLOSE ->
+            %% Socket is managed by the hold/buffering logic: drop.
+            {keep_state, Data};
         _ ->
             %% Stale pre-crash frames: ignore while holding.
             {keep_state, Data}

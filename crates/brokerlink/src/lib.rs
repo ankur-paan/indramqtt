@@ -158,6 +158,31 @@ mod tests {
         assert!(partial.is_empty());
     }
 
+    #[test]
+    fn connclose_round_trips() {
+        assert_eq!(u16::from(OpCode::ConnClose), 0x0041);
+        assert_eq!(
+            OpCode::try_from(0x0041).expect("0x0041 decodes"),
+            OpCode::ConnClose
+        );
+
+        let codec = FrameCodec::default();
+        let frame = BrokerFrame::new(OpCode::ConnClose, 4242, 7, Bytes::new(), Bytes::new())
+            .expect("Valid frame creation");
+        let mut buf = BytesMut::new();
+        codec.encode(&frame, &mut buf).expect("Encoding failed");
+        let decoded = codec
+            .decode(&mut buf)
+            .expect("Decoding failed")
+            .expect("Frame should be complete");
+        assert_eq!(decoded.header.opcode, OpCode::ConnClose);
+        assert_eq!(decoded.header.conn_id, 4242);
+        assert_eq!(decoded.header.sequence_no, 7);
+        assert!(decoded.metadata.is_empty());
+        assert!(decoded.payload.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
     #[tokio::test]
     async fn test_transport_bidirectional_duplex() {
         let (client_io, server_io) = duplex(1024);

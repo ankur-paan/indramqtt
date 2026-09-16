@@ -78,6 +78,23 @@ jobs:
         working-directory: beam
         run: rebar3 eunit
 
+  api-conformance:
+    name: API Conformance (offline unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run conformance validator unit tests
+        run: python -m unittest tests.api_conformance.test_openapi_validate -v
+        # Local live run (needs spec path + running kernel, not in CI):
+        # python -m tests.api_conformance --spec <openapi.json> --base http://127.0.0.1:18083/api/v5 --user admin --password <pw>
+
   benchmarks:
     name: Benchmark Compilation Check
     runs-on: ubuntu-latest

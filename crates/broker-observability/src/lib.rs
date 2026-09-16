@@ -18,6 +18,55 @@ pub struct Metrics {
     messages_dropped: AtomicU64,
     rules_executed: AtomicU64,
     connections_active: AtomicI64,
+    // Packet families (W1 `/metrics`, `/stats`, `/monitor_current`).
+    connect_received: AtomicU64,
+    connack_sent: AtomicU64,
+    publish_received: AtomicU64,
+    publish_sent: AtomicU64,
+    subscribe_received: AtomicU64,
+    suback_sent: AtomicU64,
+    pingreq_received: AtomicU64,
+    pingresp_sent: AtomicU64,
+    // Measured BrokerLink frame bytes (never `count * 64`).
+    bytes_received: AtomicU64,
+    bytes_sent: AtomicU64,
+    // Ingress QoS split.
+    qos0_received: AtomicU64,
+    qos1_received: AtomicU64,
+    qos2_received: AtomicU64,
+    // Delivery, overload and auth outcomes.
+    delivered: AtomicU64,
+    overload_dropped: AtomicU64,
+    auth_failures: AtomicU64,
+}
+
+/// One consistent read of every counter for API handlers.
+///
+/// Plain data (no atomics): handlers copy once per request instead of
+/// racing individual loads across a scrape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub messages_received: u64,
+    pub messages_forwarded: u64,
+    pub messages_dropped: u64,
+    pub rules_executed: u64,
+    pub connections_active: i64,
+    pub connect_received: u64,
+    pub connack_sent: u64,
+    pub publish_received: u64,
+    pub publish_sent: u64,
+    pub subscribe_received: u64,
+    pub suback_sent: u64,
+    pub pingreq_received: u64,
+    pub pingresp_sent: u64,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub qos0_received: u64,
+    pub qos1_received: u64,
+    pub qos2_received: u64,
+    pub delivered: u64,
+    pub overload_dropped: u64,
+    pub auth_failures: u64,
 }
 
 impl Metrics {
@@ -87,6 +136,244 @@ impl Metrics {
         self.connections_active.load(Ordering::Relaxed)
     }
 
+    /// One CONNECT packet (`BindConnection`) received from the edge.
+    pub fn inc_connect_received(&self) -> u64 {
+        self.inc_connect_received_by(1)
+    }
+
+    pub fn inc_connect_received_by(&self, n: u64) -> u64 {
+        self.connect_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One CONNACK (`SessionBinding`) sent toward the edge, including
+    /// rejections (bad password, anonymous denied): every bind is answered.
+    pub fn inc_connack_sent(&self) -> u64 {
+        self.inc_connack_sent_by(1)
+    }
+
+    pub fn inc_connack_sent_by(&self, n: u64) -> u64 {
+        self.connack_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One PUBLISH packet (`PublishIn`) received, before validation.
+    pub fn inc_publish_received(&self) -> u64 {
+        self.inc_publish_received_by(1)
+    }
+
+    pub fn inc_publish_received_by(&self, n: u64) -> u64 {
+        self.publish_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One `PublishOut` delivery fanned out toward a live edge connection.
+    pub fn inc_publish_sent(&self) -> u64 {
+        self.inc_publish_sent_by(1)
+    }
+
+    pub fn inc_publish_sent_by(&self, n: u64) -> u64 {
+        self.publish_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One SUBSCRIBE packet (`SubscribeIn`) received, before validation.
+    pub fn inc_subscribe_received(&self) -> u64 {
+        self.inc_subscribe_received_by(1)
+    }
+
+    pub fn inc_subscribe_received_by(&self, n: u64) -> u64 {
+        self.subscribe_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One SUBACK (`SubAckOut`) sent toward the edge.
+    pub fn inc_suback_sent(&self) -> u64 {
+        self.inc_suback_sent_by(1)
+    }
+
+    pub fn inc_suback_sent_by(&self, n: u64) -> u64 {
+        self.suback_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One PINGREQ (`Ping`) received from the edge.
+    pub fn inc_pingreq_received(&self) -> u64 {
+        self.inc_pingreq_received_by(1)
+    }
+
+    pub fn inc_pingreq_received_by(&self, n: u64) -> u64 {
+        self.pingreq_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One PINGRESP (`Pong`) sent toward the edge.
+    pub fn inc_pingresp_sent(&self) -> u64 {
+        self.inc_pingresp_sent_by(1)
+    }
+
+    pub fn inc_pingresp_sent_by(&self, n: u64) -> u64 {
+        self.pingresp_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Ingress bytes measured from real BrokerLink frame lengths.
+    pub fn inc_bytes_received(&self) -> u64 {
+        self.inc_bytes_received_by(1)
+    }
+
+    pub fn inc_bytes_received_by(&self, n: u64) -> u64 {
+        self.bytes_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Egress `PublishOut` bytes measured from real frame lengths.
+    pub fn inc_bytes_sent(&self) -> u64 {
+        self.inc_bytes_sent_by(1)
+    }
+
+    pub fn inc_bytes_sent_by(&self, n: u64) -> u64 {
+        self.bytes_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One ingress publish with QoS 0 accepted for routing.
+    pub fn inc_qos0_received(&self) -> u64 {
+        self.inc_qos0_received_by(1)
+    }
+
+    pub fn inc_qos0_received_by(&self, n: u64) -> u64 {
+        self.qos0_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One ingress publish with QoS 1 accepted for routing.
+    pub fn inc_qos1_received(&self) -> u64 {
+        self.inc_qos1_received_by(1)
+    }
+
+    pub fn inc_qos1_received_by(&self, n: u64) -> u64 {
+        self.qos1_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One ingress publish with QoS 2 accepted for routing.
+    pub fn inc_qos2_received(&self) -> u64 {
+        self.inc_qos2_received_by(1)
+    }
+
+    pub fn inc_qos2_received_by(&self, n: u64) -> u64 {
+        self.qos2_received.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One live delivery toward an edge connection (mirrors `publish_sent`
+    /// until per-ack tracking lands; offline buffering counts on replay).
+    pub fn inc_delivered(&self) -> u64 {
+        self.inc_delivered_by(1)
+    }
+
+    pub fn inc_delivered_by(&self, n: u64) -> u64 {
+        self.delivered.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One ingress message dropped by overload/quota policing.
+    pub fn inc_overload_dropped(&self) -> u64 {
+        self.inc_overload_dropped_by(1)
+    }
+
+    pub fn inc_overload_dropped_by(&self, n: u64) -> u64 {
+        self.overload_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One bind rejected on credential verification (bad password or
+    /// anonymous denied while users exist).
+    pub fn inc_auth_failures(&self) -> u64 {
+        self.inc_auth_failures_by(1)
+    }
+
+    pub fn inc_auth_failures_by(&self, n: u64) -> u64 {
+        self.auth_failures.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    pub fn connect_received(&self) -> u64 {
+        self.connect_received.load(Ordering::Relaxed)
+    }
+
+    pub fn connack_sent(&self) -> u64 {
+        self.connack_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn publish_received(&self) -> u64 {
+        self.publish_received.load(Ordering::Relaxed)
+    }
+
+    pub fn publish_sent(&self) -> u64 {
+        self.publish_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn subscribe_received(&self) -> u64 {
+        self.subscribe_received.load(Ordering::Relaxed)
+    }
+
+    pub fn suback_sent(&self) -> u64 {
+        self.suback_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn pingreq_received(&self) -> u64 {
+        self.pingreq_received.load(Ordering::Relaxed)
+    }
+
+    pub fn pingresp_sent(&self) -> u64 {
+        self.pingresp_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn qos0_received(&self) -> u64 {
+        self.qos0_received.load(Ordering::Relaxed)
+    }
+
+    pub fn qos1_received(&self) -> u64 {
+        self.qos1_received.load(Ordering::Relaxed)
+    }
+
+    pub fn qos2_received(&self) -> u64 {
+        self.qos2_received.load(Ordering::Relaxed)
+    }
+
+    pub fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn overload_dropped(&self) -> u64 {
+        self.overload_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_failures(&self) -> u64 {
+        self.auth_failures.load(Ordering::Relaxed)
+    }
+
+    /// Copy every counter in one call for API handlers.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            messages_received: self.messages_received(),
+            messages_forwarded: self.messages_forwarded(),
+            messages_dropped: self.messages_dropped(),
+            rules_executed: self.rules_executed(),
+            connections_active: self.connections_active(),
+            connect_received: self.connect_received(),
+            connack_sent: self.connack_sent(),
+            publish_received: self.publish_received(),
+            publish_sent: self.publish_sent(),
+            subscribe_received: self.subscribe_received(),
+            suback_sent: self.suback_sent(),
+            pingreq_received: self.pingreq_received(),
+            pingresp_sent: self.pingresp_sent(),
+            bytes_received: self.bytes_received(),
+            bytes_sent: self.bytes_sent(),
+            qos0_received: self.qos0_received(),
+            qos1_received: self.qos1_received(),
+            qos2_received: self.qos2_received(),
+            delivered: self.delivered(),
+            overload_dropped: self.overload_dropped(),
+            auth_failures: self.auth_failures(),
+        }
+    }
+
     /// Render all metrics in Prometheus text exposition format.
     pub fn render_prometheus_metrics(&self) -> String {
         format!(
@@ -111,6 +398,144 @@ impl Metrics {
             self.rules_executed(),
             self.connections_active(),
         )
+    }
+}
+
+/// Gauge-plus-high-water-mark store for EMQX `/stats` semantics.
+///
+/// Gauges move only through the explicit `set_*` calls from kernel
+/// lifecycle points; each `set_*` also raises the matching `*_max` via
+/// an atomic max. Maxima never fall except through `reset_maxima()`
+/// (explicit reset endpoints; no auto-decay). Per-instance like
+/// [`Metrics`] (never global) so multi-node in-process tests stay
+/// isolated.
+#[derive(Debug, Default)]
+pub struct StatsStore {
+    connections: AtomicU64,
+    connections_max: AtomicU64,
+    subscriptions: AtomicU64,
+    subscriptions_max: AtomicU64,
+    topics: AtomicU64,
+    topics_max: AtomicU64,
+    retained: AtomicU64,
+    retained_max: AtomicU64,
+}
+
+/// One consistent read of every gauge and maximum for API handlers.
+///
+/// Plain data (no atomics): handlers copy once per request instead of
+/// racing individual loads across a scrape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub connections: u64,
+    pub connections_max: u64,
+    pub subscriptions: u64,
+    pub subscriptions_max: u64,
+    pub topics: u64,
+    pub topics_max: u64,
+    pub retained: u64,
+    pub retained_max: u64,
+}
+
+/// Raise `atom` to at least `value` (compare-and-swap loop).
+fn raise_max(atom: &AtomicU64, value: u64) {
+    let mut current = atom.load(Ordering::Relaxed);
+    while current < value {
+        match atom.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+impl StatsStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current bound edge connections (mirrors `connections_active`).
+    pub fn set_connections(&self, count: u64) {
+        self.connections.store(count, Ordering::Relaxed);
+        raise_max(&self.connections_max, count);
+    }
+
+    /// Current subscriptions across active sessions.
+    pub fn set_subscriptions(&self, count: u64) {
+        self.subscriptions.store(count, Ordering::Relaxed);
+        raise_max(&self.subscriptions_max, count);
+    }
+
+    /// Current distinct topic filters across active sessions.
+    pub fn set_topics(&self, count: u64) {
+        self.topics.store(count, Ordering::Relaxed);
+        raise_max(&self.topics_max, count);
+    }
+
+    /// Current retained topics in the retained store.
+    pub fn set_retained(&self, count: u64) {
+        self.retained.store(count, Ordering::Relaxed);
+        raise_max(&self.retained_max, count);
+    }
+
+    /// Re-baseline every maximum to its current gauge (explicit reset
+    /// endpoints and tests; the only way maxima fall).
+    pub fn reset_maxima(&self) {
+        self.connections_max
+            .store(self.connections.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.subscriptions_max.store(
+            self.subscriptions.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.topics_max
+            .store(self.topics.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.retained_max
+            .store(self.retained.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    pub fn connections_max(&self) -> u64 {
+        self.connections_max.load(Ordering::Relaxed)
+    }
+
+    pub fn subscriptions(&self) -> u64 {
+        self.subscriptions.load(Ordering::Relaxed)
+    }
+
+    pub fn subscriptions_max(&self) -> u64 {
+        self.subscriptions_max.load(Ordering::Relaxed)
+    }
+
+    pub fn topics(&self) -> u64 {
+        self.topics.load(Ordering::Relaxed)
+    }
+
+    pub fn topics_max(&self) -> u64 {
+        self.topics_max.load(Ordering::Relaxed)
+    }
+
+    pub fn retained(&self) -> u64 {
+        self.retained.load(Ordering::Relaxed)
+    }
+
+    pub fn retained_max(&self) -> u64 {
+        self.retained_max.load(Ordering::Relaxed)
+    }
+
+    /// Copy every gauge and maximum in one call for API handlers.
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            connections: self.connections(),
+            connections_max: self.connections_max(),
+            subscriptions: self.subscriptions(),
+            subscriptions_max: self.subscriptions_max(),
+            topics: self.topics(),
+            topics_max: self.topics_max(),
+            retained: self.retained(),
+            retained_max: self.retained_max(),
+        }
     }
 }
 
@@ -140,5 +565,213 @@ mod tests {
         assert!(text.contains("indramqtt_rules_executed_total 3\n"));
         assert!(text.contains("indramqtt_connections_active 42\n"));
         assert!(text.contains("# TYPE indramqtt_connections_active gauge\n"));
+    }
+
+    #[test]
+    fn test_packet_counters_start_zero_and_increment() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.connect_received(), 0);
+        assert_eq!(metrics.connack_sent(), 0);
+        assert_eq!(metrics.publish_received(), 0);
+        assert_eq!(metrics.publish_sent(), 0);
+        assert_eq!(metrics.subscribe_received(), 0);
+        assert_eq!(metrics.suback_sent(), 0);
+        assert_eq!(metrics.pingreq_received(), 0);
+        assert_eq!(metrics.pingresp_sent(), 0);
+
+        assert_eq!(metrics.inc_connect_received(), 1);
+        assert_eq!(metrics.inc_connack_sent(), 1);
+        assert_eq!(metrics.inc_publish_received(), 1);
+        assert_eq!(metrics.inc_publish_received(), 2);
+        assert_eq!(metrics.inc_publish_sent_by(3), 3);
+        assert_eq!(metrics.inc_subscribe_received(), 1);
+        assert_eq!(metrics.inc_suback_sent(), 1);
+        assert_eq!(metrics.inc_pingreq_received(), 1);
+        assert_eq!(metrics.inc_pingresp_sent(), 1);
+
+        assert_eq!(metrics.connect_received(), 1);
+        assert_eq!(metrics.publish_received(), 2);
+        assert_eq!(metrics.publish_sent(), 3);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.connect_received, 1);
+        assert_eq!(snap.connack_sent, 1);
+        assert_eq!(snap.publish_received, 2);
+        assert_eq!(snap.publish_sent, 3);
+        assert_eq!(snap.subscribe_received, 1);
+        assert_eq!(snap.suback_sent, 1);
+        assert_eq!(snap.pingreq_received, 1);
+        assert_eq!(snap.pingresp_sent, 1);
+    }
+
+    #[test]
+    fn test_byte_counters_measure_real_frame_sizes() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.bytes_received(), 0);
+        assert_eq!(metrics.bytes_sent(), 0);
+
+        // Real BrokerLink frame lengths, never `count * 64`.
+        assert_eq!(metrics.inc_bytes_received_by(128), 128);
+        assert_eq!(metrics.inc_bytes_received_by(64), 192);
+        assert_eq!(metrics.inc_bytes_sent_by(1024), 1024);
+        assert_eq!(metrics.inc_bytes_sent(), 1025);
+
+        assert_eq!(metrics.bytes_received(), 192);
+        assert_eq!(metrics.bytes_sent(), 1025);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.bytes_received, 192);
+        assert_eq!(snap.bytes_sent, 1025);
+    }
+
+    #[test]
+    fn test_qos_delivery_overload_auth_counters() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.qos0_received(), 0);
+        assert_eq!(metrics.qos1_received(), 0);
+        assert_eq!(metrics.qos2_received(), 0);
+        assert_eq!(metrics.delivered(), 0);
+        assert_eq!(metrics.overload_dropped(), 0);
+        assert_eq!(metrics.auth_failures(), 0);
+
+        assert_eq!(metrics.inc_qos0_received(), 1);
+        assert_eq!(metrics.inc_qos1_received_by(2), 2);
+        assert_eq!(metrics.inc_qos2_received(), 1);
+        assert_eq!(metrics.inc_delivered_by(4), 4);
+        assert_eq!(metrics.inc_overload_dropped(), 1);
+        assert_eq!(metrics.inc_auth_failures_by(2), 2);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.qos0_received, 1);
+        assert_eq!(snap.qos1_received, 2);
+        assert_eq!(snap.qos2_received, 1);
+        assert_eq!(snap.delivered, 4);
+        assert_eq!(snap.overload_dropped, 1);
+        assert_eq!(snap.auth_failures, 2);
+    }
+
+    #[test]
+    fn test_snapshot_consistent_and_per_instance_isolated() {
+        let metrics = Metrics::new();
+        metrics.inc_messages_received();
+        metrics.inc_connect_received();
+        metrics.inc_bytes_received_by(100);
+        metrics.inc_qos1_received();
+        metrics.inc_delivered_by(2);
+        metrics.inc_connections();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.messages_received, 1);
+        assert_eq!(snap.connect_received, 1);
+        assert_eq!(snap.bytes_received, 100);
+        assert_eq!(snap.qos1_received, 1);
+        assert_eq!(snap.delivered, 2);
+        assert_eq!(snap.connections_active, 1);
+        // Untouched families stay zero in the same snapshot.
+        assert_eq!(snap.qos2_received, 0);
+        assert_eq!(snap.auth_failures, 0);
+
+        // Per-instance state only: a second instance sees nothing.
+        let other = Metrics::new();
+        let other_snap = other.snapshot();
+        assert_eq!(other_snap, MetricsSnapshot::default());
+        assert_ne!(snap, other_snap);
+    }
+
+    #[test]
+    fn test_stats_hwm_rises_and_never_falls() {
+        let stats = StatsStore::new();
+        let empty = stats.snapshot();
+        assert_eq!(empty, StatsSnapshot::default());
+
+        stats.set_connections(5);
+        stats.set_subscriptions(7);
+        stats.set_topics(3);
+        stats.set_retained(2);
+        let peak = stats.snapshot();
+        assert_eq!(peak.connections, 5);
+        assert_eq!(peak.connections_max, 5);
+        assert_eq!(peak.subscriptions_max, 7);
+        assert_eq!(peak.topics_max, 3);
+        assert_eq!(peak.retained_max, 2);
+
+        // Gauges drop, maxima hold the peaks.
+        stats.set_connections(2);
+        stats.set_subscriptions(0);
+        stats.set_topics(1);
+        stats.set_retained(0);
+        let snap = stats.snapshot();
+        assert_eq!(snap.connections, 2);
+        assert_eq!(snap.connections_max, 5);
+        assert_eq!(snap.subscriptions, 0);
+        assert_eq!(snap.subscriptions_max, 7);
+        assert_eq!(snap.topics, 1);
+        assert_eq!(snap.topics_max, 3);
+        assert_eq!(snap.retained, 0);
+        assert_eq!(snap.retained_max, 2);
+
+        // A new peak raises only its own maximum.
+        stats.set_topics(9);
+        assert_eq!(stats.topics(), 9);
+        assert_eq!(stats.topics_max(), 9);
+        assert_eq!(stats.connections_max(), 5);
+    }
+
+    #[test]
+    fn test_stats_reset_maxima_rebaselines_to_current() {
+        let stats = StatsStore::new();
+        stats.set_connections(12);
+        stats.set_subscriptions(30);
+        stats.set_topics(11);
+        stats.set_retained(4);
+        stats.set_connections(3);
+        stats.set_subscriptions(8);
+
+        stats.reset_maxima();
+        let snap = stats.snapshot();
+        assert_eq!(snap.connections, 3);
+        assert_eq!(snap.connections_max, 3);
+        assert_eq!(snap.subscriptions, 8);
+        assert_eq!(snap.subscriptions_max, 8);
+        assert_eq!(snap.topics, 11);
+        assert_eq!(snap.topics_max, 11);
+        assert_eq!(snap.retained, 4);
+        assert_eq!(snap.retained_max, 4);
+
+        // Peaks after the reset raise the maxima again.
+        stats.set_retained(6);
+        assert_eq!(stats.retained_max(), 6);
+    }
+
+    #[test]
+    fn test_stats_concurrent_setters_keep_true_peak() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let stats = Arc::new(StatsStore::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let stats = stats.clone();
+            handles.push(thread::spawn(move || {
+                // Every thread climbs through the full range, so the
+                // true peak (99) is set by every thread; interleavings
+                // must never lose it.
+                for n in 0..100u64 {
+                    stats.set_connections(n);
+                    stats.set_subscriptions(n * 2);
+                    stats.set_topics(n);
+                    stats.set_retained(n % 10);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("setter thread joins");
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.connections_max, 99);
+        assert_eq!(snap.subscriptions_max, 198);
+        assert_eq!(snap.topics_max, 99);
+        assert_eq!(snap.retained_max, 9);
+        assert!(snap.connections <= 99);
+        assert!(snap.subscriptions <= 198);
     }
 }
