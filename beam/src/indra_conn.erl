@@ -46,7 +46,8 @@
          stop/1,
          broker_frame/4,
          pick_shard/2,
-         shard_index/2]).
+         shard_index/2,
+         conn_sock_opts/0]).
 
 %% gen_statem callbacks.
 -export([callback_mode/0,
@@ -174,7 +175,12 @@ init_shard(Sock, Opts, Shards) ->
              pubs_pending => #{},
              subs => #{},
              quiet_subs => #{},
-             rebinding => false},
+             rebinding => false,
+             %% PERF-09: QoS 0 publishes shed while the owning
+             %% shard is past its ingress bound. Observable via
+             %% sys:get_state (the existing OTP status path); no
+             %% other surface was added.
+             qos0_dropped => 0},
     {ok, await_connect, Data}.
 
 %% @private True when Pid is a known shard other than our pinned one.
@@ -523,8 +529,16 @@ terminate(_Reason, _State, _Data) ->
 sock_send(gen_tcp, Sock, Bin) -> gen_tcp:send(Sock, Bin);
 sock_send(ssl, Sock, Bin) -> ssl:send(Sock, Bin).
 
-sock_setopts(gen_tcp, Sock) -> inet:setopts(Sock, [{active, once}]);
-sock_setopts(ssl, Sock) -> ssl:setopts(Sock, [{active, once}]).
+%% @doc Socket options armed on every client connection socket.
+%% `nodelay' avoids delayed-ACK interaction on small MQTT frames;
+%% 64 KiB buffers bound per-connection memory (1M-session scale)
+%% while absorbing publish bursts.
+-spec conn_sock_opts() -> [term()].
+conn_sock_opts() ->
+    [{active, once}, {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
+
+sock_setopts(gen_tcp, Sock) -> inet:setopts(Sock, conn_sock_opts());
+sock_setopts(ssl, Sock) -> ssl:setopts(Sock, conn_sock_opts()).
 
 sock_close(gen_tcp, Sock) -> gen_tcp:close(Sock);
 sock_close(ssl, Sock) -> ssl:close(Sock).
@@ -796,6 +810,14 @@ handle_publish_packet(Payload, Flags, Data) ->
                                pubs_pending => Pending#{PacketId => true}}};
                 ok ->
                     {ok, Data#{seq => Seq + 1}};
+                %% PERF-09 bounded ingress: the owning shard is past
+                %% its bound. Shed this QoS 0 publish with a counted
+                %% drop; the connection stays up. QoS 1 keeps its
+                %% existing semantics (no silent drops: any failure,
+                %% including overload, still closes).
+                {error, overloaded} when QoS =:= 0 ->
+                    Dropped = maps:get(qos0_dropped, Data, 0),
+                    {ok, Data#{qos0_dropped => Dropped + 1}};
                 _ ->
                     {stop, normal, Data}
             end;

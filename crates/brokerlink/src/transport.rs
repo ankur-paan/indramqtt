@@ -16,6 +16,47 @@ pub const MAX_BATCH_FRAMES: usize = 64;
 /// Max encoded bytes coalesced into one socket write (PERF-05).
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
 
+/// Send buffer size for BrokerLink sockets (PERF-08).
+///
+/// Matches the Erlang edge `{sndbuf, 65536}` from PERF-07: 64 KiB bounds
+/// per-connection memory at scale while fitting the 64 KiB
+/// `FramedTransport` write buffer above.
+pub const BROKERLINK_SEND_BUF_BYTES: usize = 64 * 1024;
+/// Receive buffer size for BrokerLink sockets (PERF-08).
+///
+/// Matches the Erlang edge `{recbuf, 65536}` from PERF-07.
+pub const BROKERLINK_RECV_BUF_BYTES: usize = 64 * 1024;
+
+/// Apply hot-path socket tuning to an accepted BrokerLink `TcpStream`
+/// (PERF-08).
+///
+/// Enables `TCP_NODELAY` and sets 64 KiB send/recv buffers, matching the
+/// Erlang edge options from PERF-07. Small BrokerLink frames would
+/// otherwise risk a 40 ms delayed-ACK interaction, cross-host especially;
+/// loopback RTT hides it, so expect no local latency change. Tuning
+/// failures never fail the connection: each error is logged and tuning
+/// continues with whatever the OS provided.
+pub fn tune_brokerlink_tcp(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("BrokerLink socket set_nodelay(true) failed: {}", e);
+    }
+    let sock = socket2::SockRef::from(stream);
+    if let Err(e) = sock.set_send_buffer_size(BROKERLINK_SEND_BUF_BYTES) {
+        tracing::warn!(
+            "BrokerLink socket set_send_buffer_size({}) failed: {}",
+            BROKERLINK_SEND_BUF_BYTES,
+            e
+        );
+    }
+    if let Err(e) = sock.set_recv_buffer_size(BROKERLINK_RECV_BUF_BYTES) {
+        tracing::warn!(
+            "BrokerLink socket set_recv_buffer_size({}) failed: {}",
+            BROKERLINK_RECV_BUF_BYTES,
+            e
+        );
+    }
+}
+
 #[async_trait]
 pub trait BrokerLinkTransport: Send + Sync {
     async fn send(&self, frame: BrokerFrame) -> Result<()>;
@@ -193,5 +234,43 @@ mod tests {
         // Empty batch is a no-op with no syscall.
         client.send_batch(&[]).await.unwrap();
         assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    }
+
+    /// PERF-08: the post-accept tuning helper must leave `TCP_NODELAY`
+    /// on and the 64 KiB send/recv buffers in place. Fails on the
+    /// untuned socket (nodelay off by default), passes after tuning.
+    #[tokio::test]
+    async fn test_tune_brokerlink_tcp_enables_nodelay_and_buffers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (accepted, _) = listener.accept().await.unwrap();
+        let _client = connect.await.unwrap();
+
+        assert!(
+            !accepted.nodelay().unwrap(),
+            "precondition: fresh socket has nodelay off"
+        );
+
+        super::tune_brokerlink_tcp(&accepted);
+
+        assert!(
+            accepted.nodelay().unwrap(),
+            "TCP_NODELAY must be on after tuning"
+        );
+        let sock = socket2::SockRef::from(&accepted);
+        // Linux doubles the requested SO_SNDBUF/SO_RCVBUF, Windows
+        // reports the exact value, so `>=` holds on both.
+        assert!(
+            sock.send_buffer_size().unwrap() >= super::BROKERLINK_SEND_BUF_BYTES,
+            "send buffer below requested {}",
+            super::BROKERLINK_SEND_BUF_BYTES
+        );
+        assert!(
+            sock.recv_buffer_size().unwrap() >= super::BROKERLINK_RECV_BUF_BYTES,
+            "recv buffer below requested {}",
+            super::BROKERLINK_RECV_BUF_BYTES
+        );
     }
 }
