@@ -1109,6 +1109,14 @@ fn shard_kernel_binary() -> std::path::PathBuf {
     );
 }
 
+/// Extract the downlink packet id from `PublishOut` metadata
+/// (`TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8`).
+fn shard_downlink_packet_id(meta: &[u8]) -> u16 {
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    let base = 2 + topic_len;
+    u16::from_be_bytes([meta[base], meta[base + 1]])
+}
+
 /// Bind one client over `transport`, asserting the accepted
 /// `SessionBinding` reply. Returns `(session_id, present)`.
 async fn shard_bind(
@@ -1292,6 +1300,27 @@ async fn sharded_transports_do_not_serialize() {
             OpCode::PublishOut => {
                 assert_eq!(frame.header.conn_id, 11);
                 assert!(seen.insert(frame.payload.to_vec()), "no duped delivery");
+                // T-31: ack every live QoS 1 downlink (correct MQTT
+                // client behaviour) so nothing stays inflight at
+                // detach; the reconnect then replays only what was
+                // published while detached. No assertion below changes.
+                let pid = shard_downlink_packet_id(&frame.metadata);
+                assert_ne!(pid, 0, "QoS 1 downlink carries a packet id");
+                let mut ack_meta = Vec::with_capacity(3);
+                ack_meta.extend_from_slice(&pid.to_be_bytes());
+                ack_meta.push(0u8);
+                let ack = BrokerFrame::new(
+                    OpCode::PubAckIn,
+                    11,
+                    400 + seen.len() as u64,
+                    bytes::Bytes::from(ack_meta),
+                    bytes::Bytes::new(),
+                )
+                .expect("valid puback frame");
+                tokio::time::timeout(SHARD_E2E_STEP, t1.send(ack))
+                    .await
+                    .expect("puback in time")
+                    .expect("puback send");
             }
             other => panic!("unexpected frame on T1: {other:?}"),
         }

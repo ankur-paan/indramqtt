@@ -45,6 +45,9 @@ pub struct Metrics {
     dead_mailbox_dropped: AtomicU64,
     detached_clean_dropped: AtomicU64,
     offline_queue_evicted: AtomicU64,
+    // QoS 1 downlinks delivered live once but not tracked for redelivery
+    // because the per-session inflight window (T-31) was full.
+    inflight_dropped: AtomicU64,
 }
 
 /// One consistent read of every counter for API handlers.
@@ -78,6 +81,7 @@ pub struct MetricsSnapshot {
     pub dead_mailbox_dropped: u64,
     pub detached_clean_dropped: u64,
     pub offline_queue_evicted: u64,
+    pub inflight_dropped: u64,
 }
 
 impl Metrics {
@@ -336,6 +340,16 @@ impl Metrics {
         self.offline_queue_evicted.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// One QoS 1 downlink delivered live but left untracked because the
+    /// per-session inflight window was full (T-31 drop-newest-from-track).
+    pub fn inc_inflight_dropped(&self) -> u64 {
+        self.inc_inflight_dropped_by(1)
+    }
+
+    pub fn inc_inflight_dropped_by(&self, n: u64) -> u64 {
+        self.inflight_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
     pub fn connect_received(&self) -> u64 {
         self.connect_received.load(Ordering::Relaxed)
     }
@@ -416,6 +430,10 @@ impl Metrics {
         self.offline_queue_evicted.load(Ordering::Relaxed)
     }
 
+    pub fn inflight_dropped(&self) -> u64 {
+        self.inflight_dropped.load(Ordering::Relaxed)
+    }
+
     /// Copy every counter in one call for API handlers.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -444,6 +462,7 @@ impl Metrics {
             dead_mailbox_dropped: self.dead_mailbox_dropped(),
             detached_clean_dropped: self.detached_clean_dropped(),
             offline_queue_evicted: self.offline_queue_evicted(),
+            inflight_dropped: self.inflight_dropped(),
         }
     }
 
@@ -476,7 +495,10 @@ impl Metrics {
               indramqtt_detached_clean_dropped_total {}\n\
               # HELP indramqtt_offline_queue_evicted_total Offline-queue entries evicted for detached durable sessions.\n\
               # TYPE indramqtt_offline_queue_evicted_total counter\n\
-              indramqtt_offline_queue_evicted_total {}\n",
+              indramqtt_offline_queue_evicted_total {}\n\
+              # HELP indramqtt_inflight_dropped_total QoS 1 downlinks delivered live but untracked for redelivery (per-session inflight window full).\n\
+              # TYPE indramqtt_inflight_dropped_total counter\n\
+              indramqtt_inflight_dropped_total {}\n",
             self.messages_received(),
             self.messages_forwarded(),
             self.messages_dropped(),
@@ -486,6 +508,7 @@ impl Metrics {
             self.dead_mailbox_dropped(),
             self.detached_clean_dropped(),
             self.offline_queue_evicted(),
+            self.inflight_dropped(),
         )
     }
 }
