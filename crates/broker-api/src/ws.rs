@@ -585,8 +585,11 @@ async fn handle_publish(
             Bytes::from(meta),
             publish.payload.clone(),
         ) {
-            state.conns.route(dest, frame);
-            delivered += 1;
+            // Outcome counting: dead mailboxes are already counted
+            // inside `ConnTable::route`, never as deliveries.
+            if state.conns.route(dest, frame) {
+                delivered += 1;
+            }
         }
     }
     state.metrics.inc_messages_forwarded_by(delivered);

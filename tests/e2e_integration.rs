@@ -822,7 +822,9 @@ async fn kicked_mqtt_client_sees_disconnect() {
     let forwarder = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(TIMEOUT, edge_rx.recv()).await {
-                Ok(Some(frame)) => forwarder_conns.route(frame.header.conn_id, frame),
+                Ok(Some(frame)) => {
+                    let _ = forwarder_conns.route(frame.header.conn_id, frame);
+                }
                 // All senders gone: nothing left to deliver.
                 Ok(None) => break,
                 // Idle: keep forwarding.
