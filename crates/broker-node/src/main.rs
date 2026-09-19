@@ -57,7 +57,9 @@ struct Args {
     #[arg(long, default_value = "indra-node-1")]
     node_id: String,
 
-    /// Accept MQTT connections without credentials even when users are configured.
+    /// Accept MQTT connections without credentials while no users are
+    /// configured. Ignored once users exist: a non-empty user store
+    /// always rejects unauthenticated clients.
     #[arg(long)]
     allow_anonymous: bool,
 }
@@ -138,7 +140,10 @@ fn session_binding_reply(
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         if req.username.is_none() {
-            if shared.auth.user_count() > 0 && !shared.allow_anonymous {
+            // A non-empty user store always wins over `--allow-anonymous`:
+            // unauthenticated clients are rejected whenever users exist.
+            // The flag only opens the broker while the store is empty.
+            if shared.auth.user_count() > 0 {
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87));
             }
@@ -2801,13 +2806,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_auth_accepts_anonymous_with_allow_flag() {
+    async fn bind_auth_rejects_anonymous_with_allow_flag_when_users_exist() {
+        // `--allow-anonymous` is ignored once users exist: a non-empty
+        // user store always rejects unauthenticated clients with 0x87.
         let mut shared = test_shared();
         shared.allow_anonymous = true;
         shared
             .auth
             .add_user("alice", b"s3cret")
             .expect("memory-only persist cannot fail");
+
+        let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "anonymous bind must yield return code 0x87");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-z").is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_auth_accepts_anonymous_with_allow_flag_when_store_empty() {
+        // While the user store is empty the flag keeps its meaning.
+        let mut shared = test_shared();
+        shared.allow_anonymous = true;
 
         let frame = bind_frame(83, 1, encode_bind_meta("dev-z", true, 60));
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
@@ -2824,14 +2845,17 @@ mod tests {
             .auth
             .add_user("capped-user", b"pw")
             .expect("memory-only persist cannot fail");
-        assert!(shared.auth.set_quotas(
-            "capped-user",
-            UserQuotas {
-                max_connections: Some(1),
-                max_publish_rate: None,
-                max_publish_burst: None,
-            }
-        ));
+        assert!(shared
+            .auth
+            .set_quotas(
+                "capped-user",
+                UserQuotas {
+                    max_connections: Some(1),
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                }
+            )
+            .expect("memory-only persist cannot fail"));
 
         // First connection admitted.
         let frame = bind_frame(
@@ -2887,14 +2911,17 @@ mod tests {
             .auth
             .add_user("fast-user", b"pw")
             .expect("memory-only persist cannot fail");
-        assert!(shared.auth.set_quotas(
-            "fast-user",
-            UserQuotas {
-                max_connections: None,
-                max_publish_rate: Some(2),
-                max_publish_burst: Some(2),
-            }
-        ));
+        assert!(shared
+            .auth
+            .set_quotas(
+                "fast-user",
+                UserQuotas {
+                    max_connections: None,
+                    max_publish_rate: Some(2),
+                    max_publish_burst: Some(2),
+                }
+            )
+            .expect("memory-only persist cannot fail"));
 
         // Subscriber soaks up whatever routes (proves the drop below).
         let (listener, _) = shared.sessions.get_or_create("sink", true);

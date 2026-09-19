@@ -2,7 +2,9 @@
 //!
 //! A minimal MQTT 3.1.1 packet engine over WebSocket binary frames: the
 //! browser console can CONNECT (with optional credentials), SUBSCRIBE,
-//! PUBLISH (QoS 0/1), PINGREQ and DISCONNECT. Subscriptions register in
+//! PUBLISH (QoS 0/1), PINGREQ and DISCONNECT. Anonymous CONNECT is
+//! rejected once MQTT users exist (same rule as the BrokerLink bind
+//! path). Subscriptions register in
 //! the shared router and mailboxes in the shared [`ConnTable`], so edge
 //! publishes fan out to console clients and console publishes fan out to
 //! edge clients through the same directory.
@@ -393,6 +395,13 @@ async fn handle_packet(
         // First packet must be CONNECT.
         (true, 1) => {
             let conn = decode_connect(payload, flags).ok_or(())?;
+            // A non-empty user store always wins: unauthenticated console
+            // clients are rejected whenever users exist, exactly like the
+            // BrokerLink bind path (0x87, not authorized).
+            if conn.username.is_none() && state.auth.user_count() > 0 {
+                send_bin(socket, encode_connack(false, 0x87)).await;
+                return Err(());
+            }
             if let Some(username) = conn.username.as_deref() {
                 let password = conn.password.as_deref();
                 if state
