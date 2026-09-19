@@ -283,6 +283,10 @@ impl Shared {
         let conns = Arc::new(ConnTable::default());
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         let metrics = Arc::new(Metrics::new());
+        // PERF-10: attach drop accounting to the delivery table so
+        // `ConnTable::route` counts unknown-conn and dead-mailbox drops
+        // exactly where it discards them.
+        conns.set_metrics(&metrics);
         let stats = Arc::new(StatsStore::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
@@ -395,8 +399,15 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
-        let deliveries =
-            build_downlink_frames(&self.router, &self.sessions, &topic, qos, retain, &payload);
+        let deliveries = build_downlink_frames(
+            &self.router,
+            &self.sessions,
+            &self.metrics,
+            &topic,
+            qos,
+            retain,
+            &payload,
+        );
         self.metrics
             .inc_messages_forwarded_by(deliveries.len() as u64);
         self.metrics.inc_publish_sent_by(deliveries.len() as u64);
@@ -1050,6 +1061,7 @@ async fn ingress_pipeline(
     build_downlink_frames(
         &shared.router,
         &shared.sessions,
+        &shared.metrics,
         topic,
         qos,
         retain,
@@ -1084,9 +1096,14 @@ async fn forward_cluster(shared: &Shared, topic: &Topic, qos: QoS, payload: &Byt
 /// session buffers into its offline queue instead, and a detached clean
 /// session drops. Sessions unknown to the manager fall back to the
 /// router-registered conn_id.
+///
+/// PERF-10: each silent drop also bumps its kernel counter (detached
+/// clean drop, durable-queue eviction) exactly where the frame is
+/// discarded. Drops that happened before still happen.
 fn build_downlink_frames(
     router: &Router,
     sessions: &SessionManager,
+    metrics: &Metrics,
     topic: &Topic,
     qos: QoS,
     retain: bool,
@@ -1123,12 +1140,22 @@ fn build_downlink_frames(
                         // Detached (or half-bound) session: durable
                         // sessions buffer for replay, clean ones drop.
                         if !session.clean_start {
+                            // Hook only: the eviction itself stays
+                            // inside `push_offline`; count what the
+                            // push displaced.
+                            let before = session.offline_len();
                             session.push_offline(QueuedMessage {
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
                                 payload: payload.clone(),
                             });
+                            let evicted = (before + 1).saturating_sub(session.offline_len());
+                            if evicted > 0 {
+                                metrics.inc_offline_queue_evicted_by(evicted as u64);
+                            }
+                        } else {
+                            metrics.inc_detached_clean_dropped();
                         }
                     }
                 }
@@ -1243,6 +1270,7 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
     for (conn_id, frame) in build_downlink_frames(
         &shared.router,
         &shared.sessions,
+        &shared.metrics,
         &msg.topic,
         msg.qos,
         false,
@@ -1494,6 +1522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use broker_auth::{AclAction, AclRule};
+    use broker_session::MAX_OFFLINE_QUEUE;
 
     /// Unique scratch data dir under the OS temp dir (no dev-dependency).
     fn unique_data_dir() -> std::path::PathBuf {
@@ -1663,6 +1692,83 @@ mod tests {
 
     fn test_shared() -> Shared {
         Shared::new()
+    }
+
+    #[test]
+    fn downlink_detached_clean_session_counts_drop_only() {
+        // PERF-10: one frame for a detached clean session must bump
+        // exactly the detached-clean counter and queue nothing.
+        let router = Router::new();
+        let sessions = SessionManager::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("sensors/temp").unwrap();
+        router.subscribe(
+            &filter,
+            Subscription::new("ghost-clean", 77, QoS::AtMostOnce),
+        );
+        let (session, _) = sessions.get_or_create("ghost-clean", true);
+        *session.connected.write() = false;
+        *session.conn_id.write() = None;
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        let deliveries = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtMostOnce,
+            false,
+            &Bytes::from_static(b"21.5"),
+        );
+
+        assert!(deliveries.is_empty());
+        assert_eq!(session.offline_len(), 0);
+        assert_eq!(metrics.detached_clean_dropped(), 1);
+        assert_eq!(metrics.unknown_conn_dropped(), 0);
+        assert_eq!(metrics.dead_mailbox_dropped(), 0);
+        assert_eq!(metrics.offline_queue_evicted(), 0);
+    }
+
+    #[test]
+    fn downlink_offline_eviction_counts_drop_only() {
+        // PERF-10: pushing into a full offline queue keeps the queueing
+        // itself unchanged (oldest evicted, length capped) and bumps
+        // exactly the eviction counter.
+        let router = Router::new();
+        let sessions = SessionManager::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("jobs/backlog").unwrap();
+        router.subscribe(&filter, Subscription::new("durable-1", 78, QoS::AtMostOnce));
+        let (session, _) = sessions.get_or_create("durable-1", false);
+        *session.connected.write() = false;
+        *session.conn_id.write() = None;
+        for i in 0..MAX_OFFLINE_QUEUE {
+            session.push_offline(QueuedMessage {
+                topic: Topic::new("jobs/backlog").unwrap(),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                payload: Bytes::from(format!("seed-{i}")),
+            });
+        }
+        assert_eq!(session.offline_len(), MAX_OFFLINE_QUEUE);
+
+        let topic = Topic::new("jobs/backlog").unwrap();
+        let deliveries = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtMostOnce,
+            false,
+            &Bytes::from_static(b"new"),
+        );
+
+        assert!(deliveries.is_empty());
+        assert_eq!(session.offline_len(), MAX_OFFLINE_QUEUE);
+        assert_eq!(metrics.offline_queue_evicted(), 1);
+        assert_eq!(metrics.unknown_conn_dropped(), 0);
+        assert_eq!(metrics.dead_mailbox_dropped(), 0);
+        assert_eq!(metrics.detached_clean_dropped(), 0);
     }
 
     #[test]

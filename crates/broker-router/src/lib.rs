@@ -1,4 +1,5 @@
 use ahash::{AHashMap, AHashSet};
+use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use brokerlink::BrokerFrame;
 use parking_lot::{Mutex, RwLock};
@@ -445,6 +446,44 @@ mod tests {
     }
 
     #[test]
+    fn route_unknown_conn_counts_drop_only() {
+        // PERF-10: three frames to a conn_id with no mailbox must bump
+        // exactly the unknown-conn counter, nothing else.
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::default();
+        table.set_metrics(&metrics);
+
+        for _ in 0..3 {
+            table.route(9999, BrokerFrame::ping(9999, 0));
+        }
+
+        assert_eq!(metrics.unknown_conn_dropped(), 3);
+        assert_eq!(metrics.dead_mailbox_dropped(), 0);
+        assert_eq!(metrics.detached_clean_dropped(), 0);
+        assert_eq!(metrics.offline_queue_evicted(), 0);
+    }
+
+    #[test]
+    fn route_dead_mailbox_counts_drop_only() {
+        // PERF-10: one frame into a mailbox whose receiver is gone must
+        // bump exactly the dead-mailbox counter (and unregister, as
+        // before), nothing else.
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::default();
+        table.set_metrics(&metrics);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(7, tx);
+        drop(rx);
+
+        table.route(7, BrokerFrame::ping(7, 0));
+
+        assert_eq!(metrics.dead_mailbox_dropped(), 1);
+        assert_eq!(metrics.unknown_conn_dropped(), 0);
+        assert_eq!(metrics.detached_clean_dropped(), 0);
+        assert_eq!(metrics.offline_queue_evicted(), 0);
+    }
+
+    #[test]
     fn concurrent_routes_do_not_lose_frames() {
         // Eight connections spread across buckets, hammered from eight
         // threads at once: every routed frame must arrive exactly once
@@ -502,6 +541,12 @@ mod tests {
 #[derive(Debug)]
 pub struct ConnTable {
     shards: [Mutex<HashMap<u64, ConnSlot>>; NUM_SHARDS],
+    /// PERF-10 silent-drop accounting. Set once by the owning kernel
+    /// (`set_metrics`); a table without metrics (tests, API transports
+    /// that never wire one) routes exactly as before, only uncounted.
+    /// `OnceLock` keeps the hot path to one atomic load: no per-route
+    /// lock, no behaviour change when unset.
+    metrics: std::sync::OnceLock<Arc<Metrics>>,
 }
 
 /// Number of `ConnTable` buckets. A power of two so the bucket mapping
@@ -513,6 +558,7 @@ impl Default for ConnTable {
     fn default() -> Self {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            metrics: std::sync::OnceLock::new(),
         }
     }
 }
@@ -532,6 +578,13 @@ impl ConnTable {
     /// neighbours across buckets.
     fn shard(&self, conn_id: u64) -> &Mutex<HashMap<u64, ConnSlot>> {
         &self.shards[(conn_id as usize) % NUM_SHARDS]
+    }
+
+    /// Attach the kernel [`Metrics`] for silent-drop accounting. The
+    /// first call wins; later calls are ignored so a shared table
+    /// cannot be rewired mid-flight.
+    pub fn set_metrics(&self, metrics: &Arc<Metrics>) {
+        let _ = self.metrics.set(metrics.clone());
     }
 
     pub fn register(&self, conn_id: u64, tx: UnboundedSender<BrokerFrame>) {
@@ -562,6 +615,10 @@ impl ConnTable {
     /// sequence number. Drops (and forgets) dead destinations. The stamp
     /// orders frames per destination only, so `Relaxed` is sufficient;
     /// it is never used for cross-connection synchronization.
+    ///
+    /// PERF-10: each silent drop also bumps its kernel counter (unknown
+    /// destination vs. dead mailbox) exactly where the frame is
+    /// discarded. Drops that happened before still happen.
     pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) {
         let tx = {
             let shard = self.shard(conn_id).lock();
@@ -574,7 +631,12 @@ impl ConnTable {
         if let Some(tx) = tx {
             if tx.send(frame).is_err() {
                 self.unregister(conn_id);
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.inc_dead_mailbox_dropped();
+                }
             }
+        } else if let Some(metrics) = self.metrics.get() {
+            metrics.inc_unknown_conn_dropped();
         }
     }
 }
