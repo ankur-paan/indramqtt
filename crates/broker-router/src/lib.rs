@@ -442,7 +442,41 @@ mod tests {
         assert!(rx_b.try_recv().is_err());
 
         // Unknown destinations keep drop-and-forget semantics.
-        table.route(9999, BrokerFrame::ping(9999, 0));
+        assert!(
+            !table.route(9999, BrokerFrame::ping(9999, 0)),
+            "unknown destination must report dropped"
+        );
+    }
+
+    #[test]
+    fn route_reports_whether_the_frame_reached_a_live_mailbox() {
+        let table = ConnTable::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(7, tx);
+        assert!(
+            table.route(7, BrokerFrame::ping(7, 0)),
+            "live mailbox must report enqueued"
+        );
+        assert!(
+            !table.route(9999, BrokerFrame::ping(9999, 0)),
+            "unknown destination reports dropped"
+        );
+    }
+
+    #[test]
+    fn route_reports_dead_mailbox_and_prunes_it() {
+        let table = ConnTable::default();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(8, tx);
+        drop(rx);
+        assert!(
+            !table.route(8, BrokerFrame::ping(8, 0)),
+            "dead mailbox must report dropped"
+        );
+        assert!(
+            !table.route(8, BrokerFrame::ping(8, 0)),
+            "dead destination stays pruned"
+        );
     }
 
     #[test]
@@ -612,14 +646,20 @@ impl ConnTable {
     }
 
     /// Deliver one frame to a connection, stamping a per-destination
-    /// sequence number. Drops (and forgets) dead destinations. The stamp
-    /// orders frames per destination only, so `Relaxed` is sufficient;
-    /// it is never used for cross-connection synchronization.
+    /// sequence number. Returns true when the frame reached a live
+    /// mailbox, false when the destination is unknown or its task is
+    /// gone (the frame is dropped and the dead destination pruned).
+    /// Callers must only count deliveries on true: a false return is a
+    /// real loss (QoS 1 has no retry yet), never a successful delivery.
+    /// The stamp orders frames per destination only, so `Relaxed` is
+    /// sufficient; it is never used for cross-connection synchronization.
     ///
     /// PERF-10: each silent drop also bumps its kernel counter (unknown
     /// destination vs. dead mailbox) exactly where the frame is
-    /// discarded. Drops that happened before still happen.
-    pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) {
+    /// discarded. Drops that happened before still happen. Callers must
+    /// not bump those counters themselves: one undeliverable frame
+    /// increments exactly one counter by exactly one, inside this method.
+    pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) -> bool {
         let tx = {
             let shard = self.shard(conn_id).lock();
             shard.get(&conn_id).map(|slot| {
@@ -629,14 +669,16 @@ impl ConnTable {
             })
         };
         if let Some(tx) = tx {
-            if tx.send(frame).is_err() {
-                self.unregister(conn_id);
-                if let Some(metrics) = self.metrics.get() {
-                    metrics.inc_dead_mailbox_dropped();
-                }
+            if tx.send(frame).is_ok() {
+                return true;
+            }
+            self.unregister(conn_id);
+            if let Some(metrics) = self.metrics.get() {
+                metrics.inc_dead_mailbox_dropped();
             }
         } else if let Some(metrics) = self.metrics.get() {
             metrics.inc_unknown_conn_dropped();
         }
+        false
     }
 }

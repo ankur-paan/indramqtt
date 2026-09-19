@@ -413,19 +413,23 @@ impl BrokerSink for InMemoryBrokerSink {
             retain,
             &payload,
         );
-        self.metrics
-            .inc_messages_forwarded_by(deliveries.len() as u64);
-        self.metrics.inc_publish_sent_by(deliveries.len() as u64);
-        self.metrics.inc_delivered_by(deliveries.len() as u64);
-        self.metrics.inc_bytes_sent_by(
-            deliveries
-                .iter()
-                .map(|(_, frame)| frame.total_frame_len() as u64)
-                .sum(),
-        );
+        // Only frames that reached a live mailbox count as
+        // forwarded/sent/delivered. Drops are already counted inside
+        // `ConnTable::route` (unknown-conn vs. dead-mailbox); counting
+        // them here as well would double-count the same loss.
+        let mut enqueued = 0u64;
+        let mut enqueued_bytes = 0u64;
         for (conn_id, frame) in deliveries {
-            self.conns.route(conn_id, frame);
+            let len = frame.total_frame_len() as u64;
+            if self.conns.route(conn_id, frame) {
+                enqueued += 1;
+                enqueued_bytes += len;
+            }
         }
+        self.metrics.inc_messages_forwarded_by(enqueued);
+        self.metrics.inc_publish_sent_by(enqueued);
+        self.metrics.inc_delivered_by(enqueued);
+        self.metrics.inc_bytes_sent_by(enqueued_bytes);
         Ok(())
     }
 }
@@ -639,20 +643,23 @@ where
             if let Some(ack) = ack {
                 transport.send(ack).await?;
             }
-            shared
-                .metrics
-                .inc_messages_forwarded_by(deliveries.len() as u64);
-            shared.metrics.inc_publish_sent_by(deliveries.len() as u64);
-            shared.metrics.inc_delivered_by(deliveries.len() as u64);
-            shared.metrics.inc_bytes_sent_by(
-                deliveries
-                    .iter()
-                    .map(|(_, routed)| routed.total_frame_len() as u64)
-                    .sum(),
-            );
+            // Only frames that reached a live mailbox count as
+            // forwarded/sent/delivered. Drops are already counted inside
+            // `ConnTable::route` (unknown-conn vs. dead-mailbox); counting
+            // them here as well would double-count the same loss.
+            let mut enqueued = 0u64;
+            let mut enqueued_bytes = 0u64;
             for (conn_id, routed) in deliveries {
-                shared.conns.route(conn_id, routed);
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(conn_id, routed) {
+                    enqueued += 1;
+                    enqueued_bytes += len;
+                }
             }
+            shared.metrics.inc_messages_forwarded_by(enqueued);
+            shared.metrics.inc_publish_sent_by(enqueued);
+            shared.metrics.inc_delivered_by(enqueued);
+            shared.metrics.inc_bytes_sent_by(enqueued_bytes);
         }
         OpCode::UnbindConnection => {
             apply_unbind(&frame, shared);
@@ -854,9 +861,14 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             Bytes::from(meta),
             queued.payload.clone(),
         ) {
-            replayed_bytes += routed.total_frame_len() as u64;
-            shared.conns.route(frame.header.conn_id, routed);
-            replayed += 1;
+            // Only replays that reached the live mailbox count; a dead
+            // mailbox is already counted inside `ConnTable::route`, never
+            // a delivery.
+            let len = routed.total_frame_len() as u64;
+            if shared.conns.route(frame.header.conn_id, routed) {
+                replayed_bytes += len;
+                replayed += 1;
+            }
         }
     }
     shared.metrics.inc_publish_sent_by(replayed as u64);
@@ -1005,20 +1017,22 @@ async fn apply_delayed_publish(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         let deliveries = ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
-        shared
-            .metrics
-            .inc_messages_forwarded_by(deliveries.len() as u64);
-        shared.metrics.inc_publish_sent_by(deliveries.len() as u64);
-        shared.metrics.inc_delivered_by(deliveries.len() as u64);
-        shared.metrics.inc_bytes_sent_by(
-            deliveries
-                .iter()
-                .map(|(_, routed)| routed.total_frame_len() as u64)
-                .sum(),
-        );
+        // Outcome counting, like the immediate path: only live
+        // mailboxes count as delivered; drops are already counted
+        // inside `ConnTable::route`.
+        let mut enqueued = 0u64;
+        let mut enqueued_bytes = 0u64;
         for (conn_id, routed) in deliveries {
-            shared.conns.route(conn_id, routed);
+            let len = routed.total_frame_len() as u64;
+            if shared.conns.route(conn_id, routed) {
+                enqueued += 1;
+                enqueued_bytes += len;
+            }
         }
+        shared.metrics.inc_messages_forwarded_by(enqueued);
+        shared.metrics.inc_publish_sent_by(enqueued);
+        shared.metrics.inc_delivered_by(enqueued);
+        shared.metrics.inc_bytes_sent_by(enqueued_bytes);
         forward_cluster(&shared, &inner_topic, qos, &payload).await;
     });
     (ack, Vec::new())
@@ -1281,7 +1295,8 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
         false,
         &msg.payload,
     ) {
-        shared.conns.route(conn_id, frame);
+        // A dead mailbox is already counted inside `ConnTable::route`.
+        let _ = shared.conns.route(conn_id, frame);
     }
 }
 
@@ -2109,6 +2124,205 @@ mod tests {
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].0, 51);
         assert_eq!(deliveries[0].1.payload, Bytes::from_static(b"data"));
+    }
+
+    /// A QoS 1 publish whose downlink mailbox is unknown must not be
+    /// counted as delivered. The publisher still gets its PubAck
+    /// (receipt), but the frame never reached any edge mailbox, so
+    /// `delivered`/`publish_sent`/`messages_forwarded` must stay zero.
+    /// Fails before the fix by counting a delivery to nobody.
+    #[tokio::test]
+    async fn qos1_publish_to_unknown_mailbox_is_not_counted_delivered() {
+        let shared = test_shared();
+        // Subscriber session is live and subscribed, but its edge
+        // mailbox was never registered (dead/pruned connection): the
+        // router still matches, so a delivery frame is built.
+        let bind = bind_frame(51, 1, encode_bind_meta("q1-ghost", true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(51, 2, encode_subscribe_meta(3, "q1-ghost", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Drive the real ingress path (ack + outcome counting) over a
+        // loopback BrokerLink transport.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = FramedTransport::new(client_io);
+        let server = FramedTransport::new(server_io);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let mut bound = Vec::new();
+
+        let (meta, payload) = encode_publish_meta("t", 42, 1, false, b"data");
+        handle_inbound_frame(
+            publish_frame(52, 8, meta, payload),
+            &shared,
+            &tx,
+            &server,
+            &mut bound,
+        )
+        .await
+        .expect("publish handling succeeds");
+
+        // The publisher is acked (receipt), even though nothing was delivered.
+        let ack = client.recv().await.expect("publisher ack");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+
+        // Nothing reached a live mailbox: the loss must be visible, not
+        // counted as a delivery.
+        assert_eq!(
+            shared.metrics.delivered(),
+            0,
+            "dropped downlink counted as delivered"
+        );
+        assert_eq!(shared.metrics.publish_sent(), 0);
+        assert_eq!(shared.metrics.messages_forwarded(), 0);
+        assert_eq!(
+            shared.metrics.qos1_received(),
+            1,
+            "ingress itself was processed"
+        );
+    }
+
+    /// The same dropped downlink must surface as exactly one drop under
+    /// exactly one existing counter (no double counting): an unknown
+    /// destination bumps `unknown_conn_dropped` and nothing else.
+    #[tokio::test]
+    async fn qos1_publish_to_unknown_mailbox_counts_single_drop_only() {
+        let shared = test_shared();
+        let bind = bind_frame(71, 1, encode_bind_meta("q1-ghost-2", true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(71, 2, encode_subscribe_meta(3, "q1-ghost-2", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = FramedTransport::new(client_io);
+        let server = FramedTransport::new(server_io);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let mut bound = Vec::new();
+
+        let (meta, payload) = encode_publish_meta("t", 9, 1, false, b"data");
+        handle_inbound_frame(
+            publish_frame(72, 8, meta, payload),
+            &shared,
+            &tx,
+            &server,
+            &mut bound,
+        )
+        .await
+        .expect("publish handling succeeds");
+        let ack = client.recv().await.expect("publisher ack");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+
+        assert_eq!(shared.metrics.delivered(), 0);
+        assert_eq!(
+            shared.metrics.unknown_conn_dropped(),
+            1,
+            "unknown mailbox must count exactly one unknown-conn drop"
+        );
+        assert_eq!(shared.metrics.dead_mailbox_dropped(), 0);
+        assert_eq!(shared.metrics.detached_clean_dropped(), 0);
+        assert_eq!(shared.metrics.offline_queue_evicted(), 0);
+    }
+
+    /// A dropped downlink into a dead (receiver-gone) mailbox must bump
+    /// exactly `dead_mailbox_dropped` and nothing else.
+    #[tokio::test]
+    async fn qos1_publish_to_dead_mailbox_counts_single_drop_only() {
+        let shared = test_shared();
+        let bind = bind_frame(81, 1, encode_bind_meta("q1-ghost-3", true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(81, 2, encode_subscribe_meta(3, "q1-ghost-3", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        // Register then drop the receiver: the mailbox is dead at route
+        // time, so `route` prunes it and counts a dead-mailbox drop.
+        let (tx_dead, rx_dead) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(81, tx_dead);
+        drop(rx_dead);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = FramedTransport::new(client_io);
+        let server = FramedTransport::new(server_io);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let mut bound = Vec::new();
+
+        let (meta, payload) = encode_publish_meta("t", 11, 1, false, b"data");
+        handle_inbound_frame(
+            publish_frame(82, 8, meta, payload),
+            &shared,
+            &tx,
+            &server,
+            &mut bound,
+        )
+        .await
+        .expect("publish handling succeeds");
+        let ack = client.recv().await.expect("publisher ack");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+
+        assert_eq!(shared.metrics.delivered(), 0);
+        assert_eq!(shared.metrics.dead_mailbox_dropped(), 1);
+        assert_eq!(shared.metrics.unknown_conn_dropped(), 0);
+        assert_eq!(shared.metrics.detached_clean_dropped(), 0);
+        assert_eq!(shared.metrics.offline_queue_evicted(), 0);
+    }
+
+    /// Known defect, no redelivery yet (ticket T-31): a durable
+    /// subscriber that disconnects with a QoS 1 downlink inflight (sent,
+    /// never acked) must see that message redelivered on reconnect. The
+    /// kernel keeps no per-subscriber inflight store and the edge ignores
+    /// inbound PUBACKs, so the message is lost instead.
+    ///
+    /// Ignored until inflight tracking lands; run explicitly with
+    /// `cargo test -p broker-node qos1_unacked -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn qos1_unacked_downlink_is_redelivered_after_reconnect() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-durable", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-durable", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Live mailbox: the downlink is routed (inflight, unacked).
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"redeliver-me");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "downlink must be built for the live subscriber"
+        );
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let inflight = rx61.try_recv().expect("downlink reached the edge mailbox");
+        assert_eq!(inflight.payload, Bytes::from_static(b"redeliver-me"));
+
+        // Subscriber disconnects without acking (durable session keeps
+        // subscriptions and offline queue), then reconnects non-clean.
+        let mut unbind_meta = vec![0x00u8, 0x0Au8];
+        unbind_meta.extend_from_slice(b"q1-durable");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-durable", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+
+        // The unacked message must come back; today the offline queue
+        // only holds never-routed messages, so replay is empty.
+        let replayed = replay_offline(&rebind, &shared).await;
+        assert!(
+            replayed >= 1,
+            "unacked QoS 1 downlink was not redelivered after reconnect"
+        );
     }
 
     #[tokio::test]

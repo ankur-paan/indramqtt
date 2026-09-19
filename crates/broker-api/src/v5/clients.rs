@@ -486,8 +486,11 @@ pub async fn publish_message(
             payload.clone(),
         );
         if let Ok(frame) = routed_frame {
-            state.conns.route(sub.conn_id, frame);
-            state.metrics.inc_messages_forwarded();
+            // Only live mailboxes count as forwarded; drops are already
+            // counted inside `ConnTable::route`.
+            if state.conns.route(sub.conn_id, frame) {
+                state.metrics.inc_messages_forwarded();
+            }
         }
     }
 
@@ -517,8 +520,10 @@ pub async fn publish_message(
                     payload.clone(),
                 );
                 if let Ok(frame) = routed_frame {
-                    self.conns.route(sub.conn_id, frame);
-                    self.metrics.inc_messages_forwarded();
+                    // Outcome counting, like the publish path above.
+                    if self.conns.route(sub.conn_id, frame) {
+                        self.metrics.inc_messages_forwarded();
+                    }
                 }
             }
             Ok(())
