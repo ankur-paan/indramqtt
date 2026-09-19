@@ -1,0 +1,1 @@
+[{"operation": "GET /schemas/{name}", "path_params": {"name": "connectors"}, "query": {}, "body": null, "setup": [], "cleanup": []}]
