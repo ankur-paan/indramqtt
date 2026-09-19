@@ -368,6 +368,28 @@ encode_suback_vectors_test() ->
                  indra_mqtt_codec:encode_suback(9, [16#80])),
     ?assertError(badarg, indra_mqtt_codec:encode_suback(9, [5])).
 
+encode_suback_multibyte_remaining_length_test() ->
+    %% 126 granted codes: the body is 128 bytes, so the Remaining
+    %% Length must use the two-byte form <<16#80, 16#01>>. The old
+    %% single-byte form emitted 16#80 here, whose continuation bit
+    %% makes every spec-compliant reader swallow the packet id as a
+    %% length byte and desynchronise the whole stream (short PUBLISH
+    %% bodies and shifted payloads downstream).
+    Codes126 = lists:duplicate(126, 0),
+    Bin126 = indra_mqtt_codec:encode_suback(7, Codes126),
+    <<16#90, 16#80, 16#01, Body126/binary>> = Bin126,
+    ?assertEqual(128, byte_size(Body126)),
+    {ok, Pkt126, <<>>} = indra_mqtt_codec:decode_packet(Bin126),
+    ?assertEqual(128, maps:get(remaining_length, Pkt126)),
+    %% 200 codes round-trip through the generic framing path with the
+    %% granted codes intact.
+    Codes200 = lists:duplicate(200, 1),
+    Bin200 = indra_mqtt_codec:encode_suback(9, Codes200),
+    {ok, Pkt200, <<>>} = indra_mqtt_codec:decode_packet(Bin200),
+    ?assertEqual(202, maps:get(remaining_length, Pkt200)),
+    ?assertEqual(<<0, 9, (binary:copy(<<1>>, 200))/binary>>,
+                 maps:get(payload, Pkt200)).
+
 %%====================================================================
 %% PUBLISH / PUBACK
 %%====================================================================

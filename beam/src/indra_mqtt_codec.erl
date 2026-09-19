@@ -182,12 +182,17 @@ decode_subscribe(_) ->
 
 %% @doc Encode an MQTT SUBACK packet from a packet id and granted codes.
 %%
-%% Each code is a granted QoS (0..2) or 16#80 (failure).
+%% Each code is a granted QoS (0..2) or 16#80 (failure). The Remaining
+%% Length uses the variable-byte form: multi-filter subscribes grant
+%% more than 125 codes, where a single raw byte would set the
+%% continuation bit (or overflow) and desynchronise the reader.
 -spec encode_suback(1..65535, [0..2 | 16#80]) -> binary().
 encode_suback(PacketId, Codes)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535, is_list(Codes) ->
     ok = validate_suback_codes(Codes),
-    <<16#90, (2 + length(Codes)), PacketId:16/big, (list_to_binary(Codes))/binary>>.
+    Body = <<PacketId:16/big, (list_to_binary(Codes))/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#90, RL/binary, Body/binary>>.
 
 %% @doc Decode an MQTT PUBLISH payload with its fixed-header flags.
 %%
