@@ -1,0 +1,1 @@
+[{"operation": "POST /publish", "path_params": {}, "query": {}, "body": {"topic": "conf/pub/1", "payload": "hello-conformance", "qos": 0}, "setup": [], "cleanup": []}]

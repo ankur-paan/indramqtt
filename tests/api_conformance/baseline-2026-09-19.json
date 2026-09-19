@@ -1,0 +1,3808 @@
+[
+ {
+  "method": "GET",
+  "path": "/action_types",
+  "tag": "Actions",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/0: 'kafka' not in enum [<spec enum omitted>]"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/actions",
+  "tag": "Actions",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/actions",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/actions/{id}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/actions/{id}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/actions/{id}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/actions/{id}/enable/{enable}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/actions/{id}/metrics",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/actions/{id}/metrics/reset",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/actions/{id}/{operation}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/actions_probe",
+  "tag": "Actions",
+  "outcome": "fail",
+  "status": 400,
+  "errors": [
+   "/code: 'CONNECTION_FAILED' not in enum [<spec enum omitted>]"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/actions_summary",
+  "tag": "Actions",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/alarms",
+  "tag": "Alarms",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/alarms",
+  "tag": "Alarms",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/alarms/force_deactivate",
+  "tag": "Alarms",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/api_key",
+  "tag": "API Keys",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/api_key",
+  "tag": "API Keys",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/api_key/{name}",
+  "tag": "API Keys",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/api_key/{name}",
+  "tag": "API Keys",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/api_key/{name}",
+  "tag": "API Keys",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/api_key_scopes",
+  "tag": "API Keys",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/audit",
+  "tag": "Audit",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication",
+  "tag": "Authentication",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authentication",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authentication/node_cache/reset",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/node_cache/status",
+  "tag": "Authentication",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authentication/order",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/settings",
+  "tag": "Authentication",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authentication/settings",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authentication/{id}",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/{id}",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authentication/{id}",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authentication/{id}/import_users",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authentication/{id}/metrics/reset",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authentication/{id}/position/{position}",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/{id}/status",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/{id}/users",
+  "tag": "Authentication",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authentication/{id}/users",
+  "tag": "Authentication",
+  "outcome": "pass",
+  "status": 201,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authentication/{id}/users/{user_id}",
+  "tag": "Authentication",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authentication/{id}/users/{user_id}",
+  "tag": "Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authentication/{id}/users/{user_id}",
+  "tag": "Authentication",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/cache",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/node_cache",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/node_cache",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/node_cache/reset",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/node_cache/status",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/settings",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/settings",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/sources/built_in_database/rules",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/sources/built_in_database/rules/all",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/built_in_database/rules/all",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 405,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources/built_in_database/rules/all",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/built_in_database/rules/clients",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 405,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources/built_in_database/rules/clients",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/sources/built_in_database/rules/clients/{clientid}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/built_in_database/rules/clients/{clientid}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/sources/built_in_database/rules/clients/{clientid}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/built_in_database/rules/users",
+  "tag": "Authorization",
+  "outcome": "not-implemented",
+  "status": 405,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources/built_in_database/rules/users",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/sources/built_in_database/rules/users/{username}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/built_in_database/rules/users/{username}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/sources/built_in_database/rules/users/{username}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/sources/order",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/authorization/sources/{type}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/{type}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/authorization/sources/{type}",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources/{type}/metrics/reset",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/authorization/sources/{type}/move",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/authorization/sources/{type}/status",
+  "tag": "Authorization",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/banned",
+  "tag": "Banned",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/banned",
+  "tag": "Banned",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/banned",
+  "tag": "Banned",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/banned/{as}/{who}",
+  "tag": "Banned",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/certs/global/list",
+  "tag": "TLS Management",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/certs/global/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/certs/global/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/certs/global/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/certs/ns/{namespace}/list",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/certs/ns/{namespace}/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/certs/ns/{namespace}/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/certs/ns/{namespace}/name/{name}",
+  "tag": "TLS Management",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/clients/kickout/bulk",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/clients/{clientid}",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients/{clientid}",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/clients/{clientid}/authorization/cache",
+  "tag": "Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients/{clientid}/authorization/cache",
+  "tag": "Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients/{clientid}/inflight_messages",
+  "tag": "Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients/{clientid}/mqueue_messages",
+  "tag": "Clients",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/meta: missing required property 'start'"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/clients/{clientid}/subscribe",
+  "tag": "Clients",
+  "outcome": "fail",
+  "status": 201,
+  "errors": [
+   "status 201 not documented"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/clients/{clientid}/subscribe/bulk",
+  "tag": "Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/clients/{clientid}/subscriptions",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/clients/{clientid}/unsubscribe",
+  "tag": "Clients",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/clients/{clientid}/unsubscribe/bulk",
+  "tag": "Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster",
+  "tag": "Cluster",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/cluster",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster/invitation",
+  "tag": "Cluster",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster/links",
+  "tag": "Cluster",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/cluster/links",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/cluster/links/link/{name}",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster/links/link/{name}",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/cluster/links/link/{name}",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster/links/link/{name}/metrics",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/cluster/links/link/{name}/metrics/reset",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/cluster/topology",
+  "tag": "Cluster",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/cluster/{node}/force_leave",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/cluster/{node}/invite",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/cluster/{node}/invite_async",
+  "tag": "Cluster",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/a2a_registry",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/a2a_registry",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/alarm",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/alarm",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/broker",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/broker",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/dashboard",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/dashboard",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/file_transfer",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/file_transfer",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/global_zone",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/global_zone",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/log",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/log",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/sys_topics",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/sys_topics",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/configs/sysmon",
+  "tag": "Configs",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/configs/sysmon",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/configs_reset/{rootname}",
+  "tag": "Configs",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/connectors",
+  "tag": "Connectors",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/connectors",
+  "tag": "Connectors",
+  "outcome": "pass",
+  "status": 201,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/connectors/{id}",
+  "tag": "Connectors",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/connectors/{id}",
+  "tag": "Connectors",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/connectors/{id}",
+  "tag": "Connectors",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/connectors/{id}/enable/{enable}",
+  "tag": "Connectors",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/connectors/{id}/{operation}",
+  "tag": "Connectors",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/connectors_probe",
+  "tag": "Connectors",
+  "outcome": "fail",
+  "status": 400,
+  "errors": [
+   "/code: 'CONNECTION_FAILED' not in enum [<spec enum omitted>]"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/data/export",
+  "tag": "Data Backup",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/data/files",
+  "tag": "Data Backup",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/data/files",
+  "tag": "Data Backup",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/data/files/{filename}",
+  "tag": "Data Backup",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/data/files/{filename}",
+  "tag": "Data Backup",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/data/import",
+  "tag": "Data Backup",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/ds/sites",
+  "tag": "Durable storage",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/ds/sites/{site}",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/ds/sites/{site}/forget",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/ds/storages",
+  "tag": "Durable storage",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/ds/storages/{ds}",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/ds/storages/{ds}/replicas",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/ds/storages/{ds}/replicas",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/ds/storages/{ds}/replicas/{site}",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/ds/storages/{ds}/replicas/{site}",
+  "tag": "Durable storage",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/error_codes",
+  "tag": "Error Codes",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/error_codes/{code}",
+  "tag": "Error Codes",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/exhooks",
+  "tag": "ExHook",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/exhooks",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/exhooks/{name}",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/exhooks/{name}",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/exhooks/{name}",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/exhooks/{name}/hooks",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/exhooks/{name}/move",
+  "tag": "ExHook",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/features",
+  "tag": "Features",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/file_transfer",
+  "tag": "File Transfer",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/file_transfer",
+  "tag": "File Transfer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/file_transfer/file",
+  "tag": "File Transfer",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/file_transfer/files",
+  "tag": "File Transfer",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/file_transfer/files/{clientid}/{fileid}",
+  "tag": "File Transfer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways",
+  "tag": "Gateways",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/coap/clients/{clientid}/request",
+  "tag": "CoAP Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/lwm2m/clients/{clientid}/lookup",
+  "tag": "LwM2M Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/lwm2m/clients/{clientid}/observe",
+  "tag": "LwM2M Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/lwm2m/clients/{clientid}/read",
+  "tag": "LwM2M Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/lwm2m/clients/{clientid}/write",
+  "tag": "LwM2M Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}",
+  "tag": "Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}",
+  "tag": "Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/authentication",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/authentication",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/authentication",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/authentication",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/authentication/import_users",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/authentication/users",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/authentication/users",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/authentication/users/{uid}",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/authentication/users/{uid}",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/authentication/users/{uid}",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/clients",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/clients/{clientid}",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/clients/{clientid}",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/clients/{clientid}/subscriptions",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/clients/{clientid}/subscriptions",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/clients/{clientid}/subscriptions/{topic}",
+  "tag": "Gateway Clients",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/enable/{enable}",
+  "tag": "Gateways",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/listeners",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/listeners",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/listeners/{id}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/listeners/{id}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/listeners/{id}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/listeners/{id}/authentication",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/listeners/{id}/authentication",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/listeners/{id}/authentication",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/listeners/{id}/authentication",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/listeners/{id}/authentication/import_users",
+  "tag": "Gateway Authentication",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/listeners/{id}/authentication/users",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/gateways/{name}/listeners/{id}/authentication/users",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/gateways/{name}/listeners/{id}/authentication/users/{uid}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/gateways/{name}/listeners/{id}/authentication/users/{uid}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/gateways/{name}/listeners/{id}/authentication/users/{uid}",
+  "tag": "Gateway Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/license",
+  "tag": "License",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/license",
+  "tag": "License",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/license/session_hwm_history",
+  "tag": "License",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/license/setting",
+  "tag": "License",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/license/setting",
+  "tag": "License",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/listeners",
+  "tag": "Listeners",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/listeners",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/listeners/{id}",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/listeners/{id}",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/listeners/{id}",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/listeners/{id}",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/listeners/{id}/restart",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/listeners/{id}/start",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/listeners/{id}/stop",
+  "tag": "Listeners",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/listeners_status",
+  "tag": "Listeners",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/load_rebalance/availability_check",
+  "tag": "Load Rebalance",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/load_rebalance/global_status",
+  "tag": "Load Rebalance",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/load_rebalance/status",
+  "tag": "Load Rebalance",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/load_rebalance/{node}/evacuation/start",
+  "tag": "Load Rebalance",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/load_rebalance/{node}/evacuation/stop",
+  "tag": "Load Rebalance",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/load_rebalance/{node}/start",
+  "tag": "Load Rebalance",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/load_rebalance/{node}/stop",
+  "tag": "Load Rebalance",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/login",
+  "tag": "Dashboard",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/logout",
+  "tag": "Dashboard",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/message_transformations",
+  "tag": "Message Transformation",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/message_transformations",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/message_transformations",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/message_transformations/dryrun",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/message_transformations/reorder",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/message_transformations/transformation/{name}",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/message_transformations/transformation/{name}",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/message_transformations/transformation/{name}/enable/{enable}",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/message_transformations/transformation/{name}/metrics",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/message_transformations/transformation/{name}/metrics/reset",
+  "tag": "Message Transformation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/metrics",
+  "tag": "Metrics",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/monitor",
+  "tag": "Metrics",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/monitor",
+  "tag": "Metrics",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/monitor/nodes/{node}",
+  "tag": "Metrics",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/monitor_current",
+  "tag": "Metrics",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/monitor_current/nodes/{node}",
+  "tag": "Metrics",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/auto_subscribe",
+  "tag": "Auto Subscribe",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/auto_subscribe",
+  "tag": "Auto Subscribe",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/delayed",
+  "tag": "MQTT",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/delayed",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/delayed/messages",
+  "tag": "MQTT",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/delayed/messages/{node}/{msgid}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/delayed/messages/{node}/{msgid}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/delayed/messages/{topic}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/retainer",
+  "tag": "Retainer",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/retainer",
+  "tag": "Retainer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/retainer/message/{topic}",
+  "tag": "Retainer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/retainer/message/{topic}",
+  "tag": "Retainer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/retainer/messages",
+  "tag": "Retainer",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/retainer/messages",
+  "tag": "Retainer",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/topic_metrics",
+  "tag": "MQTT",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mqtt/topic_metrics",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/topic_metrics",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/topic_metrics/{topic}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/topic_metrics/{topic}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/topic_metrics2",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/topic_metrics2",
+  "tag": "MQTT",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mqtt/topic_metrics2",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mqtt/topic_metrics2/{name}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/topic_metrics2/{name}",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/topic_metrics2/{name}/reset",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mqtt/topic_rewrite",
+  "tag": "MQTT",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mqtt/topic_rewrite",
+  "tag": "MQTT",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mt/bulk_delete_ns",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mt/bulk_export_ns_configs",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mt/bulk_import_configs",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mt/bulk_import_ns_configs",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/managed_ns_list",
+  "tag": "Multi-tenancy",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/managed_ns_list_details",
+  "tag": "Multi-tenancy",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/mt/ns/{ns}",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mt/ns/{ns}",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns/{ns}/client_count",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns/{ns}/client_list",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns/{ns}/config",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/mt/ns/{ns}/config",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/mt/ns/{ns}/kick_all_clients",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns/{ns}/metrics",
+  "tag": "Multi-tenancy",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns_list",
+  "tag": "Multi-tenancy",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/mt/ns_list_details",
+  "tag": "Multi-tenancy",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/node_eviction/status",
+  "tag": "Node Eviction",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/nodes",
+  "tag": "Nodes",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/0/load1: expected number, got string",
+   "/0/load15: expected number, got string",
+   "/0/load5: expected number, got string"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/nodes/{node}",
+  "tag": "Nodes",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/load1: expected number, got string",
+   "/load15: expected number, got string",
+   "/load5: expected number, got string"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/nodes/{node}/actions/{id}/{operation}",
+  "tag": "Actions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/nodes/{node}/connectors/{id}/{operation}",
+  "tag": "Connectors",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/nodes/{node}/metrics",
+  "tag": "Nodes",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/nodes/{node}/sources/{id}/{operation}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/nodes/{node}/stats",
+  "tag": "Nodes",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/opentelemetry",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/opentelemetry",
+  "tag": "Monitor",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/opentelemetry/whitelist/{type}",
+  "tag": "Opentelemetry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/opentelemetry/whitelist/{type}",
+  "tag": "Opentelemetry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/opentelemetry/whitelist/{type}",
+  "tag": "Opentelemetry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/prometheus",
+  "tag": "Monitor",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/auth",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/data_integration",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/message_transformation",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/namespaced_stats",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/schema_validation",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/stats",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/prometheus/topic_metrics",
+  "tag": "Monitor",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/publish",
+  "tag": "Publish",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/publish/bulk",
+  "tag": "Publish",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/queue/{name}",
+  "tag": "Message Queue",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/queue/{name}",
+  "tag": "Message Queue",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/queue/{name}",
+  "tag": "Message Queue",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/queues",
+  "tag": "Message Queue",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/queues",
+  "tag": "Message Queue",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/queues/config",
+  "tag": "Message Queue",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/queues/config",
+  "tag": "Message Queue",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/rule_engine",
+  "tag": "Rules",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/rule_engine",
+  "tag": "Rules",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/rule_events",
+  "tag": "Rules",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/rule_test",
+  "tag": "Rules",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/rules",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/rules",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 201,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/rules/{id}",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/rules/{id}",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/rules/{id}",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/rules/{id}/metrics",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/rules/{id}/metrics/reset",
+  "tag": "Rules",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/rules/{id}/test",
+  "tag": "Rules",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_registry",
+  "tag": "Schema Registry",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_registry",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/schema_registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/schema_registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_registry_external",
+  "tag": "Schema Registry",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_registry_external",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/schema_registry_external/registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_registry_external/registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/schema_registry_external/registry/{name}",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_registry_protobuf/bundle",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/schema_registry_protobuf/bundle",
+  "tag": "Schema Registry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_validations",
+  "tag": "Schema Validation",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_validations",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/schema_validations",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_validations/reorder",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/schema_validations/validation/{name}",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_validations/validation/{name}",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_validations/validation/{name}/enable/{enable}",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schema_validations/validation/{name}/metrics",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/schema_validations/validation/{name}/metrics/reset",
+  "tag": "Schema Validation",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/schemas/{name}",
+  "tag": "Dashboard",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/: expected string, got object"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sessions_count",
+  "tag": "Clients",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/slow_subscriptions",
+  "tag": "Slow Subscriptions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/slow_subscriptions",
+  "tag": "Slow Subscriptions",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/slow_subscriptions/settings",
+  "tag": "Slow Subscriptions",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/slow_subscriptions/settings",
+  "tag": "Slow Subscriptions",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/source_types",
+  "tag": "Sources",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sources",
+  "tag": "Sources",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sources",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/sources/{id}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sources/{id}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/sources/{id}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/sources/{id}/enable/{enable}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sources/{id}/metrics",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/sources/{id}/metrics/reset",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sources/{id}/{operation}",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sources_probe",
+  "tag": "Sources",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sources_summary",
+  "tag": "Sources",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sso",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/login/{backend}",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/mfa/setup",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/mfa/setup_info",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/mfa/verify",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sso/oidc/callback",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sso/running",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/saml/acs",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sso/saml/metadata",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/sso/token_exchange",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/sso/{backend}",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/sso/{backend}",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/sso/{backend}",
+  "tag": "Dashboard Single Sign-On",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/stats",
+  "tag": "Metrics",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/status",
+  "tag": "Status",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/stream/{name}",
+  "tag": "Message Stream",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/stream/{name}",
+  "tag": "Message Stream",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/stream/{name}",
+  "tag": "Message Stream",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/streams",
+  "tag": "Message Stream",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/streams",
+  "tag": "Message Stream",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/streams/config",
+  "tag": "Message Stream",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/streams/config",
+  "tag": "Message Stream",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/subscriptions",
+  "tag": "Subscriptions",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "/: expected array, got object"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/telemetry/data",
+  "tag": "Telemetry",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/telemetry/status",
+  "tag": "Telemetry",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/telemetry/status",
+  "tag": "Telemetry",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/topics",
+  "tag": "Topics",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/topics/{topic}",
+  "tag": "Topics",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/trace",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/trace",
+  "tag": "Trace",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/trace",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/trace/{name}",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/trace/{name}/download",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/trace/{name}/log",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/trace/{name}/log_detail",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/trace/{name}/stop",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/tracing",
+  "tag": "Trace",
+  "outcome": "not-implemented",
+  "status": 404,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/tracing",
+  "tag": "Trace",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/user_scopes",
+  "tag": "Dashboard",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "GET",
+  "path": "/users",
+  "tag": "Dashboard",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/users",
+  "tag": "Dashboard",
+  "outcome": "fail",
+  "status": 201,
+  "errors": [
+   "status 201 not documented"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/users/{username}",
+  "tag": "Dashboard",
+  "outcome": "pass",
+  "status": 204,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "PUT",
+  "path": "/users/{username}",
+  "tag": "Dashboard",
+  "outcome": "pass",
+  "status": 200,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/users/{username}/change_pwd",
+  "tag": "Dashboard",
+  "outcome": "fail",
+  "status": 200,
+  "errors": [
+   "status 200 not documented"
+  ],
+  "warnings": []
+ },
+ {
+  "method": "DELETE",
+  "path": "/users/{username}/mfa",
+  "tag": "Dashboard",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ },
+ {
+  "method": "POST",
+  "path": "/users/{username}/mfa",
+  "tag": "Dashboard",
+  "outcome": "skipped:needs-case",
+  "status": null,
+  "errors": [],
+  "warnings": []
+ }
+]
