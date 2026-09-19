@@ -416,6 +416,7 @@ name = "broker-router"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "broker-observability",
  "broker-protocol",
  "brokerlink",
  "parking_lot",

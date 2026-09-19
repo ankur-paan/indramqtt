@@ -38,6 +38,13 @@ pub struct Metrics {
     delivered: AtomicU64,
     overload_dropped: AtomicU64,
     auth_failures: AtomicU64,
+    // Silent QoS 0 loss points (PERF-10 drop accounting). Each bumps
+    // exactly where its frame is already being dropped; drops that
+    // happened before still happen, they are now counted.
+    unknown_conn_dropped: AtomicU64,
+    dead_mailbox_dropped: AtomicU64,
+    detached_clean_dropped: AtomicU64,
+    offline_queue_evicted: AtomicU64,
 }
 
 /// One consistent read of every counter for API handlers.
@@ -67,6 +74,10 @@ pub struct MetricsSnapshot {
     pub delivered: u64,
     pub overload_dropped: u64,
     pub auth_failures: u64,
+    pub unknown_conn_dropped: u64,
+    pub dead_mailbox_dropped: u64,
+    pub detached_clean_dropped: u64,
+    pub offline_queue_evicted: u64,
 }
 
 impl Metrics {
@@ -283,6 +294,48 @@ impl Metrics {
         self.auth_failures.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// One frame routed to a `conn_id` with no registered mailbox
+    /// (`ConnTable::route` unknown-destination drop).
+    pub fn inc_unknown_conn_dropped(&self) -> u64 {
+        self.inc_unknown_conn_dropped_by(1)
+    }
+
+    pub fn inc_unknown_conn_dropped_by(&self, n: u64) -> u64 {
+        self.unknown_conn_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One frame sent into a dead mailbox whose receiver is gone
+    /// (`ConnTable::route` send-failure drop; the destination is
+    /// unregistered as before).
+    pub fn inc_dead_mailbox_dropped(&self) -> u64 {
+        self.inc_dead_mailbox_dropped_by(1)
+    }
+
+    pub fn inc_dead_mailbox_dropped_by(&self, n: u64) -> u64 {
+        self.dead_mailbox_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One frame for a detached clean session: no live connection and
+    /// no offline queue, so the frame is dropped.
+    pub fn inc_detached_clean_dropped(&self) -> u64 {
+        self.inc_detached_clean_dropped_by(1)
+    }
+
+    pub fn inc_detached_clean_dropped_by(&self, n: u64) -> u64 {
+        self.detached_clean_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Offline-queue evictions for detached durable sessions: each
+    /// counted message is an oldest entry displaced by a newer arrival
+    /// (the queueing itself is unchanged).
+    pub fn inc_offline_queue_evicted(&self) -> u64 {
+        self.inc_offline_queue_evicted_by(1)
+    }
+
+    pub fn inc_offline_queue_evicted_by(&self, n: u64) -> u64 {
+        self.offline_queue_evicted.fetch_add(n, Ordering::Relaxed) + n
+    }
+
     pub fn connect_received(&self) -> u64 {
         self.connect_received.load(Ordering::Relaxed)
     }
@@ -347,6 +400,22 @@ impl Metrics {
         self.auth_failures.load(Ordering::Relaxed)
     }
 
+    pub fn unknown_conn_dropped(&self) -> u64 {
+        self.unknown_conn_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn dead_mailbox_dropped(&self) -> u64 {
+        self.dead_mailbox_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn detached_clean_dropped(&self) -> u64 {
+        self.detached_clean_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn offline_queue_evicted(&self) -> u64 {
+        self.offline_queue_evicted.load(Ordering::Relaxed)
+    }
+
     /// Copy every counter in one call for API handlers.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -371,6 +440,10 @@ impl Metrics {
             delivered: self.delivered(),
             overload_dropped: self.overload_dropped(),
             auth_failures: self.auth_failures(),
+            unknown_conn_dropped: self.unknown_conn_dropped(),
+            dead_mailbox_dropped: self.dead_mailbox_dropped(),
+            detached_clean_dropped: self.detached_clean_dropped(),
+            offline_queue_evicted: self.offline_queue_evicted(),
         }
     }
 
@@ -389,14 +462,30 @@ impl Metrics {
              # HELP indramqtt_rules_executed_total Total ingress rules whose filter matched.\n\
              # TYPE indramqtt_rules_executed_total counter\n\
              indramqtt_rules_executed_total {}\n\
-             # HELP indramqtt_connections_active Currently bound edge connections.\n\
-             # TYPE indramqtt_connections_active gauge\n\
-             indramqtt_connections_active {}\n",
+              # HELP indramqtt_connections_active Currently bound edge connections.\n\
+              # TYPE indramqtt_connections_active gauge\n\
+              indramqtt_connections_active {}\n\
+              # HELP indramqtt_unknown_conn_dropped_total Frames routed to a conn_id with no registered mailbox.\n\
+              # TYPE indramqtt_unknown_conn_dropped_total counter\n\
+              indramqtt_unknown_conn_dropped_total {}\n\
+              # HELP indramqtt_dead_mailbox_dropped_total Frames sent into a dead mailbox whose receiver is gone.\n\
+              # TYPE indramqtt_dead_mailbox_dropped_total counter\n\
+              indramqtt_dead_mailbox_dropped_total {}\n\
+              # HELP indramqtt_detached_clean_dropped_total Frames dropped for detached clean sessions.\n\
+              # TYPE indramqtt_detached_clean_dropped_total counter\n\
+              indramqtt_detached_clean_dropped_total {}\n\
+              # HELP indramqtt_offline_queue_evicted_total Offline-queue entries evicted for detached durable sessions.\n\
+              # TYPE indramqtt_offline_queue_evicted_total counter\n\
+              indramqtt_offline_queue_evicted_total {}\n",
             self.messages_received(),
             self.messages_forwarded(),
             self.messages_dropped(),
             self.rules_executed(),
             self.connections_active(),
+            self.unknown_conn_dropped(),
+            self.dead_mailbox_dropped(),
+            self.detached_clean_dropped(),
+            self.offline_queue_evicted(),
         )
     }
 }

@@ -180,7 +180,11 @@ init_shard(Sock, Opts, Shards) ->
              %% shard is past its ingress bound. Observable via
              %% sys:get_state (the existing OTP status path); no
              %% other surface was added.
-             qos0_dropped => 0},
+             qos0_dropped => 0,
+             %% PERF-10: outbound frames dropped after a client-socket
+             %% send failure. Observable via sys:get_state (the
+             %% existing OTP status path); no other surface was added.
+             send_failed_dropped => 0},
     {ok, await_connect, Data}.
 
 %% @private True when Pid is a known shard other than our pinned one.
@@ -547,6 +551,13 @@ arm_socket(#{sock := Sock, sockmod := Mod}) ->
     catch sock_setopts(Mod, Sock),
     ok.
 
+%% @private Count one outbound frame dropped after a client-socket
+%% send failure (PERF-10). The connection still stops on the existing
+%% path; only the accounting is new.
+bump_send_failed(Data) ->
+    Dropped = maps:get(send_failed_dropped, Data, 0),
+    Data#{send_failed_dropped => Dropped + 1}.
+
 %%====================================================================
 %% Handshake helpers
 %%====================================================================
@@ -616,10 +627,12 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
                                   keepalive => maps:get(keepalive, Pending, 0)},
                     {next_state, connected, Data1,
                      [keepalive_action(Data1), {next_event, internal, drain_buffer}]};
-                _ ->
-                    %% Rejected (RC /= 0) or send failed: CONNACK already
-                    %% flushed on success paths; just close.
-                    {stop, normal, Data}
+                ok ->
+                    %% Rejected (RC /= 0): CONNACK delivered, just close.
+                    {stop, normal, Data};
+                {error, _} ->
+                    %% CONNACK never reached the peer: counted drop.
+                    {stop, normal, bump_send_failed(Data)}
             end;
         {error, _Reason} ->
             {stop, normal, Data}
@@ -716,7 +729,7 @@ hold_scan(Buf, #{sock := Sock, sockmod := Mod} = Data, Held) ->
         {ok, #{type := 12}, Rest} ->
             case sock_send(Mod, Sock, <<16#D0, 16#00>>) of
                 ok -> hold_scan(Rest, Data, Held);
-                {error, _} -> {stop, normal, Data}
+                {error, _} -> {stop, normal, bump_send_failed(Data)}
             end;
         {ok, _Other, Rest} ->
             %% Stash this packet's bytes, keep scanning for pings.
@@ -762,7 +775,7 @@ handle_mqtt_packet(#{type := 12}, #{sock := Sock, sockmod := Mod} = Data) ->
     %% Fast edge PINGRESP; any packet resets keepalive via the caller.
     case sock_send(Mod, Sock, <<16#D0, 16#00>>) of
         ok -> {ok, Data};
-        {error, _} -> {stop, normal, Data}
+        {error, _} -> {stop, normal, bump_send_failed(Data)}
     end;
 handle_mqtt_packet(#{type := 14}, Data) ->
     handle_disconnect(Data);
@@ -856,7 +869,7 @@ handle_suback(Meta, #{sock := Sock, sockmod := Mod, subs_pending := Pending,
                                     {keep_state, Data#{subs_pending =>
                                                           maps:remove(PacketId, Pending)}};
                                 {error, _} ->
-                                    {stop, normal, Data}
+                                    {stop, normal, bump_send_failed(Data)}
                             end
                     end
             end;
@@ -872,7 +885,7 @@ handle_publish_out(Meta, AppPayload, #{sock := Sock, sockmod := Mod} = Data) ->
                                                      Retain, Dup, AppPayload),
             case sock_send(Mod, Sock, Packet) of
                 ok -> {keep_state, Data};
-                {error, _} -> {stop, normal, Data}
+                {error, _} -> {stop, normal, bump_send_failed(Data)}
             end;
         {error, _Reason} ->
             {stop, normal, Data}
@@ -890,7 +903,7 @@ handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending}
                             {keep_state, Data#{pubs_pending =>
                                                    maps:remove(PacketId, Pending)}};
                         {error, _} ->
-                            {stop, normal, Data}
+                            {stop, normal, bump_send_failed(Data)}
                     end
             end;
         {error, _Reason} ->
