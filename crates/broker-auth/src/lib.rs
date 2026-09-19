@@ -172,11 +172,10 @@ impl AclRule {
 /// first matching rule decides and anything unmatched is denied.
 ///
 /// When built with [`MemoryAuth::from_registry`] (or seeded in place
-/// with [`MemoryAuth::seed_from_registry`]) every user/ACL mutation
-/// commits the exported [`MqttUsersConf`] root and atomically saves it,
-/// so credentials and ACLs survive kernel restarts. Per-user quotas
-/// ([`UserQuotas`]) are deliberately runtime-only and are not persisted:
-/// a reload resets every user to unlimited quotas.
+/// with [`MemoryAuth::seed_from_registry`]) every user/ACL/quota
+/// mutation commits the exported [`MqttUsersConf`] root and atomically
+/// saves it, so credentials, ACLs and per-user quotas ([`UserQuotas`])
+/// survive kernel restarts.
 #[derive(Debug, Default)]
 pub struct MemoryAuth {
     users: RwLock<HashMap<String, UserEntry>>,
@@ -247,7 +246,8 @@ impl MemoryAuth {
     /// verifiers decode from their stored hex form without re-hashing;
     /// an undecodable verifier locks that account (a sentinel digest no
     /// password can match) instead of silently dropping the user, so the
-    /// outage stays visible in `usernames()`. Quotas reset to unlimited.
+    /// outage stays visible in `usernames()`. Quota bounds load from the
+    /// record (missing bounds mean unlimited).
     fn seed_from_snapshot(&self, conf: &MqttUsersConf) {
         let mut users = HashMap::with_capacity(conf.users.len());
         for entry in &conf.users {
@@ -259,7 +259,11 @@ impl MemoryAuth {
                 entry.username.clone(),
                 UserEntry {
                     password_hash,
-                    quotas: UserQuotas::default(),
+                    quotas: UserQuotas {
+                        max_connections: entry.max_connections,
+                        max_publish_rate: entry.max_publish_rate,
+                        max_publish_burst: entry.max_publish_burst,
+                    },
                 },
             );
         }
@@ -291,7 +295,8 @@ impl MemoryAuth {
     /// sorted by username so the persisted file is deterministic, rules
     /// in evaluation order (first match wins, so order is significant).
     /// Passwords export as lowercase hex of the exact stored SHA-256
-    /// digest (never plaintext, no scheme change).
+    /// digest (never plaintext, no scheme change); quota bounds export
+    /// alongside the user record they belong to.
     fn export_conf(&self) -> MqttUsersConf {
         let users = self.users.read();
         let mut entries: Vec<MqttUser> = users
@@ -299,6 +304,9 @@ impl MemoryAuth {
             .map(|(username, entry)| MqttUser {
                 username: username.clone(),
                 password_hash: encode_verifier(&entry.password_hash),
+                max_connections: entry.quotas.max_connections,
+                max_publish_rate: entry.quotas.max_publish_rate,
+                max_publish_burst: entry.quotas.max_publish_burst,
             })
             .collect();
         entries.sort_by(|a, b| a.username.cmp(&b.username));
@@ -378,20 +386,26 @@ impl MemoryAuth {
         self.users.read().len()
     }
 
-    /// Attach quota bounds to an existing user (false when unknown).
-    /// Memory-only: quotas are never persisted (see [`MemoryAuth`]).
-    pub fn set_quotas(&self, username: &str, quotas: UserQuotas) -> bool {
+    /// Attach quota bounds to an existing user (`Ok(false)` when
+    /// unknown; unknown names persist nothing). Persists through the
+    /// registry when one is attached, so a configured quota survives a
+    /// restart.
+    pub fn set_quotas(
+        &self,
+        username: &str,
+        quotas: UserQuotas,
+    ) -> std::result::Result<bool, broker_config::ConfigError> {
         match self.users.write().get_mut(username) {
             Some(entry) => {
                 entry.quotas = quotas;
-                true
             }
-            None => false,
+            None => return Ok(false),
         }
+        self.persist()?;
+        Ok(true)
     }
 
-    /// Quota bounds for a user (`None` when unknown). Quotas are
-    /// runtime-only and are never persisted (see [`MemoryAuth`]).
+    /// Quota bounds for a user (`None` when unknown).
     pub fn get_quotas(&self, username: &str) -> Option<UserQuotas> {
         self.users
             .read()
@@ -633,14 +647,16 @@ mod tests {
     async fn test_user_quotas_roundtrip() {
         let auth = MemoryAuth::new();
         assert!(auth.get_quotas("alice").is_none());
-        assert!(!auth.set_quotas(
-            "alice",
-            UserQuotas {
-                max_connections: Some(100),
-                max_publish_rate: None,
-                max_publish_burst: None,
-            }
-        ));
+        assert!(!auth
+            .set_quotas(
+                "alice",
+                UserQuotas {
+                    max_connections: Some(100),
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                }
+            )
+            .expect("memory-only persist cannot fail"));
 
         auth.add_user("alice", b"s3cret")
             .expect("memory-only persist cannot fail");
@@ -649,14 +665,16 @@ mod tests {
             Some(UserQuotas::default()),
             "fresh users start unlimited"
         );
-        assert!(auth.set_quotas(
-            "alice",
-            UserQuotas {
-                max_connections: Some(100),
-                max_publish_rate: Some(50),
-                max_publish_burst: Some(10),
-            }
-        ));
+        assert!(auth
+            .set_quotas(
+                "alice",
+                UserQuotas {
+                    max_connections: Some(100),
+                    max_publish_rate: Some(50),
+                    max_publish_burst: Some(10),
+                }
+            )
+            .expect("memory-only persist cannot fail"));
         assert_eq!(
             auth.get_quotas("alice"),
             Some(UserQuotas {
@@ -916,6 +934,114 @@ mod tests {
             .authenticate("device-9", Some("sensor-9"), Some(b"s3cret-9"))
             .await
             .is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mqtt_user_quotas_survive_restart() {
+        let dir = unique_data_dir("quotas");
+        let registry =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let auth = MemoryAuth::from_registry(&registry);
+        auth.add_user("capped", b"pw-capped")
+            .expect("persist fixture user");
+        auth.set_quotas(
+            "capped",
+            UserQuotas {
+                max_connections: Some(2),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            },
+        )
+        .expect("persist fixture quotas");
+        auth.add_user("plain", b"pw-plain")
+            .expect("persist fixture user");
+        // Unknown names store nothing and report false.
+        assert!(!auth
+            .set_quotas(
+                "ghost",
+                UserQuotas {
+                    max_connections: Some(1),
+                    ..UserQuotas::default()
+                }
+            )
+            .expect("memory-only persist cannot fail"));
+        // A password rotation keeps the configured quotas in memory and
+        // on disk.
+        auth.add_user("capped", b"pw-capped-new")
+            .expect("persist password rotation");
+        assert_eq!(
+            auth.get_quotas("capped"),
+            Some(UserQuotas {
+                max_connections: Some(2),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            })
+        );
+
+        // Rebuild from the same data dir (simulating a kernel restart).
+        let reloaded =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = MemoryAuth::from_registry(&reloaded);
+        assert_eq!(restarted.usernames(), vec!["capped", "plain"]);
+        assert_eq!(
+            restarted.get_quotas("capped"),
+            Some(UserQuotas {
+                max_connections: Some(2),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            }),
+            "configured quotas must survive a restart"
+        );
+        assert_eq!(
+            restarted.get_quotas("plain"),
+            Some(UserQuotas::default()),
+            "unset quotas reload as unlimited"
+        );
+        // The rotated password (not the original) authenticates.
+        assert!(restarted
+            .authenticate("device-1", Some("capped"), Some(b"pw-capped-new"))
+            .await
+            .is_ok());
+        assert!(restarted
+            .authenticate("device-1", Some("capped"), Some(b"pw-capped"))
+            .await
+            .is_err());
+        // The persisted file stays deterministic (sorted by username).
+        assert_eq!(
+            reloaded.snapshot().mqtt_users.users,
+            restarted.export_conf().users
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mqtt_user_password_change_survives_restart_without_reseed() {
+        let dir = unique_data_dir("pwchange");
+        let registry =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let auth = MemoryAuth::from_registry(&registry);
+        auth.add_user("sensor-1", b"old-pw")
+            .expect("persist fixture user");
+        auth.add_user("sensor-1", b"new-pw")
+            .expect("persist password change");
+
+        // Rebuild from the same data dir: the new password sticks and no
+        // default user is reseeded.
+        let reloaded =
+            Arc::new(broker_config::ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = MemoryAuth::from_registry(&reloaded);
+        assert_eq!(restarted.usernames(), vec!["sensor-1"]);
+        assert!(restarted
+            .authenticate("device-1", Some("sensor-1"), Some(b"new-pw"))
+            .await
+            .is_ok());
+        assert!(restarted
+            .authenticate("device-1", Some("sensor-1"), Some(b"old-pw"))
+            .await
+            .is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }

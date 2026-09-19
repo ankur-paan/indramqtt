@@ -194,12 +194,26 @@ impl AdminUsersConf {
 }
 
 /// One MQTT credential.
+///
+/// Quota bounds are optional per field (`None` = unlimited); missing
+/// fields in pre-persistence files load as unlimited, and unset bounds
+/// are omitted from the persisted file so quota-free records keep their
+/// historical shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MqttUser {
     /// Client username; must be non-empty and unique within the root.
     pub username: String,
     /// Password hash; must be non-empty.
     pub password_hash: String,
+    /// Maximum concurrent connections for this user (`None` = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    /// Maximum sustained publishes per second (`None` = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_publish_rate: Option<u32>,
+    /// Burst allowance for the publish rate limiter (`None` = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_publish_burst: Option<u32>,
 }
 
 /// One ACL entry attached to an MQTT user.
@@ -707,6 +721,9 @@ mod tests {
                 users: vec![MqttUser {
                     username: "sensor".to_string(),
                     password_hash: "hash-sensor".to_string(),
+                    max_connections: None,
+                    max_publish_rate: None,
+                    max_publish_burst: None,
                 }],
                 acls: vec![AclConf {
                     username: "sensor".to_string(),

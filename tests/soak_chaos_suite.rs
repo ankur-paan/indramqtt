@@ -1281,26 +1281,30 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     // Tenant Alpha admin with multi-tenant quota bounds
     auth.add_user("alpha_admin", b"alpha_secret_pass_2026")
         .expect("memory-only persist cannot fail");
-    assert!(auth.set_quotas(
-        "alpha_admin",
-        UserQuotas {
-            max_connections: Some(3),
-            max_publish_rate: Some(50),
-            max_publish_burst: Some(10),
-        },
-    ));
+    assert!(auth
+        .set_quotas(
+            "alpha_admin",
+            UserQuotas {
+                max_connections: Some(3),
+                max_publish_rate: Some(50),
+                max_publish_burst: Some(10),
+            },
+        )
+        .expect("memory-only persist cannot fail"));
 
     // Tenant Beta admin with different quota bounds
     auth.add_user("beta_admin", b"beta_secret_pass_2026")
         .expect("memory-only persist cannot fail");
-    assert!(auth.set_quotas(
-        "beta_admin",
-        UserQuotas {
-            max_connections: Some(2),
-            max_publish_rate: Some(20),
-            max_publish_burst: Some(5),
-        },
-    ));
+    assert!(auth
+        .set_quotas(
+            "beta_admin",
+            UserQuotas {
+                max_connections: Some(2),
+                max_publish_rate: Some(20),
+                max_publish_burst: Some(5),
+            },
+        )
+        .expect("memory-only persist cannot fail"));
 
     // Temporary user without explicit quotas
     auth.add_user("guest_temp", b"guest_initial_pass")

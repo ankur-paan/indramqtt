@@ -596,8 +596,11 @@ async fn create_user(
         max_publish_rate: dto.max_publish_rate,
         max_publish_burst: dto.max_publish_burst,
     }) {
-        // The user was just created, so this always succeeds.
-        state.auth.set_quotas(&req.username, quotas);
+        // The user was just created, so this always finds it; a persist
+        // failure is still surfaced instead of silently dropped.
+        if let Err(error) = state.auth.set_quotas(&req.username, quotas) {
+            return persist_error(error);
+        }
     }
     // Quotas always render as an object (all-null when unset) so GET
     // and POST share one shape.
@@ -2933,6 +2936,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mqtt_users_and_quotas_survive_restart() {
+        let dir = unique_data_dir("mqtt-survive");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let admin_token = server.login_as_admin().await;
+
+        // Create MQTT users through the API, one with quotas.
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/users",
+                json!({"username": "capped", "password": "pw-capped",
+                       "quotas": {"max_connections": 2,
+                                  "max_publish_rate": 50,
+                                  "max_publish_burst": 10}}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/users",
+                json!({"username": "plain", "password": "pw-plain"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        drop(server);
+
+        // Simulate a kernel restart: rebuild state from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+
+        // The admin password persisted too, so the rebooted node logs in
+        // with it; both MQTT users and the configured quotas are intact.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let admin_token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v1/auth/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let users = body.as_array().expect("users list");
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0]["username"], json!("capped"));
+        assert_eq!(users[0]["quotas"]["max_connections"], json!(2));
+        assert_eq!(users[0]["quotas"]["max_publish_rate"], json!(50));
+        assert_eq!(users[0]["quotas"]["max_publish_burst"], json!(10));
+        assert_eq!(users[1]["username"], json!("plain"));
+        assert_eq!(
+            users[1]["quotas"]["max_publish_rate"],
+            serde_json::Value::Null
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn connectors_survive_restart() {
         let dir = unique_data_dir("w023-conn-survive");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
@@ -5209,6 +5272,36 @@ mod tests {
         // Socket closes right after the failed CONNACK.
         assert!(client.recv_msg().await.is_none());
         assert!(state.sessions.get("console-x").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ws_anonymous_rejected_when_users_exist() {
+        let (server, state) = TestServer::start().await;
+        state
+            .auth
+            .add_user("alice", b"s3cret")
+            .expect("test user persists");
+
+        // No username while users exist: rejected with 0x87 even though
+        // the console path has no `--allow-anonymous` flag.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("console-anon", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0x87, "anonymous must yield 0x87");
+        // Socket closes right after the failed CONNACK.
+        assert!(client.recv_msg().await.is_none());
+        assert!(state.sessions.get("console-anon").is_none());
+
+        // A valid credentialed console CONNECT in the same store gets 0.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("console-ok", Some("alice"), Some(b"s3cret")))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
     }
 
     #[tokio::test]
