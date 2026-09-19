@@ -271,6 +271,31 @@ publish_qos1_puback_flow_test() ->
         teardown(LSock, Mock, Client, Conn)
     end.
 
+%% @doc T-31: a subscriber PUBACK for a QoS 1 downlink is forwarded to
+%% the kernel as PubAckIn so it releases the per-session inflight entry.
+%% Fails before the fix (the edge accepted and ignored inbound PUBACKs).
+subscriber_puback_forwards_puback_in_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6008}]),
+    _ = Port,
+    try
+        handshake(Client, Mock, <<"dev-ack">>, Conn),
+        %% Kernel routes a QoS 1 downlink; the client receives PUBLISH.
+        Meta = indra_brokerlink:encode_publish_meta(<<"t">>, 77, 1, false, false),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0021}, Meta, <<"hi">>),
+        {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(recv_all(Client)),
+        ?assertEqual(publish, maps:get(type_atom, Pkt)),
+        %% Client acks; the edge must report PubAckIn (16#0022) upstream.
+        ok = gen_tcp:send(Client, <<16#40, 16#02, 16#00, 16#4D>>),
+        [_Bind, Ack] = wait_frames(Mock, 2),
+        ?assertEqual(16#0022, maps:get(opcode, Ack)),
+        ?assertEqual(6008, maps:get(conn_id, Ack)),
+        {ok, AckMeta} = indra_brokerlink:decode_puback_meta(maps:get(meta, Ack)),
+        ?assertEqual(77, maps:get(packet_id, AckMeta)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
 inbound_publishout_to_socket_test() ->
     {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 6004}]),
     _ = Port,

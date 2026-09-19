@@ -60,6 +60,7 @@
 -define(UNBIND_CONNECTION, 16#0012).
 -define(PUBLISH_IN, 16#0020).
 -define(PUBLISH_OUT, 16#0021).
+-define(PUBACK_IN, 16#0022).
 -define(PUBACK_OUT, 16#0023).
 -define(SUBSCRIBE_IN, 16#0030).
 -define(SUBACK_OUT, 16#0031).
@@ -779,10 +780,13 @@ handle_mqtt_packet(#{type := 12}, #{sock := Sock, sockmod := Mod} = Data) ->
     end;
 handle_mqtt_packet(#{type := 14}, Data) ->
     handle_disconnect(Data);
-handle_mqtt_packet(#{type := 4}, Data) ->
-    %% Inbound PUBACK for our QoS 1 downstream deliveries: accepted and
-    %% ignored until per-subscriber inflight tracking lands.
-    {ok, Data};
+handle_mqtt_packet(#{type := 4, payload := Payload}, Data) ->
+    %% Inbound PUBACK for a QoS 1 downstream delivery: forward the
+    %% packet id to the kernel (PubAckIn) so it releases the matching
+    %% per-session inflight entry (T-31). Malformed ids are ignored;
+    %% a failed forward keeps the connection up (the kernel simply
+    %% replays on reconnect).
+    handle_puback_in(Payload, Data);
 handle_mqtt_packet(_Other, Data) ->
     %% CONNECT repeats, CONNACK/SUBACK from a client, UNSUBSCRIBE and any
     %% other unexpected packet: protocol violation, close.
@@ -844,6 +848,26 @@ handle_disconnect(#{broker := Broker, conn_id := ConnId, seq := Seq,
     Meta = indra_brokerlink:encode_unbind_meta(ClientId),
     catch indra_brokerlink:send(Broker, ?UNBIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>),
     {stop, normal, Data}.
+
+%% @private Forward one subscriber PUBACK to the kernel so it releases
+%% the matching inflight entry (T-31). The kernel owns the store; the
+%% edge only reports. Malformed payloads are ignored.
+handle_puback_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
+                                        seq := Seq} = Data)
+  when PacketId =/= 0 ->
+    Meta = indra_brokerlink:encode_puback_meta(PacketId, 0),
+    case catch indra_brokerlink:send(Broker, ?PUBACK_IN, ConnId, Seq + 1, Meta, <<>>) of
+        ok ->
+            {ok, Data#{seq => Seq + 1}};
+        {error, overloaded} ->
+            %% Shedding an ack only delays its release: the kernel
+            %% replays on reconnect, preserving at-least-once.
+            {ok, Data};
+        _ ->
+            {stop, normal, Data}
+    end;
+handle_puback_in(_, Data) ->
+    {ok, Data}.
 
 %%====================================================================
 %% Inbound Rust frames while connected

@@ -6,7 +6,7 @@ use broker_observability::{Metrics, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
-use broker_session::{QueuedMessage, SessionManager};
+use broker_session::{InflightMessage, QueuedMessage, SessionManager};
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -661,6 +661,14 @@ where
             shared.metrics.inc_delivered_by(enqueued);
             shared.metrics.inc_bytes_sent_by(enqueued_bytes);
         }
+        OpCode::PubAckIn => {
+            // T-31: the edge forwards each subscriber PUBACK; release
+            // the matching inflight entry so it is never replayed.
+            // Unknown connections, unknown sessions and stale ids are
+            // ignored: at-most-once PUBACKs from a previous incarnation
+            // must never disturb live state.
+            apply_puback(&frame, shared);
+        }
         OpCode::UnbindConnection => {
             apply_unbind(&frame, shared);
             // Forget this transport's identities for the connection so a
@@ -826,9 +834,11 @@ async fn apply_subscribe(
     (reply, retained)
 }
 
-/// Replay a resumed durable session's offline queue onto its new
-/// connection. Runs after the `SessionBinding` reply so the edge always
-/// observes binding before backlog. Returns the replayed frame count.
+/// Replay a resumed durable session's backlog onto its new connection:
+/// unacknowledged QoS 1 downlinks first (T-31, DUP set, original order,
+/// same packet ids), then the offline queue of never-routed messages.
+/// Runs after the `SessionBinding` reply so the edge always observes
+/// binding before backlog. Returns the replayed frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     let req = match decode_bind_meta(&frame.metadata) {
         Ok(req) => req,
@@ -840,6 +850,33 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     };
     let mut replayed = 0;
     let mut replayed_bytes: u64 = 0;
+    // T-31: unacked downlinks predate anything queued while detached,
+    // so they replay first. Entries stay held until their PUBACK: a
+    // second reconnect without acks replays them again. Same packet id
+    // with DUP set, so resume can never collide with ids in use.
+    for held in session.inflight_snapshot() {
+        let topic_str = held.topic.as_str();
+        let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+        meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic_str.as_bytes());
+        meta.extend_from_slice(&held.packet_id.to_be_bytes());
+        meta.push(u8::from(held.qos));
+        meta.push(u8::from(held.retain));
+        meta.push(1u8); // dup: redelivery of an unacked downlink
+        if let Ok(routed) = BrokerFrame::new(
+            OpCode::PublishOut,
+            frame.header.conn_id,
+            0, // stamped per-destination by ConnTable::route
+            Bytes::from(meta),
+            held.payload.clone(),
+        ) {
+            let len = routed.total_frame_len() as u64;
+            if shared.conns.route(frame.header.conn_id, routed) {
+                replayed_bytes += len;
+                replayed += 1;
+            }
+        }
+    }
     for queued in session.drain_offline() {
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
@@ -1144,6 +1181,23 @@ fn build_downlink_frames(
                         } else {
                             session.next_packet_id()
                         };
+                        // T-31: hold every QoS 1 downlink from the moment
+                        // it is written until its PUBACK arrives. At the
+                        // per-session bound the frame still goes out live
+                        // once but is left untracked (counted), so the
+                        // live delivery rate never pays for the window.
+                        if effective == 1 {
+                            let tracked = session.track_inflight(InflightMessage {
+                                packet_id: downlink_id,
+                                topic: topic.clone(),
+                                qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
+                                retain,
+                                payload: payload.clone(),
+                            });
+                            if !tracked {
+                                metrics.inc_inflight_dropped();
+                            }
+                        }
                         if let Some(frame) = encode_publish_out(
                             conn_id,
                             topic_str,
@@ -1302,7 +1356,8 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
 
 /// Detach one edge connection: mark its session disconnected (ownership
 /// verified against the bound conn_id) and forget its mailbox. Durable
-/// subscriptions survive; redelivery is a later sprint.
+/// subscriptions and unacked QoS 1 downlinks survive for reconnect
+/// replay; clean sessions drop their inflight state in `unbind_connection`.
 fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
     if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
         shared
@@ -1311,6 +1366,39 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
         refresh_subscription_stats(shared);
     }
     shared.conns.unregister(frame.header.conn_id);
+}
+
+/// Release one unacknowledged QoS 1 downlink on the subscriber's PUBACK
+/// (T-31). The edge reports the downlink packet id via `PubAckIn`;
+/// ownership resolves through the `conn_id -> client_id` index, so acks
+/// from a superseded connection never release a new incarnation's entry.
+fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
+    let packet_id = match decode_puback_meta(&frame.metadata) {
+        Some(packet_id) => packet_id,
+        None => return,
+    };
+    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        Some(client_id) => client_id,
+        None => return,
+    };
+    if let Some(session) = shared.sessions.get(&client_id) {
+        session.ack_inflight(packet_id);
+    }
+}
+
+/// Decode `PubAckIn` metadata into the downlink packet id. Layout
+/// `PacketId:16be | RC:8` (mirrors `indra_brokerlink:encode_puback_meta`);
+/// the return code is ignored and trailing bytes tolerated, but the id
+/// must be nonzero.
+fn decode_puback_meta(meta: &[u8]) -> Option<u16> {
+    if meta.len() < 2 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+    if packet_id == 0 {
+        return None;
+    }
+    Some(packet_id)
 }
 
 /// Decoded `(packet_id, client_id, [(filter, qos)])` subscription metadata.
@@ -1698,6 +1786,26 @@ mod tests {
         let base = 2 + topic_len;
         let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
         (topic, packet_id, meta[base + 2], meta[base + 3] != 0)
+    }
+
+    fn decode_publish_dup(meta: &[u8]) -> bool {
+        let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+        let base = 2 + topic_len;
+        meta[base + 4] != 0
+    }
+
+    fn puback_frame(conn_id: u64, seq: u64, packet_id: u16) -> BrokerFrame {
+        let mut meta = Vec::with_capacity(3);
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.push(0u8);
+        BrokerFrame::new(
+            OpCode::PubAckIn,
+            conn_id,
+            seq,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("valid puback frame")
     }
 
     fn subscribe_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
@@ -2266,16 +2374,10 @@ mod tests {
         assert_eq!(shared.metrics.offline_queue_evicted(), 0);
     }
 
-    /// Known defect, no redelivery yet (ticket T-31): a durable
-    /// subscriber that disconnects with a QoS 1 downlink inflight (sent,
-    /// never acked) must see that message redelivered on reconnect. The
-    /// kernel keeps no per-subscriber inflight store and the edge ignores
-    /// inbound PUBACKs, so the message is lost instead.
-    ///
-    /// Ignored until inflight tracking lands; run explicitly with
-    /// `cargo test -p broker-node qos1_unacked -- --ignored`.
+    /// T-31: a durable subscriber that disconnects with a QoS 1
+    /// downlink inflight (sent, never acked) must see that message
+    /// redelivered on reconnect with DUP set.
     #[tokio::test]
-    #[ignore]
     async fn qos1_unacked_downlink_is_redelivered_after_reconnect() {
         let shared = test_shared();
         let bind = bind_frame(61, 1, encode_bind_meta("q1-durable", false, 60));
@@ -2299,9 +2401,15 @@ mod tests {
         }
         let inflight = rx61.try_recv().expect("downlink reached the edge mailbox");
         assert_eq!(inflight.payload, Bytes::from_static(b"redeliver-me"));
+        assert!(
+            !decode_publish_dup(&inflight.metadata),
+            "fresh downlink carries DUP=0"
+        );
+        let (_, first_pid, _, _) = decode_publish_meta_parts(&inflight.metadata);
 
         // Subscriber disconnects without acking (durable session keeps
-        // subscriptions and offline queue), then reconnects non-clean.
+        // subscriptions, offline queue and inflight), then reconnects
+        // non-clean with a live mailbox.
         let mut unbind_meta = vec![0x00u8, 0x0Au8];
         unbind_meta.extend_from_slice(b"q1-durable");
         let unbind = BrokerFrame::new(
@@ -2315,13 +2423,238 @@ mod tests {
         apply_unbind(&unbind, &shared);
         let rebind = bind_frame(63, 1, encode_bind_meta("q1-durable", false, 60));
         reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
 
-        // The unacked message must come back; today the offline queue
-        // only holds never-routed messages, so replay is empty.
+        // The unacked message must come back with DUP set.
         let replayed = replay_offline(&rebind, &shared).await;
         assert!(
             replayed >= 1,
-            "unacked QoS 1 downlink was not redelivered after reconnect"
+            "T-26: unacked QoS 1 downlink was not redelivered after reconnect"
+        );
+        assert_eq!(replayed, 1, "exactly the one unacked downlink replays");
+        let redelivered = rx63.try_recv().expect("redelivery reached the new mailbox");
+        assert_eq!(redelivered.payload, Bytes::from_static(b"redeliver-me"));
+        assert!(
+            decode_publish_dup(&redelivered.metadata),
+            "redelivery must carry DUP=1"
+        );
+        let (_, replay_pid, _, _) = decode_publish_meta_parts(&redelivered.metadata);
+        assert_eq!(
+            replay_pid, first_pid,
+            "redelivery reuses the downlink packet id"
+        );
+    }
+
+    #[tokio::test]
+    async fn qos1_puback_releases_inflight_nothing_replayed() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-acked", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-acked", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"acked-me");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let downlink = rx61.try_recv().expect("downlink arrived");
+        let (_, pid, _, _) = decode_publish_meta_parts(&downlink.metadata);
+        assert_ne!(pid, 0);
+
+        // Subscriber acks before disconnecting: the entry is released.
+        apply_puback(&puback_frame(61, 9, pid), &shared);
+        let session = shared.sessions.get("q1-acked").expect("session known");
+        assert_eq!(session.inflight_len(), 0, "PUBACK must release the entry");
+
+        // Reconnect replays nothing.
+        let mut unbind_meta = vec![0x00u8, 0x08u8];
+        unbind_meta.extend_from_slice(b"q1-acked");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-acked", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, 0);
+        assert!(rx63.try_recv().is_err(), "acked message must not replay");
+    }
+
+    #[tokio::test]
+    async fn qos1_redelivery_preserves_order_with_dup() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-order", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-order", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let mut sent_pids = Vec::new();
+        for (i, body) in [
+            b"m-one".as_slice(),
+            b"m-two".as_slice(),
+            b"m-three".as_slice(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, body);
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 3 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = rx61.try_recv().expect("downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            sent_pids.push((pid, got.payload.clone()));
+        }
+
+        let mut unbind_meta = vec![0x00u8, 0x08u8];
+        unbind_meta.extend_from_slice(b"q1-order");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-order", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+
+        assert_eq!(replay_offline(&rebind, &shared).await, 3);
+        for (pid, payload) in sent_pids {
+            let got = rx63.try_recv().expect("ordered redelivery");
+            assert_eq!(got.payload, payload, "original order preserved");
+            assert!(
+                decode_publish_dup(&got.metadata),
+                "every replay carries DUP=1"
+            );
+            let (_, replay_pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_eq!(replay_pid, pid, "same packet id reused in order");
+        }
+        assert!(rx63.try_recv().is_err(), "no new traffic interleaved");
+    }
+
+    #[tokio::test]
+    async fn qos1_clean_session_resumes_with_empty_inflight() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-clean", true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-clean", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"volatile");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        rx61.try_recv().expect("downlink arrived");
+        assert_eq!(
+            shared
+                .sessions
+                .get("q1-clean")
+                .expect("session known")
+                .inflight_len(),
+            1
+        );
+
+        // Clean disconnect drops inflight state.
+        let mut unbind_meta = vec![0x00u8, 0x08u8];
+        unbind_meta.extend_from_slice(b"q1-clean");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        assert_eq!(
+            shared
+                .sessions
+                .get("q1-clean")
+                .expect("session survives unbind")
+                .inflight_len(),
+            0,
+            "clean disconnect keeps no inflight state"
+        );
+
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-clean", true, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, 0);
+        assert!(rx63.try_recv().is_err(), "clean resume replays nothing");
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_bound_drops_newest_from_tracking_and_counts() {
+        use broker_session::MAX_QOS1_INFLIGHT;
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-bound", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-bound", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        for i in 0..MAX_QOS1_INFLIGHT {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 3 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery unaffected by fill");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv().expect("live downlink arrived");
+        }
+        let session = shared.sessions.get("q1-bound").expect("session known");
+        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+        assert_eq!(shared.metrics.inflight_dropped(), 0);
+
+        // One past the bound: still delivered live once, left untracked.
+        let (meta, payload) = encode_publish_meta("t", 0x0FFF, 1, false, b"over");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 999, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "bound never blocks live delivery");
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        rx61.try_recv()
+            .expect("over-bound downlink still delivered live");
+        assert_eq!(
+            session.inflight_len(),
+            MAX_QOS1_INFLIGHT,
+            "store stays bounded at the limit"
+        );
+        assert_eq!(
+            shared.metrics.inflight_dropped(),
+            1,
+            "exactly one untracked delivery counted"
         );
     }
 

@@ -19,6 +19,11 @@ pub struct Session {
     pub conn_id: RwLock<Option<u64>>,
     pub subscriptions: RwLock<HashMap<TopicFilter, broker_protocol::QoS>>,
     pub offline_queue: RwLock<VecDeque<QueuedMessage>>,
+    /// QoS 1 downlinks written toward the subscriber and not yet
+    /// acknowledged (T-31). Held in delivery order so reconnect replay
+    /// resends oldest-first with DUP set. Bounded per session by
+    /// [`MAX_QOS1_INFLIGHT`]; the kernel (not the edge) owns this state.
+    pub inflight: RwLock<VecDeque<InflightMessage>>,
     /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
     /// the edge at bind time; surfaced read-only for observability.
     pub keepalive_secs: RwLock<u16>,
@@ -37,6 +42,28 @@ pub struct QueuedMessage {
     pub retain: bool,
     pub payload: Bytes,
 }
+
+/// One QoS 1 downlink held from the moment it is written toward a
+/// subscriber until its PUBACK arrives (T-31). The packet id is the
+/// downlink id on the wire; replay reuses it with DUP set, so resume
+/// never allocates a colliding id.
+#[derive(Debug, Clone)]
+pub struct InflightMessage {
+    pub packet_id: u16,
+    pub topic: Topic,
+    pub qos: QoS,
+    pub retain: bool,
+    pub payload: Bytes,
+}
+
+/// Maximum unacknowledged QoS 1 downlinks held per session (T-31).
+/// At the limit the newest downlink is still delivered live once but is
+/// NOT tracked for redelivery, and the kernel `inflight_dropped` counter
+/// bumps once per untracked delivery. Rationale: dropping the live
+/// delivery would hurt the v4 QoS 1 delivery rate (94-97%, must be 100%)
+/// more than skipping its redelivery; keeping the oldest entries
+/// preserves replay order for what is tracked.
+pub const MAX_QOS1_INFLIGHT: usize = 100;
 
 /// Maximum buffered messages per detached session; beyond this the
 /// oldest entry drops so one dead client cannot balloon the node.
@@ -72,6 +99,7 @@ impl Session {
             conn_id: RwLock::new(None),
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
+            inflight: RwLock::new(VecDeque::new()),
             keepalive_secs: RwLock::new(0),
             username: RwLock::new(None),
             next_packet_id: AtomicU16::new(1),
@@ -81,10 +109,56 @@ impl Session {
     pub fn next_packet_id(&self) -> u16 {
         loop {
             let pid = self.next_packet_id.fetch_add(1, Ordering::SeqCst);
-            if pid != 0 {
-                return pid;
+            if pid == 0 {
+                continue;
             }
+            // Never hand out an id already held inflight: a resumed
+            // session's unacked ids stay reserved until their PUBACK.
+            // The store is bounded (<= MAX_QOS1_INFLIGHT of 65535 ids),
+            // so this scan always terminates.
+            if self.inflight.read().iter().any(|m| m.packet_id == pid) {
+                continue;
+            }
+            return pid;
         }
+    }
+
+    /// Hold one QoS 1 downlink for redelivery. True means tracked; false
+    /// means the per-session bound was full (the caller still delivers
+    /// live once and counts `inflight_dropped`). Never grows past
+    /// [`MAX_QOS1_INFLIGHT`].
+    pub fn track_inflight(&self, message: InflightMessage) -> bool {
+        let mut inflight = self.inflight.write();
+        if inflight.len() >= MAX_QOS1_INFLIGHT {
+            return false;
+        }
+        inflight.push_back(message);
+        true
+    }
+
+    /// Release one downlink on its PUBACK. True when an entry was held.
+    pub fn ack_inflight(&self, packet_id: u16) -> bool {
+        let mut inflight = self.inflight.write();
+        if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
+            inflight.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    /// Ordered snapshot of unacked downlinks for reconnect replay.
+    /// Entries stay held: they remain inflight until their PUBACK, so a
+    /// second reconnect without acks replays them again.
+    pub fn inflight_snapshot(&self) -> Vec<InflightMessage> {
+        self.inflight.read().iter().cloned().collect()
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.read().len()
+    }
+
+    pub fn clear_inflight(&self) {
+        self.inflight.write().clear();
     }
 
     /// Buffer one message for later replay, evicting the oldest entry
@@ -365,6 +439,12 @@ impl SessionManager {
                     if *current_conn == Some(conn_id) {
                         *current_conn = None;
                         *session.connected.write() = false;
+                        // Clean sessions keep no inflight state across a
+                        // disconnect (T-31); durable sessions keep theirs
+                        // for reconnect replay.
+                        if session.clean_start {
+                            session.clear_inflight();
+                        }
                         session.username.read().clone()
                     } else {
                         None
@@ -547,6 +627,71 @@ mod tests {
         // Draining empties the queue.
         assert_eq!(session.offline_len(), 0);
         assert!(session.drain_offline().is_empty());
+    }
+
+    #[test]
+    fn test_inflight_tracks_acks_and_stays_bounded() {
+        use super::{InflightMessage, MAX_QOS1_INFLIGHT};
+
+        fn inflight(pid: u16) -> InflightMessage {
+            InflightMessage {
+                packet_id: pid,
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![pid as u8]),
+            }
+        }
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("inflight-1", false);
+        assert_eq!(session.inflight_len(), 0);
+
+        // Track + ack round trip; stale acks are no-ops.
+        assert!(session.track_inflight(inflight(7)));
+        assert!(session.track_inflight(inflight(8)));
+        assert_eq!(session.inflight_len(), 2);
+        assert!(session.ack_inflight(7));
+        assert!(!session.ack_inflight(7));
+        assert_eq!(session.inflight_len(), 1);
+        // Snapshot preserves order and keeps entries held for replay.
+        assert!(session.track_inflight(inflight(9)));
+        let snap = session.inflight_snapshot();
+        assert_eq!(
+            snap.iter().map(|m| m.packet_id).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert_eq!(session.inflight_len(), 2);
+
+        // Fill to the bound: the next track refuses without growing.
+        for pid in 10..(10 + MAX_QOS1_INFLIGHT as u16) {
+            let _ = session.track_inflight(inflight(pid));
+        }
+        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+        assert!(!session.track_inflight(inflight(60000)));
+        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+
+        // Packet ids skip held entries so resume never collides.
+        let fresh = session.next_packet_id();
+        assert!(
+            !session
+                .inflight_snapshot()
+                .iter()
+                .any(|m| m.packet_id == fresh),
+            "fresh id must avoid inflight ids"
+        );
+
+        // Clean disconnect clears; durable disconnect keeps.
+        let (clean, _) = manager.get_or_create("inflight-clean", true);
+        assert!(clean.track_inflight(inflight(21)));
+        *clean.conn_id.write() = Some(99);
+        manager.unbind_connection("inflight-clean", 99);
+        assert_eq!(clean.inflight_len(), 0);
+        *session.conn_id.write() = Some(77);
+        manager.unbind_connection("inflight-1", 77);
+        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+        session.clear_inflight();
+        assert_eq!(session.inflight_len(), 0);
     }
 
     #[test]
