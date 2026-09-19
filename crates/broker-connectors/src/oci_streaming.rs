@@ -374,10 +374,9 @@ pub fn signing_string(
 pub fn rsa_sign(private_key_pem: &str, signing_string: &str) -> Result<String> {
     let key = parse_rsa_key(private_key_pem)?;
     let signing_key = SigningKey::<Sha256>::new(key);
-    let mut rng = rand::thread_rng();
-    use rsa::signature::RandomizedSigner;
+    use rsa::signature::Signer;
     let signature = signing_key
-        .try_sign_with_rng(&mut rng, signing_string.as_bytes())
+        .try_sign(signing_string.as_bytes())
         .map_err(|e| ConnectorError::Dispatch(format!("oci RSA signing failed: {e}")))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()))
 }

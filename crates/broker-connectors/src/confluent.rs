@@ -429,9 +429,9 @@ pub fn scram_client_first_message(username: &str, nonce: &str) -> String {
 /// Generate a printable SASL nonce (18 random bytes, base64).
 pub fn scram_nonce() -> String {
     use base64::Engine;
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 18];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 

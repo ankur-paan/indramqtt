@@ -559,7 +559,7 @@ impl SwimMembership {
         if candidates.is_empty() {
             None
         } else {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             candidates.shuffle(&mut rng);
             Some(candidates.remove(0))
         }
@@ -573,7 +573,7 @@ impl SwimMembership {
             .filter(|id| id != &self.local && id != target)
             .collect();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         candidates.shuffle(&mut rng);
         candidates.truncate(k);
         candidates
