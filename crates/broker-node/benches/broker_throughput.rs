@@ -15,7 +15,126 @@ use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
 use bytes::Bytes;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Bounded end-to-end latency sampler (T-27).
+///
+/// The v4 benchmark JSON reports `avg_latency_ms`/`p99_latency_ms` as 0.0 on
+/// every row because no harness ever sampled latency: the fields are
+/// hardcoded placeholders (the producing script is not in any repo; only
+/// the result JSONs exist under `emqx/benchmark_suite/`). This histogram
+/// is the sampler for the in-process harness.
+///
+/// Memory is constant no matter how many samples are recorded: 64 buckets
+/// plus five scalars (~0.5 KiB on the stack). It never grows into the
+/// unbounded per-message buffer that BRIEF forbids on a message path.
+/// Per-sample cost is one `Instant::now()` pair at the call site plus a
+/// leading-zero bit scan and two integer adds here.
+///
+/// Buckets are powers of two over nanoseconds: bucket `i` counts samples
+/// in `[2^i, 2^(i+1))` ns, so percentiles are accurate to a factor of two
+/// and the mean/min/max are exact. Both stamp and receipt use the same
+/// monotonic `Instant`, so there is no cross-host clock skew by
+/// construction; a cross-host run must instead embed a send timestamp in
+/// the payload (as `team/perf/tools/mqtt_load.py` does) and accept that
+/// same-host comparison as the skew-free baseline.
+#[derive(Debug)]
+struct LatencyHistogram {
+    buckets: [u64; 64],
+    count: u64,
+    sum_ns: u128,
+    min_ns: u64,
+    max_ns: u64,
+}
+
+impl LatencyHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: [0; 64],
+            count: 0,
+            sum_ns: 0,
+            min_ns: u64::MAX,
+            max_ns: 0,
+        }
+    }
+
+    fn record(&mut self, latency: Duration) {
+        let nanos = latency.as_nanos().min(u64::MAX as u128) as u64;
+        // Bucket index is floor(log2(nanos)); a zero-nanos sample lands in
+        // bucket 0 alongside 1 ns rather than shifting by 64.
+        let bucket = if nanos == 0 {
+            0
+        } else {
+            (63 - nanos.leading_zeros()) as usize
+        };
+        self.buckets[bucket] += 1;
+        self.count += 1;
+        self.sum_ns += nanos as u128;
+        self.min_ns = self.min_ns.min(nanos);
+        self.max_ns = self.max_ns.max(nanos);
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn avg_ms(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.sum_ns as f64 / self.count as f64 / 1_000_000.0)
+    }
+
+    fn min_ms(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.min_ns as f64 / 1_000_000.0)
+    }
+
+    fn max_ms(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.max_ns as f64 / 1_000_000.0)
+    }
+
+    /// Percentile latency in ms, reported as the matching bucket's upper
+    /// bound (a conservative estimate, within 2x of the true sample).
+    /// `p` is in `[0, 100]`.
+    fn percentile_ms(&self, p: f64) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        let rank = ((p.clamp(0.0, 100.0) / 100.0 * self.count as f64).ceil() as u64).max(1);
+        let mut cumulative = 0u64;
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            cumulative += *bucket;
+            if cumulative >= rank {
+                // Bucket i spans [2^i, 2^(i+1)) ns; bucket 63 also holds
+                // everything saturating above u64, capped at u64::MAX ms.
+                let upper_ns = if i >= 63 { u64::MAX } else { 1u64 << (i + 1) };
+                return Some(upper_ns as f64 / 1_000_000.0);
+            }
+        }
+        self.max_ms()
+    }
+
+    /// One JSON line per measured stage. Field names keep the v4 result
+    /// schema (`avg_latency_ms`, `p99_latency_ms`) working so old and new
+    /// runs stay comparable; `p50_latency_ms`/`max_latency_ms` are new.
+    fn report_json(&self, stage: &str) {
+        let opt = |v: Option<f64>| v.map_or("null".to_string(), |n| format!("{n:.6}"));
+        println!(
+            "{{\"stage\": \"{stage}\", \"latency_samples\": {}, \"avg_latency_ms\": {}, \"p50_latency_ms\": {}, \"p99_latency_ms\": {}, \"max_latency_ms\": {}}}",
+            self.count(),
+            opt(self.avg_ms()),
+            opt(self.percentile_ms(50.0)),
+            opt(self.percentile_ms(99.0)),
+            opt(self.max_ms()),
+        );
+    }
+}
 
 /// Floor for full fan-out match throughput (production-shaped table,
 /// three hits per lookup including clone + set costs).
@@ -111,6 +230,25 @@ fn bench_router_match_throughput() {
     }
     let (mean_miss, stddev_miss) = compute_stats(&miss_samples);
     println!("router match throughput [miss]: {mean_miss:.0} ± {stddev_miss:.0} msg/sec");
+
+    // Latency pass (T-27): a separate loop so per-operation timing never
+    // perturbs the throughput gates above. 50k timed lookups feed a 0.5 KiB
+    // fixed histogram; the only cost is extra wall time of ~50k lookups.
+    let mut lat = LatencyHistogram::new();
+    for _ in 0..50_000 {
+        let start = Instant::now();
+        black_box(router.matches(black_box(&topic)));
+        lat.record(start.elapsed());
+    }
+    println!(
+        "router match latency [hit]: avg {:.6} ms, p50 {:.6} ms, p99 {:.6} ms, max {:.6} ms ({} samples)",
+        lat.avg_ms().unwrap_or(f64::NAN),
+        lat.percentile_ms(50.0).unwrap_or(f64::NAN),
+        lat.percentile_ms(99.0).unwrap_or(f64::NAN),
+        lat.max_ms().unwrap_or(f64::NAN),
+        lat.count(),
+    );
+    lat.report_json("router_match_hit");
 }
 
 #[derive(Debug, Default)]
@@ -213,6 +351,102 @@ fn bench_sql_ingress_throughput() {
     assert!(
         mean_per_sec > SQL_GATE_EVENTS_PER_SEC,
         "SQL ingress must evaluate > {SQL_GATE_EVENTS_PER_SEC} events/sec, measured {mean_per_sec:.0}"
+    );
+
+    // Latency pass (T-27): separate timed loop after the throughput gate so
+    // sampling cannot move the gate number. 5k timed dispatches into a
+    // 0.5 KiB fixed histogram.
+    let mut sql_lat = LatencyHistogram::new();
+    runtime.block_on(async {
+        for _ in 0..5_000 {
+            let start = Instant::now();
+            engine
+                .dispatch_ingress(
+                    black_box(&topic),
+                    black_box(&payload),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
+                .await;
+            sql_lat.record(start.elapsed());
+        }
+    });
+    println!(
+        "SQL ingress latency: avg {:.6} ms, p50 {:.6} ms, p99 {:.6} ms, max {:.6} ms ({} samples)",
+        sql_lat.avg_ms().unwrap_or(f64::NAN),
+        sql_lat.percentile_ms(50.0).unwrap_or(f64::NAN),
+        sql_lat.percentile_ms(99.0).unwrap_or(f64::NAN),
+        sql_lat.max_ms().unwrap_or(f64::NAN),
+        sql_lat.count(),
+    );
+    sql_lat.report_json("sql_ingress");
+}
+
+#[test]
+fn latency_histogram_empty_reports_none() {
+    let hist = LatencyHistogram::new();
+    assert_eq!(hist.count(), 0);
+    assert_eq!(hist.avg_ms(), None);
+    assert_eq!(hist.min_ms(), None);
+    assert_eq!(hist.max_ms(), None);
+    assert_eq!(hist.percentile_ms(50.0), None);
+    assert_eq!(hist.percentile_ms(99.0), None);
+}
+
+#[test]
+fn latency_histogram_avg_min_max_are_exact() {
+    let mut hist = LatencyHistogram::new();
+    hist.record(Duration::from_micros(100));
+    hist.record(Duration::from_micros(200));
+    hist.record(Duration::from_micros(300));
+    assert_eq!(hist.count(), 3);
+    assert!((hist.avg_ms().unwrap() - 0.2).abs() < 1e-9);
+    assert!((hist.min_ms().unwrap() - 0.1).abs() < 1e-9);
+    assert!((hist.max_ms().unwrap() - 0.3).abs() < 1e-9);
+}
+
+#[test]
+fn latency_histogram_percentile_stays_inside_sample_bucket() {
+    // 1000 identical 1 µs samples all land in one bucket; every
+    // percentile must report that bucket's bounds, not drift elsewhere.
+    let mut hist = LatencyHistogram::new();
+    for _ in 0..1000 {
+        hist.record(Duration::from_micros(1));
+    }
+    // 1000 ns is in bucket 9 ([512, 1024) ns).
+    for p in [0.0, 50.0, 99.0, 100.0] {
+        let v_ms = hist.percentile_ms(p).unwrap();
+        let v_ns = v_ms * 1_000_000.0;
+        assert!(
+            (512.0..=1024.0).contains(&v_ns),
+            "p{p} = {v_ns} ns outside the [512, 1024] ns bucket"
+        );
+    }
+    // A zero-duration sample is counted, not lost to a shift overflow.
+    hist.record(Duration::ZERO);
+    assert_eq!(hist.count(), 1001);
+    assert_eq!(hist.min_ms(), Some(0.0));
+}
+
+#[test]
+fn latency_histogram_memory_is_constant() {
+    // Bounded sampler: a million samples must fit the same fixed buckets,
+    // never an unbounded per-sample buffer.
+    assert!(
+        std::mem::size_of::<LatencyHistogram>() <= 600,
+        "histogram must stay ~0.5 KiB, got {} bytes",
+        std::mem::size_of::<LatencyHistogram>()
+    );
+    let mut hist = LatencyHistogram::new();
+    for i in 0..1_000_000u64 {
+        hist.record(Duration::from_nanos(100 + (i % 997)));
+    }
+    assert_eq!(hist.count(), 1_000_000);
+    assert_eq!(hist.buckets.len(), 64);
+    let avg = hist.avg_ms().unwrap();
+    assert!(
+        (0.0001..0.002).contains(&avg),
+        "avg {avg} ms outside the plausible [0.1, 2.0] µs band"
     );
 }
 
