@@ -1,0 +1,21 @@
+{
+  "_comment": "v5 scenario set: same 15 scenarios and parameters (pub/sub counts, payload sizes, intervals) as benchmark_results_v4.json. Target aggregate rate = pubs * 1000 / interval_ms. Publish duration raised to 20 s for every scenario (v4 used 2.4-10.4 s, which ends while messages are still in flight) plus a drain window so late deliveries are counted, not cut off. Fan-out/fan-in topologies use shared topics: every subscriber subscribes to every shared topic, so fanout = subs for those rows.",
+  "publish_sec": 20,
+  "scenarios": [
+    {"id": "qos0-5k", "v4_name": "QoS 0 - 5k TPS", "qos": 0, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 100, "shared": 0, "drain_sec": 10},
+    {"id": "qos0-10k", "v4_name": "QoS 0 - 10k TPS", "qos": 0, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "qos0-16k", "v4_name": "QoS 0 - 16k TPS", "qos": 0, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 30, "shared": 0, "drain_sec": 10},
+    {"id": "qos0-33k", "v4_name": "QoS 0 - 33k TPS", "qos": 0, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 15, "shared": 0, "drain_sec": 10},
+    {"id": "qos0-60k", "v4_name": "QoS 0 - 60k TPS (the reference broker Parity)", "qos": 0, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 8, "shared": 0, "drain_sec": 10},
+    {"id": "qos1-5k", "v4_name": "QoS 1 - 5k TPS", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 100, "shared": 0, "drain_sec": 10},
+    {"id": "qos1-10k", "v4_name": "QoS 1 - 10k TPS", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "qos1-20k", "v4_name": "QoS 1 - 20k TPS", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 25, "shared": 0, "drain_sec": 10},
+    {"id": "qos1-40k", "v4_name": "QoS 1 - 40k TPS (the reference broker Parity)", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 12, "shared": 0, "drain_sec": 10},
+    {"id": "payload-128B", "v4_name": "Payload 128B (QoS 1)", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "payload-1KB", "v4_name": "Payload 1KB (QoS 1)", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 1024, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "payload-8KB", "v4_name": "Payload 8KB (QoS 1)", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 8192, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "model-symmetric", "v4_name": "Model: Symmetric (1-to-1)", "qos": 1, "pubs": 500, "subs": 500, "payload_bytes": 128, "interval_ms": 50, "shared": 0, "drain_sec": 10},
+    {"id": "model-fanout", "v4_name": "Model: Fan-Out (10 to 500)", "qos": 1, "pubs": 10, "subs": 500, "payload_bytes": 128, "interval_ms": 10, "shared": 10, "drain_sec": 15},
+    {"id": "model-fanin", "v4_name": "Model: Fan-In (500 to 10)", "qos": 1, "pubs": 500, "subs": 10, "payload_bytes": 128, "interval_ms": 50, "shared": 500, "drain_sec": 15}
+  ]
+}
