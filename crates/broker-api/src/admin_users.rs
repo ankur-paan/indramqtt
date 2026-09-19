@@ -10,7 +10,7 @@
 
 use base64::Engine as _;
 use broker_config::{AdminUsersConf, ConfigRegistry};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -98,7 +98,7 @@ impl AdminUsers {
     /// persisted.
     pub fn with_default_admin() -> Self {
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let store = Self {
             users: RwLock::new(HashMap::new()),
             process_secret: secret,
@@ -118,7 +118,7 @@ impl AdminUsers {
     /// `must_change_password`). Memory-only: mutations are not persisted.
     pub fn from_snapshot(conf: &AdminUsersConf) -> Self {
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         let store = Self {
             users: RwLock::new(HashMap::new()),
             process_secret: secret,
@@ -155,11 +155,11 @@ impl AdminUsers {
                         "admin snapshot entry has an undecodable password verifier; account locked until its password is changed"
                     );
                     let mut salt = [0u8; SALT_LEN];
-                    rand::thread_rng().fill_bytes(&mut salt);
+                    rand::rng().fill_bytes(&mut salt);
                     let mut stored_key = [0u8; 32];
                     let mut server_key = [0u8; 32];
-                    rand::thread_rng().fill_bytes(&mut stored_key);
-                    rand::thread_rng().fill_bytes(&mut server_key);
+                    rand::rng().fill_bytes(&mut stored_key);
+                    rand::rng().fill_bytes(&mut server_key);
                     AdminUser {
                         username: entry.username.clone(),
                         role: role_from_conf(&entry.role),
@@ -252,7 +252,7 @@ impl AdminUsers {
                 return Err(AdminUserError::AlreadyExists);
             }
             let mut salt = [0u8; SALT_LEN];
-            rand::thread_rng().fill_bytes(&mut salt);
+            rand::rng().fill_bytes(&mut salt);
             let (stored_key, server_key) = derive_keys(password.as_bytes(), &salt, ITERATIONS);
             users.insert(
                 username.to_string(),
@@ -336,7 +336,7 @@ impl AdminUsers {
                 return Err(AdminUserError::SameAsOld);
             }
             let mut salt = [0u8; SALT_LEN];
-            rand::thread_rng().fill_bytes(&mut salt);
+            rand::rng().fill_bytes(&mut salt);
             let (stored_key, server_key) = derive_keys(new_password.as_bytes(), &salt, ITERATIONS);
             if let Some(user) = users.get_mut(username) {
                 user.salt = salt.to_vec();
@@ -536,7 +536,7 @@ fn is_valid_username(username: &str) -> bool {
 /// Administrator, `must_change_password = true`).
 fn default_admin_user() -> AdminUser {
     let mut salt = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     let (stored_key, server_key) = derive_keys(b"public", &salt, ITERATIONS);
     AdminUser {
         username: "admin".to_string(),

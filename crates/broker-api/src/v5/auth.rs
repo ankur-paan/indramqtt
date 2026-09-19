@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use broker_auth::{AclAction, AclRule};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -78,7 +78,7 @@ impl ApiTokens {
     /// Issue a random 32-byte URL-safe token bound to `username`/`role`.
     pub fn issue(&self, username: &str, role: AdminRole) -> String {
         let mut token_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut token_bytes);
+        rand::rng().fill_bytes(&mut token_bytes);
         let token = format!("indra_{}", URL_SAFE_NO_PAD.encode(token_bytes));
         let info = TokenInfo {
             username: username.to_string(),
@@ -115,7 +115,7 @@ impl ApiTokens {
     #[cfg(test)]
     pub(crate) fn issue_expired(&self, username: &str, role: AdminRole) -> String {
         let mut token_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut token_bytes);
+        rand::rng().fill_bytes(&mut token_bytes);
         let token = format!("indra_{}", URL_SAFE_NO_PAD.encode(token_bytes));
         let info = TokenInfo {
             username: username.to_string(),
@@ -284,7 +284,7 @@ pub async fn scram_challenge(
     State(state): State<ApiState>,
     Json(req): Json<ScramChallengeRequest>,
 ) -> Response {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut server_nonce_bytes = [0u8; 24];
     rng.fill_bytes(&mut server_nonce_bytes);
     let server_nonce = BASE64
