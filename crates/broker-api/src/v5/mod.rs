@@ -1,4 +1,4 @@
-//! EMQX v5 REST API compatibility router for IndraMQTT.
+//! v5 REST API compatibility router for IndraMQTT.
 
 pub mod auth;
 pub mod clients;

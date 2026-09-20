@@ -1,4 +1,4 @@
-//! Live observability, rate metrics, and alarm polling for EMQX v5.
+//! Live observability, rate metrics, and alarm polling for the v5 REST API.
 
 use axum::{
     extract::State,

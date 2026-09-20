@@ -1,4 +1,4 @@
-//! Cluster and Node status endpoints for EMQX v5.
+//! Cluster and node status endpoints for the v5 REST API.
 
 use axum::{
     extract::{Path, State},
@@ -24,9 +24,9 @@ pub async fn list_nodes(State(state): State<ApiState>) -> Response {
         "max_fds": 1048576,
         "connections": conns,
         "live_connections": conns,
-        "load1": "0.12",
-        "load5": "0.15",
-        "load15": "0.10",
+        "load1": 0.12,
+        "load5": 0.15,
+        "load15": 0.10,
         "log_path": "log/indramqtt.log",
         "role": "core",
         "uptime": 86400000,
@@ -53,9 +53,9 @@ pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<Strin
             "max_fds": 1048576,
             "connections": conns,
             "live_connections": conns,
-            "load1": "0.12",
-            "load5": "0.15",
-            "load15": "0.10",
+            "load1": 0.12,
+            "load5": 0.15,
+            "load15": 0.10,
             "role": "core",
             "uptime": 86400000,
             "version": "5.8.0",

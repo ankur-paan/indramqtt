@@ -1,4 +1,4 @@
-//! Schema generator for EMQX v5 OpenAPI/JSON schemas used by the Dashboard UI
+//! Schema generator for v5 OpenAPI/JSON schemas used by the Dashboard UI
 //! for rendering dynamic forms in Connector and Rule Engine Action dialogs.
 
 use axum::{

@@ -1,1 +1,1 @@
-[{"operation": "GET /nodes/{node}", "path_params": {"node": "$from:GET /nodes#/0/node"}, "query": {}, "body": null, "expect_status": 200, "setup": [], "cleanup": []}]
+[{"operation": "GET /nodes", "path_params": {}, "query": {}, "body": null, "expect_status": 200, "setup": [], "cleanup": []}, {"operation": "GET /nodes/{node}", "path_params": {"node": "$from:GET /nodes#/0/node"}, "query": {}, "body": null, "expect_status": 200, "setup": [], "cleanup": []}]
