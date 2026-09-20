@@ -10,18 +10,18 @@
 //! example the `"indramqtt@127.0.0.1"` literal rendered by
 //! `v5::nodes::list_nodes`). No caller migration happens in this task.
 
-use crate::errors::EmqxError;
+use crate::errors::ApiError;
 
 /// Resolve a requested node name against the local node name.
 ///
 /// Returns `Ok(())` only on an exact, case-sensitive match. Anything else
 /// (unknown names, empty strings, differently-cased names, prefix matches)
 /// returns 404 `NOT_FOUND` naming the unknown node.
-pub fn resolve_node(local: &str, requested: &str) -> Result<(), EmqxError> {
+pub fn resolve_node(local: &str, requested: &str) -> Result<(), ApiError> {
     if requested == local && !requested.is_empty() {
         Ok(())
     } else {
-        Err(EmqxError::NotFound(format!("node not found: {requested}")))
+        Err(ApiError::NotFound(format!("node not found: {requested}")))
     }
 }
 

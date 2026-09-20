@@ -1,4 +1,4 @@
-//! Shared server-side pagination with EMQX semantics.
+//! Shared server-side pagination with documented semantics.
 //!
 //! Every list endpoint paginates with `page` / `limit` query parameters and
 //! reports `meta { page, limit, count, hasnext }`. This module is the single
@@ -8,9 +8,9 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
-/// EMQX default page: the first page.
+/// Default page: the first page.
 pub const DEFAULT_PAGE: u32 = 1;
-/// EMQX default limit: 100 rows per page.
+/// Default limit: 100 rows per page.
 pub const DEFAULT_LIMIT: u32 = 100;
 /// Upper bound for `limit`; larger values are clamped, never rejected.
 pub const MAX_LIMIT: u32 = 1000;

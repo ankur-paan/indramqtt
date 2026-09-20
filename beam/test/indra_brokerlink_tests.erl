@@ -389,6 +389,52 @@ dispatch_publishout_to_registered_conn_test() ->
         gen_tcp:close(LSock)
     end.
 
+inbound_frames_leave_no_retained_state_test() ->
+    %% Every inbound kernel frame used to be prepended to a `frames'
+    %% list in the shard server state that was never read or trimmed,
+    %% so shard memory grew monotonically for the life of the edge
+    %% (process memory that never drains after load stops). The shard
+    %% must retain no per-frame state once a frame is dispatched.
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw},
+                                     {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(LSock),
+    Server = spawn(fun() -> dispatch_server(LSock) end),
+    {ok, Registry} = indra_conn_registry:start_link(),
+    {ok, Client} = indra_brokerlink:start_link([{transport, tcp},
+                                                {host, "127.0.0.1"},
+                                                {port, Port}]),
+    try
+        ok = indra_conn_registry:register(7701, self()),
+        N = 2000,
+        Meta = indra_brokerlink:encode_publish_meta(<<"t">>, 0, 0, false, false),
+        Frame = indra_brokerlink:encode_frame(16#0021, 7701, 9, Meta, <<"hi">>),
+        lists:foreach(fun(_) -> Server ! {emit, Frame} end, lists:seq(1, N)),
+        receive_n_broker_frames(N),
+        %% Drain period: dispatched frames must not linger in the
+        %% shard server state, mailbox, or reassembly buffer.
+        timer:sleep(500),
+        State = sys:get_state(Client),
+        ?assertEqual(false, maps:is_key(frames, State)),
+        ?assertEqual(false, maps:is_key(last_pong, State)),
+        ?assertEqual(<<>>, maps:get(buffer, State)),
+        {message_queue_len, MQLen} = process_info(Client, message_queue_len),
+        ?assertEqual(0, MQLen)
+    after
+        indra_brokerlink:stop(Client),
+        indra_conn_registry:stop(Registry),
+        gen_tcp:close(LSock)
+    end.
+
+%% @private Receive exactly N forwarded inbound frames.
+receive_n_broker_frames(0) -> ok;
+receive_n_broker_frames(N) ->
+    receive
+        {'$gen_cast', {broker_frame, _, _, _}} ->
+            receive_n_broker_frames(N - 1)
+    after 10000 ->
+        error({broker_frame_timeout, N})
+    end.
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------

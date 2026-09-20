@@ -430,8 +430,45 @@ impl SessionManager {
         }
     }
 
-    pub fn unbind_connection(&self, client_id: &str, conn_id: u64) {
-        let username_to_release: Option<String> = {
+    /// Snapshot the subscription filters of one session, if known.
+    /// Used by the kernel to sweep stale router entries on a clean-start
+    /// bind (which discards any previous state, even a persistent one).
+    pub fn subscription_filters(&self, client_id: &str) -> Vec<TopicFilter> {
+        match self.get(client_id) {
+            Some(session) => session.subscriptions.read().keys().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Drain the subscriptions of a clean session, returning the removed
+    /// filters. Persistent sessions are untouched (empty return). The
+    /// returned list is bounded by that session's own subscription count;
+    /// delivery never calls here, so the per-message cost is zero.
+    pub fn take_clean_subscriptions(&self, client_id: &str) -> Vec<TopicFilter> {
+        match self.get(client_id) {
+            Some(session) => {
+                if session.clean_start {
+                    session
+                        .subscriptions
+                        .write()
+                        .drain()
+                        .map(|(f, _)| f)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Detach one edge connection, returning the subscription filters to
+    /// sweep from the router. Only a verified owner detach of a clean
+    /// session yields filters: racing teardowns for a superseded conn_id
+    /// and persistent sessions both yield empty (their subscriptions
+    /// survive, which is what durable redelivery builds on).
+    pub fn unbind_connection(&self, client_id: &str, conn_id: u64) -> Vec<TopicFilter> {
+        let (username_to_release, swept): (Option<String>, Vec<TopicFilter>) = {
             let map = self.sessions.read();
             match map.get(client_id) {
                 Some(session) => {
@@ -445,12 +482,22 @@ impl SessionManager {
                         if session.clean_start {
                             session.clear_inflight();
                         }
-                        session.username.read().clone()
+                        let swept = if session.clean_start {
+                            session
+                                .subscriptions
+                                .write()
+                                .drain()
+                                .map(|(f, _)| f)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        (session.username.read().clone(), swept)
                     } else {
-                        None
+                        (None, Vec::new())
                     }
                 }
-                None => None,
+                None => (None, Vec::new()),
             }
         };
         if let Some(username) = username_to_release {
@@ -471,6 +518,7 @@ impl SessionManager {
         }
         // Reconnects start with a full bucket; abandoned entries vanish.
         self.buckets.write().remove(client_id);
+        swept
     }
 
     /// Admit one connection for `username` under an optional cap
@@ -912,5 +960,40 @@ mod tests {
 
         // Reconnect starts full again without waiting for refill.
         assert!(manager.check_publish_budget("pruned", 1000, 1));
+    }
+
+    #[test]
+    fn test_unbind_drains_clean_subscriptions_only() {
+        // Clean session: detach returns its filters and empties the mirror.
+        let manager = SessionManager::new();
+        let (clean, _) = manager.get_or_create("tk04-clean", true);
+        *clean.conn_id.write() = Some(81);
+        manager.add_subscription(
+            "tk04-clean",
+            TopicFilter::new("tk04/ghost").unwrap(),
+            broker_protocol::QoS::AtMostOnce,
+        );
+        assert_eq!(manager.subscription_filters("tk04-clean").len(), 1);
+        let swept = manager.unbind_connection("tk04-clean", 81);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].as_str(), "tk04/ghost");
+        assert!(manager.subscription_filters("tk04-clean").is_empty());
+
+        // Persistent session: detach yields nothing and keeps the mirror.
+        let (durable, _) = manager.get_or_create("tk04-durable", false);
+        *durable.conn_id.write() = Some(91);
+        manager.add_subscription(
+            "tk04-durable",
+            TopicFilter::new("tk04/kept").unwrap(),
+            broker_protocol::QoS::AtMostOnce,
+        );
+        let swept = manager.unbind_connection("tk04-durable", 91);
+        assert!(swept.is_empty());
+        assert_eq!(manager.subscription_filters("tk04-durable").len(), 1);
+
+        // Racing teardown for a superseded conn_id sweeps nothing.
+        let swept = manager.unbind_connection("tk04-durable", 999);
+        assert!(swept.is_empty());
+        assert_eq!(manager.subscription_filters("tk04-durable").len(), 1);
     }
 }

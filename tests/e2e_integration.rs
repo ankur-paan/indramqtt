@@ -951,7 +951,7 @@ async fn kicked_mqtt_client_sees_disconnect() {
     .await
     .expect("change password request in time")
     .expect("change password request");
-    assert_eq!(changed.status(), 200);
+    assert_eq!(changed.status(), 204);
     let login = tokio::time::timeout(
         TIMEOUT,
         http.post(format!("{base}/api/v5/login"))

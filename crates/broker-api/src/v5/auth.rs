@@ -1,4 +1,4 @@
-//! SCRAM-SHA-256 and fallback authentication for EMQX v5 REST API.
+//! SCRAM-SHA-256 and fallback authentication for the v5 REST API.
 
 use axum::{
     extract::{Extension, Path, State},
@@ -592,7 +592,7 @@ pub async fn create_user(
         return admin_error(error);
     }
     (
-        StatusCode::CREATED,
+        StatusCode::OK,
         Json(serde_json::json!({
             "username": req.username,
             "role": role_str(&role),
@@ -670,7 +670,7 @@ pub struct ChangePasswordReq {
     pub new_pwd: Option<String>,
 }
 
-/// `PUT /users/:username/change_pwd {old_pwd, new_pwd}` (EMQX-compatible).
+/// `PUT /users/:username/change_pwd {old_pwd, new_pwd}` (compatible with the documented API).
 /// Administrators may change any user's password; viewers only their own.
 /// `old_pwd` is required when changing your own password. The middleware
 /// guarantees a valid token; the self-or-administrator rule stays here.
@@ -714,11 +714,7 @@ pub async fn change_user_password(
         &username,
         bearer_token_from_credentials(&headers).as_deref(),
     );
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "username": username })),
-    )
-        .into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ---------------------------------------------------------------------------

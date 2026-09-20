@@ -181,7 +181,28 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             }
         }
     }
+    // Clean-start bind discards any previous state for this client id,
+    // including router entries left by an earlier session: snapshot them
+    // before `get_or_create` drops the old session object.
+    let stale: (String, Vec<broker_protocol::TopicFilter>) = match decode_bind_meta(&frame.metadata)
+    {
+        Ok(req) if req.clean_start => (
+            req.client_id.clone(),
+            shared.sessions.subscription_filters(&req.client_id),
+        ),
+        Ok(req) => (req.client_id.clone(), Vec::new()),
+        Err(_) => (String::new(), Vec::new()),
+    };
     let reply = reply_for_frame(frame, &shared.sessions);
+    // Sweep the stale router copies so a clean reconnect resubscribes
+    // from nothing. Off the hot path (bind only); fan-out takes no new
+    // lock and delivery cost is unchanged.
+    for filter in &stale.1 {
+        shared.router.unsubscribe(filter, &stale.0);
+    }
+    if !stale.1.is_empty() {
+        refresh_subscription_stats(shared);
+    }
     // Stamp ownership for quota release and publish attribution.
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         if let (Some(session), Some(username)) =
@@ -518,16 +539,23 @@ async fn handle_connection(
 }
 
 /// Detach a dead transport: forget its mailbox and detach every
-/// session bound on it (durable sessions keep subscriptions + offline
-/// queue). Per-transport work only: each entry touches its own session
-/// plus atomics, so deaths on other transports never block this one.
+/// session bound on it. Clean sessions drop their subscriptions (session
+/// mirror and router copies, plus their unacked QoS 1 inflight state);
+/// durable sessions keep subscriptions + offline queue + inflight for
+/// reconnect replay. Per-transport work only: each entry touches its own
+/// session plus atomics, so deaths on other transports never block this
+/// one. Router sweeps run once per detached clean session, off the hot
+/// path; fan-out takes no new lock.
 fn detach(bound: &[(String, u64)], shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
     shared.conns.prune_sender(tx);
     if bound.is_empty() {
         return;
     }
     for (client_id, conn_id) in bound {
-        shared.sessions.unbind_connection(client_id, *conn_id);
+        let swept = shared.sessions.unbind_connection(client_id, *conn_id);
+        for filter in &swept {
+            shared.router.unsubscribe(filter, client_id);
+        }
         let active = shared.metrics.dec_connections();
         shared.stats.set_connections(active.max(0) as u64);
     }
@@ -1355,14 +1383,20 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
 }
 
 /// Detach one edge connection: mark its session disconnected (ownership
-/// verified against the bound conn_id) and forget its mailbox. Durable
-/// subscriptions and unacked QoS 1 downlinks survive for reconnect
-/// replay; clean sessions drop their inflight state in `unbind_connection`.
+/// verified against the bound conn_id) and forget its mailbox. A clean
+/// session drops its subscriptions (session mirror and router copies, so
+/// a later reconnect with the same client id receives nothing until it
+/// resubscribes) and its unacked QoS 1 inflight state; durable
+/// subscriptions and unacked downlinks survive for reconnect replay. The
+/// sweep touches only this session's own filters and runs off the hot path.
 fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
     if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
-        shared
+        let swept = shared
             .sessions
             .unbind_connection(&client_id, frame.header.conn_id);
+        for filter in &swept {
+            shared.router.unsubscribe(filter, &client_id);
+        }
         refresh_subscription_stats(shared);
     }
     shared.conns.unregister(frame.header.conn_id);
@@ -2682,7 +2716,11 @@ mod tests {
     #[tokio::test]
     async fn unbind_detaches_connection_but_keeps_subscriptions() {
         let shared = test_shared();
-        let bind = bind_frame(71, 1, encode_bind_meta("gone-1", true, 60));
+        // Durable session (clean_start=false): the detach keeps subscriptions.
+        // (Clean sessions are covered by
+        // `clean_session_disconnect_drops_subscriptions_no_ghost`, which
+        // asserts the router copy is removed.)
+        let bind = bind_frame(71, 1, encode_bind_meta("gone-1", false, 60));
         reply_for_frame(&bind, &shared.sessions).expect("bind replies");
         let sub = subscribe_frame(71, 2, encode_subscribe_meta(1, "gone-1", &[("t", 0)]));
         let (reply, _) = apply_subscribe(&sub, &shared).await;
@@ -2708,6 +2746,119 @@ mod tests {
         assert_eq!(*session.conn_id.read(), None);
         // Durable subscriptions survive the detach.
         assert_eq!(shared.router.matches(&Topic::new("t").unwrap()).len(), 1);
+    }
+
+    fn unbind_frame(conn_id: u64, seq: u64, client_id: &str) -> BrokerFrame {
+        let mut meta = Vec::with_capacity(2 + client_id.len());
+        meta.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(client_id.as_bytes());
+        BrokerFrame::new(
+            OpCode::UnbindConnection,
+            conn_id,
+            seq,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame")
+    }
+
+    /// TK-04: a clean session leaves no subscriptions behind, so a later
+    /// reconnect with the same client id receives nothing until it
+    /// resubscribes. Fails before the fix with one ghost delivery.
+    #[tokio::test]
+    async fn clean_session_disconnect_drops_subscriptions_no_ghost() {
+        let shared = test_shared();
+        let bind = bind_frame(81, 1, encode_bind_meta("tk04-clean", true, 60));
+        apply_bind(&bind, &shared).await.expect("bind replies");
+        let sub = subscribe_frame(
+            81,
+            2,
+            encode_subscribe_meta(1, "tk04-clean", &[("tk04/ghost", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        assert_eq!(
+            shared
+                .router
+                .matches(&Topic::new("tk04/ghost").unwrap())
+                .len(),
+            1
+        );
+
+        // Clean disconnect sweeps both the session mirror and the router.
+        apply_unbind(&unbind_frame(81, 3, "tk04-clean"), &shared);
+        let session = shared.sessions.get("tk04-clean").expect("session row");
+        assert!(!*session.connected.read());
+        assert_eq!(*session.conn_id.read(), None);
+        assert!(session.subscriptions.read().is_empty());
+        assert!(
+            shared
+                .router
+                .matches(&Topic::new("tk04/ghost").unwrap())
+                .is_empty(),
+            "clean disconnect must remove the router copy"
+        );
+
+        // Reconnect clean with the same client id: fresh session, no subs.
+        let rebind = bind_frame(82, 1, encode_bind_meta("tk04-clean", true, 60));
+        apply_bind(&rebind, &shared).await.expect("rebind replies");
+        assert!(shared
+            .router
+            .matches(&Topic::new("tk04/ghost").unwrap())
+            .is_empty());
+
+        // A publish to the old topic reaches nobody.
+        let (meta, payload) = encode_publish_meta("tk04/ghost", 0, 0, false, b"stale");
+        let (_, deliveries) = apply_publish(&publish_frame(99, 4, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "ghost delivery: clean reconnect must receive nothing until resubscribe"
+        );
+    }
+
+    /// TK-04 companion: a persistent session keeps its subscription across
+    /// the same disconnect/reconnect sequence (what durable redelivery
+    /// builds on).
+    #[tokio::test]
+    async fn durable_session_disconnect_keeps_subscriptions() {
+        let shared = test_shared();
+        let bind = bind_frame(91, 1, encode_bind_meta("tk04-durable", false, 60));
+        apply_bind(&bind, &shared).await.expect("bind replies");
+        let sub = subscribe_frame(
+            91,
+            2,
+            encode_subscribe_meta(1, "tk04-durable", &[("tk04/kept", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        apply_unbind(&unbind_frame(91, 3, "tk04-durable"), &shared);
+        // Detached durable session: router copy and session mirror survive.
+        assert_eq!(
+            shared
+                .router
+                .matches(&Topic::new("tk04/kept").unwrap())
+                .len(),
+            1
+        );
+        assert_eq!(
+            shared
+                .sessions
+                .get("tk04-durable")
+                .expect("session row")
+                .subscriptions
+                .read()
+                .len(),
+            1
+        );
+
+        // Reconnect durably on a new connection: the subscription routes.
+        let rebind = bind_frame(92, 1, encode_bind_meta("tk04-durable", false, 60));
+        apply_bind(&rebind, &shared).await.expect("rebind replies");
+        let (meta, payload) = encode_publish_meta("tk04/kept", 0, 0, false, b"live");
+        let (_, deliveries) = apply_publish(&publish_frame(99, 4, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 92);
     }
 
     #[tokio::test]
@@ -3298,7 +3449,7 @@ mod tests {
             Some(&token),
         )
         .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         let login =
             serde_json::json!({"username": "admin", "password": "Adm1n-test-pass!"}).to_string();
         let (status, body) =

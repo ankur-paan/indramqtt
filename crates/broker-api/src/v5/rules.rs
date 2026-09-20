@@ -1,4 +1,4 @@
-//! Streaming SQL rules, data connectors, action sinks, and schema registry for EMQX v5.
+//! Streaming SQL rules, data connectors, action sinks, and schema registry for the v5 REST API.
 
 use axum::{
     extract::{Path, State},
@@ -3238,13 +3238,26 @@ async fn register_live_sink(
     }
 }
 
+/// Whether a connector id already lives in the store, matching the
+/// same `id`-or-`name` predicate the read and update paths use. Control
+/// plane only: one linear scan per create, nothing on the message path.
+fn connector_id_exists(name: &str) -> bool {
+    CONNECTORS.read().unwrap().iter().any(|c| {
+        c.get("id").and_then(|v| v.as_str()) == Some(name)
+            || c.get("name").and_then(|v| v.as_str()) == Some(name)
+    })
+}
+
 pub async fn create_connector(
     State(state): State<ApiState>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
+    // The connector id is `name`, with `id` accepted as an alias: stored
+    // entries carry both keys with the same value, and reads match either.
     let name = body
         .get("name")
         .and_then(|v| v.as_str())
+        .or_else(|| body.get("id").and_then(|v| v.as_str()))
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("connector-{}", rand::random::<u16>()));
     let raw_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -3284,6 +3297,24 @@ pub async fn create_connector(
         "http".to_string()
     };
 
+    // Reject a duplicate id before mutating anything: pushing it into
+    // the store would poison every later connector POST/PUT/DELETE, whose
+    // persistence export re-validates the whole store and fails on the
+    // duplicated id. The documented conflict code is `ALREADY_EXISTS`.
+    // This early read-check also skips the wasted probe and live-sink
+    // registration below; the write-locked re-check before the push
+    // closes the check-then-insert race for the in-memory store.
+    if connector_id_exists(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "ALREADY_EXISTS",
+                "message": "Connector already exists."
+            })),
+        )
+            .into_response();
+    }
+
     let is_reachable = probe_connector_reachable(&body).await;
     let status_str = connector_status(is_reachable);
 
@@ -3308,7 +3339,25 @@ pub async fn create_connector(
         register_live_sink(&state.engine, &conn_type, &name, &body).await;
     }
 
-    CONNECTORS.write().unwrap().push(body.clone());
+    // Re-check under the write lock so two concurrent creates for the
+    // same id cannot both pass the early check and push a duplicate pair.
+    {
+        let mut store = CONNECTORS.write().unwrap();
+        if store.iter().any(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(name.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
+        }) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "ALREADY_EXISTS",
+                    "message": "Connector already exists."
+                })),
+            )
+                .into_response();
+        }
+        store.push(body.clone());
+    }
 
     // A persist failure is a 500 (the in-memory entry stays but the disk
     // save failed); the loss must never be silent.
@@ -3826,7 +3875,7 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
             Err(err) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "code": "CONNECTION_FAILED",
+                    "code": "TEST_FAILED",
                     "message": err
                 })),
             )
@@ -3871,7 +3920,7 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
-                        "code": "CONNECTION_FAILED",
+                        "code": "TEST_FAILED",
                         "message": err
                     })),
                 )

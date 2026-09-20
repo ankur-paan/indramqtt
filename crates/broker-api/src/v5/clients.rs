@@ -1,4 +1,4 @@
-//! Client sessions, subscription trie inspection, and test publishing for EMQX v5.
+//! Client sessions, subscription trie inspection, and test publishing for the v5 REST API.
 
 use axum::{
     extract::{Path, Query, State},
@@ -306,11 +306,7 @@ pub async fn client_subscribe(
         .router
         .subscribe(&filter, Subscription::new(&*client_id, conn_id, qos));
 
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "result": "ok" })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()
 }
 
 #[derive(Deserialize)]

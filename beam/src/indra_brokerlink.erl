@@ -673,8 +673,6 @@ init(Opts) ->
                       path => Path,
                       buffer => <<>>,
                       seq => 0,
-                      last_pong => undefined,
-                      frames => [],
                       reconnect => Reconnect,
                       backoff_base_ms => BaseMs,
                       backoff_max_ms => MaxMs,
@@ -889,19 +887,18 @@ notify_down() ->
     ok.
 
 %% @private Drain complete frames from the reassembly buffer.
+%%
+%% No per-frame state is retained: each header is dispatched and then
+%% dropped, so shard memory stays flat no matter how many frames flow
+%% through. (An earlier version prepended every header to a `frames'
+%% list that nothing ever read, leaking ~140 bytes per inbound frame
+%% for the life of the edge.)
 drain_buffer(State) ->
     Buf = maps:get(buffer, State),
     case decode_frame(Buf) of
         {ok, Header, Meta, Payload, Rest} ->
-            Frames = [Header | maps:get(frames, State)],
-            State1 = case maps:get(opcode, Header) of
-                16#0002 ->
-                    State#{last_pong => Header, frames => Frames, buffer => Rest};
-                _ ->
-                    State#{frames => Frames, buffer => Rest}
-            end,
             dispatch_frame(Header, Meta, Payload),
-            drain_buffer(State1);
+            drain_buffer(State#{buffer => Rest});
         {more, _Need} ->
             State;
         {error, _Reason} ->

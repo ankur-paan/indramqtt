@@ -1,0 +1,1 @@
+[{"operation": "POST /connectors_probe", "path_params": {}, "query": {}, "body": {"type": "http", "url": "http://127.0.0.1:9"}, "expect_status": 400, "setup": [], "cleanup": []}, {"operation": "POST /actions_probe", "path_params": {}, "query": {}, "body": {"type": "http", "url": "http://127.0.0.1:9"}, "expect_status": 400, "setup": [], "cleanup": []}]

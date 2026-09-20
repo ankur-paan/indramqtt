@@ -1737,7 +1737,7 @@ mod tests {
                     &fresh,
                 )
                 .await;
-            assert_eq!(status, 200);
+            assert_eq!(status, 204);
             let (status, body) = self
                 .post(
                     "/api/v5/login",
@@ -2518,7 +2518,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         let (status, body) = server
             .post(
@@ -2564,7 +2564,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
 
         // Flag cleared on the caller's surviving token.
         let (status, body) = server.get_auth("/api/v5/current_user", &admin_token).await;
@@ -2590,7 +2590,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, body) = server
             .post(
                 "/api/v5/login",
@@ -2621,7 +2621,7 @@ mod tests {
                 &fresh,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         let (status, _) = server.get_auth("/api/v1/clients", &fresh).await;
         assert_eq!(status, 200);
     }
@@ -2681,7 +2681,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         assert_eq!(created["username"], json!("ops"));
         assert_eq!(created["role"], json!("viewer"));
         assert_eq!(created["description"], json!("read-only"));
@@ -2726,7 +2726,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         let (status, body) = server
             .post(
@@ -2744,7 +2744,7 @@ mod tests {
                 &b_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         let (status, _) = server
             .put_auth(
@@ -2778,7 +2778,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         let (status, body) = server
             .post(
@@ -2831,7 +2831,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .put_auth(
                 "/api/v5/users/w0keep/change_pwd",
@@ -2839,7 +2839,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         drop(server);
         drop(registry);
 
@@ -2882,7 +2882,7 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         // Sanity: the user logs in before the delete.
         let (status, _) = server
             .post(
@@ -3147,6 +3147,93 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn connector_duplicate_create_rejected_without_poisoning() {
+        // TK-03: a duplicate create must be rejected with the documented
+        // conflict code before the store is mutated, so later
+        // POST/PUT/DELETE keep working (no poisoned persistence).
+        let dir = unique_data_dir("tk03-conn-dup");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // No `server`/`url` target: no probe runs, status is `connected`.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "tk03-dup-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Duplicate by `name`: the documented conflict, not a 500.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "tk03-dup-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "duplicate create must be rejected, got: {body}"
+        );
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Duplicate by `id`: the same connector under the other key.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"id": "tk03-dup-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "duplicate create by id must be rejected, got: {body}"
+        );
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // The store is not poisoned: later POST/PUT/DELETE work normally.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "tk03-other-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "create after a rejected duplicate must succeed"
+        );
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/tk03-dup-conn",
+                json!({"type": "http", "enable": true}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "update of the existing id must keep working");
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/tk03-other-conn", &token)
+            .await;
+        assert_eq!(
+            status, 204,
+            "delete after a rejected duplicate must succeed"
+        );
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/tk03-dup-conn", &token)
+            .await;
+        assert_eq!(
+            status, 200,
+            "original connector must still be readable: {body}"
+        );
+        assert_eq!(body["id"], json!("tk03-dup-conn"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn fill_pending_challenges(tokens: &crate::v5::auth::ApiTokens, count: usize) {
         for i in 0..count {
             let inserted = tokens.insert_challenge(
@@ -3243,7 +3330,7 @@ mod tests {
                 &fresh,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
 
         // After the change the same token opens the API.
         let (status, _) = server.get_auth("/api/v1/clients", &fresh).await;
@@ -3262,7 +3349,7 @@ mod tests {
                 &admin,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, body) = server
             .post(
                 "/api/v5/login",
@@ -5608,5 +5695,95 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v5/schemas", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!(["actions", "connectors"]));
+    }
+
+    #[tokio::test]
+    async fn node_loads_serialise_as_numbers() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/nodes", &token).await;
+        assert_eq!(status, 200);
+        let first = &body[0];
+        for field in ["load1", "load5", "load15"] {
+            assert!(
+                first[field].is_number(),
+                "{field} must be a JSON number, got: {}",
+                first[field]
+            );
+        }
+        let node = first["node"].as_str().expect("node name").to_string();
+        let (status, single) = server
+            .get_auth(&format!("/api/v5/nodes/{node}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        for field in ["load1", "load5", "load15"] {
+            assert!(
+                single[field].is_number(),
+                "{field} must be a JSON number, got: {}",
+                single[field]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_subscribe_returns_documented_status() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/tk02-sub/subscribe",
+                json!({"topic": "tk02/sub", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn dashboard_user_create_returns_documented_status() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "tk02-user", "password": "Tk02-passw0rd!"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(created["username"], json!("tk02-user"));
+    }
+
+    #[tokio::test]
+    async fn change_pwd_returns_documented_status() {
+        let (server, _state) = TestServer::start().await;
+        let fresh = server.admin_token().await;
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "public", "new_pwd": "Tk02-new-pass!"}),
+                &fresh,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(body, json!(null));
+    }
+
+    #[tokio::test]
+    async fn probe_failures_report_documented_code() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Port 9 is closed, so the probe reaches its failure branch.
+        for path in ["/api/v5/connectors_probe", "/api/v5/actions_probe"] {
+            let (status, body) = server
+                .post_auth(
+                    path,
+                    json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{path} failure must be 400");
+            assert_eq!(body["code"], json!("TEST_FAILED"), "{path} code");
+        }
     }
 }

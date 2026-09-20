@@ -1,6 +1,6 @@
-//! Shared EMQX error codes with `{code, message}` responses.
+//! Shared management error codes with `{code, message}` responses.
 //!
-//! Every management handler must reject with the EMQX error code name the
+//! Every management handler must reject with the documented error code name the
 //! spec assigns to that failure (`CLIENTID_NOT_FOUND`, not `NOT_FOUND`,
 //! for a missing client). Today each handler hand-rolls its own literals
 //! and several use the wrong code; this module is the single place the
@@ -10,19 +10,19 @@
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 
-/// One EMQX management error: a spec code name plus human detail.
+/// One management error: a spec code name plus human detail.
 ///
 /// Each variant carries the `message` string rendered alongside `code`;
-/// use [`EmqxError::with_message`] to replace the detail while keeping
+/// use [`ApiError::with_message`] to replace the detail while keeping
 /// the variant (and therefore the code name and HTTP status).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EmqxError {
+pub enum ApiError {
     /// Generic resource miss (`GET /rules/:id`, connectors, schemas).
     NotFound(String),
     /// Malformed request body, query, or topic filter.
     BadRequest(String),
     /// `GET /clients/:clientid` for an unknown client id. Distinct from
-    /// [`EmqxError::NotFound`]: the spec assigns this endpoint its own
+    /// [`ApiError::NotFound`]: the spec assigns this endpoint its own
     /// code name.
     ClientIdNotFound(String),
     /// Dashboard/API login with a wrong username or password.
@@ -50,8 +50,8 @@ pub enum EmqxError {
     Unauthorized(String),
 }
 
-impl EmqxError {
-    /// The exact EMQX code name rendered as `code` in the response body.
+impl ApiError {
+    /// The exact documented code name rendered as `code` in the response body.
     pub fn code(&self) -> &'static str {
         match self {
             Self::NotFound(_) => "NOT_FOUND",
@@ -132,7 +132,7 @@ impl EmqxError {
     }
 }
 
-impl IntoResponse for EmqxError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
         let body = serde_json::json!({
@@ -149,7 +149,7 @@ mod tests {
     use axum::response::Response;
 
     /// Read a rendered error response back into status + JSON body.
-    async fn response_parts(err: EmqxError) -> (StatusCode, serde_json::Value) {
+    async fn response_parts(err: ApiError) -> (StatusCode, serde_json::Value) {
         let response: Response = err.into_response();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
@@ -161,22 +161,22 @@ mod tests {
 
     /// One instance of every variant, so table-driven tests cover the
     /// whole enum without a caller having to enumerate it again.
-    fn every_variant() -> Vec<EmqxError> {
+    fn every_variant() -> Vec<ApiError> {
         vec![
-            EmqxError::NotFound("missing".to_string()),
-            EmqxError::BadRequest("bad input".to_string()),
-            EmqxError::ClientIdNotFound("no such client".to_string()),
-            EmqxError::BadUsernameOrPwd("wrong credentials".to_string()),
-            EmqxError::NamePwdError("wrong credentials".to_string()),
-            EmqxError::TooManyRequests("slow down".to_string()),
-            EmqxError::AlreadyExists("duplicate".to_string()),
-            EmqxError::NotAuthorized("no scope".to_string()),
-            EmqxError::Forbidden("denied".to_string()),
-            EmqxError::BadListenerId("no such listener".to_string()),
-            EmqxError::BadNode("no such node".to_string()),
-            EmqxError::TestFailed("rule did not match".to_string()),
-            EmqxError::ConnectionFailed("target unreachable".to_string()),
-            EmqxError::Unauthorized("no token".to_string()),
+            ApiError::NotFound("missing".to_string()),
+            ApiError::BadRequest("bad input".to_string()),
+            ApiError::ClientIdNotFound("no such client".to_string()),
+            ApiError::BadUsernameOrPwd("wrong credentials".to_string()),
+            ApiError::NamePwdError("wrong credentials".to_string()),
+            ApiError::TooManyRequests("slow down".to_string()),
+            ApiError::AlreadyExists("duplicate".to_string()),
+            ApiError::NotAuthorized("no scope".to_string()),
+            ApiError::Forbidden("denied".to_string()),
+            ApiError::BadListenerId("no such listener".to_string()),
+            ApiError::BadNode("no such node".to_string()),
+            ApiError::TestFailed("rule did not match".to_string()),
+            ApiError::ConnectionFailed("target unreachable".to_string()),
+            ApiError::Unauthorized("no token".to_string()),
         ]
     }
 
@@ -216,8 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_found_and_clientid_not_found_are_distinct_codes() {
-        let generic = EmqxError::NotFound("rule nope".to_string());
-        let client = EmqxError::ClientIdNotFound("client nope".to_string());
+        let generic = ApiError::NotFound("rule nope".to_string());
+        let client = ApiError::ClientIdNotFound("client nope".to_string());
         assert_ne!(generic.code(), client.code());
         assert_eq!(generic.code(), "NOT_FOUND");
         assert_eq!(client.code(), "CLIENTID_NOT_FOUND");
@@ -233,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn with_message_preserves_dynamic_detail() {
         let err =
-            EmqxError::BadRequest("placeholder".to_string()).with_message("topic t/#/x bad: {e}");
+            ApiError::BadRequest("placeholder".to_string()).with_message("topic t/#/x bad: {e}");
         assert_eq!(err.code(), "BAD_REQUEST");
         assert_eq!(err.message(), "topic t/#/x bad: {e}");
         let (status, body) = response_parts(err).await;
@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(body["message"], serde_json::json!("topic t/#/x bad: {e}"));
 
         // `with_message` keeps the variant: code and status are unchanged.
-        let renamed = EmqxError::NotFound("a".to_string()).with_message("b".to_string());
+        let renamed = ApiError::NotFound("a".to_string()).with_message("b".to_string());
         assert_eq!(renamed.code(), "NOT_FOUND");
         assert_eq!(renamed.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(renamed.message(), "b");
@@ -266,22 +266,22 @@ mod tests {
 
     /// Exhaustive match over every variant with no wildcard arm: adding a
     /// variant breaks compilation here until its code name is pinned.
-    fn code_by_match(err: &EmqxError) -> &'static str {
+    fn code_by_match(err: &ApiError) -> &'static str {
         match err {
-            EmqxError::NotFound(_) => "NOT_FOUND",
-            EmqxError::BadRequest(_) => "BAD_REQUEST",
-            EmqxError::ClientIdNotFound(_) => "CLIENTID_NOT_FOUND",
-            EmqxError::BadUsernameOrPwd(_) => "BAD_USERNAME_OR_PWD",
-            EmqxError::NamePwdError(_) => "NAME_PWD_ERROR",
-            EmqxError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
-            EmqxError::AlreadyExists(_) => "ALREADY_EXISTS",
-            EmqxError::NotAuthorized(_) => "NOT_AUTHORIZED",
-            EmqxError::Forbidden(_) => "FORBIDDEN",
-            EmqxError::BadListenerId(_) => "BAD_LISTENER_ID",
-            EmqxError::BadNode(_) => "BAD_NODE",
-            EmqxError::TestFailed(_) => "TEST_FAILED",
-            EmqxError::ConnectionFailed(_) => "CONNECTION_FAILED",
-            EmqxError::Unauthorized(_) => "UNAUTHORIZED",
+            ApiError::NotFound(_) => "NOT_FOUND",
+            ApiError::BadRequest(_) => "BAD_REQUEST",
+            ApiError::ClientIdNotFound(_) => "CLIENTID_NOT_FOUND",
+            ApiError::BadUsernameOrPwd(_) => "BAD_USERNAME_OR_PWD",
+            ApiError::NamePwdError(_) => "NAME_PWD_ERROR",
+            ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
+            ApiError::AlreadyExists(_) => "ALREADY_EXISTS",
+            ApiError::NotAuthorized(_) => "NOT_AUTHORIZED",
+            ApiError::Forbidden(_) => "FORBIDDEN",
+            ApiError::BadListenerId(_) => "BAD_LISTENER_ID",
+            ApiError::BadNode(_) => "BAD_NODE",
+            ApiError::TestFailed(_) => "TEST_FAILED",
+            ApiError::ConnectionFailed(_) => "CONNECTION_FAILED",
+            ApiError::Unauthorized(_) => "UNAUTHORIZED",
         }
     }
 

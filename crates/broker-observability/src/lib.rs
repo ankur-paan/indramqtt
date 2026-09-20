@@ -513,7 +513,7 @@ impl Metrics {
     }
 }
 
-/// Gauge-plus-high-water-mark store for EMQX `/stats` semantics.
+/// Gauge-plus-high-water-mark store for the documented `/stats` semantics.
 ///
 /// Gauges move only through the explicit `set_*` calls from kernel
 /// lifecycle points; each `set_*` also raises the matching `*_max` via
