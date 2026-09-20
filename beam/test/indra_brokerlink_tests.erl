@@ -405,7 +405,12 @@ inbound_frames_leave_no_retained_state_test() ->
                                                 {port, Port}]),
     try
         ok = indra_conn_registry:register(7701, self()),
-        N = 2000,
+        %% Stays below the Q3 per-connection dispatch bound (128
+        %% frames): past it QoS 0 is shed by design and counted, so a
+        %% burst larger than the cap cannot expect 1:1 delivery here.
+        %% The guard below is structural (no retained keys, empty
+        %% buffer and mailbox) and holds at any N.
+        N = 100,
         Meta = indra_brokerlink:encode_publish_meta(<<"t">>, 0, 0, false, false),
         Frame = indra_brokerlink:encode_frame(16#0021, 7701, 9, Meta, <<"hi">>),
         lists:foreach(fun(_) -> Server ! {emit, Frame} end, lists:seq(1, N)),
@@ -420,6 +425,7 @@ inbound_frames_leave_no_retained_state_test() ->
         {message_queue_len, MQLen} = process_info(Client, message_queue_len),
         ?assertEqual(0, MQLen)
     after
+        catch indra_edge_counters:credit_delete(7701),
         indra_brokerlink:stop(Client),
         indra_conn_registry:stop(Registry),
         gen_tcp:close(LSock)

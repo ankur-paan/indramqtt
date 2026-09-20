@@ -525,7 +525,19 @@ async fn handle_connection(
                                 Err(_) => break,
                             }
                         }
-                        transport.send_batch(&batch).await?;
+                        // Egress stage 0: `messages_forwarded` counted
+                        // admission into this mailbox at `route()` time;
+                        // only a successful write counts as edge arrival.
+                        let batch_len = batch.len() as u64;
+                        match transport.send_batch(&batch).await {
+                            Ok(()) => {
+                                shared.metrics.inc_transport_sent_by(batch_len);
+                            }
+                            Err(e) => {
+                                shared.metrics.inc_transport_send_failed();
+                                return Err(Box::new(e));
+                            }
+                        }
                     }
                     None => {
                         // All senders gone; nothing left to deliver.
@@ -711,6 +723,16 @@ where
             }
             if before != bound.len() {
                 refresh_subscription_stats(shared);
+            }
+        }
+        OpCode::Credit => {
+            // Egress stage 1: the owning edge connection reports its
+            // pressure snapshot. Counted on receipt today; no delivery
+            // decision depends on it until the kernel queue split lands.
+            // Malformed snapshots are ignored: credit is advisory, and a
+            // single bad frame must never disturb live connections.
+            if decode_credit_meta(&frame.metadata).is_some() {
+                shared.metrics.inc_credit_received();
             }
         }
         _ => {
@@ -1433,6 +1455,19 @@ fn decode_puback_meta(meta: &[u8]) -> Option<u16> {
         return None;
     }
     Some(packet_id)
+}
+
+/// Decode an edge flow-control (`Credit`) snapshot into
+/// `(used_frames, used_bytes)`. Layout `UsedFrames:32be |
+/// UsedBytes:32be` (mirrors `indra_brokerlink:encode_credit_meta/2`);
+/// exactly 8 bytes, anything else is malformed.
+fn decode_credit_meta(meta: &[u8]) -> Option<(u32, u32)> {
+    if meta.len() != 8 {
+        return None;
+    }
+    let used_frames = u32::from_be_bytes([meta[0], meta[1], meta[2], meta[3]]);
+    let used_bytes = u32::from_be_bytes([meta[4], meta[5], meta[6], meta[7]]);
+    Some((used_frames, used_bytes))
 }
 
 /// Decoded `(packet_id, client_id, [(filter, qos)])` subscription metadata.
@@ -2406,6 +2441,76 @@ mod tests {
         assert_eq!(shared.metrics.unknown_conn_dropped(), 0);
         assert_eq!(shared.metrics.detached_clean_dropped(), 0);
         assert_eq!(shared.metrics.offline_queue_evicted(), 0);
+    }
+
+    /// Egress stage 0: a well-formed edge flow-control snapshot is
+    /// counted and changes nothing else (no gating yet).
+    #[tokio::test]
+    async fn credit_frame_is_counted_and_changes_nothing_else() {
+        let shared = test_shared();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let _client = FramedTransport::new(client_io);
+        let server = FramedTransport::new(server_io);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let mut bound = Vec::new();
+
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&7u32.to_be_bytes());
+        meta.extend_from_slice(&1024u32.to_be_bytes());
+        let credit = BrokerFrame::new(OpCode::Credit, 91, 3, Bytes::from(meta), Bytes::new())
+            .expect("valid credit frame");
+        handle_inbound_frame(credit, &shared, &tx, &server, &mut bound)
+            .await
+            .expect("credit handling succeeds");
+        assert_eq!(shared.metrics.credit_received(), 1);
+        // Nothing gated, nothing delivered, no connection state touched.
+        assert_eq!(shared.metrics.messages_forwarded(), 0);
+        assert_eq!(shared.metrics.transport_sent(), 0);
+        assert!(bound.is_empty());
+
+        // Malformed snapshot: ignored, uncounted.
+        let bad = BrokerFrame::new(
+            OpCode::Credit,
+            91,
+            4,
+            Bytes::from_static(b"short"),
+            Bytes::new(),
+        )
+        .expect("valid credit frame");
+        handle_inbound_frame(bad, &shared, &tx, &server, &mut bound)
+            .await
+            .expect("malformed credit is ignored");
+        assert_eq!(shared.metrics.credit_received(), 1);
+    }
+
+    #[test]
+    fn credit_meta_decode_accepts_only_eight_bytes() {
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&7u32.to_be_bytes());
+        meta.extend_from_slice(&1024u32.to_be_bytes());
+        assert_eq!(decode_credit_meta(&meta), Some((7, 1024)));
+        assert_eq!(decode_credit_meta(b"short"), None);
+        assert_eq!(decode_credit_meta(&[0u8; 9]), None);
+        assert_eq!(decode_credit_meta(&[]), None);
+    }
+
+    #[test]
+    fn egress_stage_counters_start_at_zero() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.transport_sent(), 0);
+        assert_eq!(metrics.transport_send_failed(), 0);
+        assert_eq!(metrics.egress_qos0_shed(), 0);
+        assert_eq!(metrics.puback_deferred(), 0);
+        assert_eq!(metrics.puback_deferred_released(), 0);
+        assert_eq!(metrics.credit_clamped(), 0);
+        assert_eq!(metrics.credit_exhausted(), 0);
+        assert_eq!(metrics.credit_received(), 0);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.transport_sent, 0);
+        assert_eq!(snap.credit_received, 0);
+        let text = metrics.render_prometheus_metrics();
+        assert!(text.contains("indramqtt_transport_sent_total 0\n"));
+        assert!(text.contains("indramqtt_credit_received_total 0\n"));
     }
 
     /// T-31: a durable subscriber that disconnects with a QoS 1

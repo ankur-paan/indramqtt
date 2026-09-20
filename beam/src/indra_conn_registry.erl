@@ -108,6 +108,11 @@ init([]) ->
     _ = ets:new(?TABLE, [named_table, public, set,
                          {read_concurrency, true},
                          {write_concurrency, true}]),
+    %% Attribution + credit tables live as long as the edge: the
+    %% registry owns them so they survive any single connection death
+    %% (per-process state would die with the process, which is exactly
+    %% the gap the stop-cause counters close).
+    ok = indra_edge_counters:ensure(),
     {ok, #{}}.
 
 handle_call({register, ConnId, Pid}, _From, State) ->
@@ -135,7 +140,14 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, State) ->
-    %% Connection died without unregistering: reap its row.
+    %% Connection died without unregistering: reap its row, plus its
+    %% egress credit account (advisory counts must not outlive the
+    %% connection; the dying process itself deletes promptly in
+    %% terminate/3, this is the backstop for kills that skip it).
+    case catch ets:match(?TABLE, {'$1', MRef, '_'}) of
+        [[ConnId]] -> catch indra_edge_counters:credit_delete(ConnId);
+        _ -> ok
+    end,
     catch ets:match_delete(?TABLE, {'_', MRef, '_'}),
     {noreply, State};
 handle_info(_Info, State) ->

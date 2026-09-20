@@ -58,11 +58,17 @@
          encode_unbind_meta/1,
          decode_unbind_meta/1]).
 
-%% BrokerLink metadata contract (W0-24/W0-25: kernel -> edge ConnClose).
-%% Empty metadata and empty payload; the header conn_id identifies the
-%% edge connection to close.
+%% BrokerLink metadata contract (egress stage 1: edge -> kernel Credit).
+%% Snapshot layout `UsedFrames:32be | UsedBytes:32be' (mirrored by the
+%% kernel `decode_credit_meta'); the header `conn_id' names the owning
+%% connection. Advisory flow control, never a delivery acknowledgement:
+%% the kernel only counts these today (no gating until the kernel queue
+%% split lands), so losing one is harmless; when gating lands a periodic
+%% refresh must bound the stall, and this comment must say where it is.
 -export([encode_connclose_meta/0,
-         decode_connclose_meta/1]).
+         decode_connclose_meta/1,
+         encode_credit_meta/2,
+         decode_credit_meta/1]).
 
 %% gen_server lifecycle + IPC API.
 -export([start_link/0,
@@ -100,7 +106,7 @@
                 | pubcomp_in | pubcomp_out
                  | subscribe_in | suback_out
                  | unsubscribe_in | unsuback_out
-                 | disconnect_in | conn_close
+                 | disconnect_in | conn_close | credit
                  | non_neg_integer().
 -type header_map() :: #{version := 0..255,
                         flags := 0..255,
@@ -225,6 +231,7 @@ opcode_to_int(unsubscribe_in) -> 16#0032;
 opcode_to_int(unsuback_out) -> 16#0033;
 opcode_to_int(disconnect_in) -> 16#0040;
 opcode_to_int(conn_close) -> 16#0041;
+opcode_to_int(credit) -> 16#0042;
 opcode_to_int(N) when is_integer(N), N >= 0, N =< 16#FFFF -> N.
 
 %% @doc Map a wire integer to its opcode atom (unknown ints pass through).
@@ -250,6 +257,7 @@ int_to_opcode(16#0032) -> unsubscribe_in;
 int_to_opcode(16#0033) -> unsuback_out;
 int_to_opcode(16#0040) -> disconnect_in;
 int_to_opcode(16#0041) -> conn_close;
+int_to_opcode(16#0042) -> credit;
 int_to_opcode(N) when is_integer(N) -> N.
 
 is_known_opcode(16#0001) -> true;
@@ -273,6 +281,7 @@ is_known_opcode(16#0032) -> true;
 is_known_opcode(16#0033) -> true;
 is_known_opcode(16#0040) -> true;
 is_known_opcode(16#0041) -> true;
+is_known_opcode(16#0042) -> true;
 is_known_opcode(_) -> false.
 
 %%====================================================================
@@ -566,6 +575,26 @@ decode_connclose_meta(<<>>) ->
     {ok, #{}};
 decode_connclose_meta(_) ->
     {error, malformed_connclose_meta}.
+
+%% @doc Encode an egress flow-control snapshot for the given account
+%% balances (see {@link egress_admit} accounting in
+%% `indra_edge_counters': BrokerLink body bytes, meta + payload).
+-spec encode_credit_meta(non_neg_integer(), non_neg_integer()) -> binary().
+encode_credit_meta(UsedFrames, UsedBytes)
+  when is_integer(UsedFrames), UsedFrames >= 0, UsedFrames =< 16#FFFFFFFF,
+       is_integer(UsedBytes), UsedBytes >= 0, UsedBytes =< 16#FFFFFFFF ->
+    <<UsedFrames:32/big, UsedBytes:32/big>>.
+
+%% @doc Decode an egress flow-control snapshot into `{UsedFrames,
+%% UsedBytes}'. Exactly 8 bytes; anything else is malformed (and must
+%% be ignored by the receiver, never fatal: credit is advisory).
+-spec decode_credit_meta(binary()) ->
+    {ok, #{used_frames := non_neg_integer(), used_bytes := non_neg_integer()}}
+  | {error, term()}.
+decode_credit_meta(<<UsedFrames:32/big, UsedBytes:32/big>>) ->
+    {ok, #{used_frames => UsedFrames, used_bytes => UsedBytes}};
+decode_credit_meta(_) ->
+    {error, malformed_credit_meta}.
 
 validate_meta_subs([]) -> erlang:error(badarg);
 validate_meta_subs(Subs) -> validate_meta_subs(Subs, 0).
@@ -909,6 +938,16 @@ drain_buffer(State) ->
 %% Opcodes routed to the owning connection process.
 -define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0031, 16#0041]).
 
+%% Q3 per-connection egress bound, enforced here at dispatch (before a
+%% frame enters any mailbox), not in the mailbox. Control frames
+%% (SessionBinding, SubAck, PubAck, ConnClose) are small and rare: they
+%% always pass. PublishOut passes through the credit account: QoS 0 past
+%% the cap is shed and counted (no delivery promise to break); QoS 1
+%% past the cap is still admitted and counted (no deferral exists yet,
+%% so shedding would be silent loss). Malformed PublishOut meta admits
+%% without accounting: the owning connection stops on it either way, and
+%% the gate must never invent a drop the connection would not take.
+
 %% @private Route an inbound Rust frame to its connection process.
 %%
 %% Looks the frame ConnId up in {@code indra_conn_registry} and casts the
@@ -921,11 +960,35 @@ dispatch_frame(Header, Meta, Payload) ->
             ok;
         true ->
             ConnId = maps:get(conn_id, Header),
-            case catch indra_conn_registry:lookup(ConnId) of
-                {ok, Pid} ->
-                    catch gen_statem:cast(Pid, {broker_frame, Header, Meta, Payload}),
+            case Opcode of
+                16#0021 ->
+                    dispatch_publish_out(ConnId, Header, Meta, Payload);
+                _ ->
+                    dispatch_cast(ConnId, Header, Meta, Payload)
+            end
+    end.
+
+%% @private Gate one PublishOut frame through the Q3 credit account.
+dispatch_publish_out(ConnId, Header, Meta, Payload) ->
+    Size = byte_size(Meta) + byte_size(Payload),
+    case decode_publish_meta(Meta) of
+        {ok, #{qos := Qos}} ->
+            case indra_edge_counters:egress_admit(ConnId, Qos, Size) of
+                {shed, _} ->
                     ok;
                 _ ->
-                    ok
-            end
+                    dispatch_cast(ConnId, Header, Meta, Payload)
+            end;
+        {error, _} ->
+            dispatch_cast(ConnId, Header, Meta, Payload)
+    end.
+
+%% @private Cast one inbound frame to its owning connection process.
+dispatch_cast(ConnId, Header, Meta, Payload) ->
+    case catch indra_conn_registry:lookup(ConnId) of
+        {ok, Pid} ->
+            catch gen_statem:cast(Pid, {broker_frame, Header, Meta, Payload}),
+            ok;
+        _ ->
+            ok
     end.
