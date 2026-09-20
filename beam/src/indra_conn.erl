@@ -47,7 +47,8 @@
          broker_frame/4,
          pick_shard/2,
          shard_index/2,
-         conn_sock_opts/0]).
+         conn_sock_opts/0,
+         drain_close_discards/0]).
 
 %% gen_statem callbacks.
 -export([callback_mode/0,
@@ -185,7 +186,13 @@ init_shard(Sock, Opts, Shards) ->
              %% PERF-10: outbound frames dropped after a client-socket
              %% send failure. Observable via sys:get_state (the
              %% existing OTP status path); no other surface was added.
-             send_failed_dropped => 0},
+             send_failed_dropped => 0,
+             %% Egress stage 0: the stop cause recorded for the
+             %% stop-cause aggregates (read back in terminate/3; state
+             %% dies with the process, counters do not). Every stop
+             %% site sets it through stop_with/2; `unknown' means a
+             %% path was missed and is counted, not hidden.
+             stop_cause => undefined},
     {ok, await_connect, Data}.
 
 %% @private True when Pid is a known shard other than our pinned one.
@@ -273,7 +280,7 @@ handle_event(cast, takeover, await_connect,
         ok ->
             {keep_state, Data, [{state_timeout, Timeout, connect_timeout}]};
         {error, _} ->
-            {stop, normal, Data}
+            {stop, normal, Data#{stop_cause => tcp_error}}
     end;
 
 %% --- core presence ----------------------------------------------------
@@ -436,14 +443,14 @@ handle_event(cast, {broker_frame, Header, Meta, Payload}, connected, Data) ->
         ?SUBACK_OUT ->
             handle_suback(Meta, Data);
         ?PUBLISH_OUT ->
-            handle_publish_out(Meta, Payload, Data);
+            egress_batch({Header, Meta, Payload}, Data);
         ?PUBACK_OUT ->
             handle_puback_out(Meta, Data);
         ?CONN_CLOSE ->
             %% Kernel-ordered close (W0-25): the kernel already unbound
             %% session state; the edge only closes the socket. terminate/3
             %% closes the socket and unregisters the conn id.
-            {stop, normal, Data};
+            stop_with(Data, kernel_close);
         _ ->
             %% Late duplicates or future opcodes: ignore for now.
             {keep_state, Data}
@@ -467,60 +474,97 @@ handle_event(info, {ssl_closed, Sock}, State, #{sock := Sock} = Data) ->
     handle_event(info, {tcp_closed, Sock}, State, Data);
 handle_event(info, {ssl_error, Sock, Reason}, State, #{sock := Sock} = Data) ->
     handle_event(info, {tcp_error, Sock, Reason}, State, Data);
+handle_event(info, {ssl_passive, Sock}, State, #{sock := Sock} = Data) ->
+    handle_event(info, {tcp_passive, Sock}, State, Data);
+
+%% --- counted-active re-arm -------------------------------------------------
+%% With `{active, 10}' the socket goes passive after 10 messages; only
+%% here (never per message) is it re-armed. The re-arm point also takes
+%% the queue-depth sample feeding the pending-bytes gauge, and runs no
+%% other housekeeping: this process must get back to draining, not GC.
+handle_event(info, {tcp_passive, Sock}, _State, #{sock := Sock} = Data) ->
+    arm_socket(Data),
+    case catch process_info(self(), message_queue_len) of
+        {message_queue_len, N} ->
+            catch indra_edge_counters:note_passive(N);
+        _ ->
+            ok
+    end,
+    {keep_state, Data};
 
 %% --- client TCP bytes while awaiting CONNECT --------------------------
+%% No per-message re-arm: the socket is counted-active (`{active, 10}'
+%% from takeover) and re-armed only at `tcp_passive'.
 handle_event(info, {tcp, Sock, Bytes}, await_connect, #{sock := Sock} = Data) ->
-    arm_socket(Data),
     Buf = <<(maps:get(buffer, Data))/binary, Bytes/binary>>,
     handle_connect_bytes(Buf, Data#{buffer => <<>>});
 handle_event(info, {tcp_closed, Sock}, _State, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
+    stop_with(Data, peer_closed);
 handle_event(info, {tcp_error, Sock, _Reason}, _State, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
+    stop_with(Data, tcp_error);
 
 %% --- client TCP bytes while connected: the messaging loop -------------
 handle_event(info, {tcp, Sock, Bytes}, connected, #{sock := Sock} = Data) ->
-    arm_socket(Data),
     Buf = <<(maps:get(buffer, Data))/binary, Bytes/binary>>,
     handle_connected_bytes(Buf, Data#{buffer => <<>>});
-handle_event(info, {tcp_closed, Sock}, connected, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
-handle_event(info, {tcp_error, Sock, _Reason}, connected, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
 
 %% --- client TCP bytes while holding for the core -----------------------
 handle_event(info, {tcp, Sock, Bytes}, await_core, #{sock := Sock} = Data) ->
-    arm_socket(Data),
     Buf = <<(maps:get(buffer, Data))/binary, Bytes/binary>>,
     case byte_size(Buf) > ?MAX_HOLD_BUFFER_BYTES of
         true ->
             %% Flood during outage: fail closed, do not balloon.
-            {stop, normal, Data};
+            stop_with(Data, hold_overflow);
         false ->
             hold_bytes(Buf, Data#{buffer => <<>>})
     end;
-handle_event(info, {tcp_closed, Sock}, await_core, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
-handle_event(info, {tcp_error, Sock, _Reason}, await_core, #{sock := Sock} = Data) ->
-    {stop, normal, Data};
 
 %% --- buffered bytes pipelined behind CONNECT ---------------------------
 handle_event(internal, drain_buffer, connected, Data) ->
     handle_connected_bytes(maps:get(buffer, Data), Data#{buffer => <<>>});
 
+%% --- fair continuation of a capped egress drain --------------------------
+%% `drain_more' arrives through the back of the mailbox (plain
+%% `send_after(0, ...)' self-message, not a next_event), so core
+%% presence and socket signals that arrived earlier are handled first.
+%% Outside `connected' there is nothing to drain: ignore.
+handle_event(info, drain_more, connected, Data) ->
+    {Queued, Capped} = drain_queued_frames(),
+    case Queued of
+        [] ->
+            {keep_state, Data};
+        _ ->
+            emit_ordered(Queued, Capped, Data)
+    end;
+
 %% --- timers -------------------------------------------------------------
 handle_event(state_timeout, connect_timeout, await_connect, Data) ->
     %% Peer never sent CONNECT: do not leak the socket.
-    {stop, normal, Data};
+    stop_with(Data, connect_timeout);
 handle_event(state_timeout, keepalive_timeout, connected, Data) ->
     %% Peer exceeded 1.5 x keepalive without any packet.
-    {stop, normal, Data};
+    stop_with(Data, keepalive_timeout);
 
 %% --- fallback -------------------------------------------------------------
 handle_event(_Type, _Event, _State, Data) ->
     {keep_state, Data}.
 
-terminate(_Reason, _State, #{sock := Sock, sockmod := Mod, conn_id := ConnId}) ->
+terminate(_Reason, _State, #{sock := Sock, sockmod := Mod, conn_id := ConnId} = Data) ->
+    %% Attribution that survives the process: the stop cause, the
+    %% queued PublishOut frames evaporating with the mailbox (labelled
+    %% by QoS), and the QoS 1 publishes accepted but never PUBACKed.
+    %% Delivery reconciles as: dispatched = received_by_tool +
+    %% still_queued + shed_counted + discarded_at_close. Any future
+    %% "delivery %" that does not print all four terms is a cutoff
+    %% artifact, not a result.
+    Cause = maps:get(stop_cause, Data, unknown),
+    catch indra_edge_counters:inc(indra_edge_counters:stop_counter(Cause)),
+    {DiscQos0, DiscQos1} = drain_close_discards(),
+    catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos0_total, DiscQos0),
+    catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos1_total, DiscQos1),
+    Unacked = map_size(maps:get(pubs_pending, Data, #{})),
+    catch indra_edge_counters:inc(edge_puback_unacked_at_close_total, Unacked),
+    catch indra_edge_counters:credit_delete(ConnId),
     catch indra_conn_registry:unregister(ConnId),
     catch sock_close(Mod, Sock),
     ok;
@@ -535,12 +579,20 @@ sock_send(gen_tcp, Sock, Bin) -> gen_tcp:send(Sock, Bin);
 sock_send(ssl, Sock, Bin) -> ssl:send(Sock, Bin).
 
 %% @doc Socket options armed on every client connection socket.
-%% `nodelay' avoids delayed-ACK interaction on small MQTT frames;
-%% 64 KiB buffers bound per-connection memory (1M-session scale)
-%% while absorbing publish bursts.
+%% Counted-active (`{active, 10}'): the socket delivers up to 10
+%% messages per re-arm instead of one, so a burst costs no per-message
+%% re-arm port call; the re-arm point (see the `tcp_passive' handling)
+%% is also where the queue-depth sample is taken. `nodelay' avoids
+%% delayed-ACK interaction on small MQTT frames; 64 KiB buffers bound
+%% per-connection memory (1M-session scale) while absorbing publish
+%% bursts. Backend choice: the default `inet' backend stays. The newer
+%% `socket' backend was considered and declined: no measurement on this
+%% path implicates the backend (the wall is syscalls per frame plus
+%% scheduling, both addressed without it), while switching backends
+%% touches every socket site including TLS for an unmeasured gain.
 -spec conn_sock_opts() -> [term()].
 conn_sock_opts() ->
-    [{active, once}, {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
+    [{active, 10}, {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
 
 sock_setopts(gen_tcp, Sock) -> inet:setopts(Sock, conn_sock_opts());
 sock_setopts(ssl, Sock) -> ssl:setopts(Sock, conn_sock_opts()).
@@ -552,12 +604,58 @@ arm_socket(#{sock := Sock, sockmod := Mod}) ->
     catch sock_setopts(Mod, Sock),
     ok.
 
+%% @private Stop with a recorded cause (read back in terminate/3 for
+%% the stop-cause aggregates). Every `{stop, ...}' site in this module
+%% goes through here; stuffing the cause into any other return shape
+%% would leave deaths unattributed.
+stop_with(Data, Cause) ->
+    {stop, normal, Data#{stop_cause => Cause}}.
+
+%% @private Classify an edge->kernel send failure for attribution. The
+%% QoS 0 overload shed never reaches here (it stays up by design); a
+%% QoS 1+ kill on `{error, overloaded}' keeps its own cause so the
+%% stall-instead-of-kill redesign can see exactly what it removes.
+classify_send_error({error, overloaded}) -> ingress_overloaded;
+classify_send_error({'EXIT', {timeout, _}}) -> call_timeout;
+classify_send_error({'EXIT', _}) -> call_failed;
+classify_send_error({error, _}) -> call_failed.
+
 %% @private Count one outbound frame dropped after a client-socket
 %% send failure (PERF-10). The connection still stops on the existing
 %% path; only the accounting is new.
 bump_send_failed(Data) ->
+    bump_send_failed(Data, 1).
+
+%% @private Count N outbound frames dropped after a client-socket send
+%% failure (the batched write path drops the whole unsent run, not one
+%% frame). Each bump also folds into the ETS aggregate so load runs can
+%% scrape it without `sys:get_state'.
+bump_send_failed(Data, N) ->
     Dropped = maps:get(send_failed_dropped, Data, 0),
-    Data#{send_failed_dropped => Dropped + 1}.
+    catch indra_edge_counters:inc(edge_egress_send_failed_total, N),
+    Data#{send_failed_dropped => Dropped + N}.
+
+%% @doc Drain the queued inbound BrokerLink frames at death and count
+%% the PublishOut frames evaporating with the mailbox, labelled by QoS.
+%% Returns `{Qos0, Qos1}'. Only matching casts are removed; everything
+%% else stays queued and dies with the process. Exported for EUnit (a
+%% full connection teardown around it would be timing-flaky); the
+%% production caller is terminate/3.
+-spec drain_close_discards() -> {non_neg_integer(), non_neg_integer()}.
+drain_close_discards() ->
+    drain_close_discards(0, 0).
+
+drain_close_discards(Qos0, Qos1) ->
+    receive
+        {'$gen_cast', {broker_frame, #{opcode := ?PUBLISH_OUT}, Meta, _Payload}} ->
+            case catch indra_brokerlink:decode_publish_meta(Meta) of
+                {ok, #{qos := 1}} -> drain_close_discards(Qos0, Qos1 + 1);
+                {ok, _} -> drain_close_discards(Qos0 + 1, Qos1);
+                _ -> drain_close_discards(Qos0, Qos1)
+            end
+    after 0 ->
+        {Qos0, Qos1}
+    end.
 
 %%====================================================================
 %% Handshake helpers
@@ -569,11 +667,11 @@ handle_connect_bytes(Buf, Data) ->
             handle_connect_packet(Payload, Rest, Data);
         {ok, #{type := _Other}, _Rest} ->
             %% MQTT 3.1.1 §3.1: first packet MUST be CONNECT.
-            {stop, normal, Data};
+            stop_with(Data, protocol_error);
         {more, _Need} ->
             {keep_state, Data#{buffer => Buf}};
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq := Seq} = Data) ->
@@ -590,11 +688,11 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                     {keep_state, Data#{seq => Seq + 1,
                                        pending => Pending,
                                        buffer => Rest}};
-                _ ->
-                    {stop, normal, Data}
+                Other ->
+                    stop_with(Data, classify_send_error(Other))
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 %% @private Re-send the pending bind to a replacement broker (core flap
@@ -630,13 +728,15 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
                      [keepalive_action(Data1), {next_event, internal, drain_buffer}]};
                 ok ->
                     %% Rejected (RC /= 0): CONNACK delivered, just close.
-                    {stop, normal, Data};
+                    %% The kernel ordered this close (bind rejection), so
+                    %% it is attributed as a kernel close.
+                    stop_with(Data, kernel_close);
                 {error, _} ->
                     %% CONNACK never reached the peer: counted drop.
-                    {stop, normal, bump_send_failed(Data)}
+                    stop_with(bump_send_failed(Data), send_failed)
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 %%====================================================================
@@ -692,7 +792,7 @@ handle_rebind_binding(Meta, Data) ->
                     end
             end;
         _ ->
-            {stop, normal, Data}
+            stop_with(Data, kernel_close)
     end.
 
 %% @private Re-register every tracked subscription; answers land in
@@ -730,7 +830,7 @@ hold_scan(Buf, #{sock := Sock, sockmod := Mod} = Data, Held) ->
         {ok, #{type := 12}, Rest} ->
             case sock_send(Mod, Sock, <<16#D0, 16#00>>) of
                 ok -> hold_scan(Rest, Data, Held);
-                {error, _} -> {stop, normal, bump_send_failed(Data)}
+                {error, _} -> stop_with(bump_send_failed(Data), send_failed)
             end;
         {ok, _Other, Rest} ->
             %% Stash this packet's bytes, keep scanning for pings.
@@ -740,7 +840,7 @@ hold_scan(Buf, #{sock := Sock, sockmod := Mod} = Data, Held) ->
         {more, _Need} ->
             {keep_state, Data#{buffer => <<Held/binary, Buf/binary>>}};
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 %%====================================================================
@@ -763,11 +863,11 @@ handle_connected_bytes(Buf, Data) ->
         {more, _Need} ->
             {keep_state, Data#{buffer => Buf}, [keepalive_action(Data)]};
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 %% @private Handle one decoded client packet. Returns `{ok, Data}` to
-%% continue or `{stop, normal, Data}` to close the connection.
+%% continue or a `stop_with/2' stop to close the connection.
 handle_mqtt_packet(#{type := 8, payload := Payload}, Data) ->
     handle_subscribe_packet(Payload, Data);
 handle_mqtt_packet(#{type := 3, flags := Flags, payload := Payload}, Data) ->
@@ -776,7 +876,7 @@ handle_mqtt_packet(#{type := 12}, #{sock := Sock, sockmod := Mod} = Data) ->
     %% Fast edge PINGRESP; any packet resets keepalive via the caller.
     case sock_send(Mod, Sock, <<16#D0, 16#00>>) of
         ok -> {ok, Data};
-        {error, _} -> {stop, normal, bump_send_failed(Data)}
+        {error, _} -> stop_with(bump_send_failed(Data), send_failed)
     end;
 handle_mqtt_packet(#{type := 14}, Data) ->
     handle_disconnect(Data);
@@ -790,7 +890,7 @@ handle_mqtt_packet(#{type := 4, payload := Payload}, Data) ->
 handle_mqtt_packet(_Other, Data) ->
     %% CONNECT repeats, CONNACK/SUBACK from a client, UNSUBSCRIBE and any
     %% other unexpected packet: protocol violation, close.
-    {stop, normal, Data}.
+    stop_with(Data, protocol_error).
 
 handle_subscribe_packet(Payload, Data) ->
     case indra_mqtt_codec:decode_subscribe(Payload) of
@@ -807,11 +907,11 @@ handle_subscribe_packet(Payload, Data) ->
                     {ok, Data#{seq => Seq + 1,
                                subs_pending => Pending#{PacketId => true},
                                subs => Tracked1}};
-                _ ->
-                    {stop, normal, Data}
+                Other ->
+                    stop_with(Data, classify_send_error(Other))
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 handle_publish_packet(Payload, Flags, Data) ->
@@ -834,12 +934,13 @@ handle_publish_packet(Payload, Flags, Data) ->
                 %% including overload, still closes).
                 {error, overloaded} when QoS =:= 0 ->
                     Dropped = maps:get(qos0_dropped, Data, 0),
+                    catch indra_edge_counters:inc(edge_ingress_qos0_shed_total),
                     {ok, Data#{qos0_dropped => Dropped + 1}};
-                _ ->
-                    {stop, normal, Data}
+                Other ->
+                    stop_with(Data, classify_send_error(Other))
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 handle_disconnect(#{broker := Broker, conn_id := ConnId, seq := Seq,
@@ -847,7 +948,7 @@ handle_disconnect(#{broker := Broker, conn_id := ConnId, seq := Seq,
     %% Fire-and-forget unbind: the socket closes regardless.
     Meta = indra_brokerlink:encode_unbind_meta(ClientId),
     catch indra_brokerlink:send(Broker, ?UNBIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>),
-    {stop, normal, Data}.
+    stop_with(Data, client_disconnect).
 
 %% @private Forward one subscriber PUBACK to the kernel so it releases
 %% the matching inflight entry (T-31). The kernel owns the store; the
@@ -863,8 +964,8 @@ handle_puback_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
             %% Shedding an ack only delays its release: the kernel
             %% replays on reconnect, preserving at-least-once.
             {ok, Data};
-        _ ->
-            {stop, normal, Data}
+        Other ->
+            stop_with(Data, classify_send_error(Other))
     end;
 handle_puback_in(_, Data) ->
     {ok, Data}.
@@ -893,27 +994,234 @@ handle_suback(Meta, #{sock := Sock, sockmod := Mod, subs_pending := Pending,
                                     {keep_state, Data#{subs_pending =>
                                                           maps:remove(PacketId, Pending)}};
                                 {error, _} ->
-                                    {stop, normal, bump_send_failed(Data)}
+                                    stop_with(bump_send_failed(Data), send_failed)
                             end
                     end
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
-handle_publish_out(Meta, AppPayload, #{sock := Sock, sockmod := Mod} = Data) ->
-    case indra_brokerlink:decode_publish_meta(Meta) of
-        {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-               retain := Retain, dup := Dup}} ->
-            Packet = indra_mqtt_codec:encode_publish(Topic, PacketId, QoS,
-                                                     Retain, Dup, AppPayload),
-            case sock_send(Mod, Sock, Packet) of
-                ok -> {keep_state, Data};
-                {error, _} -> {stop, normal, bump_send_failed(Data)}
-            end;
-        {error, _Reason} ->
-            {stop, normal, Data}
+%% Maximum PublishOut frames coalesced into one socket write, and the
+%% wire-byte cap for the same batch. 64 frames x ~200 B ~= 13 KiB
+%% typical, 64 KiB cap for large payloads: one `gen_tcp:send' iolist per
+%% mailbox drain instead of one syscall per ~150 B frame. No delayed
+%% flush: a lone frame sends immediately. A dedicated sender process per
+%% connection was considered and declined: it doubles the process count
+%% (500 subscribers -> 1000 processes) and adds a queue to fix a queue,
+%% while owner-side batching buys the same syscall reduction with no
+%% handover and no new mailbox.
+-define(EGRESS_BATCH_MAX_FRAMES, 64).
+-define(EGRESS_BATCH_MAX_BYTES, 65536).
+
+%% @private Batch one PublishOut frame with whatever is already queued
+%% behind it, then emit in one ordered pass: runs of PublishOut frames
+%% go out as a single `gen_tcp:send' iolist (the runtime takes iolists
+%% directly, so batching costs no extra copy), control frames flush the
+%% run before them so arrival order is exactly preserved. Per-message
+%% cost after this change: one ETS `update_counter' at dispatch, one at
+%% release, and 1/<=64th of a send syscall per PublishOut frame.
+egress_batch(First, Data) ->
+    {Queued, Capped} = drain_queued_frames(),
+    emit_ordered([First | Queued], Capped, Data).
+
+%% @private Non-blocking drain of queued inbound BrokerLink casts,
+%% bounded by frames and body bytes, oldest first. Only
+%% `{broker_frame, ...}' casts are removed; any other queued message
+%% (core presence, socket signals, timers) stays exactly where it was.
+%% The `$gen_cast' tuple shape is gen_statem's stable wire format for
+%% casts, relied upon here read-only.
+drain_queued_frames() ->
+    drain_queued_frames([], 0, 0).
+
+drain_queued_frames(Acc, Frames, Bytes)
+  when Frames >= ?EGRESS_BATCH_MAX_FRAMES;
+       Bytes >= ?EGRESS_BATCH_MAX_BYTES ->
+    {lists:reverse(Acc), true};
+drain_queued_frames(Acc, Frames, Bytes) ->
+    receive
+        {'$gen_cast', {broker_frame, Header, Meta, Payload}} ->
+            drain_queued_frames([{Header, Meta, Payload} | Acc],
+                                Frames + 1,
+                                Bytes + byte_size(Meta) + byte_size(Payload))
+    after 0 ->
+        {lists:reverse(Acc), false}
     end.
+
+%% @private Emit one ordered drain. When the drain hit its cap, more may
+%% be queued: re-trigger through the back of the mailbox (fair to core
+%% presence and socket signals; see the `drain_more' handling).
+emit_ordered(Frames, Capped, Data) ->
+    case emit_frames(Frames, Data, [], 0, 0) of
+        {ok, Data1} ->
+            case Capped of
+                true ->
+                    erlang:send_after(0, self(), drain_more),
+                    {keep_state, Data1};
+                false ->
+                    {keep_state, Data1}
+            end;
+        {stop, _, _} = Stop ->
+            Stop
+    end.
+
+%% @private Walk one ordered drain: accumulate PublishOut runs, flush
+%% before every control frame and at the end, stop on the first failure
+%% with everything unsent counted. Returns `{ok, Data}' or the stop.
+emit_frames([], Data, Pending, N, B) ->
+    case flush_pending(Data, Pending, N, B, []) of
+        {ok, Data1} -> {ok, Data1};
+        {stop, _, _} = Stop -> Stop
+    end;
+emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
+    case maps:get(opcode, Header, undefined) of
+        ?PUBLISH_OUT ->
+            case indra_brokerlink:decode_publish_meta(Meta) of
+                {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
+                       retain := Retain, dup := Dup}} ->
+                    Packet = indra_mqtt_codec:encode_publish(Topic, PacketId, QoS,
+                                                             Retain, Dup, Payload),
+                    emit_frames(Rest, Data, [Packet | Pending], N + 1,
+                                B + byte_size(Meta) + byte_size(Payload));
+                {error, _} ->
+                    %% The malformed frame kills the connection, but the
+                    %% run ahead of it was already due: deliver it first,
+                    %% then close with the dequeued remainder reconciled
+                    %% (the flush-failure path reconciles inside
+                    %% flush_pending, so count here only on success).
+                    case flush_pending(Data, Pending, N, B, Rest) of
+                        {ok, Data1} ->
+                            count_evaporated(Rest),
+                            stop_with(Data1, protocol_error);
+                        {stop, _, _} = Stop ->
+                            Stop
+                    end
+            end;
+        ?SUBACK_OUT ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    case handle_suback(Meta, Data1) of
+                        {keep_state, Data2} ->
+                            emit_frames(Rest, Data2, [], 0, 0);
+                        {stop, _, _} = Stop ->
+                            count_evaporated(Rest),
+                            Stop
+                    end;
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
+        ?PUBACK_OUT ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    case handle_puback_out(Meta, Data1) of
+                        {keep_state, Data2} ->
+                            emit_frames(Rest, Data2, [], 0, 0);
+                        {stop, _, _} = Stop ->
+                            count_evaporated(Rest),
+                            Stop
+                    end;
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
+        ?CONN_CLOSE ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    count_evaporated(Rest),
+                    stop_with(Data1, kernel_close);
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
+        _ ->
+            %% Late duplicates or future opcodes: ignore, keep walking.
+            emit_frames(Rest, Data, Pending, N, B)
+    end.
+
+%% @private Write one accumulated PublishOut run as a single iolist
+%% send. Empty runs cost no syscall. On success the credit account is
+%% released (which may emit one advisory flow-control frame on the
+%% slowed -> healthy transition); on failure the whole unsent run --
+%% pending plus the still-unwalked remainder -- is counted and the
+%% connection stops with cause `send_failed'.
+flush_pending(Data, [], _N, _B, _Rest) ->
+    {ok, Data};
+flush_pending(Data, Pending, N, B, Rest) ->
+    #{sock := Sock, sockmod := Mod} = Data,
+    case sock_send(Mod, Sock, lists:reverse(Pending)) of
+        ok ->
+            {ok, release_credit(Data, N, B)};
+        {error, _} ->
+            count_evaporated(Rest),
+            Unsent = N + count_publish_frames(Rest),
+            stop_with(bump_send_failed(Data, Unsent), send_failed)
+    end.
+
+%% @private Release a written run against the Q3 credit account. `Bytes'
+%% uses the same BrokerLink body measure as dispatch admission, so the
+%% two counters cannot drift apart by encoding. A release for a
+%% connection with no account (direct test calls without a dispatch
+%% pass) is a no-op.
+release_credit(Data, 0, 0) ->
+    Data;
+release_credit(#{conn_id := ConnId} = Data, N, B) ->
+    case indra_edge_counters:egress_released(ConnId, N, B) of
+        {recovered, UsedF, UsedB} ->
+            maybe_send_credit(Data, UsedF, UsedB);
+        {ok, _, _} ->
+            Data
+    end;
+release_credit(Data, _N, _B) ->
+    Data.
+
+%% @private Emit one advisory flow-control snapshot on the slowed ->
+%% healthy transition. Fire-and-forget: the kernel only counts these
+%% today, so losing one is harmless; when kernel gating lands a periodic
+%% refresh must bound the stall. It must never kill the
+%% connection and never advance the sequence on failure.
+maybe_send_credit(#{broker := Broker, conn_id := ConnId, seq := Seq} = Data,
+                  UsedF, UsedB)
+  when is_pid(Broker) ->
+    Meta = indra_brokerlink:encode_credit_meta(UsedF, UsedB),
+    case catch indra_brokerlink:send(Broker, credit, ConnId, Seq + 1, Meta, <<>>) of
+        ok ->
+            Data#{seq => Seq + 1};
+        _ ->
+            Data
+    end;
+maybe_send_credit(Data, _UsedF, _UsedB) ->
+    Data.
+
+%% @private Count PublishOut frames in an unwalked drain remainder
+%% (header opcodes only, no decoding: all of them missed the socket).
+count_publish_frames(Rest) ->
+    lists:foldl(
+      fun({Header, _Meta, _Payload}, Acc) ->
+          case maps:get(opcode, Header, undefined) of
+              ?PUBLISH_OUT -> Acc + 1;
+              _ -> Acc
+          end
+      end, 0, Rest).
+
+%% @private Reconcile a dequeued-but-unwalked drain remainder at a stop:
+%% every PublishOut in it evaporates here (never the socket, never the
+%% mailbox drain in terminate/3), so label each by QoS now. Best effort
+%% on decode: an undecodable remainder is still gone, just unlabelled.
+count_evaporated(Rest) ->
+    {Qos0, Qos1} = lists:foldl(
+      fun({Header, Meta, _Payload}, {A0, A1}) ->
+          case maps:get(opcode, Header, undefined) of
+              ?PUBLISH_OUT ->
+                  case catch indra_brokerlink:decode_publish_meta(Meta) of
+                      {ok, #{qos := 1}} -> {A0, A1 + 1};
+                      {ok, _} -> {A0 + 1, A1};
+                      _ -> {A0, A1}
+                  end;
+              _ ->
+                  {A0, A1}
+          end
+      end, {0, 0}, Rest),
+    catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos0_total, Qos0),
+    catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos1_total, Qos1),
+    ok.
 
 handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending} = Data) ->
     case indra_brokerlink:decode_puback_meta(Meta) of
@@ -927,11 +1235,11 @@ handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending}
                             {keep_state, Data#{pubs_pending =>
                                                    maps:remove(PacketId, Pending)}};
                         {error, _} ->
-                            {stop, normal, bump_send_failed(Data)}
+                            stop_with(bump_send_failed(Data), send_failed)
                     end
             end;
         {error, _Reason} ->
-            {stop, normal, Data}
+            stop_with(Data, protocol_error)
     end.
 
 keepalive_action(#{keepalive := 0}) ->

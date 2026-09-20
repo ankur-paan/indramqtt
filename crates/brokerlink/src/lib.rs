@@ -183,6 +183,15 @@ mod tests {
         assert_eq!(buf.len(), 0);
     }
 
+    #[test]
+    fn credit_opcode_maps_to_expected_wire_value() {
+        assert_eq!(u16::from(OpCode::Credit), 0x0042);
+        assert_eq!(
+            OpCode::try_from(0x0042).expect("0x0042 decodes"),
+            OpCode::Credit
+        );
+    }
+
     #[tokio::test]
     async fn test_transport_bidirectional_duplex() {
         let (client_io, server_io) = duplex(1024);

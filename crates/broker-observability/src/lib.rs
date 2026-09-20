@@ -48,6 +48,27 @@ pub struct Metrics {
     // QoS 1 downlinks delivered live once but not tracked for redelivery
     // because the per-session inflight window (T-31) was full.
     inflight_dropped: AtomicU64,
+    // Kernel-to-edge delivery accounting (egress redesign, stage 0).
+    // `messages_forwarded` counts admission into the shard transport
+    // mailbox at `route()` time; `transport_sent` counts frames actually
+    // written toward the edge by a successful batch write. The gap
+    // between them is the hidden transport backlog: reconcile delivery
+    // as `transport_sent = received_by_tool + still_queued +
+    // shed_counted + discarded_at_close`, never from `forwarded` alone.
+    transport_sent: AtomicU64,
+    transport_send_failed: AtomicU64,
+    // Egress queue bounds (fired by the kernel queue split, a later
+    // stage; defined now so the API surface is stable and dashboards
+    // can reference them). Until then they read zero.
+    egress_qos0_shed: AtomicU64,
+    puback_deferred: AtomicU64,
+    puback_deferred_released: AtomicU64,
+    credit_clamped: AtomicU64,
+    credit_exhausted: AtomicU64,
+    // Edge flow-control frames observed. Counted on receipt today;
+    // per-connection gating against them lands with the kernel queue
+    // split, so no delivery decision may depend on this yet.
+    credit_received: AtomicU64,
 }
 
 /// One consistent read of every counter for API handlers.
@@ -82,6 +103,14 @@ pub struct MetricsSnapshot {
     pub detached_clean_dropped: u64,
     pub offline_queue_evicted: u64,
     pub inflight_dropped: u64,
+    pub transport_sent: u64,
+    pub transport_send_failed: u64,
+    pub egress_qos0_shed: u64,
+    pub puback_deferred: u64,
+    pub puback_deferred_released: u64,
+    pub credit_clamped: u64,
+    pub credit_exhausted: u64,
+    pub credit_received: u64,
 }
 
 impl Metrics {
@@ -94,7 +123,9 @@ impl Metrics {
         self.messages_received.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// One `PublishOut` frame emitted toward the edge.
+    /// One `PublishOut` frame admitted into the shard transport mailbox
+    /// at `route()` time. This is transport enqueue, not edge arrival:
+    /// compare with `transport_sent` for what actually reached the edge.
     pub fn inc_messages_forwarded(&self) -> u64 {
         self.inc_messages_forwarded_by(1)
     }
@@ -350,6 +381,55 @@ impl Metrics {
         self.inflight_dropped.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// Frames actually written toward the edge by a successful transport
+    /// batch write (compare with `messages_forwarded`, which counts
+    /// admission into the transport mailbox).
+    pub fn inc_transport_sent_by(&self, n: u64) -> u64 {
+        self.transport_sent.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Failed transport batch writes toward the edge (the owning task
+    /// ends after one; its connections detach through the existing path).
+    pub fn inc_transport_send_failed(&self) -> u64 {
+        self.transport_send_failed.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// QoS 0 frames shed at route time by the per-connection egress
+    /// bound (fires with the kernel queue split; zero until then).
+    pub fn inc_egress_qos0_shed(&self) -> u64 {
+        self.egress_qos0_shed.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// QoS 1 publishes whose PUBACK is deferred for credit (fires with
+    /// the kernel queue split; zero until then).
+    pub fn inc_puback_deferred(&self) -> u64 {
+        self.puback_deferred.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Deferred PUBACKs released after credit arrived.
+    pub fn inc_puback_deferred_released(&self) -> u64 {
+        self.puback_deferred_released
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    /// Edge flow-control snapshots applied to a kernel credit balance
+    /// (fires with the kernel queue split; zero until then).
+    pub fn inc_credit_clamped(&self) -> u64 {
+        self.credit_clamped.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Route refusals for exhausted credit (fires with the kernel queue
+    /// split; zero until then).
+    pub fn inc_credit_exhausted(&self) -> u64 {
+        self.credit_exhausted.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Edge flow-control frames observed (counted today, gating later).
+    pub fn inc_credit_received(&self) -> u64 {
+        self.credit_received.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     pub fn connect_received(&self) -> u64 {
         self.connect_received.load(Ordering::Relaxed)
     }
@@ -434,6 +514,38 @@ impl Metrics {
         self.inflight_dropped.load(Ordering::Relaxed)
     }
 
+    pub fn transport_sent(&self) -> u64 {
+        self.transport_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn transport_send_failed(&self) -> u64 {
+        self.transport_send_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn egress_qos0_shed(&self) -> u64 {
+        self.egress_qos0_shed.load(Ordering::Relaxed)
+    }
+
+    pub fn puback_deferred(&self) -> u64 {
+        self.puback_deferred.load(Ordering::Relaxed)
+    }
+
+    pub fn puback_deferred_released(&self) -> u64 {
+        self.puback_deferred_released.load(Ordering::Relaxed)
+    }
+
+    pub fn credit_clamped(&self) -> u64 {
+        self.credit_clamped.load(Ordering::Relaxed)
+    }
+
+    pub fn credit_exhausted(&self) -> u64 {
+        self.credit_exhausted.load(Ordering::Relaxed)
+    }
+
+    pub fn credit_received(&self) -> u64 {
+        self.credit_received.load(Ordering::Relaxed)
+    }
+
     /// Copy every counter in one call for API handlers.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -463,6 +575,14 @@ impl Metrics {
             detached_clean_dropped: self.detached_clean_dropped(),
             offline_queue_evicted: self.offline_queue_evicted(),
             inflight_dropped: self.inflight_dropped(),
+            transport_sent: self.transport_sent(),
+            transport_send_failed: self.transport_send_failed(),
+            egress_qos0_shed: self.egress_qos0_shed(),
+            puback_deferred: self.puback_deferred(),
+            puback_deferred_released: self.puback_deferred_released(),
+            credit_clamped: self.credit_clamped(),
+            credit_exhausted: self.credit_exhausted(),
+            credit_received: self.credit_received(),
         }
     }
 
@@ -472,7 +592,7 @@ impl Metrics {
             "# HELP indramqtt_messages_received_total Total MQTT ingress messages accepted over BrokerLink.\n\
              # TYPE indramqtt_messages_received_total counter\n\
              indramqtt_messages_received_total {}\n\
-             # HELP indramqtt_messages_forwarded_total Total PublishOut frames emitted toward the edge.\n\
+              # HELP indramqtt_messages_forwarded_total Total PublishOut frames admitted into the shard transport mailbox (transport enqueue, not edge arrival; compare with transport_sent).\n\
              # TYPE indramqtt_messages_forwarded_total counter\n\
              indramqtt_messages_forwarded_total {}\n\
              # HELP indramqtt_messages_dropped_total Total ingress messages dropped by quota/rate policing.\n\
@@ -498,7 +618,31 @@ impl Metrics {
               indramqtt_offline_queue_evicted_total {}\n\
               # HELP indramqtt_inflight_dropped_total QoS 1 downlinks delivered live but untracked for redelivery (per-session inflight window full).\n\
               # TYPE indramqtt_inflight_dropped_total counter\n\
-              indramqtt_inflight_dropped_total {}\n",
+              indramqtt_inflight_dropped_total {}\n\
+              # HELP indramqtt_transport_sent_total Frames actually written toward the edge by successful transport batch writes.\n\
+              # TYPE indramqtt_transport_sent_total counter\n\
+              indramqtt_transport_sent_total {}\n\
+              # HELP indramqtt_transport_send_failed_total Failed transport batch writes toward the edge.\n\
+              # TYPE indramqtt_transport_send_failed_total counter\n\
+              indramqtt_transport_send_failed_total {}\n\
+              # HELP indramqtt_egress_qos0_shed_total QoS 0 frames shed at route time by the per-connection egress bound.\n\
+              # TYPE indramqtt_egress_qos0_shed_total counter\n\
+              indramqtt_egress_qos0_shed_total {}\n\
+              # HELP indramqtt_puback_deferred_total QoS 1 publishes whose PUBACK is deferred for credit.\n\
+              # TYPE indramqtt_puback_deferred_total counter\n\
+              indramqtt_puback_deferred_total {}\n\
+              # HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.\n\
+              # TYPE indramqtt_puback_deferred_released_total counter\n\
+              indramqtt_puback_deferred_released_total {}\n\
+              # HELP indramqtt_credit_clamped_total Edge flow-control snapshots applied to a kernel credit balance.\n\
+              # TYPE indramqtt_credit_clamped_total counter\n\
+              indramqtt_credit_clamped_total {}\n\
+              # HELP indramqtt_credit_exhausted_total Route refusals for exhausted credit.\n\
+              # TYPE indramqtt_credit_exhausted_total counter\n\
+              indramqtt_credit_exhausted_total {}\n\
+              # HELP indramqtt_credit_received_total Edge flow-control frames observed.\n\
+              # TYPE indramqtt_credit_received_total counter\n\
+              indramqtt_credit_received_total {}\n",
             self.messages_received(),
             self.messages_forwarded(),
             self.messages_dropped(),
@@ -509,6 +653,14 @@ impl Metrics {
             self.detached_clean_dropped(),
             self.offline_queue_evicted(),
             self.inflight_dropped(),
+            self.transport_sent(),
+            self.transport_send_failed(),
+            self.egress_qos0_shed(),
+            self.puback_deferred(),
+            self.puback_deferred_released(),
+            self.credit_clamped(),
+            self.credit_exhausted(),
+            self.credit_received(),
         )
     }
 }
@@ -786,6 +938,40 @@ mod tests {
         let other_snap = other.snapshot();
         assert_eq!(other_snap, MetricsSnapshot::default());
         assert_ne!(snap, other_snap);
+    }
+
+    #[test]
+    fn test_egress_stage_counters_increment_and_render() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.inc_transport_sent_by(3), 3);
+        assert_eq!(metrics.inc_transport_sent_by(2), 5);
+        assert_eq!(metrics.inc_transport_send_failed(), 1);
+        assert_eq!(metrics.inc_egress_qos0_shed(), 1);
+        assert_eq!(metrics.inc_puback_deferred(), 1);
+        assert_eq!(metrics.inc_puback_deferred_released(), 1);
+        assert_eq!(metrics.inc_credit_clamped(), 1);
+        assert_eq!(metrics.inc_credit_exhausted(), 1);
+        assert_eq!(metrics.inc_credit_received(), 1);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.transport_sent, 5);
+        assert_eq!(snap.transport_send_failed, 1);
+        assert_eq!(snap.egress_qos0_shed, 1);
+        assert_eq!(snap.puback_deferred, 1);
+        assert_eq!(snap.puback_deferred_released, 1);
+        assert_eq!(snap.credit_clamped, 1);
+        assert_eq!(snap.credit_exhausted, 1);
+        assert_eq!(snap.credit_received, 1);
+
+        let text = metrics.render_prometheus_metrics();
+        assert!(text.contains("indramqtt_transport_sent_total 5\n"));
+        assert!(text.contains("indramqtt_transport_send_failed_total 1\n"));
+        assert!(text.contains("indramqtt_egress_qos0_shed_total 1\n"));
+        assert!(text.contains("indramqtt_puback_deferred_total 1\n"));
+        assert!(text.contains("indramqtt_puback_deferred_released_total 1\n"));
+        assert!(text.contains("indramqtt_credit_clamped_total 1\n"));
+        assert!(text.contains("indramqtt_credit_exhausted_total 1\n"));
+        assert!(text.contains("indramqtt_credit_received_total 1\n"));
     }
 
     #[test]
