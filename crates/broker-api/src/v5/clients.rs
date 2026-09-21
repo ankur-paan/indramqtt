@@ -396,8 +396,8 @@ pub async fn get_client_mqueue(
         session.offline_queue.read().iter().cloned().collect();
     let total = snapshot.len();
     let page_items = paginate(&snapshot, params.page, params.limit);
-    let start = ((u64::from(params.page.max(1)) - 1) * u64::from(params.limit)).min(total as u64)
-        as usize;
+    let start =
+        ((u64::from(params.page.max(1)) - 1) * u64::from(params.limit)).min(total as u64) as usize;
     let data: Vec<serde_json::Value> = page_items
         .iter()
         .enumerate()
