@@ -782,11 +782,7 @@ pub async fn get_sessions_count(
         }
         _ => total,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "count": count })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response()
 }
 
 /// Management-plane publish fan-out shared by `POST /publish` and the

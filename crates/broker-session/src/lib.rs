@@ -605,11 +605,7 @@ impl SessionManager {
     /// and persistent sessions both yield empty (their subscriptions
     /// survive, which is what durable redelivery builds on).
     pub fn unbind_connection(&self, client_id: &str, conn_id: u64) -> Vec<TopicFilter> {
-        let (username_to_release, swept, did_detach): (
-            Option<String>,
-            Vec<TopicFilter>,
-            bool,
-        ) = {
+        let (username_to_release, swept, did_detach): (Option<String>, Vec<TopicFilter>, bool) = {
             let map = self.sessions.read();
             match map.get(client_id) {
                 Some(session) => {
@@ -647,11 +643,9 @@ impl SessionManager {
             // session. Racing teardowns (wrong conn_id, unknown client)
             // and detaches of an already-disconnected session change
             // nothing, so the counter never underflows.
-            let _ = self.connected_count.fetch_update(
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            );
+            let _ = self
+                .connected_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
         if let Some(username) = username_to_release {
             self.release_connection_slot(&username);
