@@ -89,6 +89,10 @@ pub fn protected_router() -> Router<ApiState> {
             "/clients/:clientid/mqueue_messages",
             get(clients::get_client_mqueue),
         )
+        .route(
+            "/clients/:clientid/inflight_messages",
+            get(clients::get_client_inflight),
+        )
         .route("/subscriptions", get(clients::list_subscriptions))
         .route("/topics", get(clients::list_topics))
         .route("/publish", post(clients::publish_message))
