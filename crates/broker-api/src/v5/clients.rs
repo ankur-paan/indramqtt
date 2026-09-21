@@ -242,95 +242,356 @@ pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> R
     (StatusCode::OK, Json(results)).into_response()
 }
 
+/// Maximum subscriptions returned by one per-client listing. The read
+/// clones at most this many rows under a short lock, sorted by topic for
+/// a deterministic order; per-connection state itself stays bounded by
+/// live subscribe/unsubscribe writes. Management-plane only: the
+/// delivery path never takes this lock.
+const MAX_CLIENT_SUBSCRIPTIONS: usize = 1000;
+
 pub async fn get_client_subscriptions(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
 ) -> Response {
-    let session = state.sessions.get(&client_id);
-    let subs: Vec<serde_json::Value> = match session {
-        Some(s) => s
-            .subscriptions
-            .read()
-            .iter()
-            .map(|(filter, qos)| {
-                serde_json::json!({
-                    "topic": filter.as_str(),
-                    "qos": u8::from(*qos),
-                    "node": "indramqtt@127.0.0.1",
-                    "clientid": client_id
-                })
-            })
-            .collect(),
-        None => Vec::new(),
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
     };
+    // Read over the real session mirror written by the subscribe routes,
+    // not the router trie: same state, no work on the fan-out path.
+    let mut entries: Vec<(String, u8, u8, u8, u8)> = session
+        .subscriptions
+        .read()
+        .iter()
+        .map(|(filter, opts)| {
+            (
+                filter.as_str().to_string(),
+                u8::from(opts.qos),
+                opts.nl,
+                opts.rap,
+                opts.rh,
+            )
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if entries.len() > MAX_CLIENT_SUBSCRIPTIONS {
+        entries.truncate(MAX_CLIENT_SUBSCRIPTIONS);
+    }
+    let subs: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(topic, qos, nl, rap, rh)| {
+            serde_json::json!({
+                "topic": topic,
+                "qos": qos,
+                "nl": nl,
+                "rap": rap,
+                "rh": rh,
+                "node": "indramqtt@127.0.0.1",
+                "clientid": client_id,
+            })
+        })
+        .collect();
 
     (StatusCode::OK, Json(subs)).into_response()
 }
 
-#[derive(Deserialize)]
-pub struct SubscribeReq {
-    pub topic: String,
-    #[serde(default)]
-    pub qos: u8,
+/// One management subscribe against the real router and session index.
+///
+/// Shared by the single and bulk routes; bulk reuses this per entry so
+/// both paths register the same state. It touches the session map and
+/// the router trie and nothing on the message path. Work is bounded by
+/// the request itself: one map insert plus one trie insert per entry,
+/// plus a result list of the same length for bulk. No new buffering is
+/// added to fan-out or fan-in; management-plane only.
+fn apply_single_subscribe(
+    state: &ApiState,
+    client_id: &str,
+    entry: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let session = match state.sessions.get(client_id) {
+        Some(session) => session,
+        None => {
+            return Err(ApiError::ClientIdNotFound("client not found".to_string()));
+        }
+    };
+    let (filter, qos, nl, rap, rh) = parse_subscribe_entry(entry)?;
+    state
+        .sessions
+        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
+
+    // Live connection owns the router copy; offline subscribes keep a
+    // placeholder until a live re-subscribe replaces it (the trie holds
+    // at most one `conn_id` per `(filter node, client_id)`).
+    let conn_id = (*session.conn_id.read()).unwrap_or(1);
+
+    state
+        .router
+        .subscribe(&filter, Subscription::new(client_id, conn_id, qos));
+
+    Ok(serde_json::json!({
+        "clientid": client_id,
+        "topic": filter.as_str(),
+        "qos": u8::from(qos),
+        "nl": nl,
+        "rap": rap,
+        "rh": rh,
+        "node": "indramqtt@127.0.0.1",
+    }))
+}
+
+/// Validate one subscribe entry (`{topic, qos, nl, rap, rh}`) from a
+/// pre-parsed JSON value. `topic` is required; the option fields default
+/// to 0. Malformed entries are client errors, never silent drops: an
+/// invalid filter, an out-of-range option, or a publish-only delayed
+/// prefix fails instead of registering a wrong subscription.
+fn parse_subscribe_entry(
+    value: &serde_json::Value,
+) -> Result<(TopicFilter, QoS, u8, u8, u8), ApiError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("subscribe entry must be a JSON object".to_string()))?;
+    let topic_str = obj
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("field `topic` is required".to_string()))?;
+    let qos_raw = get_option_u8(obj, "qos", 0)?;
+    if qos_raw > 2 {
+        return Err(ApiError::BadRequest(
+            "field `qos` must be 0, 1 or 2".to_string(),
+        ));
+    }
+    let nl = get_option_u8(obj, "nl", 0)?;
+    if nl > 1 {
+        return Err(ApiError::BadRequest(
+            "field `nl` must be 0 or 1".to_string(),
+        ));
+    }
+    let rap = get_option_u8(obj, "rap", 0)?;
+    if rap > 1 {
+        return Err(ApiError::BadRequest(
+            "field `rap` must be 0 or 1".to_string(),
+        ));
+    }
+    let rh = get_option_u8(obj, "rh", 0)?;
+    if rh > 2 {
+        return Err(ApiError::BadRequest(
+            "field `rh` must be 0, 1 or 2".to_string(),
+        ));
+    }
+    if broker_router::strip_delayed_prefix(topic_str).is_some() {
+        return Err(ApiError::BadRequest(
+            "delayed topics cannot be subscribed".to_string(),
+        ));
+    }
+    let filter = TopicFilter::new(topic_str)
+        .map_err(|e| ApiError::BadRequest(format!("invalid topic `{topic_str}`: {e}")))?;
+    let qos = QoS::try_from(qos_raw)
+        .map_err(|_| ApiError::BadRequest("field `qos` must be 0, 1 or 2".to_string()))?;
+    Ok((filter, qos, nl, rap, rh))
+}
+
+/// Read one optional `0..=255` option field, defaulting when absent.
+/// Wrong JSON types are client errors, not silent defaults.
+fn get_option_u8(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    default: u8,
+) -> Result<u8, ApiError> {
+    match obj.get(field) {
+        None => Ok(default),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("field `{field}` must be an integer 0..=255"))
+            }),
+        Some(_) => Err(ApiError::BadRequest(format!(
+            "field `{field}` must be an integer 0..=255"
+        ))),
+    }
 }
 
 pub async fn client_subscribe(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    Json(req): Json<SubscribeReq>,
+    body: Bytes,
 ) -> Response {
-    let filter = match TopicFilter::new(&req.topic) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "code": "BAD_REQUEST", "message": format!("Invalid filter: {e}") })),
-            ).into_response();
+    let entry: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid subscribe body: {error}"))
+                .into_response();
         }
     };
-    let qos = QoS::try_from(req.qos).unwrap_or(QoS::AtMostOnce);
-
-    state
-        .sessions
-        .add_subscription(&client_id, filter.clone(), qos);
-
-    let conn_id = state
-        .sessions
-        .get(&client_id)
-        .and_then(|s| *s.conn_id.read())
-        .unwrap_or(1);
-
-    state
-        .router
-        .subscribe(&filter, Subscription::new(&*client_id, conn_id, qos));
-
-    (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()
+    match apply_single_subscribe(&state, &client_id, &entry) {
+        Ok(item) => (StatusCode::OK, Json(item)).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
-#[derive(Deserialize)]
-pub struct UnsubscribeReq {
-    pub topic: String,
+pub async fn bulk_subscribe(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid bulk subscribe body: {error}"))
+                .into_response();
+        }
+    };
+    // Unknown clients fail the whole batch with not-found; malformed
+    // entries fail per entry while the good ones still land. The result
+    // list is bounded by the request length; no extra buffering.
+    if state.sessions.get(&client_id).is_none() {
+        return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+    }
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match apply_single_subscribe(&state, &client_id, entry) {
+            Ok(item) => results.push(item),
+            Err(ApiError::BadRequest(message)) => {
+                let topic = entry
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                results.push(serde_json::json!({
+                    "topic": topic,
+                    "code": "BAD_REQUEST",
+                    "message": message,
+                }));
+            }
+            Err(error) => {
+                let topic = entry
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                results.push(serde_json::json!({
+                    "topic": topic,
+                    "code": error.code(),
+                    "message": error.message(),
+                }));
+            }
+        }
+    }
+    (StatusCode::OK, Json(results)).into_response()
+}
+
+/// One management unsubscribe against the real router and session index.
+///
+/// Shared by the single and bulk routes; bulk reuses this per entry so
+/// both paths remove the same state. It touches the session map and the
+/// router trie and nothing on the message path. Work is bounded by the
+/// request itself: one map removal plus one trie removal per entry, plus
+/// a result list of the same length for bulk. Removing an absent
+/// subscription still succeeds; unknown clients fail. No new buffering;
+/// management-plane only.
+fn apply_single_unsubscribe(
+    state: &ApiState,
+    client_id: &str,
+    entry: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    if state.sessions.get(client_id).is_none() {
+        return Err(ApiError::ClientIdNotFound("client not found".to_string()));
+    }
+    let filter = parse_unsubscribe_entry(entry)?;
+    state.sessions.remove_subscription(client_id, &filter);
+    state.router.unsubscribe(&filter, client_id);
+    Ok(serde_json::json!({
+        "topic": filter.as_str(),
+    }))
+}
+
+/// Validate one unsubscribe entry (`{topic}`) from a pre-parsed JSON
+/// value. `topic` is required and must be a valid filter; malformed
+/// entries are client errors, never silent drops. An absent subscription
+/// is not malformed: it validates and removes to an empty success.
+fn parse_unsubscribe_entry(value: &serde_json::Value) -> Result<TopicFilter, ApiError> {
+    let obj = value.as_object().ok_or_else(|| {
+        ApiError::BadRequest("unsubscribe entry must be a JSON object".to_string())
+    })?;
+    let topic_str = obj
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("field `topic` is required".to_string()))?;
+    if broker_router::strip_delayed_prefix(topic_str).is_some() {
+        return Err(ApiError::BadRequest(
+            "delayed topics cannot be unsubscribed".to_string(),
+        ));
+    }
+    TopicFilter::new(topic_str)
+        .map_err(|e| ApiError::BadRequest(format!("invalid topic `{topic_str}`: {e}")))
 }
 
 pub async fn client_unsubscribe(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    Json(req): Json<UnsubscribeReq>,
+    body: Bytes,
 ) -> Response {
-    let filter = match TopicFilter::new(&req.topic) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "code": "BAD_REQUEST", "message": format!("Invalid filter: {e}") })),
-            ).into_response();
+    let entry: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid unsubscribe body: {error}"))
+                .into_response();
         }
     };
+    match apply_single_unsubscribe(&state, &client_id, &entry) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
 
-    state.sessions.remove_subscription(&client_id, &filter);
-    state.router.unsubscribe(&filter, &client_id);
-
-    StatusCode::NO_CONTENT.into_response()
+pub async fn bulk_unsubscribe(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid bulk unsubscribe body: {error}"))
+                .into_response();
+        }
+    };
+    // Unknown clients fail the whole batch with not-found; malformed
+    // entries fail per entry while the good ones still remove. Absent
+    // subscriptions succeed per entry. The result list is bounded by the
+    // request length; no extra buffering.
+    if state.sessions.get(&client_id).is_none() {
+        return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+    }
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match apply_single_unsubscribe(&state, &client_id, entry) {
+            Ok(item) => results.push(item),
+            Err(ApiError::BadRequest(message)) => {
+                let topic = entry
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                results.push(serde_json::json!({
+                    "topic": topic,
+                    "code": "BAD_REQUEST",
+                    "message": message,
+                }));
+            }
+            Err(error) => {
+                let topic = entry
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                results.push(serde_json::json!({
+                    "topic": topic,
+                    "code": error.code(),
+                    "message": error.message(),
+                }));
+            }
+        }
+    }
+    (StatusCode::OK, Json(results)).into_response()
 }
 
 pub async fn get_client_inflight(
@@ -421,35 +682,36 @@ pub async fn get_client_mqueue(
         .into_response()
 }
 
-pub async fn list_subscriptions(State(state): State<ApiState>) -> Response {
-    let mut data = Vec::new();
-    for cid in state.sessions.active_client_ids() {
-        if let Some(s) = state.sessions.get(&cid) {
-            for (filter, qos) in s.subscriptions.read().iter() {
-                data.push(serde_json::json!({
-                    "clientid": cid,
-                    "topic": filter.as_str(),
-                    "qos": u8::from(*qos),
-                    "node": "indramqtt@127.0.0.1"
-                }));
-            }
-        }
-    }
-
-    let count = data.len();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 100,
-                "count": count,
-                "hasnext": false
-            }
-        })),
-    )
-        .into_response()
+/// Global subscription list as a bare array (W1-14).
+///
+/// Reads the session-mirror index via
+/// [`broker_session::SessionManager::global_subscriptions`], not the
+/// router trie, so list reads never block the routing path. The snapshot
+/// is bounded by [`broker_session::MAX_GLOBAL_SUBSCRIPTIONS`] (100_000
+/// rows, sorted by `(client_id, topic)` for a deterministic page order)
+/// and then sliced with the W0 `page`/`limit` helper; unknown query keys
+/// are ignored by the extractor so new parameters degrade to the full
+/// first page instead of a 400. Management-plane only: no new buffering
+/// on fan-out or fan-in. Returns a bare list to match the documented
+/// shape (no `data`/`meta` envelope).
+pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParams) -> Response {
+    let rows = state.sessions.global_subscriptions();
+    let page_items = paginate(&rows, params.page, params.limit);
+    let data: Vec<serde_json::Value> = page_items
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "clientid": entry.client_id,
+                "topic": entry.filter.as_str(),
+                "qos": u8::from(entry.options.qos),
+                "nl": entry.options.nl,
+                "rap": entry.options.rap,
+                "rh": entry.options.rh,
+                "node": "indramqtt@127.0.0.1"
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(data)).into_response()
 }
 
 pub async fn list_topics(State(state): State<ApiState>) -> Response {
@@ -489,110 +751,483 @@ pub async fn list_topics(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct PublishRequest {
-    pub topic: String,
+/// Documented `GET /sessions_count` scoping. Only `node` narrows the
+/// count; every other query key is ignored by the `Query` extractor so
+/// new parameters degrade to the full count instead of a 400.
+#[derive(Deserialize, Default)]
+pub struct SessionsCountQuery {
     #[serde(default)]
-    pub qos: u8,
-    #[serde(default)]
-    pub retain: bool,
-    pub payload: String,
+    pub node: Option<String>,
 }
 
-pub async fn publish_message(
+/// Live-session count as a small `{"count": N}` object.
+///
+/// Constant-time read over indexed session state: one atomic maintained
+/// by the session manager, no scan of the session map. Counts connected
+/// sessions only. An explicit `node` value for another node narrows to
+/// zero on this single node; unknown query keys are ignored.
+/// Management-plane only; never touched on fan-out or fan-in.
+pub async fn get_sessions_count(
     State(state): State<ApiState>,
-    Json(req): Json<PublishRequest>,
+    Query(params): Query<SessionsCountQuery>,
 ) -> Response {
-    let topic = match Topic::new(&req.topic) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": format!("Invalid topic: {e}")
-                })),
-            )
-                .into_response();
+    let total = state.sessions.connected_count();
+    let count = match params.node.as_deref() {
+        Some(want)
+            if !want.is_empty()
+                && want != state.node_id.as_str()
+                && want != "indramqtt@127.0.0.1" =>
+        {
+            0
         }
+        _ => total,
     };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "count": count })),
+    )
+        .into_response()
+}
 
-    let qos = match QoS::try_from(req.qos) {
-        Ok(q) => q,
-        Err(_) => QoS::AtMostOnce,
-    };
-
-    let payload = Bytes::from(req.payload.into_bytes());
-
-    // Record metrics
-    state.metrics.inc_messages_received();
-
-    // Route message through Radix Trie
-    let matches = state.router.matches(&topic);
-    for sub in matches {
-        let routed_frame = brokerlink::BrokerFrame::new(
-            brokerlink::OpCode::PublishOut,
-            sub.conn_id,
-            0,
-            Bytes::new(),
-            payload.clone(),
-        );
-        if let Ok(frame) = routed_frame {
-            // Only live mailboxes count as forwarded; drops are already
-            // counted inside `ConnTable::route`.
-            if state.conns.route(sub.conn_id, frame) {
-                state.metrics.inc_messages_forwarded();
-            }
-        }
-    }
-
-    // Rules execute at ingress on this node, invoking live connector sinks
-    struct ApiBrokerSink {
-        router: std::sync::Arc<broker_router::Router>,
-        conns: std::sync::Arc<broker_router::ConnTable>,
-        metrics: std::sync::Arc<broker_observability::Metrics>,
-    }
-
-    #[async_trait::async_trait]
-    impl broker_rules::BrokerSink for ApiBrokerSink {
-        async fn publish(
-            &self,
-            topic: Topic,
-            payload: Bytes,
-            _qos: QoS,
-            _retain: bool,
-        ) -> Result<(), broker_rules::RuleEngineError> {
-            let matches = self.router.matches(&topic);
-            for sub in matches {
-                let routed_frame = brokerlink::BrokerFrame::new(
-                    brokerlink::OpCode::PublishOut,
-                    sub.conn_id,
-                    0,
-                    Bytes::new(),
-                    payload.clone(),
-                );
-                if let Ok(frame) = routed_frame {
-                    // Outcome counting, like the publish path above.
-                    if self.conns.route(sub.conn_id, frame) {
-                        self.metrics.inc_messages_forwarded();
+/// Management-plane publish fan-out shared by `POST /publish` and the
+/// rule republish sink below.
+///
+/// Mirrors the kernel ingress fan-out (`broker-node`): delivery QoS is
+/// `min(publish QoS, subscription QoS)`; live sessions get a
+/// per-session downlink packet id (QoS 1 tracked for redelivery until
+/// its PUBACK); detached durable sessions buffer into their offline
+/// queue; detached clean sessions drop; unknown sessions fall back to
+/// the router-registered `conn_id`. Returns
+/// `(live frames, offline queued, router matches)`.
+fn build_publish_deliveries(
+    state: &ApiState,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+) -> (Vec<(u64, brokerlink::BrokerFrame)>, usize, usize) {
+    let qos_raw = u8::from(qos);
+    let topic_str = topic.as_str();
+    let matched = state.router.matches(topic);
+    let matched_count = matched.len();
+    let mut deliveries = Vec::new();
+    let mut offline_queued = 0usize;
+    for sub in matched {
+        let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
+        match state.sessions.get(sub.client_id.as_ref()) {
+            Some(session) => {
+                let connected = *session.connected.read();
+                let live = *session.conn_id.read();
+                match (connected, live) {
+                    (true, Some(conn_id)) => {
+                        let downlink_id = if effective == 0 {
+                            0u16
+                        } else {
+                            session.next_packet_id()
+                        };
+                        if effective == 1 {
+                            let tracked = session.track_inflight(broker_session::InflightMessage {
+                                packet_id: downlink_id,
+                                topic: topic.clone(),
+                                qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
+                                retain,
+                                payload: payload.clone(),
+                            });
+                            if !tracked {
+                                state.metrics.inc_inflight_dropped();
+                            }
+                        }
+                        if let Some(frame) = encode_publish_out_frame(
+                            conn_id,
+                            topic_str,
+                            downlink_id,
+                            effective,
+                            retain,
+                            payload,
+                        ) {
+                            deliveries.push((conn_id, frame));
+                        }
+                    }
+                    _ => {
+                        if !session.clean_start {
+                            let before = session.offline_len();
+                            session.push_offline(broker_session::QueuedMessage {
+                                topic: topic.clone(),
+                                qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
+                                retain,
+                                payload: payload.clone(),
+                            });
+                            let evicted = (before + 1).saturating_sub(session.offline_len());
+                            if evicted > 0 {
+                                state.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                            }
+                            offline_queued += 1;
+                        } else {
+                            state.metrics.inc_detached_clean_dropped();
+                        }
                     }
                 }
             }
-            Ok(())
+            None => {
+                let downlink_id = if effective == 0 { 0u16 } else { 1u16 };
+                if let Some(frame) = encode_publish_out_frame(
+                    sub.conn_id,
+                    topic_str,
+                    downlink_id,
+                    effective,
+                    retain,
+                    payload,
+                ) {
+                    deliveries.push((sub.conn_id, frame));
+                }
+            }
         }
     }
+    (deliveries, offline_queued, matched_count)
+}
 
+/// Encode one `PublishOut` frame (`TopicLen | Topic | PacketId | QoS |
+/// Retain | Dup(0)`); sequence is stamped per destination by
+/// `ConnTable::route`.
+fn encode_publish_out_frame(
+    conn_id: u64,
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    payload: &Bytes,
+) -> Option<brokerlink::BrokerFrame> {
+    let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3);
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(0u8);
+    brokerlink::BrokerFrame::new(
+        brokerlink::OpCode::PublishOut,
+        conn_id,
+        0,
+        Bytes::from(meta),
+        payload.clone(),
+    )
+    .ok()
+}
+
+/// Route already-built frames, counting only live mailbox arrivals as
+/// forwarded/sent/delivered (drops are counted inside `ConnTable::route`).
+fn route_publish_frames(state: &ApiState, frames: Vec<(u64, brokerlink::BrokerFrame)>) -> u64 {
+    let mut enqueued = 0u64;
+    let mut enqueued_bytes = 0u64;
+    for (conn_id, frame) in frames {
+        let len = frame.total_frame_len() as u64;
+        if state.conns.route(conn_id, frame) {
+            enqueued += 1;
+            enqueued_bytes += len;
+        }
+    }
+    state.metrics.inc_messages_forwarded_by(enqueued);
+    state.metrics.inc_publish_sent_by(enqueued);
+    state.metrics.inc_delivered_by(enqueued);
+    state.metrics.inc_bytes_sent_by(enqueued_bytes);
+    enqueued
+}
+
+fn publish_id() -> String {
+    format!(
+        "{:08X}{:08X}{:08X}{:08X}",
+        rand::random::<u32>(),
+        rand::random::<u32>(),
+        rand::random::<u32>(),
+        rand::random::<u32>(),
+    )
+}
+
+/// Validate one publish entry (`{topic, payload, payload_encoding, qos,
+/// retain}`) from a pre-parsed JSON value. `topic` is required and must
+/// be a concrete topic; `payload` defaults to `""`; `payload_encoding`
+/// is `plain` (default) or `base64`; `qos` defaults to 0 and must be
+/// 0, 1 or 2; `retain` defaults to false and must be a boolean.
+/// Malformed entries are client errors with `BAD_REQUEST`.
+fn parse_publish_entry(value: &serde_json::Value) -> Result<(Topic, Bytes, QoS, bool), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "publish entry must be a JSON object".to_string())?;
+    let topic_str = obj
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `topic` is required".to_string())?;
+    if topic_str.len() > u16::MAX as usize {
+        return Err("field `topic` is too long".to_string());
+    }
+    let topic = Topic::new(topic_str).map_err(|e| format!("invalid topic `{topic_str}`: {e}"))?;
+    let qos_raw = match obj.get("qos") {
+        None => 0u8,
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| "field `qos` must be 0, 1 or 2".to_string())?,
+        Some(_) => return Err("field `qos` must be 0, 1 or 2".to_string()),
+    };
+    if qos_raw > 2 {
+        return Err("field `qos` must be 0, 1 or 2".to_string());
+    }
+    let qos = QoS::try_from(qos_raw).map_err(|_| "field `qos` must be 0, 1 or 2".to_string())?;
+    let retain = match obj.get("retain") {
+        None => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => return Err("field `retain` must be a boolean".to_string()),
+    };
+    let encoding = match obj.get("payload_encoding") {
+        None => "plain",
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(_) => {
+            return Err("field `payload_encoding` must be \"plain\" or \"base64\"".to_string());
+        }
+    };
+    if encoding != "plain" && encoding != "base64" {
+        return Err("field `payload_encoding` must be \"plain\" or \"base64\"".to_string());
+    }
+    let payload_str = match obj.get("payload") {
+        None => "",
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(_) => return Err("field `payload` must be a string".to_string()),
+    };
+    let payload = if encoding == "base64" {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD
+            .decode(payload_str.as_bytes())
+            .map(Bytes::from)
+            .map_err(|e| format!("field `payload` is not valid base64: {e}"))?
+    } else {
+        Bytes::from(payload_str.as_bytes().to_vec())
+    };
+    Ok((topic, payload, qos, retain))
+}
+
+/// Rule republish sink for the management publish path: pure in-memory
+/// fan-out through the same session-aware builder as direct publishes,
+/// so rule output observes identical QoS downgrade, packet id and
+/// offline/inflight semantics. No sockets, no MQTT loopback.
+struct ApiBrokerSink {
+    router: std::sync::Arc<broker_router::Router>,
+    sessions: std::sync::Arc<broker_session::SessionManager>,
+    conns: std::sync::Arc<broker_router::ConnTable>,
+    metrics: std::sync::Arc<broker_observability::Metrics>,
+}
+
+#[async_trait::async_trait]
+impl broker_rules::BrokerSink for ApiBrokerSink {
+    async fn publish(
+        &self,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
+        let qos_raw = u8::from(qos);
+        let topic_str = topic.as_str();
+        let mut frames = Vec::new();
+        for sub in self.router.matches(&topic) {
+            let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
+            match self.sessions.get(sub.client_id.as_ref()) {
+                Some(session) => {
+                    let connected = *session.connected.read();
+                    let live = *session.conn_id.read();
+                    match (connected, live) {
+                        (true, Some(conn_id)) => {
+                            let downlink_id = if effective == 0 {
+                                0u16
+                            } else {
+                                session.next_packet_id()
+                            };
+                            if effective == 1 {
+                                let tracked =
+                                    session.track_inflight(broker_session::InflightMessage {
+                                        packet_id: downlink_id,
+                                        topic: topic.clone(),
+                                        qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
+                                        retain,
+                                        payload: payload.clone(),
+                                    });
+                                if !tracked {
+                                    self.metrics.inc_inflight_dropped();
+                                }
+                            }
+                            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+                            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+                            meta.extend_from_slice(topic_str.as_bytes());
+                            meta.extend_from_slice(&downlink_id.to_be_bytes());
+                            meta.push(effective);
+                            meta.push(u8::from(retain));
+                            meta.push(0u8);
+                            if let Ok(frame) = brokerlink::BrokerFrame::new(
+                                brokerlink::OpCode::PublishOut,
+                                conn_id,
+                                0,
+                                Bytes::from(meta),
+                                payload.clone(),
+                            ) {
+                                frames.push((conn_id, frame));
+                            }
+                        }
+                        _ => {
+                            if !session.clean_start {
+                                let before = session.offline_len();
+                                session.push_offline(broker_session::QueuedMessage {
+                                    topic: topic.clone(),
+                                    qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
+                                    retain,
+                                    payload: payload.clone(),
+                                });
+                                let evicted = (before + 1).saturating_sub(session.offline_len());
+                                if evicted > 0 {
+                                    self.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                }
+                            } else {
+                                self.metrics.inc_detached_clean_dropped();
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let downlink_id = if effective == 0 { 0u16 } else { 1u16 };
+                    let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+                    meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+                    meta.extend_from_slice(topic_str.as_bytes());
+                    meta.extend_from_slice(&downlink_id.to_be_bytes());
+                    meta.push(effective);
+                    meta.push(u8::from(retain));
+                    meta.push(0u8);
+                    if let Ok(frame) = brokerlink::BrokerFrame::new(
+                        brokerlink::OpCode::PublishOut,
+                        sub.conn_id,
+                        0,
+                        Bytes::from(meta),
+                        payload.clone(),
+                    ) {
+                        frames.push((sub.conn_id, frame));
+                    }
+                }
+            }
+        }
+        let mut enqueued = 0u64;
+        let mut enqueued_bytes = 0u64;
+        for (conn_id, frame) in frames {
+            let len = frame.total_frame_len() as u64;
+            if self.conns.route(conn_id, frame) {
+                enqueued += 1;
+                enqueued_bytes += len;
+            }
+        }
+        self.metrics.inc_messages_forwarded_by(enqueued);
+        self.metrics.inc_publish_sent_by(enqueued);
+        self.metrics.inc_delivered_by(enqueued);
+        self.metrics.inc_bytes_sent_by(enqueued_bytes);
+        Ok(())
+    }
+}
+
+/// Publish one message through ingress accounting, rule execution then session-aware
+/// fan-out, mirroring kernel ingress order. Retain flag is preserved in delivery frames
+/// and offline/inflight entries; no extra per-message buffering is added. Returns match count.
+async fn do_mgmt_publish(
+    state: &ApiState,
+    topic: &Topic,
+    payload: &Bytes,
+    qos: QoS,
+    retain: bool,
+) -> usize {
+    state.metrics.inc_messages_received();
+    state.metrics.inc_publish_received();
+    match qos {
+        QoS::AtMostOnce => {
+            state.metrics.inc_qos0_received();
+        }
+        QoS::AtLeastOnce => {
+            state.metrics.inc_qos1_received();
+        }
+        QoS::ExactlyOnce => {
+            state.metrics.inc_qos2_received();
+        }
+    }
     let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(ApiBrokerSink {
         router: state.router.clone(),
+        sessions: state.sessions.clone(),
         conns: state.conns.clone(),
         metrics: state.metrics.clone(),
     });
-
     let rules_fired = state
         .engine
-        .dispatch_ingress(&topic, &payload, qos, &sink)
+        .dispatch_ingress(topic, payload, qos, &sink)
         .await;
     state.metrics.inc_rules_executed_by(rules_fired as u64);
+    let (frames, _offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
+    route_publish_frames(state, frames);
+    matched
+}
 
-    (StatusCode::OK, Json(serde_json::json!({ "result": "ok" }))).into_response()
+pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid publish body: {error}")).into_response();
+        }
+    };
+    let (topic, payload, qos, retain) = match parse_publish_entry(&value) {
+        Ok(parts) => parts,
+        Err(message) => return ApiError::BadRequest(message).into_response(),
+    };
+    do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "id": publish_id() })),
+    )
+        .into_response()
+}
+
+/// Bulk management publish through the single-entry injection routine.
+///
+/// Takes a JSON array of publish entries (same shape as `POST /publish`)
+/// and injects each through `parse_publish_entry` plus `do_mgmt_publish`,
+/// so bulk output observes identical validation, rule, retained and
+/// fan-out semantics. One bad entry never fails the batch: it is marked
+/// with the documented error shape in the result while the good ones
+/// still deliver. A wholly malformed body (invalid JSON or not an array)
+/// is a client error. Bounded iteration over the request itself: one
+/// parse plus one fan-out per entry, plus a result list of the same
+/// length. No extra buffering beyond the request and result lists;
+/// management-plane only.
+pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Response {
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid publish bulk body: {error}"))
+                .into_response();
+        }
+    };
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match parse_publish_entry(entry) {
+            Ok((topic, payload, qos, retain)) => {
+                do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+                results.push(serde_json::json!({
+                    "topic": topic.as_str(),
+                    "id": publish_id(),
+                }));
+            }
+            Err(message) => {
+                let topic = entry
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                results.push(serde_json::json!({
+                    "topic": topic,
+                    "code": "BAD_REQUEST",
+                    "message": message,
+                }));
+            }
+        }
+    }
+    (StatusCode::OK, Json(results)).into_response()
 }

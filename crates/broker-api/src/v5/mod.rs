@@ -1,6 +1,7 @@
 //! v5 REST API compatibility router for IndraMQTT.
 
 pub mod auth;
+pub mod banned;
 pub mod clients;
 pub mod gateways;
 pub mod monitoring;
@@ -82,8 +83,16 @@ pub fn protected_router() -> Router<ApiState> {
             post(clients::client_subscribe),
         )
         .route(
+            "/clients/:clientid/subscribe/bulk",
+            post(clients::bulk_subscribe),
+        )
+        .route(
             "/clients/:clientid/unsubscribe",
             post(clients::client_unsubscribe),
+        )
+        .route(
+            "/clients/:clientid/unsubscribe/bulk",
+            post(clients::bulk_unsubscribe),
         )
         .route(
             "/clients/:clientid/mqueue_messages",
@@ -93,9 +102,18 @@ pub fn protected_router() -> Router<ApiState> {
             "/clients/:clientid/inflight_messages",
             get(clients::get_client_inflight),
         )
+        .route(
+            "/banned",
+            get(banned::list_banned)
+                .post(banned::create_banned)
+                .delete(banned::clear_banned),
+        )
+        .route("/banned/:as/:who", delete(banned::delete_banned_one))
         .route("/subscriptions", get(clients::list_subscriptions))
         .route("/topics", get(clients::list_topics))
+        .route("/sessions_count", get(clients::get_sessions_count))
         .route("/publish", post(clients::publish_message))
+        .route("/publish/bulk", post(clients::publish_bulk))
         // Rules, Flow Designer & Connectors
         .route("/rules", get(rules::list_rules).post(rules::create_rule))
         .route(

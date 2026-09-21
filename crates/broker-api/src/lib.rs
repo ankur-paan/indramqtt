@@ -61,6 +61,10 @@ pub struct ApiState {
     /// path; the async `serve_api` forwarder routes this copy after the
     /// connection is unregistered and drops it by design.
     pub edge_tx: UnboundedSender<BrokerFrame>,
+    /// Ban directory for `/api/v5/banned` (W1-01): bounded matcher map
+    /// with lazy expiry. Management-plane only; never touched on the
+    /// per-message path.
+    pub bans: Arc<crate::v5::banned::BanStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -111,6 +115,7 @@ impl ApiState {
             config,
             node_id,
             edge_tx,
+            bans: Arc::new(crate::v5::banned::BanStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -135,6 +140,7 @@ impl ApiState {
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
             edge_tx,
+            bans: Arc::new(crate::v5::banned::BanStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -1569,6 +1575,15 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Serialises the connector tests that share the process-global v5
+    /// connector store. Parallel creates/persists export the whole global
+    /// into each test's own data dir, so one test's snapshot can resurrect
+    /// another test's deleted entry on restart (e.g. w023-del-conn reads
+    /// back 200 instead of 404). Holding this across the whole test keeps
+    /// the create/delete/persist/seed sequence atomic. No production code
+    /// depends on it; it only orders tests.
+    static CONNECTOR_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// In-process HTTP round-trip over loopback TCP: no extra crates, no
     /// daemons. The server is spawned per test and aborted at the end.
     struct TestServer {
@@ -2293,6 +2308,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_count_tracks_connects_and_disconnects() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Zero sessions read as zero, not an error.
+        let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 0}));
+        assert_eq!(state.sessions.connected_count(), 0);
+
+        // Two connected sessions read as two via the atomic counter.
+        for (id, conn) in [("w1-13-a", 13_101u64), ("w1-13-b", 13_102u64)] {
+            let (session, _) = state.sessions.get_or_create(id, true);
+            state.sessions.bind_session(&session, conn);
+        }
+        assert_eq!(state.sessions.connected_count(), 2);
+        let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 2}));
+
+        // After one verified detach the count drops to one.
+        state.sessions.unbind_connection("w1-13-a", 13_101);
+        assert_eq!(state.sessions.connected_count(), 1);
+        let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 1}));
+
+        // The documented node scope narrows: the local node keeps the
+        // count, another node narrows to zero.
+        let (status, body) = server
+            .get_auth("/api/v5/sessions_count?node=indra-node-1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 1}));
+        let (status, body) = server
+            .get_auth("/api/v5/sessions_count?node=indramqtt@127.0.0.1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 1}));
+        let (status, body) = server
+            .get_auth("/api/v5/sessions_count?node=no-such-node", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 0}));
+
+        // Unknown parameters are ignored, not rejected.
+        let (status, body) = server
+            .get_auth("/api/v5/sessions_count?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"count": 1}));
+    }
+
+    #[tokio::test]
+    async fn global_subscriptions_lists_both_with_paging_and_shrinks() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty system reads as a bare empty array, not an envelope.
+        let (status, body) = server.get_auth("/api/v5/subscriptions", &token).await;
+        assert_eq!(status, 200);
+        let empty = body.as_array().expect("global list is a bare array");
+        assert!(empty.is_empty(), "no subscriptions yet: {empty:?}");
+
+        // Two clients subscribed through the real subscribe route.
+        for (id, topic) in [("w1-14-a", "w1-14/first"), ("w1-14-b", "w1-14/second")] {
+            state.sessions.get_or_create(id, true);
+            let (status, _) = server
+                .post_auth(
+                    &format!("/api/v5/clients/{id}/subscribe"),
+                    json!({"topic": topic, "qos": 1}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 200);
+        }
+
+        // List shows both entries with the documented per-entry fields.
+        let (status, body) = server.get_auth("/api/v5/subscriptions", &token).await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("global list is a bare array");
+        assert_eq!(subs.len(), 2, "both subscriptions listed: {subs:?}");
+        // Deterministic order by (clientid, topic).
+        assert_eq!(subs[0]["clientid"], json!("w1-14-a"));
+        assert_eq!(subs[0]["topic"], json!("w1-14/first"));
+        assert_eq!(subs[1]["clientid"], json!("w1-14-b"));
+        assert_eq!(subs[1]["topic"], json!("w1-14/second"));
+        for entry in subs {
+            assert_eq!(entry["qos"], json!(1));
+            assert_eq!(entry["nl"], json!(0));
+            assert_eq!(entry["rap"], json!(0));
+            assert_eq!(entry["rh"], json!(0));
+            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert!(entry["clientid"].is_string());
+            assert!(entry["topic"].is_string());
+        }
+
+        // Paging is honoured: one row per page.
+        let (status, body) = server
+            .get_auth("/api/v5/subscriptions?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        let first = body.as_array().expect("paged list stays a bare array");
+        assert_eq!(first.len(), 1, "first page holds one row: {first:?}");
+        assert_eq!(first[0]["clientid"], json!("w1-14-a"));
+
+        let (status, body) = server
+            .get_auth("/api/v5/subscriptions?page=2&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        let second = body.as_array().expect("paged list stays a bare array");
+        assert_eq!(second.len(), 1, "second page holds one row: {second:?}");
+        assert_eq!(second[0]["clientid"], json!("w1-14-b"));
+
+        // After one unsubscribe the list shrinks to the survivor.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-14-a/unsubscribe",
+                json!({"topic": "w1-14/first"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        let (status, body) = server.get_auth("/api/v5/subscriptions", &token).await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("global list is a bare array");
+        assert_eq!(subs.len(), 1, "list shrinks after unsubscribe: {subs:?}");
+        assert_eq!(subs[0]["clientid"], json!("w1-14-b"));
+        assert_eq!(subs[0]["topic"], json!("w1-14/second"));
+    }
+
+    #[tokio::test]
     async fn inflight_lists_staged_delivery_empty_and_unknown() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -2464,6 +2612,148 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["data"].as_array().expect("data").len(), 1);
         assert_eq!(body["meta"]["hasnext"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn banned_create_list_clear_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty store reads as an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/banned", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Create one entry.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/banned",
+                json!({"as": "clientid", "who": "w1-01-c1", "reason": "round trip"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(created["as"], json!("clientid"));
+        assert_eq!(created["who"], json!("w1-01-c1"));
+
+        // Listing now carries the entry plus paging metadata.
+        let (status, body) = server.get_auth("/api/v5/banned", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["data"][0]["who"], json!("w1-01-c1"));
+        assert_eq!(body["data"][0]["as"], json!("clientid"));
+
+        // Unknown query keys do not break the list call.
+        let (status, body) = server
+            .get_auth("/api/v5/banned?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+
+        // Clearing drops everything; the next list is empty again.
+        let (status, _) = server
+            .delete_auth("/api/v5/banned?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/banned", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn banned_malformed_create_is_bad_request() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for bad in [
+            json!({}),
+            json!({"as": "clientid"}),
+            json!({"who": "w1-01-x"}),
+            json!({"as": "not-a-kind", "who": "w1-01-x"}),
+            json!({"as": "clientid", "who": ""}),
+            json!({"as": "peerhost", "who": "not-an-ip"}),
+        ] {
+            let (status, body) = server.post_auth("/api/v5/banned", bad, &token).await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+
+        // Nothing above may have stored anything.
+        let (status, body) = server.get_auth("/api/v5/banned", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn banned_duplicate_create_reports_conflict() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/banned",
+                json!({"as": "username", "who": "w1-01-dup"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/banned",
+                json!({"as": "username", "who": "w1-01-dup"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn banned_delete_one_present_absent_and_bad_kind() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Create one entry through the store.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/banned",
+                json!({"as": "clientid", "who": "w1-02-del", "reason": "delete one"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Deleting it by kind/value reports no-content success.
+        let (status, _) = server
+            .delete_auth("/api/v5/banned/clientid/w1-02-del", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // It is gone from the list afterwards.
+        let (status, body) = server.get_auth("/api/v5/banned", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+
+        // Deleting it again reports not-found, not success.
+        let (status, body) = server
+            .delete_auth("/api/v5/banned/clientid/w1-02-del", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // An unknown kind is a client error with the documented shape.
+        let (status, body) = server
+            .delete_auth("/api/v5/banned/not-a-kind/w1-02-del", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
     }
 
     #[tokio::test]
@@ -3362,6 +3652,7 @@ mod tests {
 
     #[tokio::test]
     async fn connectors_survive_restart() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let dir = unique_data_dir("w023-conn-survive");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
         let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
@@ -3429,6 +3720,7 @@ mod tests {
 
     #[tokio::test]
     async fn connector_delete_survives_restart() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let dir = unique_data_dir("w023-conn-delete");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
         let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
@@ -3514,6 +3806,7 @@ mod tests {
 
     #[tokio::test]
     async fn connector_duplicate_create_rejected_without_poisoning() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         // TK-03: a duplicate create must be rejected with the documented
         // conflict code before the store is mutated, so later
         // POST/PUT/DELETE keep working (no poisoned persistence).
@@ -3972,6 +4265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connectors_create_kafka_rabbitmq_logger() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
@@ -5823,16 +6117,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn removed_listeners_banned_routes_return_404() {
+    async fn removed_listeners_routes_return_404() {
+        // W1-01 restores `/api/v5/banned` on the real store, so only the
+        // listener routes stay removed here; banned coverage lives with
+        // the ban store tests below.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         for raw in [
             "GET /api/v5/listeners HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
             "GET /api/v5/listeners/tcp:default HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
             "POST /api/v5/listeners/x/stop HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-            "GET /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
-            "POST /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-            "DELETE /api/v5/banned HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
         ] {
             let raw = raw.replace("TOKEN", &token);
             let (status, _) = server.request_raw(&raw).await;
@@ -6092,8 +6386,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn client_subscribe_returns_documented_status() {
-        let (server, _state) = TestServer::start().await;
+        let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
+        state.sessions.get_or_create("tk02-sub", true);
         let (status, _) = server
             .post_auth(
                 "/api/v5/clients/tk02-sub/subscribe",
@@ -6102,6 +6397,663 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn subscribe_single_registers_and_lists() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-08-a", true);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-08-a/subscribe",
+                json!({"topic": "w1-08/single", "qos": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("w1-08-a"));
+        assert_eq!(body["topic"], json!("w1-08/single"));
+        assert_eq!(body["qos"], json!(1));
+        assert_eq!(body["node"], json!("indramqtt@127.0.0.1"));
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-08-a/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(
+            subs.iter()
+                .any(|s| s["topic"] == json!("w1-08/single") && s["qos"] == json!(1)),
+            "single subscribe lands and reads back: {subs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_bulk_mixed_good_and_bad_reports_per_entry() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-08-b", true);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-08-b/subscribe/bulk",
+                json!([
+                    {"topic": "w1-08/bulk/good", "qos": 0},
+                    {"topic": "bad/#/topic", "qos": 0},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["topic"], json!("w1-08/bulk/good"));
+        assert_eq!(results[0]["clientid"], json!("w1-08-b"));
+        assert_eq!(results[1]["topic"], json!("bad/#/topic"));
+        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
+        assert!(results[1]["message"].is_string());
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-08-b/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(
+            subs.iter().any(|s| s["topic"] == json!("w1-08/bulk/good")),
+            "bulk good entry lands: {subs:?}"
+        );
+        assert!(
+            !subs.iter().any(|s| s["topic"] == json!("bad/#/topic")),
+            "bulk bad entry never lands: {subs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_client_is_not_found() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-08-missing/subscribe",
+                json!({"topic": "w1-08/nowhere", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-08-missing/subscribe/bulk",
+                json!([{"topic": "w1-08/nowhere", "qos": 0}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_malformed_body_is_bad_request() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-08-c", true);
+
+        for bad in [
+            json!({"qos": 0}),
+            json!({"topic": "", "qos": 0}),
+            json!({"topic": "bad/#/topic", "qos": 0}),
+            json!({"topic": "w1-08/ok", "qos": 9}),
+            json!({"topic": "w1-08/ok", "nl": 2}),
+        ] {
+            let (status, body) = server
+                .post_auth("/api/v5/clients/w1-08-c/subscribe", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-08-c/subscribe/bulk",
+                json!({"topic": "w1-08/ok"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn publish_to_durable_subscriber_queues_offline() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-11-a", false);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-11-a/subscribe",
+                json!({"topic": "w1-11/delivery", "qos": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "w1-11/delivery", "payload": "hello-w1-11", "qos": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["id"].is_string(), "publish accepts with id: {body:?}");
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-11-a/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("mqueue data is a list");
+        assert!(
+            data.iter()
+                .any(|m| m["topic"] == json!("w1-11/delivery")
+                    && m["payload"] == json!("hello-w1-11")),
+            "published message reaches detached durable queue: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscribers_still_accepts() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "w1-11/nobody-here", "payload": "hello", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn publish_malformed_body_is_bad_request() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for bad in [
+            json!({"payload": "x"}),
+            json!({"topic": "", "payload": "x"}),
+            json!({"topic": "bad/#/topic", "payload": "x"}),
+            json!({"topic": "w1-11/ok", "qos": 9, "payload": "x"}),
+            json!({"topic": "w1-11/ok", "payload": 42}),
+            json!({"topic": "w1-11/ok", "payload": "x", "payload_encoding": "hex"}),
+            json!({"topic": "w1-11/ok", "payload": "!!!", "payload_encoding": "base64"}),
+            json!({"topic": "w1-11/ok", "retain": "yes", "payload": "x"}),
+            json!({"topic": "w1-11/ok", "payload": "x", "payload_encoding": 42}),
+            json!({"topic": "w1-11/ok", "payload": "x", "qos": "1"}),
+        ] {
+            let (status, body) = server.post_auth("/api/v5/publish", bad, &token).await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+            let obj = body.as_object().expect("error body is an object");
+            assert_eq!(
+                obj.len(),
+                2,
+                "error shape is exactly code+message: {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_retain_flag_and_base64_honoured() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-11-b", false);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-11-b/subscribe",
+                json!({"topic": "w1-11/retained", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // "hi-w11" as base64 with retain flag set.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish",
+                json!({
+                    "topic": "w1-11/retained",
+                    "payload": "aGktdzEx",
+                    "payload_encoding": "base64",
+                    "qos": 0,
+                    "retain": true,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(body["id"].is_string());
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-11-b/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("mqueue data is a list");
+        assert!(
+            data.iter()
+                .any(|m| m["topic"] == json!("w1-11/retained") && m["payload"] == json!("hi-w11")),
+            "base64 payload decodes and retain flag delivers: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_bulk_mixed_good_and_bad_reports_per_entry() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-12-a", false);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-12-a/subscribe",
+                json!({"topic": "w1-12/bulk/good", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish/bulk",
+                json!([
+                    {"topic": "w1-12/bulk/good", "payload": "hello-w1-12", "qos": 0},
+                    {"topic": "bad/#/topic", "payload": "x", "qos": 0},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["topic"], json!("w1-12/bulk/good"));
+        assert!(
+            results[0]["id"].is_string(),
+            "bulk good entry accepts with id: {results:?}"
+        );
+        assert_eq!(results[1]["topic"], json!("bad/#/topic"));
+        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
+        assert!(results[1]["message"].is_string());
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-12-a/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("mqueue data is a list");
+        assert!(
+            data.iter()
+                .any(|m| m["topic"] == json!("w1-12/bulk/good")
+                    && m["payload"] == json!("hello-w1-12")),
+            "bulk good entry delivers while bad entry fails: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_bulk_all_good_delivers_every_entry() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-12-b", false);
+
+        for topic in ["w1-12/all/1", "w1-12/all/2"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/clients/w1-12-b/subscribe",
+                    json!({"topic": topic, "qos": 0}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 200);
+        }
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish/bulk",
+                json!([
+                    {"topic": "w1-12/all/1", "payload": "one", "qos": 0},
+                    {"topic": "w1-12/all/2", "payload": "two", "qos": 0},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(
+                result["id"].is_string(),
+                "every bulk entry accepts with id: {results:?}"
+            );
+            assert!(
+                result.get("code").is_none(),
+                "success entries carry no error code: {results:?}"
+            );
+        }
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-12-b/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("mqueue data is a list");
+        assert!(
+            data.iter()
+                .any(|m| m["topic"] == json!("w1-12/all/1") && m["payload"] == json!("one")),
+            "first bulk entry delivers: {data:?}"
+        );
+        assert!(
+            data.iter()
+                .any(|m| m["topic"] == json!("w1-12/all/2") && m["payload"] == json!("two")),
+            "second bulk entry delivers: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_bulk_malformed_body_is_bad_request() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/publish/bulk",
+                json!({"topic": "w1-12/ok", "payload": "x"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let obj = body.as_object().expect("error body is an object");
+        assert_eq!(
+            obj.len(),
+            2,
+            "error shape is exactly code+message: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_single_round_trip_removes_and_reads_empty() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-10-a", true);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-a/subscribe",
+                json!({"topic": "w1-10/single", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-10-a/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(
+            subs.iter().any(|s| s["topic"] == json!("w1-10/single")),
+            "subscribed entry present before unsubscribe: {subs:?}"
+        );
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-a/unsubscribe",
+                json!({"topic": "w1-10/single"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-10-a/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(
+            !subs.iter().any(|s| s["topic"] == json!("w1-10/single")),
+            "unsubscribed entry gone: {subs:?}"
+        );
+
+        // Removing an absent subscription still succeeds.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-a/unsubscribe",
+                json!({"topic": "w1-10/single"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_bulk_mixed_present_absent_reports_success() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-10-b", true);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-b/subscribe",
+                json!({"topic": "w1-10/bulk/present", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-b/unsubscribe/bulk",
+                json!([
+                    {"topic": "w1-10/bulk/present"},
+                    {"topic": "w1-10/bulk/absent"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["topic"], json!("w1-10/bulk/present"));
+        assert!(
+            results[0]["code"].is_null(),
+            "present entry succeeds without code: {results:?}"
+        );
+        assert_eq!(results[1]["topic"], json!("w1-10/bulk/absent"));
+        assert!(
+            results[1]["code"].is_null(),
+            "absent entry still succeeds: {results:?}"
+        );
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-10-b/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(
+            !subs
+                .iter()
+                .any(|s| s["topic"] == json!("w1-10/bulk/present")),
+            "bulk-removed entry gone: {subs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_unknown_client_is_not_found() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-missing/unsubscribe",
+                json!({"topic": "w1-10/nowhere"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-missing/unsubscribe/bulk",
+                json!([{"topic": "w1-10/nowhere"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_malformed_body_is_bad_request() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-10-c", true);
+
+        for bad in [
+            json!({"qos": 0}),
+            json!({"topic": ""}),
+            json!({"topic": "bad/#/topic"}),
+        ] {
+            let (status, body) = server
+                .post_auth("/api/v5/clients/w1-10-c/unsubscribe", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-c/unsubscribe/bulk",
+                json!({"topic": "w1-10/ok"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // One bad entry fails per entry while the good one still removes.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-c/subscribe",
+                json!({"topic": "w1-10/bulk/good", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/w1-10-c/unsubscribe/bulk",
+                json!([
+                    {"topic": "w1-10/bulk/good"},
+                    {"topic": "bad/#/topic"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["topic"], json!("w1-10/bulk/good"));
+        assert!(results[0]["code"].is_null());
+        assert_eq!(results[1]["topic"], json!("bad/#/topic"));
+        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
+        assert!(results[1]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn client_subscriptions_empty_list_is_empty_not_error() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-09-empty", true);
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-09-empty/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert!(subs.is_empty(), "unsubscribed client reads empty: {subs:?}");
+    }
+
+    #[tokio::test]
+    async fn client_subscriptions_lists_subscribe_with_options() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("w1-09-opts", true);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-09-opts/subscribe",
+                json!({"topic": "w1-09/with-opts", "qos": 1, "nl": 1, "rap": 0, "rh": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-09-opts/subscribe",
+                json!({"topic": "w1-09/defaults", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-09-opts/subscriptions", &token)
+            .await;
+        assert_eq!(status, 200);
+        let subs = body.as_array().expect("subscriptions list");
+        assert_eq!(subs.len(), 2, "both subscribes read back: {subs:?}");
+        let entry = subs
+            .iter()
+            .find(|s| s["topic"] == json!("w1-09/with-opts"))
+            .expect("subscribed entry present");
+        assert_eq!(entry["qos"], json!(1));
+        assert_eq!(entry["nl"], json!(1));
+        assert_eq!(entry["rap"], json!(0));
+        assert_eq!(entry["rh"], json!(1));
+        assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(entry["clientid"], json!("w1-09-opts"));
+        let defaults = subs
+            .iter()
+            .find(|s| s["topic"] == json!("w1-09/defaults"))
+            .expect("default entry present");
+        assert_eq!(defaults["qos"], json!(0));
+        assert_eq!(defaults["nl"], json!(0));
+        assert_eq!(defaults["rap"], json!(0));
+        assert_eq!(defaults["rh"], json!(0));
+        assert_eq!(defaults["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(defaults["clientid"], json!("w1-09-opts"));
+    }
+
+    #[tokio::test]
+    async fn client_subscriptions_unknown_is_not_found() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-09-missing/subscriptions", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
     }
 
     #[tokio::test]

@@ -10,6 +10,35 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
+/// Granted subscription options mirrored on the session for the
+/// management API. `qos` is the granted QoS; `nl`, `rap` and `rh` are
+/// the subscription options from the SUBSCRIBE entry (all default to 0
+/// for live MQTT and legacy callers that only carry a QoS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionOptions {
+    pub qos: QoS,
+    pub nl: u8,
+    pub rap: u8,
+    pub rh: u8,
+}
+
+impl SubscriptionOptions {
+    pub fn new(qos: QoS, nl: u8, rap: u8, rh: u8) -> Self {
+        Self { qos, nl, rap, rh }
+    }
+}
+
+impl From<QoS> for SubscriptionOptions {
+    fn from(qos: QoS) -> Self {
+        Self {
+            qos,
+            nl: 0,
+            rap: 0,
+            rh: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub id: SessionId,
@@ -17,7 +46,7 @@ pub struct Session {
     pub clean_start: bool,
     pub connected: RwLock<bool>,
     pub conn_id: RwLock<Option<u64>>,
-    pub subscriptions: RwLock<HashMap<TopicFilter, broker_protocol::QoS>>,
+    pub subscriptions: RwLock<HashMap<TopicFilter, SubscriptionOptions>>,
     pub offline_queue: RwLock<VecDeque<QueuedMessage>>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
@@ -75,6 +104,25 @@ pub const MAX_OFFLINE_QUEUE: usize = 1024;
 /// [`SessionManager::new_with_limits`], or pass `None` there for an
 /// unbounded memory-backed queue.
 pub const DEFAULT_MAX_OFFLINE_QUEUE: usize = 10_000;
+
+/// Maximum rows snapshotted by one global subscription listing (W1-14).
+/// The read clones at most this many `(client, filter)` rows under short
+/// session locks, sorted for a deterministic order, then the W0 paging
+/// helper slices the requested page. Per-connection state itself stays
+/// bounded by live subscribe/unsubscribe writes. Management-plane only:
+/// the delivery path never takes these locks and the router trie is
+/// never touched by the list read.
+pub const MAX_GLOBAL_SUBSCRIPTIONS: usize = 100_000;
+
+/// One row of the global subscription index: owner plus the granted
+/// filter and its options, as mirrored on the session by the subscribe
+/// routes (same state the per-client list reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalSubscription {
+    pub client_id: String,
+    pub filter: TopicFilter,
+    pub options: SubscriptionOptions,
+}
 
 /// Management-API detail row for one client session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +292,13 @@ pub struct SessionManager {
     /// Pruned on unbind so reconnects start full and state cannot grow
     /// without bound.
     buckets: RwLock<HashMap<String, TokenBucket>>,
+    /// Live-session count for the management count endpoint (W1-13).
+    /// Maintained by `get_or_create` (increment on a newly connected
+    /// session) and `unbind_connection` (decrement on a verified detach),
+    /// so the count endpoint reads one atomic instead of scanning the
+    /// session map. Management-plane only; never touched on fan-out or
+    /// fan-in.
+    connected_count: AtomicU64,
     /// Offline queue cap applied by [`SessionManager::queue_offline`];
     /// `None` queues without bound.
     max_offline_queue: Option<usize>,
@@ -270,6 +325,7 @@ impl SessionManager {
             conn_index: RwLock::new(HashMap::new()),
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
+            connected_count: AtomicU64::new(0),
             max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
         }
     }
@@ -359,6 +415,44 @@ impl SessionManager {
         ids
     }
 
+    /// Snapshot every subscription in the system for the global list
+    /// (W1-14). Reads the session mirror written by the subscribe
+    /// routes, not the router trie, so list reads never block the
+    /// routing path: one short read per session plus one short map read,
+    /// no router lock, no work on fan-out or fan-in. Covers connected
+    /// and detached durable sessions (clean disconnects already drain
+    /// their rows). Sorted by `(client_id, filter)` for a deterministic
+    /// page order and truncated to [`MAX_GLOBAL_SUBSCRIPTIONS`] so one
+    /// list call cannot balloon the node. Management-plane only.
+    pub fn global_subscriptions(&self) -> Vec<GlobalSubscription> {
+        let sessions = self.sessions.read();
+        let mut rows: Vec<GlobalSubscription> = Vec::new();
+        for (client_id, session) in sessions.iter() {
+            for (filter, options) in session.subscriptions.read().iter() {
+                if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
+                    break;
+                }
+                rows.push(GlobalSubscription {
+                    client_id: client_id.clone(),
+                    filter: filter.clone(),
+                    options: *options,
+                });
+            }
+            if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
+                break;
+            }
+        }
+        drop(sessions);
+        rows.sort_by(|a, b| {
+            (a.client_id.as_str(), a.filter.as_str())
+                .cmp(&(b.client_id.as_str(), b.filter.as_str()))
+        });
+        if rows.len() > MAX_GLOBAL_SUBSCRIPTIONS {
+            rows.truncate(MAX_GLOBAL_SUBSCRIPTIONS);
+        }
+        rows
+    }
+
     /// Full detail row for one client, if known (for the management API).
     pub fn client_info(&self, client_id: &str) -> Option<ClientInfo> {
         self.get(client_id).map(|session| ClientInfo {
@@ -383,9 +477,29 @@ impl SessionManager {
     }
 
     /// Track one granted subscription on the session (mirrors the router).
+    /// Legacy and live-MQTT callers only carry a QoS; the subscription
+    /// options default to `nl = 0, rap = 0, rh = 0`.
     pub fn add_subscription(&self, client_id: &str, filter: TopicFilter, qos: QoS) {
+        self.add_subscription_with_options(client_id, filter, qos, 0, 0, 0);
+    }
+
+    /// Track one granted management subscription with its full options.
+    /// Values are already validated by the caller (`nl <= 1`, `rap <= 1`,
+    /// `rh <= 2`); re-subscribing the same filter replaces the entry.
+    pub fn add_subscription_with_options(
+        &self,
+        client_id: &str,
+        filter: TopicFilter,
+        qos: QoS,
+        nl: u8,
+        rap: u8,
+        rh: u8,
+    ) {
         if let Some(session) = self.get(client_id) {
-            session.subscriptions.write().insert(filter, qos);
+            session
+                .subscriptions
+                .write()
+                .insert(filter, SubscriptionOptions::new(qos, nl, rap, rh));
         }
     }
 
@@ -403,11 +517,21 @@ impl SessionManager {
             // A fresh session supersedes any live binding: capture the old
             // conn_id now so its index entry can be pruned below (after
             // the map guard drops; index lock never nests inside it).
+            // Capture the old connected flag too so the live-session
+            // counter stays exact: replacing a connected session keeps the
+            // count, replacing a disconnected (or absent) one increments.
             let stale_conn = map.get(client_id).and_then(|s| *s.conn_id.read());
+            let stale_connected = map
+                .get(client_id)
+                .map(|s| *s.connected.read())
+                .unwrap_or(false);
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
             map.insert(client_id.to_string(), session.clone());
             drop(map);
+            if !stale_connected {
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(stale) = stale_conn {
                 let mut index = self.conn_index.write();
                 if index
@@ -420,14 +544,27 @@ impl SessionManager {
             }
             (session, false)
         } else if let Some(existing) = map.get(client_id) {
-            *existing.connected.write() = true;
+            let was_connected = *existing.connected.read();
+            if !was_connected {
+                *existing.connected.write() = true;
+                self.connected_count.fetch_add(1, Ordering::SeqCst);
+            }
             (existing.clone(), true)
         } else {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
             map.insert(client_id.to_string(), session.clone());
+            drop(map);
+            self.connected_count.fetch_add(1, Ordering::SeqCst);
             (session, false)
         }
+    }
+
+    /// Constant-time live-session count for the management count endpoint.
+    /// Reads one atomic maintained by `get_or_create`/`unbind_connection`;
+    /// never scans the session map and never runs on the message path.
+    pub fn connected_count(&self) -> u64 {
+        self.connected_count.load(Ordering::SeqCst)
     }
 
     /// Snapshot the subscription filters of one session, if known.
@@ -468,12 +605,17 @@ impl SessionManager {
     /// and persistent sessions both yield empty (their subscriptions
     /// survive, which is what durable redelivery builds on).
     pub fn unbind_connection(&self, client_id: &str, conn_id: u64) -> Vec<TopicFilter> {
-        let (username_to_release, swept): (Option<String>, Vec<TopicFilter>) = {
+        let (username_to_release, swept, did_detach): (
+            Option<String>,
+            Vec<TopicFilter>,
+            bool,
+        ) = {
             let map = self.sessions.read();
             match map.get(client_id) {
                 Some(session) => {
                     let mut current_conn = session.conn_id.write();
                     if *current_conn == Some(conn_id) {
+                        let was_connected = *session.connected.read();
                         *current_conn = None;
                         *session.connected.write() = false;
                         // Clean sessions keep no inflight state across a
@@ -492,14 +634,25 @@ impl SessionManager {
                         } else {
                             Vec::new()
                         };
-                        (session.username.read().clone(), swept)
+                        (session.username.read().clone(), swept, was_connected)
                     } else {
-                        (None, Vec::new())
+                        (None, Vec::new(), false)
                     }
                 }
-                None => (None, Vec::new()),
+                None => (None, Vec::new(), false),
             }
         };
+        if did_detach {
+            // Verified owner detach of a live session: one fewer connected
+            // session. Racing teardowns (wrong conn_id, unknown client)
+            // and detaches of an already-disconnected session change
+            // nothing, so the counter never underflows.
+            let _ = self.connected_count.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            );
+        }
         if let Some(username) = username_to_release {
             self.release_connection_slot(&username);
         }
@@ -601,6 +754,45 @@ mod tests {
         *session.conn_id.write() = Some(7);
         manager.unbind_connection("client-a", 7);
         assert_eq!(manager.active_client_ids(), vec!["client-b"]);
+    }
+
+    #[test]
+    fn test_connected_count_tracks_connects_and_disconnects() {
+        let manager = SessionManager::new();
+        assert_eq!(manager.connected_count(), 0);
+
+        // Two fresh sessions read as two without scanning.
+        let (a, _) = manager.get_or_create("w1-13-a", true);
+        manager.bind_session(&a, 13_101);
+        let (b, _) = manager.get_or_create("w1-13-b", true);
+        manager.bind_session(&b, 13_102);
+        assert_eq!(manager.connected_count(), 2);
+        assert_eq!(manager.active_client_ids().len(), 2);
+
+        // Replacing a connected clean session keeps the count.
+        manager.get_or_create("w1-13-a", true);
+        assert_eq!(manager.connected_count(), 2);
+
+        // The replacement drops the old binding: rebind before detaching.
+        let fresh = manager.get("w1-13-a").expect("replaced session");
+        manager.bind_session(&fresh, 13_103);
+        assert_eq!(manager.connected_count(), 2);
+
+        // One verified detach drops to one; racing teardowns change nothing.
+        manager.unbind_connection("w1-13-a", 13_103);
+        assert_eq!(manager.connected_count(), 1);
+        manager.unbind_connection("w1-13-a", 13_103);
+        manager.unbind_connection("w1-13-b", 999);
+        assert_eq!(manager.connected_count(), 1);
+
+        // Persistent reconnect of a detached session increments again.
+        let (durable, _) = manager.get_or_create("w1-13-d", false);
+        assert_eq!(manager.connected_count(), 2);
+        *durable.conn_id.write() = Some(77);
+        manager.unbind_connection("w1-13-d", 77);
+        assert_eq!(manager.connected_count(), 1);
+        manager.get_or_create("w1-13-d", false);
+        assert_eq!(manager.connected_count(), 2);
     }
 
     #[test]
