@@ -2102,6 +2102,371 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clients_list_is_paged_with_envelope() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-03-a", true);
+        state.sessions.get_or_create("w1-03-b", true);
+        state.sessions.get_or_create("w1-03-c", true);
+
+        // Full list carries both clients plus paging metadata.
+        let (status, body) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .expect("data is a list")
+            .iter()
+            .map(|row| row["clientid"].as_str().expect("clientid"))
+            .collect();
+        assert_eq!(ids, vec!["w1-03-a", "w1-03-b", "w1-03-c"]);
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(3));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        assert_eq!(body["data"][0]["connected"], json!(true));
+
+        // Documented paging params are honoured.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?page=1&limit=2", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+        assert_eq!(body["meta"]["count"], json!(3));
+        assert_eq!(body["meta"]["hasnext"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/clients?page=2&limit=2", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 1);
+        assert_eq!(body["data"][0]["clientid"], json!("w1-03-c"));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Unknown params are ignored gracefully, not rejected.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(3));
+
+        // Malformed paging falls back to defaults, never 400.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?page=abc&limit=xyz", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn clients_list_filters_before_paginating() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-03-f1", true);
+        state.sessions.get_or_create("w1-03-f2", true);
+
+        // The documented id filter narrows the page and the count.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?clientid=w1-03-f2", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 1);
+        assert_eq!(body["data"][0]["clientid"], json!("w1-03-f2"));
+        assert_eq!(body["meta"]["count"], json!(1));
+
+        // Filtering applies before the page window: the match on the
+        // second row is still found on the first page.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?clientid=w1-03-f2&page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 1);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // A filter with no match yields an empty page, not an error.
+        let (status, body) = server
+            .get_auth("/api/v5/clients?clientid=no-such-client", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn clients_kick_removes_from_list() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for (id, conn) in [("w1-03-k1", 9101u64), ("w1-03-k2", 9102u64)] {
+            let (session, _) = state.sessions.get_or_create(id, true);
+            *session.conn_id.write() = Some(conn);
+            *session.connected.write() = true;
+        }
+
+        let (status, body) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+
+        let (status, _) = server.delete_auth("/api/v5/clients/w1-03-k1", &token).await;
+        assert_eq!(status, 204);
+
+        let (status, body) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["data"][0]["clientid"], json!("w1-03-k2"));
+    }
+
+    #[tokio::test]
+    async fn kick_unknown_client_is_not_found() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .delete_auth("/api/v5/clients/no-such-client", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn bulk_kick_mixed_known_unknown_reports_per_client() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for (id, conn) in [("w1-04-a", 9201u64), ("w1-04-b", 9202u64)] {
+            let (session, _) = state.sessions.get_or_create(id, true);
+            *session.conn_id.write() = Some(conn);
+            *session.connected.write() = true;
+        }
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/kickout/bulk",
+                json!(["w1-04-a", "w1-04-b", "w1-04-missing"]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let results = body.as_array().expect("bulk result is a list");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["clientid"], json!("w1-04-a"));
+        assert_eq!(results[0]["result"], json!("ok"));
+        assert_eq!(results[1]["clientid"], json!("w1-04-b"));
+        assert_eq!(results[1]["result"], json!("ok"));
+        assert_eq!(results[2]["clientid"], json!("w1-04-missing"));
+        assert_eq!(results[2]["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(results[2]["message"].is_string());
+
+        // Both known clients are disconnected and gone from the list.
+        let (status, body) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn bulk_kick_malformed_body_is_bad_request() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/clients/kickout/bulk",
+                json!({"clientids": ["w1-04-a"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+
+        let (status, body) = server
+            .post_auth("/api/v5/clients/kickout/bulk", json!([123]), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn inflight_lists_staged_delivery_empty_and_unknown() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-06-a", true);
+
+        // Empty inflight reads as an empty page, not an error.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-06-a/inflight_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Stage one unacknowledged QoS 1 downlink over the real tracker.
+        let session = state.sessions.get("w1-06-a").expect("known session");
+        assert!(session.track_inflight(broker_session::InflightMessage {
+            packet_id: 7,
+            topic: Topic::new("conf/inflight/1").expect("valid topic"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: bytes::Bytes::from_static(b"hello"),
+        }));
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-06-a/inflight_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let entry = &body["data"][0];
+        assert_eq!(entry["topic"], json!("conf/inflight/1"));
+        assert_eq!(entry["qos"], json!(1));
+        assert!(
+            entry["packet_id"] == json!(7) || entry["msgid"] == json!("7"),
+            "entry carries the packet identity: {entry}"
+        );
+        assert!(entry["payload"].is_string());
+
+        // Unknown clients give not-found with the documented shape.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/no-such-client/inflight_messages", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn inflight_is_paged_with_w0_helper() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-06-p", true);
+        let session = state.sessions.get("w1-06-p").expect("known session");
+        for pid in [11u16, 12, 13] {
+            assert!(session.track_inflight(broker_session::InflightMessage {
+                packet_id: pid,
+                topic: Topic::new("conf/inflight/p").expect("valid topic"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: bytes::Bytes::from_static(b"x"),
+            }));
+        }
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w1-06-p/inflight_messages?page=1&limit=2",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+        assert_eq!(body["meta"]["count"], json!(3));
+        assert_eq!(body["meta"]["hasnext"], json!(true));
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w1-06-p/inflight_messages?page=2&limit=2",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 1);
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn mqueue_lists_staged_offline_empty_and_unknown() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-07-a", true);
+
+        // Empty queue reads as an empty page, not an error.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-07-a/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Hold one message for the offline client over the real queue.
+        let session = state.sessions.get("w1-07-a").expect("known session");
+        session.push_offline(broker_session::QueuedMessage {
+            topic: Topic::new("conf/mqueue/1").expect("valid topic"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: bytes::Bytes::from_static(b"hello"),
+        });
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w1-07-a/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let entry = &body["data"][0];
+        assert_eq!(entry["topic"], json!("conf/mqueue/1"));
+        assert_eq!(entry["qos"], json!(1));
+        assert!(entry["payload"].is_string());
+        assert!(
+            entry["msgid"].is_string(),
+            "entry carries the stored-message identity: {entry}"
+        );
+
+        // Unknown clients give not-found with the documented shape.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/no-such-client/mqueue_messages", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn mqueue_is_paged_with_w0_helper() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        state.sessions.get_or_create("w1-07-p", true);
+        let session = state.sessions.get("w1-07-p").expect("known session");
+        for i in 0..3u8 {
+            session.push_offline(broker_session::QueuedMessage {
+                topic: Topic::new("conf/mqueue/p").expect("valid topic"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: bytes::Bytes::from(vec![i]),
+            });
+        }
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w1-07-p/mqueue_messages?page=1&limit=2",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+        assert_eq!(body["meta"]["count"], json!(3));
+        assert_eq!(body["meta"]["hasnext"], json!(true));
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w1-07-p/mqueue_messages?page=2&limit=2",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 1);
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+    }
+
+    #[tokio::test]
     async fn test_metrics_exposes_prometheus_counters() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;

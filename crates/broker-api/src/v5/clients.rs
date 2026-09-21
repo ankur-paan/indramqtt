@@ -11,55 +11,64 @@ use broker_router::Subscription;
 use bytes::Bytes;
 use serde::Deserialize;
 
+use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
+/// Documented `GET /clients` filters. Every field is optional; unknown
+/// query keys are ignored by the `Query` extractor and unknown
+/// `conn_state` values match everything, so new spec filters degrade to
+/// an unfiltered page instead of a 400.
 #[derive(Deserialize, Default)]
-pub struct ClientQueryParams {
-    #[serde(rename = "_page", default = "default_page")]
-    pub page: usize,
-    #[serde(rename = "_limit", default = "default_limit")]
-    pub limit: usize,
+pub struct ClientFilters {
+    #[serde(default)]
     pub conn_state: Option<String>,
+    #[serde(default)]
     pub clientid: Option<String>,
-}
-
-fn default_page() -> usize {
-    1
-}
-
-fn default_limit() -> usize {
-    20
 }
 
 pub async fn list_clients(
     State(state): State<ApiState>,
-    Query(params): Query<ClientQueryParams>,
+    params: PageParams,
+    Query(filters): Query<ClientFilters>,
 ) -> Response {
+    // Indexed session snapshot: `active_client_ids` returns the sorted
+    // ids of connected sessions from the session map. Management-plane
+    // read only; no per-message work, no full scan per message, and the
+    // snapshot is bounded by the live connection count.
     let all_client_ids = state.sessions.active_client_ids();
-    let total = all_client_ids.len();
 
-    let mut data = Vec::new();
-    let start = (params.page.saturating_sub(1)) * params.limit;
-    let page_ids: Vec<String> = all_client_ids
-        .into_iter()
-        .skip(start)
-        .take(params.limit)
-        .collect();
-
-    for cid in page_ids {
-        let session = state.sessions.get(&cid);
-        let is_connected = session
+    // Filter first, then paginate: slicing before filtering would drop
+    // matching rows that fall outside the raw page window and report a
+    // pre-filter count in `meta`.
+    let mut matching: Vec<(String, bool)> = Vec::new();
+    for cid in all_client_ids {
+        if let Some(want) = filters.clientid.as_deref() {
+            if cid != want {
+                continue;
+            }
+        }
+        let is_connected = state
+            .sessions
+            .get(&cid)
             .as_ref()
             .map(|s| *s.connected.read())
             .unwrap_or(false);
-
-        if let Some(state_filter) = &params.conn_state {
+        if let Some(state_filter) = filters.conn_state.as_deref() {
             if (state_filter == "connected" && !is_connected)
                 || (state_filter == "disconnected" && is_connected)
             {
                 continue;
             }
         }
+        matching.push((cid, is_connected));
+    }
+    let total = matching.len();
+    let page_ids = paginate(&matching, params.page, params.limit);
+
+    let mut data = Vec::new();
+    for (cid, is_connected) in page_ids {
+        let session = state.sessions.get(cid);
 
         let keepalive = session
             .as_ref()
@@ -86,18 +95,11 @@ pub async fn list_clients(
         }));
     }
 
-    let hasnext = start + params.limit < total;
-
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": {
-                "page": params.page,
-                "limit": params.limit,
-                "count": total,
-                "hasnext": hasnext
-            }
+            "meta": meta_page(params.page, params.limit, total),
         })),
     )
         .into_response()
@@ -150,98 +152,94 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
         .into_response()
 }
 
-pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
-    if let Some(session) = state.sessions.get(&client_id) {
-        // Copy the bound connection id first: the read guard must drop
-        // before `unbind_connection` takes the write lock below, or the
-        // handler deadlocks itself on the session lock.
-        let conn_id = *session.conn_id.read();
-        if let Some(conn_id) = conn_id {
-            // Deliver `ConnClose` to the edge BEFORE tearing down kernel
-            // state. The synchronous route hands the frame to the
-            // still-registered connection mailbox, so delivery cannot
-            // lose a race with the `unregister` below: the async
-            // `serve_api` forwarder alone would route only after this
-            // handler already unregistered the connection, and the
-            // close would be dropped while the edge socket stays open.
-            // Both sends are non-blocking and never fail the kick.
-            match brokerlink::BrokerFrame::new(
-                brokerlink::OpCode::ConnClose,
-                conn_id,
-                0,
-                Bytes::new(),
-                Bytes::new(),
-            ) {
-                Ok(frame) => {
-                    state.conns.route(conn_id, frame.clone());
-                    // Specified kernel→edge close handoff. By the time
-                    // the forwarder routes this copy the connection is
-                    // unregistered, so it is dropped there by design; a
-                    // failed send only warns (forwarder already gone).
-                    if state.edge_tx.send(frame).is_err() {
-                        tracing::warn!(
-                            client_id = %client_id,
-                            conn_id,
-                            "kick: edge gone, ConnClose dropped"
-                        );
-                    }
-                }
-                Err(error) => tracing::warn!(
+/// Disconnect one client through the single-kick path.
+///
+/// Copies the bound connection id first so the read guard drops before
+/// `unbind_connection` takes the write lock (or the caller deadlocks
+/// itself on the session lock). Delivers `ConnClose` to the edge BEFORE
+/// tearing down kernel state: the synchronous route hands the frame to
+/// the still-registered connection mailbox, so delivery cannot lose a
+/// race with the `unregister` below. Both sends are non-blocking and
+/// never fail the kick; a dead edge only warns. Returns true when a live
+/// connection was closed, false for unknown ids or sessions with nothing
+/// live to disconnect.
+fn kick_one(state: &ApiState, client_id: &str) -> bool {
+    let session = match state.sessions.get(client_id) {
+        Some(session) => session,
+        None => return false,
+    };
+    let conn_id = *session.conn_id.read();
+    let Some(conn_id) = conn_id else {
+        return false;
+    };
+    match brokerlink::BrokerFrame::new(
+        brokerlink::OpCode::ConnClose,
+        conn_id,
+        0,
+        Bytes::new(),
+        Bytes::new(),
+    ) {
+        Ok(frame) => {
+            state.conns.route(conn_id, frame.clone());
+            // Specified kernel→edge close handoff. By the time
+            // the forwarder routes this copy the connection is
+            // unregistered, so it is dropped there by design; a
+            // failed send only warns (forwarder already gone).
+            if state.edge_tx.send(frame).is_err() {
+                tracing::warn!(
                     client_id = %client_id,
                     conn_id,
-                    "kick: cannot build ConnClose frame: {error}"
-                ),
+                    "kick: edge gone, ConnClose dropped"
+                );
             }
-            state.conns.unregister(conn_id);
-            state.sessions.unbind_connection(&client_id, conn_id);
         }
+        Err(error) => tracing::warn!(
+            client_id = %client_id,
+            conn_id,
+            "kick: cannot build ConnClose frame: {error}"
+        ),
+    }
+    state.conns.unregister(conn_id);
+    state.sessions.unbind_connection(client_id, conn_id);
+    true
+}
+
+pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
+    if !kick_one(&state, &client_id) {
+        // Unknown id or known session with nothing live to disconnect:
+        // report not-found with the documented error shape.
+        return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn batch_kick_clients(
-    State(state): State<ApiState>,
-    Json(client_ids): Json<Vec<String>>,
-) -> Response {
-    for client_id in client_ids {
-        if let Some(session) = state.sessions.get(&client_id) {
-            // Copy first so the read guard drops before `unbind_connection`
-            // takes the write lock (see single kick).
-            let conn_id = *session.conn_id.read();
-            if let Some(conn_id) = conn_id {
-                // Same ordering as the single kick: the close frame is
-                // routed synchronously BEFORE kernel teardown so it
-                // cannot lose a race with `unregister` (see above).
-                // Unknown ids stay silent (204); a dead edge only warns.
-                match brokerlink::BrokerFrame::new(
-                    brokerlink::OpCode::ConnClose,
-                    conn_id,
-                    0,
-                    Bytes::new(),
-                    Bytes::new(),
-                ) {
-                    Ok(frame) => {
-                        state.conns.route(conn_id, frame.clone());
-                        if state.edge_tx.send(frame).is_err() {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                conn_id,
-                                "kick: edge gone, ConnClose dropped"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        client_id = %client_id,
-                        conn_id,
-                        "kick: cannot build ConnClose frame: {error}"
-                    ),
-                }
-                state.conns.unregister(conn_id);
-                state.sessions.unbind_connection(&client_id, conn_id);
-            }
+pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> Response {
+    let client_ids: Vec<String> = match serde_json::from_slice(&body[..]) {
+        Ok(ids) => ids,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid bulk kick body: {error}"))
+                .into_response();
+        }
+    };
+    // Bounded fan-out over the request itself: one synchronous close
+    // frame per id through the shared single-kick routine, no extra
+    // buffering beyond the result list and no spawned tasks. The result
+    // list is management-plane only; the per-message path stays free of
+    // new allocation (empty metadata and payload frames).
+    let mut results = Vec::with_capacity(client_ids.len());
+    for client_id in &client_ids {
+        if kick_one(&state, client_id) {
+            results.push(serde_json::json!({"clientid": client_id, "result": "ok"}));
+        } else {
+            results.push(serde_json::json!({
+                "clientid": client_id,
+                "result": "not_found",
+                "code": "CLIENTID_NOT_FOUND",
+                "message": "client not found"
+            }));
         }
     }
-    StatusCode::NO_CONTENT.into_response()
+    (StatusCode::OK, Json(results)).into_response()
 }
 
 pub async fn get_client_subscriptions(
@@ -335,31 +333,89 @@ pub async fn client_unsubscribe(
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn get_client_mqueue(
+pub async fn get_client_inflight(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
+    params: PageParams,
 ) -> Response {
-    let mut data = Vec::new();
-    if let Some(session) = state.sessions.get(&client_id) {
-        for qm in session.offline_queue.read().iter() {
-            data.push(serde_json::json!({
-                "topic": qm.topic.as_str(),
-                "qos": u8::from(qm.qos),
-                "payload": String::from_utf8_lossy(&qm.payload),
-                "publish_at": "2026-09-13T21:00:00Z"
-            }));
+    // Unknown clients read as not-found with the documented error shape.
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
-    }
+    };
+    // Bounded per-client view over the real QoS 1 tracker: the snapshot
+    // clones at most `MAX_QOS1_INFLIGHT` (100) entries under a short read
+    // lock, then paginates with the W0 helper. Management-plane read only;
+    // the delivery hot path never takes a management lock (it takes the
+    // session write lock only to track/ack, never to serve this view).
+    let snapshot = session.inflight_snapshot();
+    let total = snapshot.len();
+    let page_items = paginate(&snapshot, params.page, params.limit);
+    let data: Vec<serde_json::Value> = page_items
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "topic": m.topic.as_str(),
+                "packet_id": m.packet_id,
+                "msgid": m.packet_id.to_string(),
+                "qos": u8::from(m.qos),
+                "payload": String::from_utf8_lossy(&m.payload),
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 20,
-                "count": data.len(),
-                "hasnext": false
-            }
+            "meta": meta_page(params.page, params.limit, total),
+        })),
+    )
+        .into_response()
+}
+
+pub async fn get_client_mqueue(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    params: PageParams,
+) -> Response {
+    // Unknown clients read as not-found with the documented error shape.
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    // Bounded per-client view over the real offline queue: the snapshot
+    // clones at most `MAX_OFFLINE_QUEUE` (1024) entries under a short read
+    // lock, then paginates with the W0 helper. Management-plane read only;
+    // no new buffering on the delivery path and the delivery hot path
+    // never takes a management lock.
+    let snapshot: Vec<broker_session::QueuedMessage> =
+        session.offline_queue.read().iter().cloned().collect();
+    let total = snapshot.len();
+    let page_items = paginate(&snapshot, params.page, params.limit);
+    let start =
+        ((u64::from(params.page.max(1)) - 1) * u64::from(params.limit)).min(total as u64) as usize;
+    let data: Vec<serde_json::Value> = page_items
+        .iter()
+        .enumerate()
+        .map(|(i, qm)| {
+            serde_json::json!({
+                "msgid": (start + i + 1).to_string(),
+                "topic": qm.topic.as_str(),
+                "qos": u8::from(qm.qos),
+                "payload": String::from_utf8_lossy(&qm.payload),
+                "publish_at": "2026-09-13T21:00:00Z"
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": data,
+            "meta": meta_page(params.page, params.limit, total),
         })),
     )
         .into_response()
