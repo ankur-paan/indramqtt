@@ -84,7 +84,7 @@ sequenceDiagram
 
     Note over Rust: Kernel Upgrade / Restart Initiated
     Rust->>Rust: Process Exits
-    Note over BEAM: Sockets held open; edge enters await_core state
+    Note over BEAM: Sockets held open, edge enters await_core state
     Client->>BEAM: PUBLISH (QoS 1)
     BEAM->>BEAM: Buffer frame in edge ring buffer
 
