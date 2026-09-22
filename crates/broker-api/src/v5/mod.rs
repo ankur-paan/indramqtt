@@ -1,9 +1,11 @@
 //! v5 REST API compatibility router for IndraMQTT.
 
+pub mod alarms;
 pub mod auth;
 pub mod banned;
 pub mod clients;
 pub mod gateways;
+pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
 pub mod rules;
@@ -60,11 +62,23 @@ pub fn protected_router() -> Router<ApiState> {
             delete(auth::delete_authz_rule),
         )
         // Live Monitoring & Rates
+        .route("/metrics", get(monitoring::get_metrics))
+        .route(
+            "/monitor",
+            get(monitor::list_monitor).delete(monitor::clear_monitor),
+        )
+        .route("/monitor/nodes/:node", get(monitor::get_monitor_node))
         .route("/monitor_current", get(monitoring::monitor_current))
+        .route(
+            "/monitor_current/nodes/:node",
+            get(monitoring::monitor_current_node),
+        )
         .route("/stats", get(monitoring::get_stats))
         // Cluster & Nodes
         .route("/nodes", get(nodes::list_nodes))
         .route("/nodes/:node", get(nodes::get_node))
+        .route("/nodes/:node/metrics", get(monitoring::get_metrics_node))
+        .route("/nodes/:node/stats", get(monitoring::get_stats_node))
         .route("/nodes/:node/clients/:clientid", get(clients::get_client))
         // Clients & Subscriptions
         .route("/clients", get(clients::list_clients))
@@ -109,8 +123,14 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(banned::clear_banned),
         )
         .route("/banned/:as/:who", delete(banned::delete_banned_one))
+        .route(
+            "/alarms",
+            get(alarms::list_alarms).delete(alarms::clear_alarms),
+        )
+        .route("/alarms/force_deactivate", post(alarms::force_deactivate))
         .route("/subscriptions", get(clients::list_subscriptions))
         .route("/topics", get(clients::list_topics))
+        .route("/topics/:topic", get(clients::get_topic))
         .route("/sessions_count", get(clients::get_sessions_count))
         .route("/publish", post(clients::publish_message))
         .route("/publish/bulk", post(clients::publish_bulk))

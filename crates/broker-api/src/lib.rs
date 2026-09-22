@@ -7,7 +7,7 @@ use axum::{
 };
 use broker_auth::{AclAction, AclRule, MemoryAuth};
 use broker_config::ConfigRegistry;
-use broker_observability::Metrics;
+use broker_observability::{Metrics, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router as SubscriptionRouter};
 use broker_rules::{Rule, RuleAction, RuleEngine, RuleEngineError};
@@ -65,6 +65,20 @@ pub struct ApiState {
     /// with lazy expiry. Management-plane only; never touched on the
     /// per-message path.
     pub bans: Arc<crate::v5::banned::BanStore>,
+    /// Alarm directory for `/api/v5/alarms` (W1-16): bounded active map
+    /// plus deactivated history. Management-plane only; never touched on
+    /// the per-message path.
+    pub alarms: Arc<crate::v5::alarms::AlarmStore>,
+    /// Monitor history for `/api/v5/monitor` (W1-19): bounded ring of
+    /// sampled points. Management-plane only; never touched on the
+    /// per-message path.
+    pub monitor: Arc<crate::v5::monitor::MonitorHistory>,
+    /// Gauge-plus-high-water-mark store for `/api/v5/stats` and
+    /// `/api/v5/nodes/{node}/stats` (W1-25): the kernel keeps it exact
+    /// from connection/subscription/retained lifecycle points and the
+    /// handlers below read one constant-time snapshot per request.
+    /// Management-plane only; never touched on the per-message path.
+    pub stats: Arc<StatsStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -116,6 +130,9 @@ impl ApiState {
             node_id,
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
+            alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
+            monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
+            stats: Arc::new(StatsStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -141,6 +158,9 @@ impl ApiState {
             node_id: "indra-node-1".to_string(),
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
+            alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
+            monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
+            stats: Arc::new(StatsStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -1598,6 +1618,7 @@ mod tests {
         auth: Arc<MemoryAuth>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
         tokens: Arc<crate::v5::auth::ApiTokens>,
+        alarms: Arc<crate::v5::alarms::AlarmStore>,
         edge_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>>>,
     }
 
@@ -1637,6 +1658,7 @@ mod tests {
                 auth: auth.clone(),
                 admin_users: api_state.admin_users.clone(),
                 tokens: api_state.tokens.clone(),
+                alarms: api_state.alarms.clone(),
                 edge_rx: Arc::new(tokio::sync::Mutex::new(edge_rx)),
             };
             let app = router(api_state);
@@ -2362,6 +2384,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_snapshot_is_flat_numeric_and_monotonic() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Documented counter names grouped as bytes, packets, messages,
+        // delivery, client and session. Every value must stay numeric.
+        let expected = [
+            "bytes.received",
+            "bytes.sent",
+            "packets.received",
+            "packets.sent",
+            "packets.connect.received",
+            "packets.connack.sent",
+            "packets.connack.error",
+            "packets.connack.auth_error",
+            "packets.publish.received",
+            "packets.publish.sent",
+            "packets.subscribe.received",
+            "packets.suback.sent",
+            "packets.pingreq.received",
+            "packets.pingresp.sent",
+            "messages.received",
+            "messages.sent",
+            "messages.dropped",
+            "messages.delivered",
+            "messages.qos0.received",
+            "messages.qos1.received",
+            "messages.qos2.received",
+            "delivery.dropped",
+            "delivery.dropped.no_subscribers",
+            "delivery.dropped.queue_full",
+            "client.connect",
+            "client.connack",
+            "client.connected",
+            "client.subscribe",
+        ];
+
+        // First read on a quiet node: flat object, no paging envelope.
+        let (status, first) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let first_map = first.as_object().expect("metrics is a flat object");
+        assert!(
+            first.get("data").is_none(),
+            "metrics is not paged: {first:?}"
+        );
+        assert!(
+            first.get("meta").is_none(),
+            "metrics has no meta: {first:?}"
+        );
+        for name in expected {
+            let value = first_map
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(value.is_number(), "{name} is numeric: {value:?}");
+        }
+
+        // Traffic between reads through the real counters: one connect,
+        // one publish ingress and its fan-out, plus measured frame bytes.
+        state.metrics.inc_connect_received();
+        state.metrics.inc_connack_sent();
+        state.metrics.inc_publish_received();
+        state.metrics.inc_messages_received();
+        state.metrics.inc_qos1_received();
+        state.metrics.inc_bytes_received_by(128);
+        state.metrics.inc_messages_forwarded();
+        state.metrics.inc_publish_sent();
+        state.metrics.inc_delivered();
+        state.metrics.inc_bytes_sent_by(64);
+        state.metrics.inc_subscribe_received();
+        state.metrics.inc_suback_sent();
+        state.metrics.inc_pingreq_received();
+        state.metrics.inc_pingresp_sent();
+
+        // Second read: every documented counter is non-decreasing.
+        let (status, second) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let second_map = second.as_object().expect("metrics stays a flat object");
+        for name in expected {
+            let before = first_map[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} numeric"));
+            let after = second_map[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} numeric"));
+            assert!(after >= before, "{name} moves forward: {before} -> {after}");
+        }
+        assert!(second_map["messages.received"].as_u64().unwrap() >= 1);
+        assert!(second_map["packets.publish.received"].as_u64().unwrap() >= 1);
+        assert!(second_map["bytes.received"].as_u64().unwrap() >= 128);
+
+        // Unknown parameters are ignored, not rejected.
+        let (status, third) = server
+            .get_auth("/api/v5/metrics?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        let third_map = third.as_object().expect("metrics with query stays flat");
+        for name in expected {
+            assert!(third_map.get(name).is_some(), "unknown query keeps {name}");
+        }
+    }
+
+    #[tokio::test]
     async fn global_subscriptions_lists_both_with_paging_and_shrinks() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -2438,6 +2562,288 @@ mod tests {
         assert_eq!(subs.len(), 1, "list shrinks after unsubscribe: {subs:?}");
         assert_eq!(subs[0]["clientid"], json!("w1-14-b"));
         assert_eq!(subs[0]["topic"], json!("w1-14/second"));
+    }
+
+    #[tokio::test]
+    async fn topics_list_and_detail_round_trip() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty index reads as an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/topics", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Subscribing alone never creates a topic row.
+        state.sessions.get_or_create("w1-15-sub", true);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/clients/w1-15-sub/subscribe",
+                json!({"topic": "w1-15/filter", "qos": 0}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server.get_auth("/api/v5/topics", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["data"],
+            json!([]),
+            "subscribe must not index: {body:?}"
+        );
+
+        // Publish two concrete topics through the management publish path.
+        for topic in ["w1-15/alpha", "w1-15/beta"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/publish",
+                    json!({"topic": topic, "payload": "hi", "qos": 0}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 200);
+        }
+
+        // List shows both entries with the documented per-entry fields.
+        let (status, body) = server.get_auth("/api/v5/topics", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        let data = body["data"].as_array().expect("topics list has data");
+        assert_eq!(data.len(), 2, "both topics listed: {data:?}");
+        // Deterministic order: sorted by topic.
+        assert_eq!(data[0]["topic"], json!("w1-15/alpha"));
+        assert_eq!(data[1]["topic"], json!("w1-15/beta"));
+        for entry in data {
+            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert!(entry["topic"].is_string());
+        }
+
+        // W0 paging is honoured: one row per page.
+        let (status, first) = server
+            .get_auth("/api/v5/topics?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(first["meta"]["count"], json!(2));
+        assert_eq!(first["meta"]["hasnext"], json!(true));
+        assert_eq!(first["data"].as_array().unwrap().len(), 1);
+        assert_eq!(first["data"][0]["topic"], json!("w1-15/alpha"));
+
+        let (status, second) = server
+            .get_auth("/api/v5/topics?page=2&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(second["data"].as_array().unwrap().len(), 1);
+        assert_eq!(second["data"][0]["topic"], json!("w1-15/beta"));
+
+        // Unknown query keys do not break the list call.
+        let (status, body) = server
+            .get_auth("/api/v5/topics?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+
+        // Detail hit returns the documented record (slashed names arrive
+        // percent-encoded and match exactly after decoding).
+        let (status, body) = server
+            .get_auth("/api/v5/topics/w1-15%2Falpha", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["topic"], json!("w1-15/alpha"));
+        assert_eq!(body["node"], json!("indramqtt@127.0.0.1"));
+
+        // Detail miss returns the documented not-found shape; prefix and
+        // filter forms never match.
+        for missing in ["w1-15%2Fmissing", "w1-15%2Falp", "w1-15%2Falpha%2Fx"] {
+            let (status, body) = server
+                .get_auth(&format!("/api/v5/topics/{missing}"), &token)
+                .await;
+            assert_eq!(status, 404, "unknown topic must 404: {missing}");
+            assert_eq!(body["code"], json!("NOT_FOUND"));
+            assert!(body["message"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn alarms_raise_list_clear_round_trip() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty store reads as an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // No deactivated history yet either.
+        let (status, body) = server
+            .get_auth("/api/v5/alarms?activated=false", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Raise two test alarms directly on the store (alarms have no
+        // creation endpoint; the kernel raises them internally).
+        state
+            .alarms
+            .activate("w1-16-b-alarm", "second alarm", serde_json::json!({}));
+        state.alarms.activate(
+            "w1-16-a-alarm",
+            "first alarm",
+            serde_json::json!({"high_watermark": 70}),
+        );
+
+        // Listing carries both entries with the documented per-alarm fields.
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        let data = body["data"].as_array().expect("alarms list has data");
+        assert_eq!(data.len(), 2, "both alarms listed: {data:?}");
+        // Deterministic order: sorted by name.
+        assert_eq!(data[0]["name"], json!("w1-16-a-alarm"));
+        assert_eq!(data[1]["name"], json!("w1-16-b-alarm"));
+        for entry in data {
+            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert!(entry["name"].is_string());
+            assert!(entry["message"].is_string());
+            assert!(entry["details"].is_object());
+            assert!(entry["duration"].is_number());
+            assert!(entry["activate_at"].is_string());
+            assert!(entry["activate_at"]
+                .as_str()
+                .is_some_and(|s| s.contains('T')));
+            assert_eq!(entry["deactivate_at"], json!("infinity"));
+        }
+        assert_eq!(data[0]["message"], json!("first alarm"));
+        assert_eq!(data[0]["details"], json!({"high_watermark": 70}));
+
+        // W0 paging is honoured: one row per page.
+        let (status, first) = server
+            .get_auth("/api/v5/alarms?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(first["meta"]["count"], json!(2));
+        assert_eq!(first["meta"]["hasnext"], json!(true));
+        assert_eq!(first["data"].as_array().unwrap().len(), 1);
+        assert_eq!(first["data"][0]["name"], json!("w1-16-a-alarm"));
+
+        let (status, second) = server
+            .get_auth("/api/v5/alarms?page=2&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(second["data"].as_array().unwrap().len(), 1);
+        assert_eq!(second["data"][0]["name"], json!("w1-16-b-alarm"));
+
+        // Unknown query keys do not break the list call.
+        let (status, body) = server
+            .get_auth("/api/v5/alarms?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+
+        // Clearing deactivates everything; the next list is empty again
+        // while the deactivated history keeps what was cleared.
+        let (status, _) = server
+            .delete_auth("/api/v5/alarms?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        let (status, body) = server
+            .get_auth("/api/v5/alarms?activated=false", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(2));
+        let history = body["data"].as_array().expect("cleared alarms kept");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["name"], json!("w1-16-a-alarm"));
+        assert_ne!(history[0]["deactivate_at"], json!("infinity"));
+
+        // Clearing an empty store still reports success.
+        let (status, _) = server.delete_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn alarms_force_deactivate_round_trip() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // With one active alarm, force-deactivate reports success and the
+        // follow-up list reads empty.
+        state.alarms.activate(
+            "w1-17-alarm",
+            "force me",
+            serde_json::json!({"high_watermark": 70}),
+        );
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+
+        let (status, _) = server
+            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Repeating with no alarms still reports success.
+        let (status, _) = server
+            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // A named body deactivates just that alarm; the other stays listed.
+        state
+            .alarms
+            .activate("w1-17-a-alarm", "first alarm", serde_json::json!({}));
+        state
+            .alarms
+            .activate("w1-17-b-alarm", "second alarm", serde_json::json!({}));
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/alarms/force_deactivate",
+                json!({"name": "w1-17-a-alarm"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["data"][0]["name"], json!("w1-17-b-alarm"));
+
+        // Deactivating an unknown name still reports success and changes
+        // nothing; clearing the last alarm by empty body empties the list.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/alarms/force_deactivate",
+                json!({"name": "w1-17-missing"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let (status, _) = server
+            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
     }
 
     #[tokio::test]
@@ -6265,27 +6671,25 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_monitoring_fake_routes_return_404() {
+        // W1-16 restores `/api/v5/alarms` on the real store, W1-17
+        // restores `POST /api/v5/alarms/force_deactivate`, W1-18
+        // restores `GET /api/v5/metrics` on the real counters and W1-19
+        // restores `GET`/`DELETE /api/v5/monitor` on the history store,
+        // so no monitoring route stays removed here; metrics, alarms and
+        // monitor coverage lives with their store tests below.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/metrics", "/api/v5/monitor", "/api/v5/alarms"] {
-            let (status, _) = server.get_auth(path, &token).await;
-            assert_eq!(status, 404, "removed route GET {path} must be 404");
-        }
-        for path in ["/api/v5/monitor", "/api/v5/alarms"] {
-            let (status, _) = server.delete_auth(path, &token).await;
-            assert_eq!(status, 404, "removed route DELETE {path} must be 404");
-        }
-        let (status, _) = server
-            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
-            .await;
-        assert_eq!(
-            status, 404,
-            "removed route POST /api/v5/alarms/force_deactivate must be 404"
-        );
-        for path in ["/api/v5/monitor_current", "/api/v5/stats"] {
+        for path in [
+            "/api/v5/metrics",
+            "/api/v5/monitor",
+            "/api/v5/monitor_current",
+            "/api/v5/stats",
+        ] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 200, "kept route GET {path} must be 200");
         }
+        let (status, _) = server.delete_auth("/api/v5/monitor", &token).await;
+        assert_eq!(status, 204, "kept route DELETE /api/v5/monitor must be 204");
     }
 
     #[tokio::test]

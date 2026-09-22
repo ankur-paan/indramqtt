@@ -1164,6 +1164,13 @@ async fn ingress_pipeline(
         .await;
     shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
+    // Topic index (W1-15): remember the concrete publish topic so the
+    // management list/detail reads observe edge publishes as well as
+    // management publishes. Bounded short-lock insert shared with the
+    // API layer; delivery proceeds even when the index is full.
+    // Management-plane index only, no work on fan-out or fan-in.
+    shared.router.record_topic(topic.as_str());
+
     build_downlink_frames(
         &shared.router,
         &shared.sessions,
@@ -1577,7 +1584,7 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // the connection directory to the owning edge task. The send is
     // non-blocking and a missing edge only warns in the kick path.
     let (edge_tx, mut edge_rx) = unbounded_channel::<BrokerFrame>();
-    let state = broker_api::ApiState::new(
+    let mut state = broker_api::ApiState::new(
         shared.engine.clone(),
         shared.sessions.clone(),
         shared.router.clone(),
@@ -1588,6 +1595,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
         shared.node_id.clone(),
         edge_tx,
     );
+    // Share the kernel's gauge-plus-high-water-mark store (W1-25) so the
+    // node/global stats reads observe the lifecycle points above instead
+    // of an empty per-request copy. One `Arc` clone, no new buffering.
+    state.stats = shared.stats.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {

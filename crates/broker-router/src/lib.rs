@@ -97,12 +97,25 @@ struct TrieNode {
     exact_subs: SubscriptionSet,
 }
 
+/// Maximum concrete topics remembered by the topic index (W1-15).
+/// The list read snapshots at most this many names under a short lock,
+/// sorted for a deterministic page order, then the W0 paging helper
+/// slices the requested page. Per-topic state is one shared string;
+/// publishes past the cap are dropped from the index (delivery still
+/// proceeds) so one client cannot balloon the node. Management-plane
+/// only: the fan-out match path never touches this set.
+pub const MAX_KNOWN_TOPICS: usize = 100_000;
+
 pub struct Router {
     root: RwLock<TrieNode>,
     /// Round-robin cursors per shared-subscription group. Mutated under
     /// `matches`, hence behind the lock; keyed by group name alone so one
     /// group balances across all its filters.
     rr_cursors: RwLock<AHashMap<Arc<str>, usize>>,
+    /// Known concrete topics seen on publishes (W1-15). Separate lock
+    /// from the subscription trie so management list reads never block
+    /// the routing path and publishes only take a short write.
+    known_topics: RwLock<AHashSet<Arc<str>>>,
 }
 
 impl Default for Router {
@@ -116,7 +129,57 @@ impl Router {
         Self {
             root: RwLock::new(TrieNode::default()),
             rr_cursors: RwLock::new(AHashMap::new()),
+            known_topics: RwLock::new(AHashSet::new()),
         }
+    }
+
+    /// Remember one concrete publish topic for the management topic
+    /// index (W1-15). Exact topic string only, no wildcard expansion.
+    /// Bounded by [`MAX_KNOWN_TOPICS`]: inserts past the cap are
+    /// ignored while delivery proceeds. Empty and over-long names are
+    /// ignored (publishes already validate). Takes only a short lock;
+    /// never allocates on the fan-out match path beyond the insert
+    /// itself. Management-plane index; fan-in/fan-out never read it.
+    pub fn record_topic(&self, topic: &str) {
+        if topic.is_empty() || topic.len() > u16::MAX as usize {
+            return;
+        }
+        {
+            let known = self.known_topics.read();
+            if known.contains(topic) {
+                return;
+            }
+            if known.len() >= MAX_KNOWN_TOPICS {
+                return;
+            }
+        }
+        let mut known = self.known_topics.write();
+        if known.len() >= MAX_KNOWN_TOPICS && !known.contains(topic) {
+            return;
+        }
+        known.insert(topic.into());
+    }
+
+    /// Snapshot every known topic, sorted for a deterministic page
+    /// order (W1-15). Clones at most [`MAX_KNOWN_TOPICS`] shared
+    /// strings under a short lock; the caller slices the page.
+    /// Management-plane only: the routing trie is never touched.
+    pub fn list_topics(&self) -> Vec<String> {
+        let known = self.known_topics.read();
+        let mut out: Vec<String> = known.iter().map(|t| t.to_string()).collect();
+        drop(known);
+        out.sort();
+        if out.len() > MAX_KNOWN_TOPICS {
+            out.truncate(MAX_KNOWN_TOPICS);
+        }
+        out
+    }
+
+    /// Exact topic membership for the detail read (W1-15). The path
+    /// parameter arrives percent-decoded by the extractor, so this is
+    /// a plain exact comparison with no wildcard or prefix matching.
+    pub fn contains_topic(&self, topic: &str) -> bool {
+        self.known_topics.read().contains(topic)
     }
 
     pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) {
@@ -414,6 +477,36 @@ mod tests {
                 "worker-b"
             );
         }
+    }
+
+    #[test]
+    fn topic_index_records_lists_and_matches_exactly() {
+        let router = Router::new();
+        assert!(router.list_topics().is_empty());
+        assert!(!router.contains_topic("w1-15/a"));
+
+        // Subscribing alone never creates a topic row.
+        router.subscribe(
+            &TopicFilter::new("w1-15/+").unwrap(),
+            Subscription::new("c1", 1, QoS::AtMostOnce),
+        );
+        assert!(router.list_topics().is_empty());
+
+        // Recording is exact and sorted; duplicates do not duplicate.
+        router.record_topic("w1-15/b");
+        router.record_topic("w1-15/a");
+        router.record_topic("w1-15/a");
+        assert_eq!(
+            router.list_topics(),
+            vec!["w1-15/a".to_string(), "w1-15/b".to_string()]
+        );
+        assert!(router.contains_topic("w1-15/a"));
+        assert!(!router.contains_topic("w1-15"));
+        assert!(!router.contains_topic("w1-15/a/b"));
+
+        // Empty and over-long names are ignored.
+        router.record_topic("");
+        assert_eq!(router.list_topics().len(), 2);
     }
 
     #[test]
