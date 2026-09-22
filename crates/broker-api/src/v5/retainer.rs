@@ -53,11 +53,92 @@ const DEFAULT_MAX_PUBLISH_RATE: &str = "1000/s";
 const DEFAULT_STORAGE_TYPE: &str = "ram";
 const DEFAULT_MAX_RETAINED_MESSAGES: u64 = 0;
 
-/// Fixed publish timestamp rendered when the store keeps no clock.
-/// The retained store keeps topic, QoS and payload only, so the read
-/// synthesises the documented date-time field instead of inventing a
-/// per-message clock. Shape-stable and validator-clean.
-const SYNTHETIC_PUBLISH_AT: &str = "2026-09-20T00:00:00Z";
+/// Current wall-clock time as millis since the Unix epoch. Read once per
+/// stored message on the write path (retained/appends are rare), never on
+/// the delivery hot path.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Format millis since the Unix epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+/// Millis precision keeps the stored instant distinguishable from a fixed
+/// value within the same second; the shape stays a documented date-time.
+pub fn format_rfc3339_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as i64;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+    // Howard Hinnant's civil-from-days algorithm, shifted from 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z",)
+}
+
+/// Parse what [`format_rfc3339_ms`] emits back to millis since the Unix
+/// epoch. Accepts both `...SS.mmmZ` and `...SSZ`. Returns `None` for
+/// anything else. Test-only helper for asserting the returned instant is
+/// the stored one rather than a fixed value.
+pub fn parse_rfc3339_ms(text: &str) -> Option<u64> {
+    let text = text.strip_suffix('Z')?;
+    let (date_part, time_part) = text.split_once('T')?;
+    let mut date_iter = date_part.split('-');
+    let year: i64 = date_iter.next()?.parse().ok()?;
+    let month: i64 = date_iter.next()?.parse().ok()?;
+    let day: i64 = date_iter.next()?.parse().ok()?;
+    if date_iter.next().is_some() {
+        return None;
+    }
+    let (time_main, millis) = match time_part.split_once('.') {
+        Some((main, frac)) => {
+            let frac_ms: u64 = if frac.len() >= 3 {
+                frac[..3].parse().ok()?
+            } else {
+                format!("{:0<3}", frac).parse().ok()?
+            };
+            (main, frac_ms)
+        }
+        None => (time_part, 0),
+    };
+    let mut time_iter = time_main.split(':');
+    let hour: u64 = time_iter.next()?.parse().ok()?;
+    let minute: u64 = time_iter.next()?.parse().ok()?;
+    let second: u64 = time_iter.next()?.parse().ok()?;
+    if time_iter.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days from civil date (Hinnant), then back to epoch days.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    let secs = days as u64 * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(secs * 1000 + millis)
+}
 
 /// Backend type rendered inside `backend`.
 const BACKEND_TYPE: &str = "built_in_database";
@@ -696,21 +777,37 @@ async fn sync_retained_count(state: &ApiState) {
 /// Render one stored message in the documented detail shape.
 ///
 /// `msgid` is a deterministic 32-hex digest of topic and payload (the
-/// store keeps no GUID); `publish_at` is the synthetic read-time stamp
-/// above; `from_clientid`/`from_username` are empty when the store keeps
-/// no origin. `payload` is base64 so arbitrary bytes survive JSON.
+/// store keeps no GUID); `publish_at` is the instant recorded where the
+/// message was already being written, omitted for entries that predate
+/// timestamp recording rather than substituted; `from_clientid`/
+/// `from_username` are empty when the store keeps no origin. `payload`
+/// is base64 so arbitrary bytes survive JSON.
 fn retained_detail_json(stored: &broker_storage::StoredMessage) -> serde_json::Value {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let payload_b64 = STANDARD.encode(stored.payload.as_ref());
-    serde_json::json!({
-        "msgid": msgid_for(stored.topic.as_str(), stored.payload.as_ref()),
-        "topic": stored.topic.as_str(),
-        "qos": u8::from(stored.qos),
-        "publish_at": SYNTHETIC_PUBLISH_AT,
-        "from_clientid": "",
-        "from_username": "",
-        "payload": payload_b64,
-    })
+    let mut map = serde_json::Map::with_capacity(7);
+    map.insert(
+        "msgid".to_string(),
+        serde_json::Value::from(msgid_for(stored.topic.as_str(), stored.payload.as_ref())),
+    );
+    map.insert(
+        "topic".to_string(),
+        serde_json::Value::from(stored.topic.as_str()),
+    );
+    map.insert(
+        "qos".to_string(),
+        serde_json::Value::from(u8::from(stored.qos)),
+    );
+    if let Some(ms) = stored.publish_at_ms {
+        map.insert(
+            "publish_at".to_string(),
+            serde_json::Value::from(format_rfc3339_ms(ms)),
+        );
+    }
+    map.insert("from_clientid".to_string(), serde_json::Value::from(""));
+    map.insert("from_username".to_string(), serde_json::Value::from(""));
+    map.insert("payload".to_string(), serde_json::Value::from(payload_b64));
+    serde_json::Value::Object(map)
 }
 
 /// Deterministic 32-hex id from topic and payload bytes (FNV-1a twice
@@ -1013,5 +1110,99 @@ mod tests {
         assert!(validate_duration("msg_expiry_interval", "0s").is_ok());
         assert!(validate_duration("msg_expiry_interval", "5m").is_ok());
         assert!(validate_duration("msg_expiry_interval", "").is_err());
+    }
+
+    #[test]
+    fn rfc3339_ms_round_trips_known_instant() {
+        // 2026-09-20T00:00:00.000Z is 1_789_862_400_000 ms after the epoch.
+        let rendered = format_rfc3339_ms(1_789_862_400_000);
+        assert_eq!(rendered, "2026-09-20T00:00:00.000Z");
+        assert_eq!(parse_rfc3339_ms(&rendered), Some(1_789_862_400_000));
+        // Second precision without millis still parses.
+        assert_eq!(
+            parse_rfc3339_ms("2026-09-20T00:00:00Z"),
+            Some(1_789_862_400_000)
+        );
+        assert!(parse_rfc3339_ms("not-a-time").is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_publish_at_is_store_time_not_a_constant() {
+        use broker_protocol::{QoS, Topic};
+
+        let state = standalone_state();
+        let before = now_ms();
+        let topic = Topic::new("conf/retainer/b110-time").expect("valid topic");
+        state
+            .retained
+            .set_retained(
+                topic.clone(),
+                QoS::AtLeastOnce,
+                bytes::Bytes::from("hello-b110"),
+            )
+            .await
+            .expect("store retained");
+        let after = now_ms();
+
+        let (status, body) = response_parts(
+            get_retainer_message(
+                State(state.clone()),
+                Path("conf/retainer/b110-time".to_string()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let published = body
+            .get("publish_at")
+            .and_then(|v| v.as_str())
+            .expect("stored entry carries publish_at");
+        assert_ne!(published, "2026-09-20T00:00:00Z");
+        assert_ne!(published, "2026-09-13T21:00:00Z");
+        let parsed = parse_rfc3339_ms(published).expect("publish_at is RFC3339");
+        assert!(
+            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
+            "publish_at {published} ({parsed}) must be the store time [{before}, {after}]"
+        );
+
+        // The list renders the same recorded instant, not a constant.
+        let (status, listed) = response_parts(
+            list_retainer_messages(
+                State(state),
+                PageParams {
+                    page: 1,
+                    limit: 100,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &listed["data"][0];
+        assert_eq!(
+            row["publish_at"].as_str(),
+            Some(published),
+            "list and detail must agree on the recorded instant"
+        );
+    }
+
+    #[test]
+    fn retained_detail_omits_publish_at_without_recorded_time() {
+        use broker_protocol::{QoS, Topic};
+
+        let stored = broker_storage::StoredMessage {
+            offset: 0,
+            topic: Topic::new("conf/retainer/legacy").expect("valid topic"),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            payload: bytes::Bytes::from_static(b"old"),
+            publish_at_ms: None,
+        };
+        let rendered = retained_detail_json(&stored);
+        assert!(
+            rendered.get("publish_at").is_none(),
+            "entries predating timestamp recording must omit publish_at: {rendered}"
+        );
+        assert_eq!(rendered["topic"], serde_json::json!("conf/retainer/legacy"));
     }
 }

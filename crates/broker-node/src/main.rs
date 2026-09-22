@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use broker_auth::{Authenticator, Authorizer, MemoryAuth};
+use broker_auth::{Authenticator, Authorizer, LdapAuthenticator, LdapConfig, MemoryAuth};
 use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
 use broker_config::{ConfigError, ConfigRegistry};
+use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
@@ -9,6 +10,7 @@ use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
     InflightMessage, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionManager,
 };
+use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -74,6 +76,67 @@ struct Args {
     /// msg/s without drops.
     #[arg(long, default_value_t = broker_router::DEFAULT_QOS0_BACKLOG)]
     qos0_backlog: usize,
+
+    /// CoAP gateway UDP listen address (B1-04). Empty disables the
+    /// gateway (the default): nothing listens, nothing is dispatched,
+    /// and the crate stays out of the data path. Set explicitly
+    /// (e.g. `127.0.0.1:5683`) to run the gateway: CoAP POST/PUT to
+    /// `/ps/<topic>` publishes through the kernel router so ordinary
+    /// MQTT subscribers receive it, GET reads the retained store, and
+    /// GET with Observe registers a bounded observer notified on later
+    /// publishes.
+    #[arg(long, default_value = "")]
+    coap_bind: String,
+
+    /// Durable stream journal directory (B1-07). Empty (the default)
+    /// disables journaling: publishes pay one `is_none` check and no disk
+    /// I/O. Set to a directory (e.g. `<data-dir>/streams`) to journal
+    /// every publish through a bounded channel drained by a background
+    /// task that appends to [`DurableStreamStore`] with an fsync per
+    /// record. Disabled by default so benchmarks and existing deployments
+    /// see no new work on the fan-out path.
+    #[arg(long, default_value = "")]
+    stream_dir: String,
+
+    /// Directory server URL for LDAP authentication (B2-01). Empty (the
+    /// default) disables LDAP: CONNECT falls back to the local user
+    /// store only. Set to `ldap://host:port` or `ldaps://host:port` to
+    /// enable directory-backed authentication at CONNECT (service bind,
+    /// search, then bind as the entry DN). TLS verification is on by
+    /// default for `ldaps://`; point `--ldap-ca-cert` at a PEM CA file
+    /// for private directories.
+    #[arg(long, default_value = "")]
+    ldap_url: String,
+
+    /// Base DN under which directory users are searched.
+    #[arg(long, default_value = "")]
+    ldap_base_dn: String,
+
+    /// Service account DN used for the initial bind plus search.
+    #[arg(long, default_value = "")]
+    ldap_bind_dn: String,
+
+    /// Service account password for the initial bind.
+    #[arg(long, default_value = "")]
+    ldap_bind_password: String,
+
+    /// User search filter with a `{username}` placeholder, escaped per
+    /// RFC 4515 (default `(uid={username})`).
+    #[arg(long, default_value = "(uid={username})")]
+    ldap_user_filter: String,
+
+    /// User-entry attribute listing directory groups (`memberOf`).
+    #[arg(long, default_value = "memberOf")]
+    ldap_group_attribute: String,
+
+    /// Required group DN: empty disables the group check, otherwise the
+    /// entry must list this DN to connect.
+    #[arg(long, default_value = "")]
+    ldap_required_group: String,
+
+    /// Path to a PEM CA certificate for private directories (`ldaps://`).
+    #[arg(long, default_value = "")]
+    ldap_ca_cert: String,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -151,24 +214,78 @@ fn session_binding_reply(
 /// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
+        // B1-03: banned identities never reach the session. Checked
+        // before credentials and quotas so a banned client is refused
+        // with the banned return code (0x8A, mapped to CONNACK 5 on the
+        // edge) with no session created and no quota slot consumed.
+        // A connect is not the delivery path, so one read lock here
+        // costs the message path nothing.
+        if shared.bans.is_banned(
+            &req.client_id,
+            req.username.as_deref(),
+            req.peerhost.as_deref(),
+        ) {
+            shared.metrics.inc_auth_failures();
+            return Some(session_binding_reply(frame, 0, false, 0x8A));
+        }
         if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
             // unauthenticated clients are rejected whenever users exist.
-            // The flag only opens the broker while the store is empty.
-            if shared.auth.user_count() > 0 {
+            // A configured directory does the same: anonymous never
+            // authenticates against LDAP. The flag only opens the broker
+            // while the store is empty and no directory is configured.
+            if shared.auth.user_count() > 0 || shared.ldap.is_some() {
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87));
             }
         } else {
             let password = req.password.as_deref();
-            if shared
-                .auth
-                .authenticate(&req.client_id, req.username.as_deref(), password)
-                .await
-                .is_err()
-            {
-                shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x86));
+            // B2-01: local users first, then the directory. With an empty
+            // local store and no directory the broker stays open (existing
+            // behaviour); with a directory configured the open mode is
+            // disabled and every credentialed CONNECT goes through the
+            // directory unless a local user matches. A directory outage
+            // fails closed with a clear log line inside the authenticator
+            // and never grants access.
+            let local_has_users = shared.auth.user_count() > 0;
+            let mut via_ldap = false;
+            if local_has_users {
+                let local_ok = shared
+                    .auth
+                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .await
+                    .is_ok();
+                if local_ok {
+                    // Local credential accepted; quotas apply below.
+                } else if let Some(ldap) = shared.ldap.as_ref() {
+                    if ldap
+                        .authenticate(&req.client_id, req.username.as_deref(), password)
+                        .await
+                        .is_ok()
+                    {
+                        via_ldap = true;
+                    } else {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                    }
+                } else {
+                    shared.metrics.inc_auth_failures();
+                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                }
+            } else if let Some(ldap) = shared.ldap.as_ref() {
+                if ldap
+                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .await
+                    .is_ok()
+                {
+                    via_ldap = true;
+                } else {
+                    shared.metrics.inc_auth_failures();
+                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                }
+            } else {
+                // Open broker: no users, no directory. Fall through to the
+                // session resolution below (rc 0).
             }
             // Takeover pre-release: a live session for this client means
             // the previous holder was orphaned by this very bind.
@@ -183,10 +300,15 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 }
             }
             if let Some(username) = &req.username {
-                let max = shared
-                    .auth
-                    .get_quotas(username)
-                    .and_then(|quotas| quotas.max_connections);
+                // Directory users have no local quotas: unlimited.
+                let max = if via_ldap {
+                    None
+                } else {
+                    shared
+                        .auth
+                        .get_quotas(username)
+                        .and_then(|quotas| quotas.max_connections)
+                };
                 if !shared.sessions.acquire_connection_slot(username, max) {
                     return Some(session_binding_reply(frame, 0, false, 0x8B));
                 }
@@ -221,6 +343,14 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             (shared.sessions.get(&req.client_id), &req.username)
         {
             *session.username.write() = Some(username.clone());
+        }
+        // Stamp the peer address for publish-time ban checks (B1-03):
+        // only overwritten when the edge forwarded one, so a rebind
+        // without a peer section keeps the last known address.
+        if let (Some(session), Some(peerhost)) =
+            (shared.sessions.get(&req.client_id), &req.peerhost)
+        {
+            *session.peerhost.write() = Some(peerhost.clone());
         }
     }
     reply
@@ -284,14 +414,19 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
 /// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
 /// optionally followed by a credentials section `UserLen:16be | Username
 /// | PassLen:16be | Password` (absent entirely when the client connects
-/// anonymously). The keepalive is framing-validated here; supervision
-/// lives on the edge.
+/// anonymously), optionally followed by a peer-address section
+/// `PeerLen:16be | PeerIp` carrying the client IP literal the edge saw
+/// on its socket (B1-03: drives `peerhost` / `peerhost_net` bans).
+/// Binds encoded before the peer section existed carry no trailing bytes
+/// and still decode with `peerhost` unset. The keepalive is
+/// framing-validated here; supervision lives on the edge.
 struct BindRequest {
     client_id: String,
     clean_start: bool,
     keepalive_secs: u16,
     username: Option<String>,
     password: Option<Vec<u8>>,
+    peerhost: Option<String>,
 }
 
 fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
@@ -307,40 +442,189 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     let keepalive_secs = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
     let client_id = std::str::from_utf8(id_bytes).map_err(|_| "client id not UTF-8")?;
     let rest = &meta[5 + id_len..];
-    let (username, password) = decode_bind_credentials(rest)?;
+    let identity = decode_bind_identity(rest)?;
     Ok(BindRequest {
         client_id: client_id.to_string(),
         clean_start: flags & 0x01 != 0,
         keepalive_secs,
-        username,
-        password,
+        username: identity.username,
+        password: identity.password,
+        peerhost: identity.peerhost,
     })
 }
 
-/// Decode the optional trailing credentials section: empty means
-/// anonymous; otherwise exactly `UserLen | Username | PassLen | Password`.
-fn decode_bind_credentials(rest: &[u8]) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
+/// Credentials plus peer address decoded from the bind tail.
+struct BindIdentity {
+    username: Option<String>,
+    password: Option<Vec<u8>>,
+    peerhost: Option<String>,
+}
+
+/// Decode the optional trailing credentials and peer-address sections:
+/// empty means anonymous with no peer address; otherwise a credentials
+/// section `UserLen | Username | PassLen | Password`, optionally followed
+/// by a peer section `PeerLen:16be | PeerIp` (an IP literal). An anonymous
+/// bind from a peer-aware edge carries only the peer section. A trailing
+/// section that is neither valid credentials nor a valid peer address is
+/// malformed, exactly as trailing garbage was before the peer section.
+fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.is_empty() {
-        return Ok((None, None));
+        return Ok(BindIdentity {
+            username: None,
+            password: None,
+            peerhost: None,
+        });
     }
     if rest.len() < 2 {
         return Err("bind credentials truncated");
     }
     let user_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
     if rest.len() < 2 + user_len + 2 {
-        return Err("bind credentials truncated");
+        // Too short for credentials: it can only be an anonymous bind
+        // carrying just the peer section.
+        return match decode_peer_section(rest) {
+            Some(peerhost) => Ok(BindIdentity {
+                username: None,
+                password: None,
+                peerhost: Some(peerhost),
+            }),
+            None => Err("bind credentials truncated"),
+        };
     }
     let username = std::str::from_utf8(&rest[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
     let base = 2 + user_len;
     let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
-    if rest.len() != base + 2 + pass_len {
-        return Err("bind meta length mismatch");
+    if rest.len() < base + 2 + pass_len {
+        return Err("bind credentials truncated");
     }
-    let password = rest[base + 2..].to_vec();
-    Ok((Some(username.to_string()), Some(password)))
+    let password = rest[base + 2..base + 2 + pass_len].to_vec();
+    let tail = &rest[base + 2 + pass_len..];
+    if tail.is_empty() {
+        return Ok(BindIdentity {
+            username: Some(username.to_string()),
+            password: Some(password),
+            peerhost: None,
+        });
+    }
+    match decode_peer_section(tail) {
+        Some(peerhost) => Ok(BindIdentity {
+            username: Some(username.to_string()),
+            password: Some(password),
+            peerhost: Some(peerhost),
+        }),
+        None => Err("bind meta length mismatch"),
+    }
+}
+
+/// Decode one peer-address section `PeerLen:16be | PeerIp`: exactly those
+/// bytes and an IP literal, otherwise `None`.
+fn decode_peer_section(section: &[u8]) -> Option<String> {
+    if section.len() < 2 {
+        return None;
+    }
+    let peer_len = u16::from_be_bytes([section[0], section[1]]) as usize;
+    if section.len() != 2 + peer_len {
+        return None;
+    }
+    let literal = std::str::from_utf8(&section[2..]).ok()?;
+    // Only IP literals travel here; anything else is malformed input,
+    // never a peer identity to match bans against.
+    literal.parse::<std::net::IpAddr>().ok()?;
+    Some(literal.to_string())
 }
 
 /// State shared by every BrokerLink connection task on this node.
+/// One publish queued for the background stream writer.
+#[derive(Debug)]
+struct JournalEntry {
+    topic: Topic,
+    qos: QoS,
+    payload: Bytes,
+    timestamp_ms: u64,
+}
+
+/// Bounded async journal from the publish path to [`DurableStreamStore`].
+///
+/// The publish path calls [`try_record`](StreamJournalHandle::try_record),
+/// which does one non-blocking `try_send` and never awaits file I/O, so an
+/// fsync can never stall delivery. A single background task owns the
+/// receiver and calls `append_with_timestamp` (fsync per record under the
+/// default policy). Capacity is 1024 entries; when full the newest record
+/// is dropped and `dropped` increments. Durability window: channel delay
+/// plus one fsync (usually well under 10 ms); dropped records are lost and
+/// counted, never retried. Memory is bounded by the channel plus one
+/// in-flight append.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct StreamJournalHandle {
+    store: Arc<DurableStreamStore>,
+    tx: tokio::sync::mpsc::Sender<JournalEntry>,
+    dropped: Arc<AtomicU64>,
+}
+
+#[allow(dead_code)]
+impl StreamJournalHandle {
+    fn open(
+        dir: impl AsRef<std::path::Path>,
+        config: StreamConfig,
+    ) -> std::result::Result<Arc<Self>, broker_storage::StorageError> {
+        let store = Arc::new(DurableStreamStore::open_with_config(dir, config)?);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<JournalEntry>(1024);
+        let writer = store.clone();
+        tokio::spawn(async move {
+            while let Some(entry) = rx.recv().await {
+                if let Err(e) = writer.append_with_timestamp(
+                    entry.topic,
+                    entry.qos,
+                    entry.payload,
+                    std::collections::HashMap::new(),
+                    entry.timestamp_ms,
+                ) {
+                    warn!("Stream journal append failed: {e}");
+                }
+            }
+        });
+        Ok(Arc::new(Self {
+            store,
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        }))
+    }
+
+    /// Enqueue one publish without blocking. Drops (and counts) the record
+    /// when the channel is full so delivery never waits for disk.
+    fn try_record(&self, topic: &Topic, qos: QoS, payload: &Bytes) {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let entry = JournalEntry {
+            topic: topic.clone(),
+            qos,
+            payload: payload.clone(),
+            timestamp_ms,
+        };
+        if self.tx.try_send(entry).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Journal one publish when enabled, otherwise one `is_none` check.
+///
+/// Off the hot path by construction: no await, no file I/O, at most a
+/// small clone plus a channel send. Empty journals (the default) cost the
+/// branch only.
+fn maybe_journal_stream(shared: &Shared, topic: &Topic, qos: QoS, payload: &Bytes) {
+    if let Some(journal) = shared.stream_journal.as_ref() {
+        journal.try_record(topic, qos, payload);
+    }
+}
+
 #[derive(Clone)]
 struct Shared {
     sessions: Arc<SessionManager>,
@@ -359,6 +643,12 @@ struct Shared {
     /// restart. One Arc clone; the hook clones the capped list once per
     /// bind, never per message.
     auto_subscribe: Arc<broker_api::v5::auto_subscribe::AutoSubscribeStore>,
+    /// Ban directory for B1-03: shared with the management API so
+    /// validated ban writes are visible to the connect and publish
+    /// checks without a restart. One Arc clone; connects take one read
+    /// lock off the delivery path, publishes take one read lock that
+    /// returns after a length check when the store is empty.
+    bans: Arc<broker_api::v5::banned::BanStore>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
@@ -373,6 +663,11 @@ struct Shared {
     /// touched on the per-message path.
     readiness: Arc<NodeReadiness>,
     auth: Arc<MemoryAuth>,
+    /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
+    /// at CONNECT when the local store refuses the credentials; a
+    /// directory outage fails closed. One `Arc` clone at boot; connects
+    /// take a semaphore permit off the delivery path.
+    ldap: Option<Arc<LdapAuthenticator>>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
     /// boot; validated defaults in tests and before boot wiring runs.
@@ -380,6 +675,24 @@ struct Shared {
     /// Local node name (`--node-id`), passed into the API layer for the
     /// node-scope helper. Stored only until W1 wires it in.
     node_id: String,
+    /// CoAP gateway translator and bounded observer table (B1-04).
+    /// Always present so the publish path needs no `Option` branch;
+    /// empty when `--coap-bind` is unset, in which case the gateway
+    /// task never runs and the publish hook returns after one length
+    /// check. One `Arc` clone at boot; registrations take a short
+    /// write lock off the delivery path.
+    coap: Arc<CoapGatewayHandler>,
+    /// UDP socket the gateway listener bound (B1-04). `None` unless
+    /// `--coap-bind` names an address: set once at boot before any
+    /// task clones `Shared`, read-only afterwards. The publish hook
+    /// snapshots observers and spawns the UDP sends off the hot path;
+    /// unit tests leave it `None` so the hook is a no-op.
+    coap_socket: Option<Arc<tokio::net::UdpSocket>>,
+    /// Durable stream journal (B1-07). `None` (the default) disables
+    /// journaling with a single branch on the publish path. `Some` journals
+    /// every publish through a bounded channel drained off the hot path.
+    /// One `Arc` clone at boot; the hook never blocks delivery.
+    stream_journal: Option<Arc<StreamJournalHandle>>,
 }
 
 impl Shared {
@@ -446,14 +759,19 @@ impl Shared {
             retained: Arc::new(MemoryStore::new()),
             retainer_config: Arc::new(broker_api::v5::retainer::RetainerConfigStore::new()),
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
+            bans: Arc::new(broker_api::v5::banned::BanStore::new()),
             cluster: None,
             metrics,
             stats,
             readiness,
             auth: Arc::new(MemoryAuth::new()),
+            ldap: None,
             allow_anonymous: false,
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
+            coap: Arc::new(CoapGatewayHandler::new()),
+            coap_socket: None,
+            stream_journal: None,
         }
     }
 }
@@ -1442,6 +1760,29 @@ async fn apply_publish(
     // QoS 2 completes its handshake with PUBREC so the publisher never
     // stalls, but nothing is stored and the later PUBREL routes nothing).
     if let Some(publisher) = shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        // B1-03: a client banned mid-session stops being served. The ban
+        // directory is consulted on every publish authorisation: one read
+        // lock that returns after a length check when no bans exist, one
+        // short scan otherwise (QoS 1 timings before/after are in the
+        // B1-03 report). Denied publishes die exactly like ACL denials.
+        let (username, peerhost) = match shared.sessions.get(&publisher) {
+            Some(session) => (
+                session.username.read().clone(),
+                session.peerhost.read().clone(),
+            ),
+            None => (None, None),
+        };
+        if shared
+            .bans
+            .is_banned(&publisher, username.as_deref(), peerhost.as_deref())
+        {
+            let ack = match qos {
+                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
+                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
+                QoS::AtMostOnce => None,
+            };
+            return (ack, Vec::new());
+        }
         if shared
             .auth
             .authorize_publish(&publisher, &topic)
@@ -1851,7 +2192,14 @@ async fn ingress_pipeline(
     // Management-plane index only, no work on fan-out or fan-in.
     shared.router.record_topic(topic.as_str());
 
-    build_downlink_frames(
+    // Durable stream journal (B1-07): enqueue without blocking so the
+    // publish path never waits for disk. Disabled (`None`) costs one
+    // branch; enabled costs one bounded `try_send`, with drops counted.
+    // The background task fsyncs per record; the window is channel delay
+    // plus one fsync.
+    maybe_journal_stream(shared, topic, qos, payload);
+
+    let deliveries = build_downlink_frames(
         &shared.router,
         &shared.sessions,
         &shared.metrics,
@@ -1859,7 +2207,12 @@ async fn ingress_pipeline(
         qos,
         retain,
         payload,
-    )
+    );
+    // CoAP observe fan-out (B1-04): notify bounded observers off the
+    // hot path. Empty when the gateway never ran: one read lock that
+    // returns after a length check, no spawn, no socket work.
+    maybe_notify_coap_observers(shared, topic.as_str(), payload);
+    deliveries
 }
 
 /// Clustered mode: one forward per matching remote node; each remote
@@ -1876,6 +2229,237 @@ async fn forward_cluster(shared: &Shared, topic: &Topic, qos: QoS, payload: &Byt
             }
             Err(e) => {
                 warn!("Cluster route resolution failed: {}", e);
+            }
+        }
+    }
+}
+
+/// CoAP gateway ingress and observe fan-out (B1-04).
+///
+/// A CoAP POST/PUT to `/ps/<topic>` enters here after URI validation:
+/// the payload is stored retained (CoAP has no retain flag; keeping the
+/// last value preserves the old gateway's GET semantics on the real
+/// retained store) and fanned out through the same [`ingress_pipeline`]
+/// an MQTT publish takes, so ordinary MQTT subscribers receive it.
+/// Cluster forwarding matches the MQTT path. QoS is `AtMostOnce`:
+/// CoAP confirms at its own layer (CHANGED/CONTENT), so the kernel owes
+/// no MQTT packet-id tracking for gateway ingress.
+///
+/// Publish-path cost mirrors the ban check (B1-03): when no observer is
+/// registered the notify hook below takes one read lock and returns
+/// after a length check. When observers exist the hook snapshots at
+/// most 32 entries for this topic and spawns the UDP sends, so fan-out
+/// never blocks on the network.
+async fn apply_coap_publish(
+    shared: &Shared,
+    topic_str: &str,
+    payload: &Bytes,
+) -> Option<Vec<(u64, BrokerFrame)>> {
+    let topic = Topic::new(topic_str.to_string()).ok()?;
+    shared.metrics.inc_publish_received();
+    shared.metrics.inc_qos0_received();
+    shared.metrics.inc_messages_received();
+    let deliveries = ingress_pipeline(shared, &topic, QoS::AtMostOnce, true, payload).await;
+    forward_cluster(shared, &topic, QoS::AtMostOnce, payload).await;
+    Some(deliveries)
+}
+
+/// Snapshot this topic's observers and send one NON notification each,
+/// off the hot path.
+///
+/// No-op when the gateway never ran (`coap_socket` is `None`) or when
+/// nobody observes anything (`has_observers` false): a single length
+/// check, no allocation. Otherwise clones at most
+/// `MAX_OBSERVERS_PER_TOPIC` small entries and spawns one task that owns
+/// its socket clone, payload and observer list; the publish path never
+/// awaits the network.
+fn maybe_notify_coap_observers(shared: &Shared, topic_str: &str, payload: &Bytes) {
+    if !shared.coap.has_observers() {
+        return;
+    }
+    let observers = shared.coap.observers_for(topic_str);
+    if observers.is_empty() {
+        return;
+    }
+    let Some(socket) = shared.coap_socket.clone() else {
+        return;
+    };
+    let handler = shared.coap.clone();
+    let payload = payload.clone();
+    tokio::spawn(async move {
+        let seq = handler.next_observe_seq();
+        for observer in &observers {
+            let notify = handler.build_notify(observer, payload.clone(), seq);
+            let bytes = notify.encode();
+            let _ = socket.send_to(&bytes, observer.peer).await;
+        }
+    });
+}
+
+/// Serve the CoAP gateway (B1-04) on an already-bound UDP socket.
+///
+/// Every datagram is validated as `/ps/<topic>` before it touches the
+/// router: POST/PUT publishes through [`apply_coap_publish`] (retained
+/// store plus router fan-out, then routed into live mailboxes with the
+/// same forwarded/sent/delivered accounting as MQTT), GET reads the
+/// retained store (CONTENT or NOT FOUND, with an Observe option and
+/// registration when the client asked to observe), DELETE clears
+/// retained state. Malformed topics answer BAD REQUEST and route
+/// nothing, so a listener that accepts bytes can never silently drop
+/// them: every accepted publish reaches the router.
+async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let (len, peer) = match socket.recv_from(&mut buf).await {
+            Ok(next) => next,
+            Err(e) => {
+                warn!("CoAP gateway recv failed: {e}");
+                continue;
+            }
+        };
+        let req = match CoapMessage::decode(&buf[..len]) {
+            Ok(req) => req,
+            Err(_) => continue,
+        };
+        match req.code {
+            CoapCode::POST | CoapCode::PUT => {
+                let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::BAD_REQUEST,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::from_static(b"Topic cannot be empty"),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                };
+                if Topic::new(topic_str.clone()).is_err() {
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::BAD_REQUEST,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::from_static(b"Invalid topic"),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                }
+                let payload = req.payload.clone();
+                let deliveries = apply_coap_publish(&shared, &topic_str, &payload)
+                    .await
+                    .unwrap_or_default();
+                let mut enqueued = 0u64;
+                let mut enqueued_bytes = 0u64;
+                for (conn_id, routed) in deliveries {
+                    let len = routed.total_frame_len() as u64;
+                    if shared.conns.route(conn_id, routed) {
+                        enqueued += 1;
+                        enqueued_bytes += len;
+                    }
+                }
+                shared.metrics.inc_messages_forwarded_by(enqueued);
+                shared.metrics.inc_publish_sent_by(enqueued);
+                shared.metrics.inc_delivered_by(enqueued);
+                shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+                let resp = CoapMessage {
+                    message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                    code: CoapCode::CHANGED,
+                    message_id: req.message_id,
+                    token: req.token.clone(),
+                    options: Vec::new(),
+                    payload: Bytes::new(),
+                };
+                let _ = socket.send_to(&resp.encode(), peer).await;
+            }
+            CoapCode::GET => {
+                let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::BAD_REQUEST,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::from_static(b"Topic cannot be empty"),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                };
+                let Ok(topic) = Topic::new(topic_str.clone()) else {
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::BAD_REQUEST,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::from_static(b"Invalid topic"),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                };
+                let observing = CoapGatewayHandler::is_observe_register(&req);
+                if observing {
+                    shared
+                        .coap
+                        .register_observer(&topic_str, peer, req.token.clone());
+                }
+                let retained = shared.retained.get_retained(&topic).await.ok().flatten();
+                match retained {
+                    Some(stored) => {
+                        let resp = if observing {
+                            let seq = shared.coap.next_observe_seq();
+                            shared
+                                .coap
+                                .make_observe_response(&req, stored.payload.clone(), seq)
+                        } else {
+                            req.make_ack(CoapCode::CONTENT, stored.payload.clone())
+                        };
+                        let _ = socket.send_to(&resp.encode(), peer).await;
+                    }
+                    None => {
+                        let resp = if observing {
+                            let seq = shared.coap.next_observe_seq();
+                            shared.coap.make_observe_response(&req, Bytes::new(), seq)
+                        } else {
+                            req.make_ack(CoapCode::NOT_FOUND, Bytes::from_static(b"Not Found"))
+                        };
+                        let _ = socket.send_to(&resp.encode(), peer).await;
+                    }
+                }
+            }
+            CoapCode::DELETE => {
+                let Some(topic_str) = CoapGatewayHandler::coap_topic(&req) else {
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::BAD_REQUEST,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::from_static(b"Topic cannot be empty"),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                };
+                if let Ok(topic) = Topic::new(topic_str) {
+                    if shared.retained.clear_retained(&topic).await.is_ok() {
+                        sync_retained_stat(&shared).await;
+                    }
+                }
+                let resp = CoapMessage {
+                    message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                    code: CoapCode::DELETED,
+                    message_id: req.message_id,
+                    token: req.token.clone(),
+                    options: Vec::new(),
+                    payload: Bytes::new(),
+                };
+                let _ = socket.send_to(&resp.encode(), peer).await;
+            }
+            _ => {
+                let resp = req.make_ack(CoapCode::METHOD_NOT_ALLOWED, Bytes::new());
+                let _ = socket.send_to(&resp.encode(), peer).await;
             }
         }
     }
@@ -1985,6 +2569,7 @@ fn build_downlink_frames(
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
                                 payload: shared.clone(),
+                                publish_at_ms: None,
                             });
                             let evicted = (before + 1).saturating_sub(session.offline_len());
                             if evicted > 0 {
@@ -2143,6 +2728,9 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
         // A dead mailbox is already counted inside `ConnTable::route`.
         let _ = shared.conns.route(conn_id, frame);
     }
+    // CoAP observers see cluster forwards like local ingress (same cheap
+    // empty check when the gateway never ran).
+    maybe_notify_coap_observers(shared, msg.topic.as_str(), &msg.payload);
 }
 
 /// Detach one edge connection: mark its session disconnected (ownership
@@ -2349,6 +2937,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // writes are visible to the connect hook without a restart.
     // One Arc clone; reads take a short lock and clone at most 20 rows.
     state.auto_subscribe = shared.auto_subscribe.clone();
+    // Share the ban directory (B1-03) so validated management writes
+    // are enforced by the connect and publish checks without a restart.
+    // One Arc clone; checks take a short read lock, never a write.
+    state.bans = shared.bans.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -2392,6 +2984,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot yields today's empty behaviour (no rules); an invalid
     // stored rule fails boot loudly, never skipped silently.
     shared.engine.seed_from_registry(&shared.config)?;
+    // Durable stream journal (B1-07): opt-in via `--stream-dir`. Empty
+    // leaves `stream_journal` as `None` so the publish hook is one branch
+    // and benchmarks see no new disk work. A corrupt stream directory
+    // fails boot loudly rather than silently losing history.
+    if !args.stream_dir.is_empty() {
+        match StreamJournalHandle::open(&args.stream_dir, StreamConfig::default()) {
+            Ok(handle) => {
+                info!("Stream journal enabled in {}", args.stream_dir);
+                shared.stream_journal = Some(handle);
+            }
+            Err(e) => {
+                return Err(format!("cannot open stream journal {}: {e}", args.stream_dir).into());
+            }
+        }
+    }
+    // Directory authentication (B2-01): opt-in via `--ldap-url`. Empty
+    // leaves `ldap` as `None` so CONNECT pays one `is_some` branch and
+    // benchmarks see no new work. When set, CONNECT consults the local
+    // store first, then the directory; a directory outage fails closed.
+    if !args.ldap_url.is_empty() {
+        let ldap_config = LdapConfig {
+            server_url: args.ldap_url.clone(),
+            base_dn: args.ldap_base_dn.clone(),
+            bind_dn: args.ldap_bind_dn.clone(),
+            bind_password: args.ldap_bind_password.clone(),
+            user_filter: args.ldap_user_filter.clone(),
+            group_attribute: args.ldap_group_attribute.clone(),
+            required_group: args.ldap_required_group.clone(),
+            ca_cert_path: if args.ldap_ca_cert.is_empty() {
+                None
+            } else {
+                Some(args.ldap_ca_cert.clone())
+            },
+            ..LdapConfig::default()
+        };
+        info!(
+            "LDAP directory authentication enabled for {}",
+            args.ldap_url
+        );
+        shared.ldap = Some(Arc::new(LdapAuthenticator::new(ldap_config)));
+    }
 
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
@@ -2402,7 +3035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let license_key = args
             .license_key
             .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
-        let status = ClusterLicense::evaluate(license_key.as_deref(), 1, now);
+        let status = ClusterLicense::evaluate(license_key.as_deref(), 1, now, &args.node_id);
         ClusterLicense::log_status_banner(&status);
 
         let local_node = broker_cluster::NodeId::new(&args.node_id);
@@ -2455,6 +3088,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("Management API exited: {}", e);
             }
         });
+    }
+    // CoAP gateway (B1-04): off unless `--coap-bind` names an address.
+    // Bound once here so `Shared.coap_socket` is read-only afterwards;
+    // the listener task owns a clone and publishes through the router.
+    if !args.coap_bind.is_empty() {
+        match tokio::net::UdpSocket::bind(&args.coap_bind).await {
+            Ok(socket) => {
+                let socket = Arc::new(socket);
+                shared.coap_socket = Some(socket.clone());
+                info!("CoAP gateway listening on {}", args.coap_bind);
+                let gateway_shared = shared.clone();
+                tokio::spawn(async move {
+                    run_coap_gateway(gateway_shared, socket).await;
+                });
+            }
+            Err(e) => {
+                warn!("Failed to bind CoAP gateway on {}: {}", args.coap_bind, e);
+            }
+        }
     }
 
     serve_brokerlink(&args.brokerlink_bind, shared).await
@@ -2710,6 +3362,7 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 retain: false,
                 payload: Bytes::from(format!("seed-{i}")),
+                publish_at_ms: None,
             });
         }
         assert_eq!(session.offline_len(), MAX_OFFLINE_QUEUE);
@@ -4618,6 +5271,160 @@ mod tests {
         assert_eq!(rc, 0);
     }
 
+    /// B2-01: directory authentication through the broker CONNECT path.
+    ///
+    /// Starts a real directory server (yamldap, speaking the LDAP wire
+    /// protocol) and drives CONNECTs through `apply_bind`, the same entry
+    /// point the BrokerLink edge uses. Valid directory binds are accepted,
+    /// wrong passwords, unknown users and wrong-group users are refused
+    /// with 0x86, anonymous is refused with 0x87 while the directory is
+    /// configured, and an unreachable directory fails closed.
+    #[tokio::test]
+    async fn ldap_bind_through_broker_connect() {
+        const BASE_DN: &str = "dc=example,dc=com";
+        const SERVICE_DN: &str = "cn=reader,dc=example,dc=com";
+        const SERVICE_PW: &str = "readerpw";
+        const REQUIRED_GROUP: &str = "cn=mqtt-users,ou=groups,dc=example,dc=com";
+
+        let dir_yaml = format!(
+            "directory:\n  base_dn: {BASE_DN}\nentries:\n  - dn: {BASE_DN}\n    objectClass: [top, domain]\n    dc: example\n  - dn: ou=users,{BASE_DN}\n    objectClass: [top, organizationalUnit]\n    ou: users\n  - dn: ou=groups,{BASE_DN}\n    objectClass: [top, organizationalUnit]\n    ou: groups\n  - dn: {SERVICE_DN}\n    objectClass: [top, person]\n    cn: reader\n    sn: reader\n    userPassword: {SERVICE_PW}\n  - dn: uid=alice,ou=users,{BASE_DN}\n    objectClass: [top, person, inetOrgPerson]\n    uid: alice\n    cn: Alice\n    sn: Alice\n    userPassword: alicepw\n    memberOf: {REQUIRED_GROUP}\n  - dn: uid=bob,ou=users,{BASE_DN}\n    objectClass: [top, person, inetOrgPerson]\n    uid: bob\n    cn: Bob\n    sn: Bob\n    userPassword: bobpw\n    memberOf: cn=other-group,ou=groups,{BASE_DN}\n  - dn: {REQUIRED_GROUP}\n    objectClass: [top, groupOfNames]\n    cn: mqtt-users\n    member: uid=alice,ou=users,{BASE_DN}\n"
+        );
+        let dir_file = tempfile::NamedTempFile::new().expect("temp directory YAML");
+        std::fs::write(dir_file.path(), dir_yaml).expect("write directory YAML");
+        let directory_config = yamldap::Config::new(dir_file.path())
+            .with_bind_address("127.0.0.1:0".parse().expect("loopback"));
+        let directory = yamldap::Server::new(directory_config)
+            .await
+            .expect("directory starts");
+        let handle = directory.start().await.expect("directory listens");
+        let url = format!("ldap://{}", handle.local_addr());
+
+        let ldap_config = LdapConfig {
+            server_url: url,
+            base_dn: BASE_DN.to_string(),
+            bind_dn: SERVICE_DN.to_string(),
+            bind_password: SERVICE_PW.to_string(),
+            user_filter: "(uid={username})".to_string(),
+            group_attribute: "memberOf".to_string(),
+            required_group: REQUIRED_GROUP.to_string(),
+            pool_size: 4,
+            connect_timeout_ms: 3_000,
+            read_timeout_ms: 3_000,
+            timeout_ms: 0,
+            tls_verify: true,
+            ca_cert_path: None,
+            bind_dn_template: String::new(),
+            filter_template: String::new(),
+        };
+        let mut shared = test_shared();
+        shared.ldap = Some(std::sync::Arc::new(LdapAuthenticator::new(ldap_config)));
+        // Local users keep working alongside the directory.
+        shared
+            .auth
+            .add_user("local-user", b"localpw")
+            .expect("seed local user");
+
+        // Valid directory bind through the broker: accepted.
+        let frame = bind_frame(
+            91,
+            1,
+            encode_bind_meta_creds("ldap-device-1", true, 60, "alice", b"alicepw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "valid directory bind must be accepted");
+        assert!(shared.sessions.get("ldap-device-1").is_some());
+
+        // Local user still authenticates with the directory configured.
+        let frame = bind_frame(
+            92,
+            1,
+            encode_bind_meta_creds("local-device", true, 60, "local-user", b"localpw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "local users keep working with LDAP enabled");
+
+        // Wrong directory password: refused with 0x86, no session.
+        let frame = bind_frame(
+            93,
+            1,
+            encode_bind_meta_creds("ldap-device-2", true, 60, "alice", b"wrong"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "wrong directory password must yield 0x86");
+        assert!(!present);
+        assert!(shared.sessions.get("ldap-device-2").is_none());
+
+        // Unknown directory user: refused with 0x86.
+        let frame = bind_frame(
+            94,
+            1,
+            encode_bind_meta_creds("ldap-device-3", true, 60, "mallory", b"anything"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "unknown directory user must yield 0x86");
+
+        // Correct password but wrong group: authorised as denied.
+        let frame = bind_frame(
+            95,
+            1,
+            encode_bind_meta_creds("ldap-device-4", true, 60, "bob", b"bobpw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "wrong-group user must be denied with 0x86");
+        assert!(shared.sessions.get("ldap-device-4").is_none());
+
+        // Anonymous while a directory is configured: refused with 0x87.
+        let frame = bind_frame(96, 1, encode_bind_meta("ldap-anon", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(
+            rc, 0x87,
+            "anonymous must be refused while LDAP is configured"
+        );
+
+        // Unreachable directory fails closed through the same path.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let closed_addr = closed.local_addr().expect("local addr");
+        drop(closed);
+        let down_config = LdapConfig {
+            server_url: format!("ldap://{closed_addr}"),
+            base_dn: BASE_DN.to_string(),
+            bind_dn: SERVICE_DN.to_string(),
+            bind_password: SERVICE_PW.to_string(),
+            user_filter: "(uid={username})".to_string(),
+            group_attribute: "memberOf".to_string(),
+            required_group: REQUIRED_GROUP.to_string(),
+            pool_size: 2,
+            connect_timeout_ms: 1_000,
+            read_timeout_ms: 1_000,
+            timeout_ms: 0,
+            tls_verify: true,
+            ca_cert_path: None,
+            bind_dn_template: String::new(),
+            filter_template: String::new(),
+        };
+        let mut down_shared = test_shared();
+        down_shared.ldap = Some(std::sync::Arc::new(LdapAuthenticator::new(down_config)));
+        let frame = bind_frame(
+            97,
+            1,
+            encode_bind_meta_creds("ldap-down", true, 60, "alice", b"alicepw"),
+        );
+        let reply = apply_bind(&frame, &down_shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "directory outage must fail closed with 0x86");
+        assert!(down_shared.sessions.get("ldap-down").is_none());
+    }
+
     #[tokio::test]
     async fn bind_quota_overage_returns_0x8b() {
         use broker_auth::UserQuotas;
@@ -4779,6 +5586,231 @@ mod tests {
         let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
         assert!(deliveries.is_empty(), "denied publish must not fan out");
+    }
+
+    /// Test mirror of the edge peer-address section: append
+    /// `PeerLen:16be | PeerIp` to an encoded bind.
+    fn encode_bind_meta_peer(base: Bytes, peer: &str) -> Bytes {
+        let mut meta = base.to_vec();
+        meta.extend_from_slice(&(peer.len() as u16).to_be_bytes());
+        meta.extend_from_slice(peer.as_bytes());
+        Bytes::from(meta)
+    }
+
+    fn ban_entry(as_type: &str, who: &str, until: &str) -> broker_api::v5::banned::BanEntry {
+        broker_api::v5::banned::BanEntry {
+            as_type: as_type.to_string(),
+            who: who.to_string(),
+            by: "test".to_string(),
+            reason: "test".to_string(),
+            at: "2026-01-01T00:00:00+00:00".to_string(),
+            until: until.to_string(),
+        }
+    }
+
+    #[test]
+    fn bind_meta_peer_section_round_trip() {
+        // Credentials plus peer address decode together.
+        let meta = encode_bind_meta_peer(
+            encode_bind_meta_creds("dev-p", true, 60, "alice", b"pw"),
+            "192.0.2.10",
+        );
+        let req = decode_bind_meta(&meta).expect("peer bind decodes");
+        assert_eq!(req.client_id, "dev-p");
+        assert_eq!(req.username.as_deref(), Some("alice"));
+        assert_eq!(req.password, Some(b"pw".to_vec()));
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        // Anonymous plus peer address decodes without credentials.
+        let meta = encode_bind_meta_peer(encode_bind_meta("dev-a", false, 30), "2001:db8::1");
+        let req = decode_bind_meta(&meta).expect("anonymous peer bind decodes");
+        assert_eq!(req.client_id, "dev-a");
+        assert!(req.username.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("2001:db8::1"));
+        // Legacy binds without a peer section still decode with no peer.
+        let req = decode_bind_meta(&encode_bind_meta("dev-l", true, 60)).expect("legacy decodes");
+        assert!(req.peerhost.is_none());
+        let req = decode_bind_meta(&encode_bind_meta_creds("dev-c", true, 60, "u", b"p"))
+            .expect("legacy creds decode");
+        assert!(req.peerhost.is_none());
+        // Trailing bytes that are neither credentials nor a peer address
+        // stay malformed, exactly as before the peer section.
+        let mut garbage = encode_bind_meta("dev-g", true, 60).to_vec();
+        garbage.extend_from_slice(b"not-a-section");
+        assert!(decode_bind_meta(&Bytes::from(garbage)).is_err());
+    }
+
+    #[tokio::test]
+    async fn ban_refuses_banned_client_id_on_connect() {
+        let shared = test_shared();
+        shared
+            .bans
+            .insert(ban_entry("clientid", "banned-1", "infinity"))
+            .expect("ban insert");
+
+        let frame = bind_frame(91, 1, encode_bind_meta("banned-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "banned client id must yield return code 0x8A");
+        assert!(!present);
+        assert!(shared.sessions.get("banned-1").is_none());
+
+        // An unbanned id still connects against the same store.
+        let frame = bind_frame(92, 1, encode_bind_meta("fine-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn ban_refuses_banned_username_on_connect() {
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user("banned-user", b"pw")
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_user("fine-user", b"pw2")
+            .expect("memory-only persist cannot fail");
+        shared
+            .bans
+            .insert(ban_entry("username", "banned-user", "infinity"))
+            .expect("ban insert");
+
+        // Valid credentials do not save a banned username.
+        let frame = bind_frame(
+            91,
+            1,
+            encode_bind_meta_creds("dev-u", true, 60, "banned-user", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "banned username must yield return code 0x8A");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-u").is_none());
+
+        // The same client id under an unbanned username connects.
+        let frame = bind_frame(
+            92,
+            1,
+            encode_bind_meta_creds("dev-u", true, 60, "fine-user", b"pw2"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn ban_refuses_banned_peerhost_on_connect() {
+        let shared = test_shared();
+        shared
+            .bans
+            .insert(ban_entry("peerhost", "192.0.2.44", "infinity"))
+            .expect("ban insert");
+        shared
+            .bans
+            .insert(ban_entry("peerhost_net", "203.0.113.0/24", "infinity"))
+            .expect("ban insert");
+
+        // Exact address ban refuses.
+        let meta = encode_bind_meta_peer(encode_bind_meta("ip-client", true, 60), "192.0.2.44");
+        let reply = apply_bind(&bind_frame(91, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "banned peer address must yield return code 0x8A");
+        assert!(!present);
+        assert!(shared.sessions.get("ip-client").is_none());
+
+        // CIDR ban refuses an address inside the network.
+        let meta = encode_bind_meta_peer(encode_bind_meta("net-client", true, 60), "203.0.113.9");
+        let reply = apply_bind(&bind_frame(92, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "CIDR-banned peer must yield return code 0x8A");
+
+        // The same id from an unbanned address connects.
+        let meta = encode_bind_meta_peer(encode_bind_meta("ip-client", true, 60), "192.0.2.45");
+        let reply = apply_bind(&bind_frame(93, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn ban_mid_session_publish_is_refused() {
+        let shared = test_shared();
+        // A live listener proves the drop: it would receive otherwise.
+        let (listener, _) = shared.sessions.get_or_create("ban-listener", true);
+        *listener.conn_id.write() = Some(93);
+        let sub = subscribe_frame(
+            93,
+            1,
+            encode_subscribe_meta(1, "ban-listener", &[("t/ban", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // The publisher connects cleanly before any ban exists.
+        let frame = bind_frame(92, 1, encode_bind_meta("ban-pub", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+
+        // Served before the ban: QoS 1 ack 0 and one delivery.
+        let (meta, payload) = encode_publish_meta("t/ban", 5, 1, false, b"before");
+        let (ack, deliveries) = apply_publish(&publish_frame(92, 2, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 publish gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x00]);
+        assert_eq!(deliveries.len(), 1);
+
+        // The ban lands mid-session: the next publish is refused exactly
+        // like an ACL denial (PubAck 0x87, no fan-out).
+        shared
+            .bans
+            .insert(ban_entry("clientid", "ban-pub", "infinity"))
+            .expect("ban insert");
+        let (meta, payload) = encode_publish_meta("t/ban", 6, 1, false, b"after");
+        let (ack, deliveries) = apply_publish(&publish_frame(92, 3, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x06, 0x87]);
+        assert!(deliveries.is_empty(), "banned publish must not fan out");
+    }
+
+    #[tokio::test]
+    async fn expired_ban_refuses_nobody() {
+        let shared = test_shared();
+        let past = "2000-01-01T00:00:00+00:00";
+        for (as_type, who) in [
+            ("clientid", "old-id"),
+            ("username", "old-user"),
+            ("peerhost", "192.0.2.99"),
+        ] {
+            shared
+                .bans
+                .insert(ban_entry(as_type, who, past))
+                .expect("ban insert");
+        }
+
+        // All three identities at once on one connect: still accepted.
+        let meta = encode_bind_meta_peer(
+            encode_bind_meta_creds("old-id", true, 60, "old-user", b"pw"),
+            "192.0.2.99",
+        );
+        let reply = apply_bind(&bind_frame(91, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "expired bans must not refuse the connect");
+
+        // And the publish is served, not refused.
+        let (meta, payload) = encode_publish_meta("t/old", 7, 1, false, b"x");
+        let (ack, _) = apply_publish(&publish_frame(91, 2, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 publish gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x07, 0x00]);
     }
 
     #[tokio::test]
@@ -5827,5 +6859,180 @@ mod tests {
         let qos1 = rx.try_recv().expect("QoS 1 via guaranteed mailbox");
         assert_eq!(qos1.payload, Bytes::from_static(b"keep"));
         assert_eq!(session.inflight_len(), 1, "QoS 1 tracked for redelivery");
+    }
+
+    /// B1-04: a CoAP publish through the gateway reaches an ordinary MQTT
+    /// subscriber through the same router path an MQTT publish takes.
+    ///
+    /// Drives the real gateway entry point (`apply_coap_publish`:
+    /// retained store plus `ingress_pipeline` plus cluster forward) and
+    /// asserts the router delivers to a session bound via the normal
+    /// `apply_subscribe` path. Fails before the wiring (no gateway
+    /// ingress reaches the router); passes after it.
+    #[tokio::test]
+    async fn coap_publish_reaches_mqtt_subscriber() {
+        let shared = test_shared();
+        // Ordinary MQTT subscriber on the gateway topic.
+        let sub = subscribe_frame(
+            71,
+            1,
+            encode_subscribe_meta(1, "mqtt-sub-1", &[("coap/sensors/temp", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("mqtt-sub-1", true);
+        *session.conn_id.write() = Some(71);
+        *session.connected.write() = true;
+
+        // CoAP gateway ingress: POST /ps/coap/sensors/temp.
+        let payload = Bytes::from_static(b"21.5");
+        let deliveries = apply_coap_publish(&shared, "coap/sensors/temp", &payload)
+            .await
+            .expect("valid CoAP topic routes");
+        assert_eq!(deliveries.len(), 1, "one MQTT subscriber must match");
+        assert_eq!(deliveries[0].0, 71);
+        assert_eq!(deliveries[0].1.payload, payload);
+        let (topic, _, _, _) = decode_publish_meta_parts(&deliveries[0].1.metadata);
+        assert_eq!(topic, "coap/sensors/temp");
+
+        // Retained so a later CoAP GET reads the same value.
+        let stored = shared
+            .retained
+            .get_retained(&Topic::new("coap/sensors/temp").unwrap())
+            .await
+            .expect("retained read")
+            .expect("CoAP publish is retained");
+        assert_eq!(stored.payload, payload);
+
+        // Malformed CoAP topics route nothing.
+        assert!(apply_coap_publish(&shared, "coap/#/bad", &payload)
+            .await
+            .is_none());
+        assert!(apply_coap_publish(&shared, "", &payload).await.is_none());
+    }
+
+    /// B1-04: an ordinary MQTT publish notifies a registered CoAP
+    /// observer over UDP.
+    ///
+    /// Registers one bounded observer, publishes through the real MQTT
+    /// ingress (`apply_publish` -> `ingress_pipeline` -> notify hook),
+    /// and asserts the observer socket receives a CONTENT notification
+    /// carrying the Observe option and the published payload. Fails
+    /// before the hook (no UDP leaves the broker); passes after it.
+    #[tokio::test]
+    async fn mqtt_publish_notifies_coap_observer_over_udp() {
+        let mut shared = test_shared();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway socket");
+        let server = Arc::new(server);
+        shared.coap_socket = Some(server.clone());
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind observer socket");
+        let client_addr = client.local_addr().expect("observer addr");
+        let token = Bytes::from_static(b"ntfy");
+        assert!(shared
+            .coap
+            .register_observer("notify/topic", client_addr, token.clone()));
+        assert!(shared.coap.has_observers());
+
+        // Ordinary MQTT publish on the observed topic.
+        let (meta, payload) = encode_publish_meta("notify/topic", 7, 0, false, b"hello-udp");
+        let (_, deliveries) = apply_publish(&publish_frame(90, 1, meta, payload), &shared).await;
+        let _ = deliveries;
+
+        // The notify hook spawns the UDP send off the hot path: wait for it.
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("observer notified within timeout")
+        .expect("udp recv");
+        let notify = broker_gateway::coap::CoapMessage::decode(&buf[..len]).expect("decode notify");
+        assert_eq!(notify.code, broker_gateway::coap::CoapCode::CONTENT);
+        assert_eq!(notify.token, token);
+        assert_eq!(notify.payload, Bytes::from_static(b"hello-udp"));
+        assert!(
+            notify
+                .options
+                .iter()
+                .any(|o| o.number == broker_gateway::coap::option_number::OBSERVE),
+            "notification must carry the Observe option"
+        );
+    }
+
+    /// B1-07: a publish through the real broker ingress lands in the
+    /// durable stream journal without blocking delivery.
+    ///
+    /// Attaches a journal backed by a scratch directory, publishes via
+    /// `ingress_pipeline` (the same path MQTT and CoAP publishes take),
+    /// and asserts the background writer persisted the record at offset 0
+    /// with the right payload. Fails when the store is never wired in
+    /// (nothing to read back); passes once the hook enqueues off the hot
+    /// path. Also asserts a restart of the store from the same directory
+    /// still serves the journalled record.
+    #[tokio::test]
+    async fn publish_is_journalled_to_durable_stream_off_hot_path() {
+        let dir = {
+            static SLOT: AtomicU64 = AtomicU64::new(0);
+            let slot = SLOT.fetch_add(1, Ordering::SeqCst);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir().join(format!(
+                "indramqtt-stream-journal-{}-{nanos}-{slot}",
+                std::process::id()
+            ))
+        };
+        let mut shared = Shared::new();
+        let journal =
+            StreamJournalHandle::open(&dir, StreamConfig::default()).expect("open journal");
+        let store = journal.store.clone();
+        shared.stream_journal = Some(journal.clone());
+
+        // Real broker ingress, not a direct store call.
+        let topic = Topic::new("journal/probe").unwrap();
+        let payload = Bytes::from_static(b"journalled-bytes");
+        let deliveries = ingress_pipeline(&shared, &topic, QoS::AtLeastOnce, false, &payload).await;
+        let _ = deliveries;
+
+        // The publish path never blocks: it only enqueued. The background
+        // task persists within milliseconds; poll for it.
+        let mut seen = None;
+        for _ in 0..100 {
+            if store.stream_len("journal/probe") >= 1 {
+                seen = Some(store.seek_offset("journal/probe", 0, 1).expect("seek"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let records = seen.expect("background journal persists within timeout");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].payload, Bytes::from_static(b"journalled-bytes"));
+        assert_eq!(records[0].topic.as_str(), "journal/probe");
+        assert_eq!(journal.dropped_count(), 0);
+
+        // Restarting the store from the same directory keeps the record.
+        drop(store);
+        drop(journal);
+        // Give the background task a moment to exit with its sender.
+        tokio::task::yield_now().await;
+        let reopened =
+            DurableStreamStore::open_with_config(&dir, StreamConfig::default()).expect("reopen");
+        assert_eq!(reopened.stream_len("journal/probe"), 1);
+        assert_eq!(
+            reopened
+                .get("journal/probe", 0)
+                .expect("replayed after restart")
+                .payload,
+            Bytes::from_static(b"journalled-bytes")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

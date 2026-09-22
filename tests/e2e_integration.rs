@@ -124,6 +124,7 @@ fn test_e2e_session_lifecycle_and_offline_queue() {
             qos: QoS::AtLeastOnce,
             retain: false,
             payload,
+            publish_at_ms: None,
         });
     }
     assert_eq!(session.offline_len(), 20);

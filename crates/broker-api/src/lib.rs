@@ -1191,7 +1191,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid aws_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpAwsIotTransport::new(&config.endpoint)
+                    broker_connectors::TlsAwsIotTransport::new(&config)
                         .map_err(|e| format!("invalid aws_iot transport: {e}"))?,
                 );
                 let sink = broker_connectors::AwsIotSink::new(config, transport)
@@ -1207,7 +1207,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid azure_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpAzureIotTransport::new(&config.iot_hub_name)
+                    broker_connectors::TlsAzureIotTransport::new(&config)
                         .map_err(|e| format!("invalid azure_iot transport: {e}"))?,
                 );
                 let sink = broker_connectors::AzureIotSink::new(config, transport)
@@ -3017,6 +3017,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             payload: bytes::Bytes::from_static(b"hello"),
+            publish_at_ms: None,
         });
 
         let (status, body) = server
@@ -3055,6 +3056,7 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 retain: false,
                 payload: bytes::Bytes::from(vec![i]),
+                publish_at_ms: None,
             });
         }
 

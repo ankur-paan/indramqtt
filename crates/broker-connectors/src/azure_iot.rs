@@ -5,7 +5,12 @@
 //! shape as Event Hubs: `sr`/`sig`/`se`/`skn` over the device
 //! resource URI), X.509 validation at config time, Device Twin
 //! reported/desired patch topics, and Direct Method invocation
-//! routing with response framing.
+//! routing with response framing. MQTT travels over TLS: server
+//! certificates verify against the configured CA bundle plus the
+//! platform roots, SAS tokens ride as the MQTT password, and X.509
+//! devices additionally authenticate with a client certificate.
+//! Missing credentials are a dispatch error, never a cleartext
+//! fallback.
 //!
 //! SAS tokens renew proactively before expiry; a 401 ExpiredToken
 //! forces one renewal + retry, 429 QuotaExceeded backs off, and 404
@@ -19,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
+use super::cloud_tls;
 use super::{now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Azure IoT Hub authentication credentials.
@@ -124,6 +131,20 @@ pub struct AzureIotConfig {
     /// Request timeout in ms (default 5000).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// TCP connect timeout in ms (default 5000).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: Option<u64>,
+    /// TLS handshake timeout in ms (default 5000).
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: Option<u64>,
+    /// Extra CA bundle PEM for server verification, in addition to
+    /// the platform roots.
+    #[serde(default)]
+    pub ca_bundle_pem: Option<String>,
+    /// SAS token lifetime in seconds for `SharedAccessKey` auth
+    /// (default 3600, minimum 60).
+    #[serde(default = "default_sas_ttl_secs")]
+    pub sas_ttl_secs: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -138,9 +159,66 @@ fn default_max_retries() -> Option<usize> {
     Some(5)
 }
 
+fn default_connect_timeout_ms() -> Option<u64> {
+    Some(5000)
+}
+
+fn default_handshake_timeout_ms() -> Option<u64> {
+    Some(5000)
+}
+
+fn default_sas_ttl_secs() -> Option<u64> {
+    Some(3600)
+}
+
 impl AzureIotConfig {
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// TCP connect timeout (default 5000 ms).
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// TLS handshake timeout (default 5000 ms).
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// SAS token lifetime in seconds (default 3600, minimum 60).
+    pub fn effective_sas_ttl(&self) -> u64 {
+        self.sas_ttl_secs.unwrap_or(3600).max(60)
+    }
+
+    /// Split `iot_hub_name` into host/port (default 8883). The port
+    /// suffix exists for loopback qualification; production hubs use
+    /// 8883.
+    pub fn host_port(&self) -> Result<(String, u16)> {
+        cloud_tls::parse_host_port(&self.iot_hub_name, 8883)
+    }
+
+    /// Bare hub hostname without any `:port` suffix (used for SAS
+    /// resource URIs and the MQTT username).
+    pub fn hub_hostname(&self) -> String {
+        self.host_port()
+            .map(|(host, _)| host)
+            .unwrap_or_else(|_| self.iot_hub_name.trim().to_string())
+    }
+
+    /// MQTT client id: the device id, or `device/module` for modules.
+    pub fn mqtt_client_id(&self) -> String {
+        match &self.module_id {
+            Some(module) => format!("{}/{}", self.device_id, module),
+            None => self.device_id.clone(),
+        }
+    }
+
+    /// MQTT username: `{hub}/{device}[/{module}]/?api-version={ver}`.
+    pub fn mqtt_username(&self) -> String {
+        let hub = self.hub_hostname();
+        let client = self.mqtt_client_id();
+        format!("{hub}/{client}/?api-version={}", self.api_version)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -149,6 +227,8 @@ impl AzureIotConfig {
                 "azure-iot hub name must not be empty".to_string(),
             ));
         }
+        // Hub must parse to a concrete host/port now (TLS dials it).
+        self.host_port()?;
         if self.device_id.trim().is_empty() || self.device_id.contains(['/', '#', '+']) {
             return Err(ConnectorError::Dispatch(format!(
                 "azure-iot device_id must be a concrete segment: {:?}",
@@ -167,6 +247,13 @@ impl AzureIotConfig {
             return Err(ConnectorError::Dispatch(
                 "azure-iot api_version must not be empty".to_string(),
             ));
+        }
+        if let Some(bundle) = &self.ca_bundle_pem {
+            if !bundle.trim().is_empty() && !bundle.contains("BEGIN CERTIFICATE") {
+                return Err(ConnectorError::Dispatch(
+                    "azure-iot ca_bundle_pem is not a PEM document".to_string(),
+                ));
+            }
         }
         if self.batch_size == Some(0) {
             return Err(ConnectorError::Dispatch(
@@ -191,14 +278,12 @@ impl AzureIotConfig {
     }
 
     /// Device (or module) resource URI covered by SAS tokens:
-    /// `{hub}/devices/{device}[/modules/{module}]` (no scheme).
+    /// `{hub}/devices/{device}[/modules/{module}]` (no scheme, no port).
     pub fn resource_uri(&self) -> String {
+        let hub = self.hub_hostname();
         match &self.module_id {
-            Some(module) => format!(
-                "{}/devices/{}/modules/{}",
-                self.iot_hub_name, self.device_id, module
-            ),
-            None => format!("{}/devices/{}", self.iot_hub_name, self.device_id),
+            Some(module) => format!("{hub}/devices/{}/modules/{module}", self.device_id),
+            None => format!("{hub}/devices/{}", self.device_id),
         }
     }
 }
@@ -519,72 +604,127 @@ impl AzureIotTransport for MockAzureIotTransport {
     }
 }
 
-/// TCP loopback transport: MQTT PUBLISH framing over a plain socket
-/// (TLS/SAS terminate in front of it in production).
-pub struct TcpAzureIotTransport {
+/// TLS transport: MQTT over TLS to Azure IoT Hub (port 8883 by
+/// default). Server certificates verify against the configured CA
+/// bundle plus the platform roots. SAS variants send the token as
+/// the MQTT password; X.509 devices authenticate with a client
+/// certificate. The TCP socket is only ever the TLS underlay: there
+/// is no cleartext path and a missing credential is a dispatch
+/// error.
+pub struct TlsAzureIotTransport {
     host: String,
     port: u16,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
+    client_id: String,
+    username: String,
+    expect_password: bool,
+    tls: Arc<rustls::ClientConfig>,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    io_timeout: Duration,
+    stream: tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>,
 }
 
-impl TcpAzureIotTransport {
-    pub fn new(hub_name: &str) -> Result<Self> {
-        let hub_name = hub_name.trim();
-        if hub_name.is_empty() {
-            return Err(ConnectorError::Dispatch(
-                "azure-iot hub name must not be empty".to_string(),
-            ));
-        }
-        let (host, port) = match hub_name.rsplit_once(':') {
-            Some((host, port)) if !port.contains('.') => {
-                let port: u16 = port.parse().map_err(|_| {
-                    ConnectorError::Dispatch(format!("azure-iot bad port in {hub_name:?}"))
-                })?;
-                (host, port)
+impl TlsAzureIotTransport {
+    pub fn new(config: &AzureIotConfig) -> Result<Self> {
+        config.validate()?;
+        let (host, port) = config.host_port()?;
+        let roots = cloud_tls::root_store_with(config.ca_bundle_pem.as_deref())?;
+        let (client_cert, expect_password) = match &config.auth {
+            AzureIotAuth::SharedAccessKey { key, .. } => {
+                if key.trim().is_empty() {
+                    return Err(ConnectorError::Dispatch(
+                        "azure-iot shared access key must not be empty; no plain-text fallback"
+                            .to_string(),
+                    ));
+                }
+                (None, true)
             }
-            _ => (hub_name, 8883),
+            AzureIotAuth::SasToken { token } => {
+                if !token.starts_with("SharedAccessSignature ") {
+                    return Err(ConnectorError::Dispatch(
+                        "azure-iot SAS token must start with SharedAccessSignature; \
+                         no plain-text fallback"
+                            .to_string(),
+                    ));
+                }
+                (None, true)
+            }
+            AzureIotAuth::X509 { cert_pem, key_pem } => {
+                let chain = cloud_tls::certs_from_pem(cert_pem).map_err(|e| {
+                    ConnectorError::Dispatch(format!("azure-iot client certificate rejected: {e}"))
+                })?;
+                let key = cloud_tls::private_key_from_pem(key_pem).map_err(|e| {
+                    ConnectorError::Dispatch(format!("azure-iot client key rejected: {e}"))
+                })?;
+                (Some((chain, key)), false)
+            }
         };
+        let tls = cloud_tls::client_config(roots, client_cert, &[])?;
         Ok(Self {
-            host: host.to_string(),
+            host,
             port,
+            client_id: config.mqtt_client_id(),
+            username: config.mqtt_username(),
+            expect_password,
+            tls,
+            connect_timeout: config.connect_timeout(),
+            handshake_timeout: config.handshake_timeout(),
+            io_timeout: config.timeout(),
             stream: tokio::sync::Mutex::new(None),
         })
+    }
+
+    async fn ensure_connected(&self, sas_token: &str) -> Result<()> {
+        if self.expect_password && sas_token.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "azure-iot SAS token missing; no plain-text fallback".to_string(),
+            ));
+        }
+        if self.stream.lock().await.is_some() {
+            return Ok(());
+        }
+        let password = if self.expect_password {
+            Some(sas_token)
+        } else {
+            None
+        };
+        let mut stream = cloud_tls::tls_dial(
+            &self.host,
+            self.port,
+            self.tls.clone(),
+            self.connect_timeout,
+            self.handshake_timeout,
+            "azure-iot",
+        )
+        .await?;
+        let connect = cloud_tls::encode_mqtt_connect(
+            &self.client_id,
+            true,
+            60,
+            Some(&self.username),
+            password,
+        )?;
+        cloud_tls::mqtt_connect_over_tls(&mut stream, &connect, "azure-iot", self.io_timeout)
+            .await?;
+        *self.stream.lock().await = Some(stream);
+        Ok(())
     }
 }
 
 #[async_trait]
-impl AzureIotTransport for TcpAzureIotTransport {
-    async fn publish(&self, publish: &AzureIotPublish, _sas_token: &str) -> Result<()> {
-        self.connect().await?;
-        use tokio::io::AsyncWriteExt;
+impl AzureIotTransport for TlsAzureIotTransport {
+    async fn publish(&self, publish: &AzureIotPublish, sas_token: &str) -> Result<()> {
+        self.ensure_connected(sas_token).await?;
         let bytes =
             super::mqtt_bridge::encode_publish(&publish.topic, 1, false, 1, &publish.body, false)?;
         let mut guard = self.stream.lock().await;
         let stream = guard
             .as_mut()
             .ok_or_else(|| ConnectorError::Connection("azure-iot not connected".to_string()))?;
-        stream
-            .write_all(&bytes)
+        tokio::time::timeout(self.io_timeout, stream.write_all(&bytes))
             .await
+            .map_err(|_| ConnectorError::Connection("azure-iot publish timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("azure-iot publish failed: {e}")))?;
-        Ok(())
-    }
-}
-
-impl TcpAzureIotTransport {
-    async fn connect(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("azure-iot connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("azure-iot connect failed: {e}")))?;
-        *self.stream.lock().await = Some(stream);
         Ok(())
     }
 }
@@ -603,9 +743,14 @@ impl AzureIotConnectTransport for MockAzureIotTransport {
 }
 
 #[async_trait]
-impl AzureIotConnectTransport for TcpAzureIotTransport {
+impl AzureIotConnectTransport for TlsAzureIotTransport {
     async fn connect_transport(&self) -> Result<()> {
-        self.connect().await
+        if self.expect_password {
+            return Err(ConnectorError::Dispatch(
+                "azure-iot SAS connect needs a token; publish connects lazily".to_string(),
+            ));
+        }
+        self.ensure_connected("").await
     }
 }
 
@@ -634,9 +779,10 @@ impl AzureIotSink {
     ) -> Result<Self> {
         config.validate()?;
         let linger = config.effective_linger();
+        let ttl = config.effective_sas_ttl();
         let sas_cache = match &config.auth {
             AzureIotAuth::SharedAccessKey { key, key_name } => Some(Arc::new(
-                AzureIotSasCache::new(config.resource_uri(), key_name.clone(), key.clone(), 3_600),
+                AzureIotSasCache::new(config.resource_uri(), key_name.clone(), key.clone(), ttl),
             )),
             _ => None,
         };
@@ -848,6 +994,10 @@ mod tests {
             linger_ms: Some(50),
             max_retries: Some(5),
             timeout_ms: None,
+            connect_timeout_ms: None,
+            handshake_timeout_ms: None,
+            ca_bundle_pem: None,
+            sas_ttl_secs: None,
         }
     }
 
@@ -1086,46 +1236,329 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
     }
 
+    #[test]
+    fn test_no_plain_socket_path() {
+        // The module must not contain a cleartext MQTT path: the only
+        // TCP dial lives in the shared TLS helper, and SAS/X.509 gaps
+        // are dispatch errors, never a fallback. Needles are built at
+        // runtime so this assertion does not match itself.
+        let source = include_str!("azure_iot.rs");
+        let needle = ["TcpStream", "connect"].join("::");
+        assert!(
+            !source.contains(&needle),
+            "azure-iot must not open a plain socket"
+        );
+        let deferred = ["terminate in front", "of it"].join(" ");
+        assert!(
+            !source.contains(&deferred),
+            "azure-iot must not defer TLS to deployment"
+        );
+    }
+
+    #[test]
+    fn test_tls_timeouts_and_sas_lifetime_defaults() {
+        let config = test_config();
+        assert_eq!(
+            config.connect_timeout(),
+            Duration::from_millis(5000),
+            "connect default must stay 5000 ms"
+        );
+        assert_eq!(
+            config.handshake_timeout(),
+            Duration::from_millis(5000),
+            "handshake default must stay 5000 ms"
+        );
+        assert_eq!(config.effective_sas_ttl(), 3600);
+        let mut custom = test_config();
+        custom.connect_timeout_ms = Some(1500);
+        custom.handshake_timeout_ms = Some(2500);
+        custom.sas_ttl_secs = Some(30);
+        assert_eq!(custom.connect_timeout(), Duration::from_millis(1500));
+        assert_eq!(custom.handshake_timeout(), Duration::from_millis(2500));
+        // Lifetimes below 60 s clamp to the 60 s minimum.
+        assert_eq!(custom.effective_sas_ttl(), 60);
+        custom.sas_ttl_secs = Some(7200);
+        assert_eq!(custom.effective_sas_ttl(), 7200);
+    }
+
+    #[test]
+    fn test_mqtt_identity_helpers() {
+        let config = test_config();
+        assert_eq!(config.mqtt_client_id(), "edge-1");
+        assert_eq!(
+            config.mqtt_username(),
+            "my-hub.azure-devices.net/edge-1/?api-version=2021-04-12"
+        );
+        let mut module = test_config();
+        module.module_id = Some("mod-a".to_string());
+        assert_eq!(module.mqtt_client_id(), "edge-1/mod-a");
+        assert_eq!(
+            module.mqtt_username(),
+            "my-hub.azure-devices.net/edge-1/mod-a/?api-version=2021-04-12"
+        );
+    }
+
+    #[test]
+    fn test_missing_credentials_have_no_fallback() {
+        let mut config = test_config();
+        config.auth = AzureIotAuth::SharedAccessKey {
+            key: "   ".to_string(),
+            key_name: None,
+        };
+        assert!(
+            matches!(
+                TlsAzureIotTransport::new(&config),
+                Err(ConnectorError::Dispatch(_))
+            ),
+            "empty key must fail loudly"
+        );
+
+        config = test_config();
+        config.auth = AzureIotAuth::SasToken {
+            token: "Bearer nope".to_string(),
+        };
+        let err = TlsAzureIotTransport::new(&config);
+        match err {
+            Err(ConnectorError::Dispatch(message)) => {
+                assert!(message.contains("SharedAccessSignature"));
+            }
+            _ => panic!("bare token must fail loudly"),
+        }
+    }
+
+    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
+    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
+    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
+    const TEST_CLIENT_CERT_PEM: &str = include_str!("../testdata/client-cert.pem");
+    const TEST_CLIENT_KEY_PEM: &str = include_str!("../testdata/client-key.pem");
+
+    fn sas_test_config(hub: &str) -> AzureIotConfig {
+        AzureIotConfig {
+            iot_hub_name: hub.to_string(),
+            device_id: "edge-1".to_string(),
+            module_id: None,
+            auth: AzureIotAuth::SharedAccessKey {
+                key: "dGVzdC1rZXktbWF0ZXJpYWwtMzItYnl0ZXMhIU9L".to_string(),
+                key_name: Some("iothubowner".to_string()),
+            },
+            api_version: "2021-04-12".to_string(),
+            direct_methods_enabled: true,
+            twin_sync_enabled: true,
+            batch_size: Some(500),
+            buffer_capacity: None,
+            linger_ms: Some(50),
+            max_retries: Some(5),
+            timeout_ms: Some(2000),
+            connect_timeout_ms: Some(2000),
+            handshake_timeout_ms: Some(2000),
+            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            sas_ttl_secs: Some(3600),
+        }
+    }
+
+    fn x509_test_config(hub: &str) -> AzureIotConfig {
+        AzureIotConfig {
+            iot_hub_name: hub.to_string(),
+            device_id: "edge-1".to_string(),
+            module_id: None,
+            auth: AzureIotAuth::X509 {
+                cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
+                key_pem: TEST_CLIENT_KEY_PEM.to_string(),
+            },
+            api_version: "2021-04-12".to_string(),
+            direct_methods_enabled: true,
+            twin_sync_enabled: true,
+            batch_size: Some(500),
+            buffer_capacity: None,
+            linger_ms: Some(50),
+            max_retries: Some(5),
+            timeout_ms: Some(2000),
+            connect_timeout_ms: Some(2000),
+            handshake_timeout_ms: Some(2000),
+            ca_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            sas_ttl_secs: None,
+        }
+    }
+
+    async fn read_publish_frame<S>(tls: &mut S) -> crate::mqtt_bridge::DecodedPublish
+    where
+        S: tokio::io::AsyncReadExt + Unpin,
+    {
+        let mut head = [0u8; 1];
+        tls.read_exact(&mut head).await.expect("head");
+        assert_eq!(head[0], 0x32);
+        let mut len_buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            tls.read_exact(&mut byte).await.expect("len");
+            len_buf.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+        }
+        let (remaining, _) =
+            crate::mqtt_bridge::decode_remaining_length(&len_buf).expect("remaining");
+        let mut rest = vec![0u8; remaining];
+        tls.read_exact(&mut rest).await.expect("body");
+        let mut frame = vec![head[0]];
+        frame.extend_from_slice(&len_buf);
+        frame.extend_from_slice(&rest);
+        crate::mqtt_bridge::decode_publish(&frame, false).expect("decode")
+    }
+
     #[tokio::test]
-    async fn test_c2d_ack_loopback() {
-        use tokio::io::AsyncReadExt;
+    async fn test_tls_handshake_with_sas_password() {
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
+        let server_config = crate::cloud_tls::test_certs::server_config(
+            TEST_SERVER_CERT_PEM,
+            TEST_SERVER_KEY_PEM,
+            None,
+        )
+        .expect("test server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        let expected_username = "127.0.0.1/edge-1/?api-version=2021-04-12".to_string();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // One QoS 1 PUBLISH addressed at the D2C topic.
-            let mut head = [0u8; 1];
-            stream.read_exact(&mut head).await.expect("head");
-            assert_eq!(head[0], 0x32);
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.expect("len");
-            let mut rest = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut rest).await.expect("body");
-            let mut frame = vec![head[0], len[0]];
-            frame.extend_from_slice(&rest);
-            let decoded = crate::mqtt_bridge::decode_publish(&frame, false).expect("decode");
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (client_id, username, password) = crate::cloud_tls::read_client_connect(&mut tls)
+                .await
+                .expect("read CONNECT");
+            assert_eq!(client_id, "edge-1");
+            assert_eq!(username.as_deref(), Some(expected_username.as_str()));
+            let password = password.expect("SAS password required");
+            assert!(password.starts_with("SharedAccessSignature sr="));
+            tls.write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("CONNACK");
+            let decoded = read_publish_frame(&mut tls).await;
             assert!(decoded.topic.starts_with("devices/edge-1/messages/events/"));
             assert_eq!(decoded.payload, b"{}");
         });
 
-        let transport = Arc::new(TcpAzureIotTransport::new(&format!("127.0.0.1:{port}")).unwrap());
+        let config = sas_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAzureIotTransport::new(&config).unwrap());
+        // SAS transports connect lazily through publish (the token is
+        // minted per flush); an explicit connect without a token fails
+        // loudly instead of falling back.
+        assert!(transport.connect_transport().await.is_err());
+        let token = sas_token(
+            &config.resource_uri(),
+            Some("iothubowner"),
+            "dGVzdC1rZXktbWF0ZXJpYWwtMzItYnl0ZXMhIU9L",
+            1_789_211_889,
+        );
+        transport
+            .publish(
+                &AzureIotPublish {
+                    topic: "devices/edge-1/messages/events/%24.ct=application%2Fjson".to_string(),
+                    body: b"{}".to_vec(),
+                },
+                &token,
+            )
+            .await
+            .unwrap();
+        // An empty SAS token never touches the wire.
+        let err = transport
+            .publish(
+                &AzureIotPublish {
+                    topic: "devices/edge-1/messages/events/x".to_string(),
+                    body: b"{}".to_vec(),
+                },
+                "  ",
+            )
+            .await
+            .expect_err("empty SAS must fail");
+        assert!(matches!(err, ConnectorError::Dispatch(_)));
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server done")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_with_client_certificate() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let server_config = crate::cloud_tls::test_certs::server_config(
+            TEST_SERVER_CERT_PEM,
+            TEST_SERVER_KEY_PEM,
+            Some(TEST_CA_PEM),
+        )
+        .expect("test server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            // The client certificate verified against the test CA;
+            // CONNECT carries the username with no password.
+            let (client_id, username, password) = crate::cloud_tls::read_client_connect(&mut tls)
+                .await
+                .expect("read CONNECT");
+            assert_eq!(client_id, "edge-1");
+            assert_eq!(
+                username.as_deref(),
+                Some("127.0.0.1/edge-1/?api-version=2021-04-12")
+            );
+            assert_eq!(password, None);
+            tls.write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("CONNACK");
+            let decoded = read_publish_frame(&mut tls).await;
+            assert!(decoded.topic.starts_with("devices/edge-1/messages/events/"));
+            assert_eq!(decoded.payload, b"{}");
+        });
+
+        let config = x509_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAzureIotTransport::new(&config).unwrap());
         transport.connect_transport().await.unwrap();
         transport
             .publish(
                 &AzureIotPublish {
                     topic: "devices/edge-1/messages/events/%24.ct=application%2Fjson".to_string(),
                     body: b"{}".to_vec(),
-                    // token unused on the loopback path.
                 },
-                "SharedAccessSignature sr=x",
+                "",
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), server)
+        tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn test_plain_listener_cannot_complete_handshake() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
+        });
+        let config = sas_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAzureIotTransport::new(&config).unwrap());
+        let err = transport
+            .publish(
+                &AzureIotPublish {
+                    topic: "devices/edge-1/messages/events/x".to_string(),
+                    body: b"{}".to_vec(),
+                },
+                "SharedAccessSignature sr=x&sig=y&se=1",
+            )
+            .await
+            .expect_err("plain listener must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        server.abort();
     }
 }

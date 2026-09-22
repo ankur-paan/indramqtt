@@ -2,9 +2,13 @@
 //!
 //! Covers `GET /banned` (paged list), `POST /banned` (create one entry),
 //! `DELETE /banned` (clear all) and `DELETE /banned/{as}/{who}` (drop one
-//! entry). Single-node, management-plane only:
-//! nothing here runs on the per-message path, so delivery never takes a
-//! management lock and no new buffering is added to fan-out or fan-in.
+//! entry). Single-node, management-plane writes:
+//! the broker consults the store on the connect path (before the session
+//! is created) and on publish authorisation (so a client banned
+//! mid-session stops being served). Both reads take one short read lock
+//! and scan at most the stored entries; an empty store returns after one
+//! length check, so the common case costs almost nothing on the publish
+//! path (see [`BanStore::is_banned`]).
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_BANS`] entries in the matcher map; creates past the
@@ -12,7 +16,8 @@
 //! - `who` is capped at 512 chars and `by`/`reason` at 1024 chars, so one
 //!   entry cannot balloon memory;
 //! - expiry is lazy: entries whose `until` has passed are dropped on the
-//!   next list or create (no background task, no per-message sweep).
+//!   next list or create (no background task), and live-match checks
+//!   skip them without taking a write lock.
 
 use axum::{
     extract::{Path, Query, State},
@@ -76,8 +81,10 @@ impl BanEntry {
 
 /// In-memory ban directory keyed by (`as`, `who`).
 ///
-/// Single-node map behind one lock; every method finishes quickly and no
-/// delivery path touches it, so management reads never block messaging.
+/// Single-node map behind one lock; every method finishes quickly.
+/// Management writes take the write lock; the broker's connect and
+/// publish checks take a short read lock and never mutate, so delivery
+/// never blocks on a management write beyond one lock hold.
 pub struct BanStore {
     inner: RwLock<HashMap<(String, String), BanEntry>>,
 }
@@ -133,6 +140,45 @@ impl BanStore {
         sweep_expired_locked(&mut map, now);
         map.remove(&(as_type.to_string(), who.to_string()))
             .is_some()
+    }
+
+    /// Whether the given identity is currently banned (B1-03 enforcement).
+    ///
+    /// Consulted by the broker on CONNECT (before the session is created)
+    /// and on publish authorisation (so a client banned mid-session stops
+    /// being served). Expired entries never match; they are skipped here
+    /// without mutating, and the next list/create sweeps them.
+    ///
+    /// Cost: one read lock plus a scan of at most the stored entries. An
+    /// empty store returns after one length check. Exact kinds
+    /// (`clientid`, `username`, `peerhost`) compare by value; pattern
+    /// kinds compile their stored pattern per call (`clientid_re` /
+    /// `username_re` as regex search, `peerhost_net` as CIDR containment),
+    /// so a store holding pattern bans costs more per publish than an
+    /// exact-only store. Unknown kinds never match.
+    pub fn is_banned(
+        &self,
+        client_id: &str,
+        username: Option<&str>,
+        peerhost: Option<&str>,
+    ) -> bool {
+        let now = now_epoch_secs();
+        let map = self.inner.read().expect("ban store lock");
+        if map.is_empty() {
+            return false;
+        }
+        // Parse the peer address once: the edge always sends an IP
+        // literal, so an unparseable value simply matches no address ban.
+        let peer_ip: Option<std::net::IpAddr> = peerhost.and_then(|s| s.trim().parse().ok());
+        for entry in map.values() {
+            if until_is_expired(&entry.until, now) {
+                continue;
+            }
+            if entry_matches_identity(entry, client_id, username, peerhost, peer_ip) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -435,6 +481,88 @@ fn sweep_expired_locked(map: &mut HashMap<(String, String), BanEntry>, now: u64)
     map.retain(|_, e| !until_is_expired(&e.until, now));
 }
 
+/// Whether one stored ban matches the connecting/publishing identity.
+/// Exact kinds compare by value; `clientid_re` / `username_re` run the
+/// stored pattern as a regex search; `peerhost_net` checks CIDR
+/// containment of the parsed peer address.
+fn entry_matches_identity(
+    entry: &BanEntry,
+    client_id: &str,
+    username: Option<&str>,
+    peerhost: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match entry.as_type.as_str() {
+        "clientid" => entry.who == client_id,
+        "username" => username == Some(entry.who.as_str()),
+        "peerhost" => match (peer_ip, entry.who.parse::<std::net::IpAddr>()) {
+            (Some(ip), Ok(want)) => ip == want,
+            // Either side unparseable: fall back to the raw string so an
+            // exact literal still matches instead of silently missing.
+            _ => peerhost == Some(entry.who.as_str()),
+        },
+        "clientid_re" => regex_ban_matches(&entry.who, client_id),
+        "username_re" => username
+            .map(|name| regex_ban_matches(&entry.who, name))
+            .unwrap_or(false),
+        "peerhost_net" => peer_ip
+            .map(|ip| cidr_ban_contains(&entry.who, ip))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Regex search of a stored pattern against a value. Patterns are stored
+/// verbatim (management validation does not compile them), so an invalid
+/// pattern matches nothing instead of failing the lookup. Compiled per
+/// call: ban checks run per connect and per publish, and the store holds
+/// no compiled cache (B1-03 keeps no new cache layer).
+fn regex_ban_matches(pattern: &str, value: &str) -> bool {
+    match regex::Regex::new(pattern) {
+        Ok(re) => re.is_match(value),
+        Err(_) => false,
+    }
+}
+
+/// Whether `ip` falls inside the stored `addr/prefix` network. A malformed
+/// network, an out-of-range prefix, or a v4/v6 family mismatch matches
+/// nothing.
+fn cidr_ban_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
+    let (net_str, prefix_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let Ok(net) = net_str.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    match (net, ip) {
+        (std::net::IpAddr::V4(net), std::net::IpAddr::V4(ip)) => {
+            if prefix > 32 {
+                return false;
+            }
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (std::net::IpAddr::V6(net), std::net::IpAddr::V6(ip)) => {
+            if prefix > 128 {
+                return false;
+            }
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - prefix);
+            (u128::from(net) & mask) == (u128::from(ip) & mask)
+        }
+        _ => false,
+    }
+}
+
 fn until_is_expired(until: &str, now: u64) -> bool {
     if until == "infinity" {
         return false;
@@ -569,4 +697,89 @@ fn parse_time_of_day(s: &str) -> Option<(u32, u32, u32)> {
         return None;
     }
     Some((hh, mm, ss))
+}
+
+#[cfg(test)]
+mod ban_match_tests {
+    use super::*;
+
+    fn entry(as_type: &str, who: &str, until: &str) -> BanEntry {
+        BanEntry {
+            as_type: as_type.to_string(),
+            who: who.to_string(),
+            by: "test".to_string(),
+            reason: "test".to_string(),
+            at: epoch_to_rfc3339(now_epoch_secs()),
+            until: until.to_string(),
+        }
+    }
+
+    fn store_with(entries: Vec<BanEntry>) -> BanStore {
+        let store = BanStore::new();
+        for e in entries {
+            store.insert(e).expect("fixture insert");
+        }
+        store
+    }
+
+    #[test]
+    fn empty_store_bans_nobody() {
+        let store = BanStore::new();
+        assert!(!store.is_banned("any", Some("user"), Some("10.0.0.1")));
+        assert!(!store.is_banned("any", None, None));
+    }
+
+    #[test]
+    fn exact_kinds_match_by_value() {
+        let store = store_with(vec![
+            entry("clientid", "banned-id", "infinity"),
+            entry("username", "banned-user", "infinity"),
+            entry("peerhost", "192.0.2.7", "infinity"),
+        ]);
+        assert!(store.is_banned("banned-id", None, None));
+        assert!(!store.is_banned("other-id", None, None));
+        assert!(store.is_banned("other-id", Some("banned-user"), None));
+        assert!(!store.is_banned("other-id", Some("other-user"), None));
+        assert!(!store.is_banned("other-id", None, None));
+        assert!(store.is_banned("other-id", None, Some("192.0.2.7")));
+        assert!(!store.is_banned("other-id", None, Some("192.0.2.8")));
+        assert!(!store.is_banned("other-id", None, None));
+    }
+
+    #[test]
+    fn pattern_kinds_match() {
+        let store = store_with(vec![
+            entry("clientid_re", "^spam-", "infinity"),
+            entry("username_re", "bot$", "infinity"),
+            entry("peerhost_net", "10.9.0.0/16", "infinity"),
+        ]);
+        assert!(store.is_banned("spam-1", None, None));
+        assert!(!store.is_banned("ham-1", None, None));
+        assert!(store.is_banned("ham-1", Some("chatbot"), None));
+        assert!(!store.is_banned("ham-1", Some("human"), None));
+        assert!(!store.is_banned("ham-1", None, None));
+        assert!(store.is_banned("ham-1", None, Some("10.9.4.22")));
+        assert!(!store.is_banned("ham-1", None, Some("10.10.4.22")));
+        assert!(!store.is_banned("ham-1", None, None));
+    }
+
+    #[test]
+    fn invalid_patterns_and_bad_cidr_match_nobody() {
+        let store = store_with(vec![
+            entry("clientid_re", "([unclosed", "infinity"),
+            entry("peerhost_net", "10.9.0.0/33", "infinity"),
+        ]);
+        assert!(!store.is_banned("anything", Some("anyone"), Some("10.9.0.9")));
+    }
+
+    #[test]
+    fn expired_entries_match_nobody() {
+        let past = epoch_to_rfc3339(now_epoch_secs().saturating_sub(60));
+        let store = store_with(vec![
+            entry("clientid", "old-id", &past),
+            entry("username", "old-user", &past),
+            entry("peerhost", "192.0.2.9", &past),
+        ]);
+        assert!(!store.is_banned("old-id", Some("old-user"), Some("192.0.2.9")));
+    }
 }

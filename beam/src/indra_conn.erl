@@ -695,8 +695,12 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
     case indra_mqtt_codec:decode_connect(Payload) of
         {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive,
                username := User, password := Pass}} ->
+            %% The peer address rides the bind so the kernel can refuse
+            %% address-banned clients (B1-03); a bind without it simply
+            %% matches no address ban, never fails.
             Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive,
-                                                     {User, Pass}),
+                                                     {User, Pass},
+                                                     peer_ip_opt(Data)),
             case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
                 ok ->
                     Pending = #{client_id => ClientId, keepalive => Keepalive},
@@ -717,7 +721,8 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
 resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
               pending := #{client_id := ClientId, keepalive := Keepalive}} = Data) ->
     Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined}),
+                                             {undefined, undefined},
+                                             peer_ip_opt(Data)),
     case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
         ok ->
             {keep_state, Data#{seq => Seq + 1}};
@@ -726,6 +731,33 @@ resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
     end;
 resend_bind(Data) ->
     {keep_state, Data}.
+
+%% @private Client IP literal for the bind peer section (B1-03): the
+%% address the client socket came from, so the kernel can refuse
+%% address-banned clients. `undefined' when the socket is gone or the
+%% address cannot be read; the kernel then matches no address ban for
+%% this bind instead of failing it.
+peer_ip_opt(#{sock := Sock, sockmod := SockMod}) ->
+    peer_ip(Sock, SockMod);
+peer_ip_opt(_) ->
+    undefined.
+
+peer_ip(Sock, gen_tcp) ->
+    case catch inet:peername(Sock) of
+        {ok, {IP, _Port}} ->
+            list_to_binary(inet:ntoa(IP));
+        _ ->
+            undefined
+    end;
+peer_ip(Sock, ssl) ->
+    case catch ssl:peername(Sock) of
+        {ok, {IP, _Port}} ->
+            list_to_binary(inet:ntoa(IP));
+        _ ->
+            undefined
+    end;
+peer_ip(_, _) ->
+    undefined.
 
 handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_session_binding_meta(Meta) of
@@ -768,7 +800,8 @@ start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                client_id := ClientId, keepalive := Keepalive} = Data)
   when is_binary(ClientId) ->
     Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined}),
+                                             {undefined, undefined},
+                                             peer_ip_opt(Data)),
     case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
         ok ->
             {next_state, await_core, Data#{seq => Seq + 1,

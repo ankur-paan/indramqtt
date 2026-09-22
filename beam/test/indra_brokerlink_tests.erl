@@ -242,6 +242,47 @@ bind_meta_bad_credentials_rejected_test() ->
                  indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
                                                   {<<"alice">>, undefined})).
 
+bind_meta_peer_roundtrip_test() ->
+    %% Credentials plus peer address decode together (B1-03).
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"s3cret">>, maps:get(password, Dec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, Dec)),
+    %% Anonymous plus peer address decodes without credentials.
+    Anon = indra_brokerlink:encode_bind_meta(<<"dev-a">>, false, 30,
+                                            {undefined, undefined},
+                                            <<"2001:db8::1">>),
+    {ok, ADec} = indra_brokerlink:decode_bind_meta(Anon),
+    ?assertEqual(undefined, maps:get(username, ADec)),
+    ?assertEqual(undefined, maps:get(password, ADec)),
+    ?assertEqual(<<"2001:db8::1">>, maps:get(peerhost, ADec)),
+    %% Legacy binds decode with no peer address.
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"dev-l">>, true, 60)),
+    ?assertEqual(undefined, maps:get(peerhost, LDec)),
+    %% Undefined peer encodes exactly like /4.
+    ?assertEqual(indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                                  {<<"alice">>, <<"s3cret">>}),
+                 indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                                  {<<"alice">>, <<"s3cret">>},
+                                                  undefined)),
+    %% A non-IP peer literal is rejected at encode time.
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {undefined, undefined},
+                                                  <<"not-an-ip">>)),
+    %% A trailing section that is neither credentials nor a peer
+    %% address stays malformed: valid credentials followed by a
+    %% non-IP peer section.
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(
+                   <<0, 5, "dev-1", 1, 0, 60, 0, 5, "alice",
+                     0, 6, "s3cret", 0, 2, "zz">>)).
+
 bind_meta_malformed_rejected_test() ->
     ?assertEqual({error, malformed_bind_meta},
                  indra_brokerlink:decode_bind_meta(<<>>)),

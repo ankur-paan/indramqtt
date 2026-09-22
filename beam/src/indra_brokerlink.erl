@@ -42,6 +42,7 @@
 %% BrokerLink metadata contracts (Sprint 2: connection handshake).
 -export([encode_bind_meta/3,
          encode_bind_meta/4,
+         encode_bind_meta/5,
          decode_bind_meta/1,
          encode_session_binding_meta/3,
          decode_session_binding_meta/1]).
@@ -311,6 +312,11 @@ is_known_opcode(_) -> false.
 %% authenticated connects) is:
 %% {@code UserLen:16be | Username | PassLen:16be | Password}.
 %% Anonymous connects omit it entirely (existing encodings are unchanged).
+%% A peer-aware edge appends one trailing peer-address section
+%% {@code PeerLen:16be | PeerIp} carrying the client IP literal it saw on
+%% the socket (B1-03: drives the kernel `peerhost' / `peerhost_net'
+%% bans). Binds encoded before the peer section existed carry no trailing
+%% bytes and still decode with `peerhost' unset.
 %%
 %% SessionBinding meta (Opcode 16#0011, Rust -> BEAM):
 %% <pre>
@@ -319,14 +325,18 @@ is_known_opcode(_) -> false.
 %%   |                | (0 | 1)       | (0 = ok)   |
 %%   +----------------+---------------+------------+
 %% </pre>
-%% RC mirrors the MQTT 3.1.1 CONNACK return code (0 = accepted,
-%% 2 = identifier rejected).
+%% RC carries the kernel bind outcome: 0 = accepted, 2 = identifier
+%% rejected, plus the MQTT 5 style reason codes the edge maps to a
+%% 3.1.1 CONNACK (16#86 bad username/password, 16#87 not authorized,
+%% 16#8A banned, 16#8B quota exceeded; see
+%% `indra_mqtt_codec:connack_return_code/1').
 
 -type bind_meta() :: #{client_id := binary(),
                        clean_start := boolean(),
                        keepalive := 0..65535,
                        username := binary() | undefined,
-                       password := binary() | undefined}.
+                       password := binary() | undefined,
+                       peerhost := binary() | undefined}.
 -type session_binding_meta() :: #{session_id := non_neg_integer(),
                                   session_present := boolean(),
                                   return_code := 0..255}.
@@ -359,6 +369,35 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, {User, Pass})
 encode_bind_meta(_, _, _, _) ->
     erlang:error(badarg).
 
+%% @doc Encode BindConnection metadata with credentials and the client
+%% peer address. Pass `undefined' for the peer to encode exactly like
+%% {@link encode_bind_meta/4} (pre-peer format, still accepted by the
+%% kernel with no address bans matched). A binary peer must be an IP
+%% literal; anything else is rejected.
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, undefined) ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp)
+  when is_binary(PeerIp) ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds),
+    true = (byte_size(PeerIp) > 0) orelse erlang:error(badarg),
+    true = (byte_size(PeerIp) =< 65535) orelse erlang:error(badarg),
+    true = is_peer_ip(PeerIp) orelse erlang:error(badarg),
+    <<Base/binary, (byte_size(PeerIp)):16/big, PeerIp/binary>>;
+encode_bind_meta(_, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @private True when the binary is an IP literal (v4 or v6).
+is_peer_ip(PeerIp) when is_binary(PeerIp) ->
+    case catch inet:parse_address(binary_to_list(PeerIp)) of
+        {ok, _} -> true;
+        _ -> false
+    end;
+is_peer_ip(_) ->
+    false.
+
 %% @doc Decode BindConnection metadata.
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
@@ -368,15 +407,17 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
                    clean_start => (Flags band 16#01) =:= 16#01,
                    keepalive => Keepalive,
                    username => undefined,
-                   password => undefined}};
-        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Creds/binary>> ->
-            case decode_bind_creds(Creds) of
-                {ok, User, Pass} ->
+                   password => undefined,
+                   peerhost => undefined}};
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
+            case decode_bind_creds(Tail) of
+                {ok, User, Pass, Peer} ->
                     {ok, #{client_id => ClientId,
                            clean_start => (Flags band 16#01) =:= 16#01,
                            keepalive => Keepalive,
                            username => User,
-                           password => Pass}};
+                           password => Pass,
+                           peerhost => Peer}};
                 {error, _} = Err ->
                     Err
             end;
@@ -386,20 +427,53 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
 decode_bind_meta(_) ->
     {error, malformed_bind_meta}.
 
+%% @private Decode the trailing sections after the fixed bind header:
+%% a credentials section, optionally followed by a peer-address
+%% section; or, for an anonymous bind from a peer-aware edge, just the
+%% peer section. A trailing section that is neither valid credentials
+%% nor a valid peer address is malformed, exactly as trailing garbage
+%% was before the peer section existed.
 decode_bind_creds(<<ULen:16/big, Rest/binary>>) ->
     case Rest of
         <<User:ULen/binary, PLen:16/big, PassRest/binary>> ->
             case PassRest of
                 <<Pass:PLen/binary>> when PLen > 0 ->
-                    {ok, User, Pass};
+                    {ok, User, Pass, undefined};
+                <<Pass:PLen/binary, PeerTail/binary>> when PLen > 0 ->
+                    case decode_peer_section(PeerTail) of
+                        {ok, Peer} ->
+                            {ok, User, Pass, Peer};
+                        error ->
+                            {error, malformed_bind_meta}
+                    end;
                 _ ->
                     {error, malformed_bind_meta}
             end;
         _ ->
-            {error, malformed_bind_meta}
+            case decode_peer_section(<<ULen:16/big, Rest/binary>>) of
+                {ok, Peer} ->
+                    {ok, undefined, undefined, Peer};
+                error ->
+                    {error, malformed_bind_meta}
+            end
     end;
 decode_bind_creds(_) ->
     {error, malformed_bind_meta}.
+
+%% @private Decode one peer-address section `PeerLen:16be | PeerIp':
+%% exactly those bytes and an IP literal, otherwise `error'.
+decode_peer_section(<<PLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<Peer:PLen/binary>> ->
+            case is_peer_ip(Peer) of
+                true -> {ok, Peer};
+                false -> error
+            end;
+        _ ->
+            error
+    end;
+decode_peer_section(_) ->
+    error.
 
 %% @doc Encode SessionBinding metadata for the given session outcome.
 -spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255) -> binary().

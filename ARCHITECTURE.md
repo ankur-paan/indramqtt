@@ -2,7 +2,7 @@
 
 **IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is a distributed, ultra-concurrent MQTT messaging and streaming platform designed for hyper-scale cloud deployments and mission-critical industrial edge systems.
 
-This document details the internal design, concurrency models, data flows, and layer decoupling that enable IndraMQTT to achieve **>3M msg/sec** routing throughput, **<15 MB RSS** idle memory footprint, and **zero TCP disconnects** across kernel restarts.
+This document details the internal design, concurrency models, data flows, and layer decoupling of IndraMQTT. Routing and rule evaluation are measured by in-process microbenchmarks in `crates/broker-node/benches/broker_throughput.rs`: `bench_router_match_throughput` reports ~3.05M hit-path lookups/sec across 1,000 installed filters (3 targets) and ~7.80M fast-miss lookups/sec single-threaded, and `bench_sql_ingress_throughput` reports ~4.77M events/sec single-threaded with 100 percent sink delivery; these are function-call rates, not end-to-end network throughput (end-to-end loopback measurements live in `benchmark_suite/benchmark_results_v5.json`). Restart immunity (the edge holds the client socket in `await_core` and rebinds without a disconnect) is proven only for a single loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget). No idle-RSS benchmark is committed in-tree, so no idle footprint figure is claimed here.
 
 ---
 
@@ -15,7 +15,7 @@ graph TB
     subgraph Clients[MQTT Edge Clients]
         TCP_CLI[MQTT Clients :1883]
         TLS_CLI[MQTTS Clients :8883]
-        WS_CLI[WebSocket Clients :8083]
+        WS_CLI[WebSocket Test Console :18083 /ws/mqtt]
     end
 
     subgraph BEAM[Layer 1: BEAM Network Appliance - Erlang/OTP 26+]
@@ -67,7 +67,8 @@ In legacy brokers (e.g., HiveMQ, VerneMQ, Mosquitto), a broker node restart or s
 In IndraMQTT:
 - The **BEAM Network Appliance** (Erlang/OTP) owns client sockets, TLS sessions, packet framing, and keepalives. It has no business logic, no distributed database, and no rule engine.
 - The **Rust Core Engine** owns the canonical session, subscription state, inflight QoS tracking, offline queues, and rule engines.
-- If the Rust core restarts or upgrades, the BEAM edge buffers uncommitted frames, maintains open client TCP/TLS sockets, and re-binds active sessions in **< 200 ms** upon core resumption. **Result: Zero client disconnects.**
+- **Protocol scope**: the edge speaks MQTT v3.1.1 only (`decode_connect` in `beam/src/indra_mqtt_codec.erl` accepts protocol level 4 and rejects level 5 as `unsupported_protocol`); MQTT v5 is not supported yet. TLS is the edge `ssl` transport (proven by `tls_connect_connack_test` in `beam/test/indra_listener_tests.erl`). MQTT-over-WebSocket is a dashboard test console on the API port (`/ws/mqtt` in `crates/broker-api/src/ws.rs`), not an edge listener on `:8083`.
+- If the Rust core restarts or upgrades, the BEAM edge buffers uncommitted frames, maintains open client TCP/TLS sockets, and re-binds active sessions upon core resumption. Recovery within 500 ms without a client TCP disconnect is proven only for a single loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl`; this is not a multi-client production restart measurement.
 
 ```mermaid
 sequenceDiagram
@@ -88,7 +89,7 @@ sequenceDiagram
     Client->>BEAM: PUBLISH (QoS 1)
     BEAM->>BEAM: Buffer frame in edge ring buffer
 
-    Note over Rust: Rust Kernel Resumed (<200 ms)
+    Note over Rust: Rust Kernel Resumed (500 ms test budget)
     BEAM->>Rust: BrokerLink::RebindAllSessions()
     Rust-->>BEAM: BrokerLink::RebindAck()
     BEAM->>Rust: Flush buffered PUBLISH frames
@@ -109,8 +110,8 @@ Communication between the BEAM edge and Rust core occurs over **BrokerLink**, a 
 ### 3. Lock-Free Radix Trie Subscription Router
 The subscription router in `crates/broker-router` is optimized for zero memory allocations on hit paths:
 * **Segment Tokens**: Subscription filters (`device/+/temperature`, `sensors/#`, `$share/group1/data`) are parsed into token slices stored with zero-allocation `Arc<str>` and fast hashing (`ahash`).
-* **Fast-Miss Traversal**: Walk-only branch evaluation sustains **7.80M msg/sec** on fast-miss lookups.
-* **Hit-Path Saturation**: Evaluates exact and wildcard subscriptions at **3.05M msg/sec** under 1,000 active concurrent topic filters.
+* **Fast-Miss Traversal**: Walk-only branch evaluation sustains **~7.80M ± 0.20M lookups/sec** on fast-miss lookups in the in-process single-threaded microbenchmark `bench_router_match_throughput` in `crates/broker-node/benches/broker_throughput.rs`; not end-to-end network throughput.
+* **Hit-Path Saturation**: Evaluates exact and wildcard subscriptions at **~3.05M ± 0.10M lookups/sec** across 1,000 installed filters (3 targets per lookup) in the in-process single-threaded microbenchmark `bench_router_match_throughput` in `crates/broker-node/benches/broker_throughput.rs`; not end-to-end network throughput.
 
 ---
 
@@ -120,7 +121,7 @@ IndraMQTT embeds the [`rekuiper-sql`](https://github.com/ankur-paan/rekuiper) st
 ```mermaid
 graph LR
     MQTT_PUB[MQTT Ingress Publish] --> EVAL{Rule Engine}
-    EVAL -->|Stateless Rule| HOTPATH[Inline Evaluator - 4.77M events/sec]
+    EVAL -->|Stateless Rule| HOTPATH[Inline Evaluator - 4.77M events/sec microbenchmark]
     EVAL -->|Stateful Window| WORKER[Background WindowWorker Tokio Task]
     
     HOTPATH --> DISPATCH[Action Dispatcher]
@@ -131,8 +132,8 @@ graph LR
 ```
 
 * **Stateless Rules (Community Tier)**:
-  - 185 scalar functions (trigonometry, math, bitwise, string, datetime, conditionals).
-  - Evaluated inline on the ingress thread with zero task spawns and zero network loopback at **>4.77M events/sec**.
+  - 185 scalar functions (trigonometry, math, bitwise, string, datetime, conditionals; catalog length asserted by `test_function_catalog_has_185_entries` in `crates/broker-rules/src/lib.rs`).
+  - Evaluated inline on the ingress thread with zero task spawns and zero network loopback at **~4.77M ± 0.10M events/sec** in the in-process single-threaded microbenchmark `bench_sql_ingress_throughput` in `crates/broker-node/benches/broker_throughput.rs` (JSON parsing plus `WHERE`/`SELECT` with `Block` backpressure and 100 percent sink delivery); not end-to-end network throughput.
 * **Stateful Window Operators (Enterprise Tier)**:
   - `TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW`, `COUNTWINDOW`.
   - Dedicated background Tokio worker tasks with interval bounds injection (`window_start()`, `window_end()`).
@@ -160,6 +161,7 @@ pub trait Sink: Send + Sync {
 
 * **Micro-Batching & Backoff**: Standardized using shared `BatchQueue` and `BackoffState` helpers.
 * **Zero External Dependencies in Tests**: All unit and integration tests execute against in-memory mock transports (`MemoryKafkaTransport`, `MockS3Transport`, `MockHttpTransport`, `MemoryDiskLogWriter`, etc.).
+* **Capability & Qualification**: See `crates/broker-connectors/CAPABILITY.md` for what each sink actually speaks and what it was tested against; no sink in this tree has been qualified against a real vendor server.
 
 ---
 

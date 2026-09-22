@@ -20,6 +20,7 @@ pub mod azure_iot;
 pub mod bigquery;
 pub mod cassandra;
 pub mod clickhouse;
+pub mod cloud_tls;
 pub mod cockroachdb;
 pub mod confluent;
 pub mod couchbase;
@@ -69,7 +70,7 @@ pub use alloydb::{
 pub use aws_iot::{
     shadow_update_document, sign_websocket_url, AwsIotAuth, AwsIotConfig, AwsIotConnector,
     AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping,
-    MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TcpAwsIotTransport,
+    MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TlsAwsIotTransport,
 };
 pub use azure_blob::{
     azure_error_code, canonicalized_resource, classify_blob_status, shared_key_authorization,
@@ -86,7 +87,7 @@ pub use azure_iot::{
     d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token, AzureIotAuth,
     AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink,
     AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport,
-    TcpAzureIotTransport, TwinTopics,
+    TlsAzureIotTransport, TwinTopics,
 };
 pub use bigquery::{
     classify_insert_errors, render_insert_body as render_bigquery_body, BigQueryConnector,

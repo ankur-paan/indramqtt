@@ -4,9 +4,11 @@
 //! Core topics (with `${client_id}` substitution), telemetry wraps
 //! into Device Shadow documents on demand, and SigV4 signs WebSocket
 //! URLs (`GET /mqtt`, service `iotdevicegateway`, ALPN `mqtt`) via
-//! the shared signer. X.509 mutual TLS is validated at config time
-//! (PEM shape); the live TLS handshake belongs to the deployment's
-//! transport.
+//! the shared signer. MQTT travels over TLS with mutual X.509
+//! authentication: the client certificate/key come from
+//! configuration, the server chain verifies against the configured
+//! CA bundle plus the platform roots, and ALPN negotiates `mqtt`
+//! where the endpoint requires it.
 //!
 //! Throttling (429 / `TooManyRequestsException`) and disconnects
 //! retry with backoff; authorization rejections (`Unauthorized` /
@@ -21,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+use super::cloud_tls;
 use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// AWS IoT authentication mode.
@@ -154,6 +157,18 @@ fn default_batch_size() -> Option<usize> {
     Some(250)
 }
 
+fn default_connect_timeout_ms() -> Option<u64> {
+    Some(5000)
+}
+
+fn default_handshake_timeout_ms() -> Option<u64> {
+    Some(5000)
+}
+
+fn default_aws_alpn() -> Option<Vec<String>> {
+    Some(vec!["mqtt".to_string()])
+}
+
 /// AWS IoT bridge configuration. Buffering is unbounded by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwsIotConfig {
@@ -187,6 +202,20 @@ pub struct AwsIotConfig {
     /// Request timeout in ms (default 5000).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// TCP connect timeout in ms (default 5000).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: Option<u64>,
+    /// TLS handshake timeout in ms (default 5000).
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: Option<u64>,
+    /// Extra CA bundle PEM for server verification, in addition to
+    /// the platform roots and (for mTLS) `auth.ca_cert_pem`.
+    #[serde(default)]
+    pub ca_bundle_pem: Option<String>,
+    /// ALPN protocols offered during the handshake (`Some(["mqtt"])`
+    /// by default; `Some([])` disables ALPN).
+    #[serde(default = "default_aws_alpn")]
+    pub alpn_protocols: Option<Vec<String>>,
 }
 
 fn default_max_retries() -> Option<usize> {
@@ -202,12 +231,36 @@ impl AwsIotConfig {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
     }
 
+    /// TCP connect timeout (default 5000 ms).
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// TLS handshake timeout (default 5000 ms).
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// Effective ALPN protocols (`None` means the default `["mqtt"]`).
+    pub fn effective_alpn(&self) -> Vec<String> {
+        self.alpn_protocols
+            .clone()
+            .unwrap_or_else(|| vec!["mqtt".to_string()])
+    }
+
+    /// Split `endpoint` into host/port (default 8883).
+    pub fn host_port(&self) -> Result<(String, u16)> {
+        cloud_tls::parse_host_port(&self.endpoint, 8883)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "aws-iot endpoint must not be empty".to_string(),
             ));
         }
+        // Endpoint must parse to a concrete host/port now (TLS dials it).
+        self.host_port()?;
         if self.region.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "aws-iot region must not be empty".to_string(),
@@ -219,6 +272,13 @@ impl AwsIotConfig {
             ));
         }
         self.auth.validate()?;
+        if let Some(bundle) = &self.ca_bundle_pem {
+            if !bundle.trim().is_empty() && !bundle.contains("BEGIN CERTIFICATE") {
+                return Err(ConnectorError::Dispatch(
+                    "aws-iot ca_bundle_pem is not a PEM document".to_string(),
+                ));
+            }
+        }
         if self.topic_mappings.is_empty() {
             return Err(ConnectorError::Dispatch(
                 "aws-iot topic_mappings must not be empty".to_string(),
@@ -470,55 +530,127 @@ impl AwsIotTransport for MockAwsIotTransport {
     }
 }
 
-/// TCP loopback transport: MQTT PUBLISH framing over a plain socket
-/// (mTLS terminates in front of it in production). Used by the
-/// loopback test through the shared mqtt_bridge codec.
-pub struct TcpAwsIotTransport {
+/// TLS transport: MQTT over mutual-TLS to AWS IoT Core (port 8883
+/// by default). The TCP socket is only ever used as the underlay for
+/// the TLS handshake; there is no cleartext MQTT path. SigV4
+/// (WebSocket auth on port 443) cannot do MQTT on 8883: construction
+/// succeeds so management validation stays offline, but `connect`
+/// fails loudly without opening any socket.
+pub struct TlsAwsIotTransport {
     host: String,
     port: u16,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
+    client_id: String,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    io_timeout: Duration,
+    stream: tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>,
 }
 
-impl TcpAwsIotTransport {
-    pub fn new(endpoint: &str) -> Result<Self> {
-        let rest = endpoint.trim();
-        if rest.is_empty() {
-            return Err(ConnectorError::Dispatch(
-                "aws-iot endpoint must not be empty".to_string(),
-            ));
-        }
-        // `{prefix}-ats.iot.{region}.amazonaws.com[:port]` or bare host.
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((host, port)) if !port.contains('.') => {
-                let port: u16 = port.parse().map_err(|_| {
-                    ConnectorError::Dispatch(format!("aws-iot bad port in {rest:?}"))
-                })?;
-                (host, port)
-            }
-            _ => (rest, 8883),
-        };
-        Ok(Self {
-            host: host.to_string(),
+impl TlsAwsIotTransport {
+    pub fn new(config: &AwsIotConfig) -> Result<Self> {
+        config.validate()?;
+        let (host, port) = config.host_port()?;
+        let common = (
+            host,
             port,
-            stream: tokio::sync::Mutex::new(None),
-        })
+            config.client_id.clone(),
+            config.connect_timeout(),
+            config.handshake_timeout(),
+            config.timeout(),
+        );
+        match &config.auth {
+            AwsIotAuth::Mtls {
+                ca_cert_pem,
+                client_cert_pem,
+                client_key_pem,
+            } => {
+                let chain = cloud_tls::certs_from_pem(client_cert_pem).map_err(|e| {
+                    ConnectorError::Dispatch(format!("aws-iot client certificate rejected: {e}"))
+                })?;
+                let key = cloud_tls::private_key_from_pem(client_key_pem).map_err(|e| {
+                    ConnectorError::Dispatch(format!("aws-iot client key rejected: {e}"))
+                })?;
+                let roots =
+                    cloud_tls::root_store_with(ca_pem_combine(config, ca_cert_pem).as_deref())?;
+                let tls =
+                    cloud_tls::client_config(roots, Some((chain, key)), &config.effective_alpn())?;
+                Ok(Self {
+                    host: common.0,
+                    port: common.1,
+                    client_id: common.2,
+                    tls: Some(tls),
+                    connect_timeout: common.3,
+                    handshake_timeout: common.4,
+                    io_timeout: common.5,
+                    stream: tokio::sync::Mutex::new(None),
+                })
+            }
+            AwsIotAuth::SigV4 { .. } => Ok(Self {
+                host: common.0,
+                port: common.1,
+                client_id: common.2,
+                tls: None,
+                connect_timeout: common.3,
+                handshake_timeout: common.4,
+                io_timeout: common.5,
+                stream: tokio::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    fn connect_frame(&self) -> Result<Vec<u8>> {
+        cloud_tls::encode_mqtt_connect(&self.client_id, true, 60, None, None)
+    }
+}
+
+fn ca_pem_combine<'a>(config: &'a AwsIotConfig, mtls_ca: &'a str) -> Option<String> {
+    let mut combined = String::new();
+    if !mtls_ca.trim().is_empty() {
+        combined.push_str(mtls_ca);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    if let Some(bundle) = &config.ca_bundle_pem {
+        if !bundle.trim().is_empty() {
+            combined.push_str(bundle);
+            if !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+        }
+    }
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
     }
 }
 
 #[async_trait]
-impl AwsIotTransport for TcpAwsIotTransport {
+impl AwsIotTransport for TlsAwsIotTransport {
     async fn connect(&self) -> Result<()> {
         if self.stream.lock().await.is_some() {
             return Ok(());
         }
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
+        let tls = self.tls.clone().ok_or_else(|| {
+            ConnectorError::Dispatch(
+                "aws-iot SigV4 is WebSocket auth on port 443; MQTT over TLS needs \
+                 mTLS client credentials and has no plain-text fallback"
+                    .to_string(),
+            )
+        })?;
+        let mut stream = cloud_tls::tls_dial(
+            &self.host,
+            self.port,
+            tls,
+            self.connect_timeout,
+            self.handshake_timeout,
+            "aws-iot",
         )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("aws-iot connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("aws-iot connect failed: {e}")))?;
+        .await?;
+        let connect = self.connect_frame()?;
+        cloud_tls::mqtt_connect_over_tls(&mut stream, &connect, "aws-iot", self.io_timeout).await?;
         *self.stream.lock().await = Some(stream);
         Ok(())
     }
@@ -536,9 +668,9 @@ impl AwsIotTransport for TcpAwsIotTransport {
         let stream = guard
             .as_mut()
             .ok_or_else(|| ConnectorError::Connection("aws-iot not connected".to_string()))?;
-        stream
-            .write_all(&bytes)
+        tokio::time::timeout(self.io_timeout, stream.write_all(&bytes))
             .await
+            .map_err(|_| ConnectorError::Connection("aws-iot publish timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
         Ok(())
     }
@@ -787,6 +919,10 @@ mod tests {
             linger_ms: Some(50),
             max_retries: Some(5),
             timeout_ms: None,
+            connect_timeout_ms: None,
+            handshake_timeout_ms: None,
+            ca_bundle_pem: None,
+            alpn_protocols: None,
         }
     }
 
@@ -1017,24 +1153,147 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
     }
 
+    #[test]
+    fn test_no_plain_socket_path() {
+        // The module must not contain a cleartext MQTT path: the only
+        // TCP dial lives in the shared TLS helper, and SigV4 without
+        // mTLS is a dispatch error, never a fallback. The needle is
+        // built at runtime so this assertion does not match itself.
+        let source = include_str!("aws_iot.rs");
+        let needle = ["TcpStream", "connect"].join("::");
+        assert!(
+            !source.contains(&needle),
+            "aws-iot must not open a plain socket"
+        );
+        let deferred = ["terminates in front", "of it"].join(" ");
+        assert!(
+            !source.contains(&deferred),
+            "aws-iot must not defer TLS to deployment"
+        );
+    }
+
     #[tokio::test]
-    async fn test_loopback_publish_framing() {
-        use tokio::io::AsyncReadExt;
+    async fn test_tls_transport_needs_mtls() {
+        // SigV4 credentials cannot do MQTT over TLS on 8883: fail
+        // loudly at connect time instead of falling back to
+        // cleartext. Construction stays offline so management
+        // validation never dials.
+        let mut config = test_config();
+        config.endpoint = "127.0.0.1:8883".to_string();
+        let transport = TlsAwsIotTransport::new(&config).unwrap();
+        match transport.connect().await {
+            Err(ConnectorError::Dispatch(message)) => {
+                assert!(message.contains("no plain-text fallback"));
+            }
+            _ => panic!("SigV4 must not connect over MQTT"),
+        }
+    }
+
+    #[test]
+    fn test_tls_timeouts_and_alpn_defaults() {
+        let config = test_config();
+        assert_eq!(
+            config.connect_timeout(),
+            Duration::from_millis(5000),
+            "connect default must stay 5000 ms"
+        );
+        assert_eq!(
+            config.handshake_timeout(),
+            Duration::from_millis(5000),
+            "handshake default must stay 5000 ms"
+        );
+        assert_eq!(config.effective_alpn(), vec!["mqtt".to_string()]);
+        let mut custom = test_config();
+        custom.connect_timeout_ms = Some(1500);
+        custom.handshake_timeout_ms = Some(2500);
+        custom.alpn_protocols = Some(vec![]);
+        assert_eq!(custom.connect_timeout(), Duration::from_millis(1500));
+        assert_eq!(custom.handshake_timeout(), Duration::from_millis(2500));
+        assert!(custom.effective_alpn().is_empty());
+    }
+
+    const TEST_CA_PEM: &str = include_str!("../testdata/ca-cert.pem");
+    const TEST_SERVER_CERT_PEM: &str = include_str!("../testdata/server-cert.pem");
+    const TEST_SERVER_KEY_PEM: &str = include_str!("../testdata/server-key.pem");
+    const TEST_CLIENT_CERT_PEM: &str = include_str!("../testdata/client-cert.pem");
+    const TEST_CLIENT_KEY_PEM: &str = include_str!("../testdata/client-key.pem");
+
+    fn mtls_test_config(endpoint: &str) -> AwsIotConfig {
+        AwsIotConfig {
+            endpoint: endpoint.to_string(),
+            region: "us-east-1".to_string(),
+            client_id: "edge-gateway-1".to_string(),
+            auth: AwsIotAuth::Mtls {
+                ca_cert_pem: TEST_CA_PEM.to_string(),
+                client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
+                client_key_pem: TEST_CLIENT_KEY_PEM.to_string(),
+            },
+            topic_mappings: vec![BridgeTopicMapping {
+                local_topic: "devices/+/telemetry".to_string(),
+                remote_topic: "$aws/things/${client_id}/telemetry".to_string(),
+                direction: BridgeDirection::LocalToRemote,
+            }],
+            shadow_sync: None,
+            batch_size: Some(10),
+            buffer_capacity: None,
+            linger_ms: Some(50),
+            max_retries: Some(1),
+            timeout_ms: Some(2000),
+            connect_timeout_ms: Some(2000),
+            handshake_timeout_ms: Some(2000),
+            ca_bundle_pem: None,
+            alpn_protocols: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_and_publish() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
+        let server_config = crate::cloud_tls::test_certs::server_config(
+            TEST_SERVER_CERT_PEM,
+            TEST_SERVER_KEY_PEM,
+            Some(TEST_CA_PEM),
+        )
+        .expect("test server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            // Mutual TLS negotiated ALPN `mqtt`.
+            let negotiated = tls.get_ref().1.alpn_protocol().map(|v| v.to_vec());
+            assert_eq!(negotiated, Some(b"mqtt".to_vec()));
+            let (client_id, username, password) = crate::cloud_tls::read_client_connect(&mut tls)
+                .await
+                .expect("read CONNECT");
+            assert_eq!(client_id, "edge-gateway-1");
+            assert_eq!(username, None);
+            assert_eq!(password, None);
+            tls.write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("CONNACK");
             // One QoS 1 PUBLISH frame; decode through the shared codec.
             let mut head = [0u8; 1];
-            stream.read_exact(&mut head).await.expect("head");
+            tls.read_exact(&mut head).await.expect("head");
             assert_eq!(head[0], 0x32);
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.expect("len");
-            let mut rest = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut rest).await.expect("body");
-            let mut frame = vec![head[0], len[0]];
+            let mut len_buf = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                tls.read_exact(&mut byte).await.expect("len");
+                len_buf.push(byte[0]);
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            let (remaining, _) =
+                crate::mqtt_bridge::decode_remaining_length(&len_buf).expect("remaining");
+            let mut rest = vec![0u8; remaining];
+            tls.read_exact(&mut rest).await.expect("body");
+            let mut frame = vec![head[0]];
+            frame.extend_from_slice(&len_buf);
             frame.extend_from_slice(&rest);
             let decoded = crate::mqtt_bridge::decode_publish(&frame, false).expect("decode");
             assert_eq!(decoded.topic, "$aws/things/edge-gateway-1/telemetry");
@@ -1042,7 +1301,8 @@ mod tests {
             assert_eq!(decoded.payload, b"{\"temp\":21.5}");
         });
 
-        let transport = Arc::new(TcpAwsIotTransport::new(&format!("127.0.0.1:{port}")).unwrap());
+        let config = mtls_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAwsIotTransport::new(&config).unwrap());
         transport.connect().await.unwrap();
         transport
             .publish(&AwsIotFrame {
@@ -1054,9 +1314,35 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), server)
+        tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn test_plain_listener_cannot_complete_handshake() {
+        use tokio::net::TcpListener;
+
+        // A cleartext listener speaks no TLS: the client must fail the
+        // handshake instead of leaking MQTT in the clear.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncReadExt;
+            // Read whatever the client sends, then close without a
+            // ServerHello so the handshake cannot complete.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
+        });
+        let config = mtls_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAwsIotTransport::new(&config).unwrap());
+        let err = transport
+            .connect()
+            .await
+            .expect_err("plain listener must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        server.abort();
     }
 }

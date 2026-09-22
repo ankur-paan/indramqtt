@@ -20,7 +20,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::node_scope::resolve_node;
 use crate::ApiState;
@@ -59,7 +58,7 @@ fn node_record(state: &ApiState, node_name: &str) -> serde_json::Value {
         "role": "core",
         "uptime": 86400000,
         "version": "5.8.0",
-        "datetime": chrono_iso()
+        "datetime": node_datetime()
     })
 }
 
@@ -99,12 +98,10 @@ pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<Strin
     (StatusCode::OK, Json(node_record(&state, &node_name))).into_response()
 }
 
-fn chrono_iso() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("2026-09-13T21:{:02}:{:02}Z", (now / 60) % 60, now % 60)
+/// Current node time as a documented date-time, read once per request on
+/// the management plane (never on the message path).
+fn node_datetime() -> String {
+    crate::v5::retainer::format_rfc3339_ms(crate::v5::retainer::now_ms())
 }
 
 #[cfg(test)]
@@ -219,6 +216,24 @@ mod tests {
         assert!(
             message.contains("no-such-node"),
             "message names the unknown node: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn datetime_is_current_time_not_a_constant() {
+        let state = standalone_state();
+        let before = crate::v5::retainer::now_ms();
+        let (_, list_body) = response_body(list_nodes(State(state)).await).await;
+        let after = crate::v5::retainer::now_ms();
+        let datetime = list_body[0]
+            .get("datetime")
+            .and_then(|v| v.as_str())
+            .expect("node carries datetime");
+        assert_ne!(datetime, "2026-09-13T21:00:00Z");
+        let parsed = crate::v5::retainer::parse_rfc3339_ms(datetime).expect("datetime is RFC3339");
+        assert!(
+            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
+            "datetime {datetime} ({parsed}) must be the current time [{before}, {after}]"
         );
     }
 }

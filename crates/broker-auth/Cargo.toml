@@ -13,6 +13,12 @@ parking_lot = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ldap3 = "0.12"
+native-tls = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
+yamldap = "0.2"
+tempfile = "3"

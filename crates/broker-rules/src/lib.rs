@@ -4169,6 +4169,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     linger_ms: Some(10),
                     max_retries: Some(5),
                     timeout_ms: None,
+                    connect_timeout_ms: None,
+                    handshake_timeout_ms: None,
+                    ca_bundle_pem: None,
+                    alpn_protocols: None,
                 },
                 aws_transport.clone(),
             )
@@ -4196,6 +4200,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     linger_ms: Some(10),
                     max_retries: Some(5),
                     timeout_ms: None,
+                    connect_timeout_ms: None,
+                    handshake_timeout_ms: None,
+                    ca_bundle_pem: None,
+                    sas_ttl_secs: None,
                 },
                 azure_transport.clone(),
             )

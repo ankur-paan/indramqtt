@@ -27,6 +27,57 @@ pub struct ClientFilters {
     pub clientid: Option<String>,
 }
 
+/// Render one client session in the documented detail shape.
+///
+/// `connected_at` is the instant recorded where the session is already
+/// being written (creation, reconnect, bind), omitted for sessions that
+/// predate timestamp recording rather than substituted.
+fn client_detail_json(
+    client_id: &str,
+    session: Option<&std::sync::Arc<broker_session::Session>>,
+    is_connected: bool,
+    keepalive: u16,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(15);
+    map.insert("clientid".to_string(), serde_json::Value::from(client_id));
+    let username = session
+        .and_then(|s| s.username.read().clone())
+        .unwrap_or_else(|| client_id.to_string());
+    map.insert("username".to_string(), serde_json::Value::from(username));
+    map.insert(
+        "connected".to_string(),
+        serde_json::Value::from(is_connected),
+    );
+    map.insert(
+        "ip_address".to_string(),
+        serde_json::Value::from("127.0.0.1"),
+    );
+    map.insert("port".to_string(), serde_json::Value::from(54321));
+    map.insert("keepalive".to_string(), serde_json::Value::from(keepalive));
+    map.insert("proto_type".to_string(), serde_json::Value::from("MQTT"));
+    map.insert("proto_ver".to_string(), serde_json::Value::from(5));
+    map.insert("clean_start".to_string(), serde_json::Value::from(true));
+    map.insert("expiry_interval".to_string(), serde_json::Value::from(7200));
+    if let Some(ms) = session.and_then(|s| *s.connected_at_ms.read()) {
+        map.insert(
+            "connected_at".to_string(),
+            serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+        );
+    }
+    map.insert("is_bridge".to_string(), serde_json::Value::from(false));
+    map.insert("inflight_cnt".to_string(), serde_json::Value::from(0));
+    map.insert("awaiting_rel_cnt".to_string(), serde_json::Value::from(0));
+    map.insert(
+        "mqueue_len".to_string(),
+        serde_json::Value::from(session.map(|s| s.offline_len()).unwrap_or(0) as u64),
+    );
+    map.insert(
+        "node".to_string(),
+        serde_json::Value::from("indramqtt@127.0.0.1"),
+    );
+    serde_json::Value::Object(map)
+}
+
 pub async fn list_clients(
     State(state): State<ApiState>,
     params: PageParams,
@@ -75,24 +126,12 @@ pub async fn list_clients(
             .map(|s| *s.keepalive_secs.read())
             .unwrap_or(60);
 
-        data.push(serde_json::json!({
-            "clientid": cid,
-            "username": session.as_ref().and_then(|s| s.username.read().clone()).unwrap_or_else(|| cid.clone()),
-            "connected": is_connected,
-            "ip_address": "127.0.0.1",
-            "port": 54321,
-            "keepalive": keepalive,
-            "proto_type": "MQTT",
-            "proto_ver": 5,
-            "clean_start": true,
-            "expiry_interval": 7200,
-            "connected_at": "2026-09-13T21:00:00Z",
-            "is_bridge": false,
-            "inflight_cnt": 0,
-            "awaiting_rel_cnt": 0,
-            "mqueue_len": session.as_ref().map(|s| s.offline_len()).unwrap_or(0),
-            "node": "indramqtt@127.0.0.1"
-        }));
+        data.push(client_detail_json(
+            cid,
+            session.as_ref(),
+            *is_connected,
+            keepalive,
+        ));
     }
 
     (
@@ -130,24 +169,12 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "clientid": client_id,
-            "username": session.as_ref().and_then(|s| s.username.read().clone()).unwrap_or_else(|| client_id.clone()),
-            "connected": is_connected,
-            "ip_address": "127.0.0.1",
-            "port": 54321,
-            "keepalive": keepalive,
-            "proto_type": "MQTT",
-            "proto_ver": 5,
-            "clean_start": true,
-            "expiry_interval": 7200,
-            "connected_at": "2026-09-13T21:00:00Z",
-            "is_bridge": false,
-            "inflight_cnt": 0,
-            "awaiting_rel_cnt": 0,
-            "mqueue_len": session.as_ref().map(|s| s.offline_len()).unwrap_or(0),
-            "node": "indramqtt@127.0.0.1"
-        })),
+        Json(client_detail_json(
+            &client_id,
+            session.as_ref(),
+            is_connected,
+            keepalive,
+        )),
     )
         .into_response()
 }
@@ -636,6 +663,32 @@ pub async fn get_client_inflight(
         .into_response()
 }
 
+/// Render one offline-queue entry in the documented mqueue shape.
+///
+/// `publish_at` is the instant recorded where the message was already
+/// being written (offline queue insert), omitted for entries that predate
+/// timestamp recording rather than substituted.
+fn mqueue_entry_json(qm: &broker_session::QueuedMessage, msgid: String) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(5);
+    map.insert("msgid".to_string(), serde_json::Value::from(msgid));
+    map.insert(
+        "topic".to_string(),
+        serde_json::Value::from(qm.topic.as_str()),
+    );
+    map.insert("qos".to_string(), serde_json::Value::from(u8::from(qm.qos)));
+    map.insert(
+        "payload".to_string(),
+        serde_json::Value::from(String::from_utf8_lossy(&qm.payload).into_owned()),
+    );
+    if let Some(ms) = qm.publish_at_ms {
+        map.insert(
+            "publish_at".to_string(),
+            serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 pub async fn get_client_mqueue(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
@@ -662,15 +715,7 @@ pub async fn get_client_mqueue(
     let data: Vec<serde_json::Value> = page_items
         .iter()
         .enumerate()
-        .map(|(i, qm)| {
-            serde_json::json!({
-                "msgid": (start + i + 1).to_string(),
-                "topic": qm.topic.as_str(),
-                "qos": u8::from(qm.qos),
-                "payload": String::from_utf8_lossy(&qm.payload),
-                "publish_at": "2026-09-13T21:00:00Z"
-            })
-        })
+        .map(|(i, qm)| mqueue_entry_json(qm, (start + i + 1).to_string()))
         .collect();
     (
         StatusCode::OK,
@@ -873,6 +918,7 @@ fn build_publish_deliveries(
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
                                 payload: payload.clone(),
+                                publish_at_ms: None,
                             });
                             let evicted = (before + 1).saturating_sub(session.offline_len());
                             if evicted > 0 {
@@ -1096,6 +1142,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                     qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                     retain,
                                     payload: payload.clone(),
+                                    publish_at_ms: None,
                                 });
                                 let evicted = (before + 1).saturating_sub(session.offline_len());
                                 if evicted > 0 {
@@ -1325,4 +1372,126 @@ pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Respons
         }
     }
     (StatusCode::OK, Json(results)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn standalone_state() -> ApiState {
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        ApiState::standalone(engine)
+    }
+
+    async fn response_parts(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("client body is small and readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("client body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn mqueue_publish_at_is_queue_time_not_a_constant() {
+        use broker_protocol::{QoS, Topic};
+
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("b110-mqueue", false);
+        *session.connected.write() = false;
+        *session.conn_id.write() = None;
+
+        let before = crate::v5::retainer::now_ms();
+        session.push_offline(broker_session::QueuedMessage {
+            topic: Topic::new("conf/mqueue/b110").expect("valid topic"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: bytes::Bytes::from_static(b"hello-b110"),
+            publish_at_ms: None,
+        });
+        let after = crate::v5::retainer::now_ms();
+
+        let (status, body) = response_parts(
+            get_client_mqueue(
+                State(state),
+                Path("b110-mqueue".to_string()),
+                PageParams {
+                    page: 1,
+                    limit: 100,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = &body["data"][0];
+        let published = entry
+            .get("publish_at")
+            .and_then(|v| v.as_str())
+            .expect("queued entry carries publish_at");
+        assert_ne!(published, "2026-09-13T21:00:00Z");
+        assert_ne!(published, "2026-09-20T00:00:00Z");
+        let parsed =
+            crate::v5::retainer::parse_rfc3339_ms(published).expect("publish_at is RFC3339");
+        assert!(
+            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
+            "publish_at {published} ({parsed}) must be the queue time [{before}, {after}]"
+        );
+    }
+
+    #[test]
+    fn mqueue_entry_omits_publish_at_without_recorded_time() {
+        use broker_protocol::{QoS, Topic};
+
+        let qm = broker_session::QueuedMessage {
+            topic: Topic::new("conf/mqueue/legacy").expect("valid topic"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: bytes::Bytes::from_static(b"old"),
+            publish_at_ms: None,
+        };
+        let rendered = mqueue_entry_json(&qm, "1".to_string());
+        assert!(
+            rendered.get("publish_at").is_none(),
+            "entries predating timestamp recording must omit publish_at: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_at_is_bind_time_not_a_constant() {
+        let state = standalone_state();
+        let before = crate::v5::retainer::now_ms();
+        state.sessions.get_or_create("b110-conn", true);
+        let after = crate::v5::retainer::now_ms();
+
+        let (status, body) =
+            response_parts(get_client(State(state), Path("b110-conn".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let connected = body
+            .get("connected_at")
+            .and_then(|v| v.as_str())
+            .expect("client carries connected_at");
+        assert_ne!(connected, "2026-09-13T21:00:00Z");
+        let parsed =
+            crate::v5::retainer::parse_rfc3339_ms(connected).expect("connected_at is RFC3339");
+        assert!(
+            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
+            "connected_at {connected} ({parsed}) must be the bind time [{before}, {after}]"
+        );
+    }
+
+    #[test]
+    fn client_detail_omits_connected_at_without_recorded_time() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("b110-legacy", true);
+        *session.connected_at_ms.write() = None;
+        let rendered = client_detail_json("b110-legacy", Some(&session), true, 60);
+        assert!(
+            rendered.get("connected_at").is_none(),
+            "sessions predating timestamp recording must omit connected_at: {rendered}"
+        );
+    }
 }
