@@ -204,10 +204,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
     // macro recurses once per key and trips the compiler recursion limit
     // at this size, while a map insert per gauge stays flat.
     let mut body = serde_json::Map::with_capacity(24);
-    body.insert(
-        "channels.count".to_string(),
-        serde_json::Value::from(conns),
-    );
+    body.insert("channels.count".to_string(), serde_json::Value::from(conns));
     body.insert(
         "channels.max".to_string(),
         serde_json::Value::from(conns_max),
@@ -220,14 +217,8 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "connections.max".to_string(),
         serde_json::Value::from(conns_max),
     );
-    body.insert(
-        "delayed.count".to_string(),
-        serde_json::Value::from(0u64),
-    );
-    body.insert(
-        "delayed.max".to_string(),
-        serde_json::Value::from(0u64),
-    );
+    body.insert("delayed.count".to_string(), serde_json::Value::from(0u64));
+    body.insert("delayed.max".to_string(), serde_json::Value::from(0u64));
     body.insert(
         "live_connections.count".to_string(),
         serde_json::Value::from(conns),
@@ -252,10 +243,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "retained.max".to_string(),
         serde_json::Value::from(retained_max),
     );
-    body.insert(
-        "sessions.count".to_string(),
-        serde_json::Value::from(conns),
-    );
+    body.insert("sessions.count".to_string(), serde_json::Value::from(conns));
     body.insert(
         "sessions.max".to_string(),
         serde_json::Value::from(conns_max),
@@ -292,10 +280,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
         "subscriptions.shared.max".to_string(),
         serde_json::Value::from(0u64),
     );
-    body.insert(
-        "topics.count".to_string(),
-        serde_json::Value::from(topics),
-    );
+    body.insert("topics.count".to_string(), serde_json::Value::from(topics));
     body.insert(
         "topics.max".to_string(),
         serde_json::Value::from(topics_max),
@@ -315,10 +300,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
 /// store (one constant-time copy per request, kept exact by the kernel
 /// lifecycle points), with every value numeric and no work on the
 /// per-message path.
-pub async fn get_stats_node(
-    State(state): State<ApiState>,
-    Path(node): Path<String>,
-) -> Response {
+pub async fn get_stats_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
         && resolve_node(LEGACY_NODE_NAME, &node).is_err()
     {
@@ -617,10 +599,7 @@ pub async fn get_metrics(State(state): State<ApiState>) -> Response {
 /// numeric counters as [`get_metrics`] (same documented names, same
 /// monotonic counters), with one bounded counter-block copy per request
 /// and no work on the per-message path.
-pub async fn get_metrics_node(
-    State(state): State<ApiState>,
-    Path(node): Path<String>,
-) -> Response {
+pub async fn get_metrics_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
         && resolve_node(LEGACY_NODE_NAME, &node).is_err()
     {
@@ -817,8 +796,7 @@ mod tests {
             actions_messages: 12,
         };
         state.monitor.record(prev);
-        let (_, global) =
-            snapshot_body(monitor_current(State(state.clone())).await).await;
+        let (_, global) = snapshot_body(monitor_current(State(state.clone())).await).await;
         for known in [LEGACY_NODE_NAME, "indra-node-1"] {
             let response =
                 monitor_current_node(State(state.clone()), Path(known.to_string())).await;
@@ -849,8 +827,7 @@ mod tests {
     async fn node_snapshot_unknown_node_is_not_found() {
         let state = standalone_state();
         state.metrics.inc_messages_received();
-        let response =
-            monitor_current_node(State(state), Path("no-such-node".to_string())).await;
+        let response = monitor_current_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
@@ -903,8 +880,7 @@ mod tests {
         let (_, global) = snapshot_body(get_metrics(State(state.clone())).await).await;
         let global_map = global.as_object().expect("global metrics is a flat object");
         for known in [LEGACY_NODE_NAME, "indra-node-1"] {
-            let response =
-                get_metrics_node(State(state.clone()), Path(known.to_string())).await;
+            let response = get_metrics_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
             let node_map = body.as_object().expect("node metrics is a flat object");
@@ -918,8 +894,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing {name} for node {known}"));
                 assert!(value.is_number(), "{name} is numeric: {value:?}");
                 assert_eq!(
-                    value,
-                    &global_map[name],
+                    value, &global_map[name],
                     "{name} matches the global read for node {known}"
                 );
             }
@@ -930,8 +905,7 @@ mod tests {
     async fn node_metrics_unknown_node_is_not_found() {
         let state = standalone_state();
         state.metrics.inc_messages_received();
-        let response =
-            get_metrics_node(State(state), Path("no-such-node".to_string())).await;
+        let response = get_metrics_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
@@ -979,8 +953,7 @@ mod tests {
         state.stats.set_topics(2);
         state.stats.set_retained(1);
         for known in [LEGACY_NODE_NAME, "indra-node-1"] {
-            let response =
-                get_stats_node(State(state.clone()), Path(known.to_string())).await;
+            let response = get_stats_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
             assert!(
@@ -1035,11 +1008,7 @@ mod tests {
         state.stats.set_subscriptions(7);
         state.stats.set_topics(3);
         state.stats.set_retained(2);
-        let response = get_stats_node(
-            State(state.clone()),
-            Path("indra-node-1".to_string()),
-        )
-        .await;
+        let response = get_stats_node(State(state.clone()), Path("indra-node-1".to_string())).await;
         let (_, peak) = snapshot_body(response).await;
         assert_eq!(peak["connections.max"], serde_json::json!(5));
         assert_eq!(peak["subscriptions.max"], serde_json::json!(7));
@@ -1065,8 +1034,7 @@ mod tests {
     async fn node_stats_unknown_node_is_not_found() {
         let state = standalone_state();
         state.stats.set_connections(1);
-        let response =
-            get_stats_node(State(state), Path("no-such-node".to_string())).await;
+        let response = get_stats_node(State(state), Path("no-such-node".to_string())).await;
         let (status, body) = snapshot_body(response).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
