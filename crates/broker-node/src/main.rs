@@ -6,7 +6,9 @@ use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
-use broker_session::{InflightMessage, QueuedMessage, SessionManager};
+use broker_session::{
+    InflightMessage, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionManager,
+};
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -62,6 +64,16 @@ struct Args {
     /// always rejects unauthenticated clients.
     #[arg(long)]
     allow_anonymous: bool,
+
+    /// Per-subscriber QoS 0 egress backlog bound (D1-02). Each live
+    /// connection queues at most this many QoS 0 frames; past it the
+    /// oldest queued QoS 0 frame drops (counted via `egress_qos0_shed`,
+    /// labelled by client). QoS 1/2 never shed. Default 1000 matches
+    /// the detached offline bound and caps per-subscriber QoS 0 memory
+    /// near 1,000 small frames while absorbing a ~1 s burst at 1k
+    /// msg/s without drops.
+    #[arg(long, default_value_t = broker_router::DEFAULT_QOS0_BACKLOG)]
+    qos0_backlog: usize,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -538,10 +550,16 @@ async fn handle_connection(
     debug!("BrokerLink IPC connection from {}", peer);
 
     let transport = FramedTransport::new(stream);
-    // Mailbox for frames routed to this connection by other tasks
-    // (e.g. PublishOut fan-out). The sender is registered under our
-    // conn_id once the edge binds.
+    // Mailbox for guaranteed frames routed to this transport by other
+    // tasks (e.g. QoS 1/2 fan-out). QoS 0 rides the bounded
+    // per-subscriber backlog in `ConnTable` (D1-02) and is drained
+    // alongside this mailbox so a stalled subscriber sheds oldest-first
+    // without slowing publishers. The sender is registered under our
+    // conn_id once the edge binds. `waker` is this transport's directed
+    // QoS 0 wakeup: each bind points its slot at it so fan-out wakes
+    // exactly its owner (never the wrong shard).
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+    let waker = Arc::new(tokio::sync::Notify::new());
     // Identities bound on this transport. One BrokerLink connection
     // multiplexes every client of its edge shard, so a single slot only
     // remembers the last bind and a dead socket would leak the rest as
@@ -572,7 +590,48 @@ async fn handle_connection(
                     frame.header.opcode, frame.header.conn_id, frame.header.sequence_no
                 );
 
-                handle_inbound_frame(frame, &shared, &tx, &transport, &mut bound).await?;
+                handle_inbound_frame(frame, &shared, &tx, &transport, &mut bound, &waker).await?;
+                // Opportunistic egress: fan-out in the frame above may
+                // have queued QoS 0 for our own bound connections
+                // (self-delivery) while we were not waiting on the
+                // notify. Drain without waiting so a QoS-0-only burst
+                // never depends on winning a notify race.
+                if !bound.is_empty() {
+                    let mut rx_batch = Vec::new();
+                    let mut batch_bytes = 0usize;
+                    while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
+                        && batch_bytes < brokerlink::transport::MAX_BATCH_BYTES
+                    {
+                        match rx.try_recv() {
+                            Ok(frame) => {
+                                batch_bytes += frame.total_frame_len();
+                                rx_batch.push(frame);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let qos0_batch = drain_qos0_for_transport(
+                        &shared,
+                        &bound,
+                        brokerlink::transport::MAX_BATCH_FRAMES
+                            .saturating_sub(rx_batch.len()),
+                        brokerlink::transport::MAX_BATCH_BYTES
+                            .saturating_sub(batch_bytes),
+                    );
+                    if !rx_batch.is_empty() || !qos0_batch.is_empty() {
+                        let batch = merge_egress_batch(rx_batch, qos0_batch);
+                        let batch_len = batch.len() as u64;
+                        match transport.send_batch(&batch).await {
+                            Ok(()) => {
+                                shared.metrics.inc_transport_sent_by(batch_len);
+                            }
+                            Err(e) => {
+                                shared.metrics.inc_transport_send_failed();
+                                return Err(Box::new(e));
+                            }
+                        }
+                    }
+                }
             }
             outbound = rx.recv() => {
                 match outbound {
@@ -580,25 +639,38 @@ async fn handle_connection(
                         // PERF-05: flush once per poll. Coalesce what is
                         // already queued (non-blocking drain, bounded by
                         // frames and encoded bytes) into one write_all +
-                        // flush; order is arrival order. No artificial
-                        // delay: a lone frame sends immediately.
-                        let mut batch = vec![first];
+                        // flush; order is arrival order within each class.
+                        // Guaranteed frames come from `rx`, QoS 0 from the
+                        // bounded backlog; the merge restores per-destination
+                        // sequence order so mixed qualities never reorder a
+                        // subscriber. No artificial delay: a lone frame
+                        // sends immediately.
+                        let mut rx_batch = vec![first];
                         let mut batch_bytes =
-                            batch[0].total_frame_len();
-                        while batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
+                            rx_batch[0].total_frame_len();
+                        while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
                             && batch_bytes
                                 < brokerlink::transport::MAX_BATCH_BYTES
                         {
                             match rx.try_recv() {
                                 Ok(frame) => {
                                     batch_bytes += frame.total_frame_len();
-                                    batch.push(frame);
+                                    rx_batch.push(frame);
                                 }
                                 Err(_) => break,
                             }
                         }
+                        let qos0_batch = drain_qos0_for_transport(
+                            &shared,
+                            &bound,
+                            brokerlink::transport::MAX_BATCH_FRAMES
+                                .saturating_sub(rx_batch.len()),
+                            brokerlink::transport::MAX_BATCH_BYTES
+                                .saturating_sub(batch_bytes),
+                        );
+                        let batch = merge_egress_batch(rx_batch, qos0_batch);
                         // Egress stage 0: `messages_forwarded` counted
-                        // admission into this mailbox at `route()` time;
+                        // admission into the mailboxes at `route()` time;
                         // only a successful write counts as edge arrival.
                         let batch_len = batch.len() as u64;
                         match transport.send_batch(&batch).await {
@@ -612,14 +684,181 @@ async fn handle_connection(
                         }
                     }
                     None => {
-                        // All senders gone; nothing left to deliver.
+                        // Guaranteed senders gone; QoS 0 may still hold
+                        // queued frames for our bound connections: drain
+                        // what remains before detaching.
+                        let qos0_batch = drain_qos0_for_transport(
+                            &shared,
+                            &bound,
+                            brokerlink::transport::MAX_BATCH_FRAMES,
+                            brokerlink::transport::MAX_BATCH_BYTES,
+                        );
+                        if !qos0_batch.is_empty() {
+                            let batch_len = qos0_batch.len() as u64;
+                            match transport.send_batch(&qos0_batch).await {
+                                Ok(()) => {
+                                    shared.metrics.inc_transport_sent_by(batch_len);
+                                }
+                                Err(e) => {
+                                    shared.metrics.inc_transport_send_failed();
+                                    detach(&bound, &shared, &tx);
+                                    return Err(Box::new(e));
+                                }
+                            }
+                        }
                         detach(&bound, &shared, &tx);
                         return Ok(());
                     }
                 }
             }
+            () = waker.notified() => {
+                // QoS-0-only burst for our own bound connections (directed
+                // wakeup, never another shard's): drain both mailboxes in
+                // one batch so a QoS-0-only workload never sleeps.
+                let mut rx_batch = Vec::new();
+                let mut batch_bytes = 0usize;
+                while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
+                    && batch_bytes < brokerlink::transport::MAX_BATCH_BYTES
+                {
+                    match rx.try_recv() {
+                        Ok(frame) => {
+                            batch_bytes += frame.total_frame_len();
+                            rx_batch.push(frame);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if rx_batch.is_empty() {
+                    // Spurious wakeup with nothing for us (another
+                    // transport's connections): park again without a
+                    // socket write. Check cheaply whether any of our
+                    // connections actually holds QoS 0 before draining.
+                    let mut ours = false;
+                    for (_, conn_id) in &bound {
+                        if shared.conns.qos0_len(*conn_id) > 0 {
+                            ours = true;
+                            break;
+                        }
+                    }
+                    if !ours {
+                        continue;
+                    }
+                }
+                let qos0_batch = drain_qos0_for_transport(
+                    &shared,
+                    &bound,
+                    brokerlink::transport::MAX_BATCH_FRAMES
+                        .saturating_sub(rx_batch.len()),
+                    brokerlink::transport::MAX_BATCH_BYTES
+                        .saturating_sub(batch_bytes),
+                );
+                if rx_batch.is_empty() && qos0_batch.is_empty() {
+                    continue;
+                }
+                let batch = merge_egress_batch(rx_batch, qos0_batch);
+                let batch_len = batch.len() as u64;
+                match transport.send_batch(&batch).await {
+                    Ok(()) => {
+                        shared.metrics.inc_transport_sent_by(batch_len);
+                    }
+                    Err(e) => {
+                        shared.metrics.inc_transport_send_failed();
+                        return Err(Box::new(e));
+                    }
+                }
+            }
         }
     }
+}
+
+/// Drain QoS 0 backlogs for one transport's bound connections,
+/// round-robin so one stalled subscriber cannot starve a fast one on
+/// the same shard. Respects `max_frames` and `max_bytes` via the
+/// budget-aware drain in [`ConnTable`]; stops early when no connection
+/// makes progress. Never blocks; pops only what is queued.
+fn drain_qos0_for_transport(
+    shared: &Shared,
+    bound: &[(String, u64)],
+    max_frames: usize,
+    max_bytes: usize,
+) -> Vec<BrokerFrame> {
+    let mut out = Vec::new();
+    if max_frames == 0 || bound.is_empty() {
+        return out;
+    }
+    let mut out_bytes = 0usize;
+    // Round-robin one pass per connection per round: a full backlog on
+    // one connection fills at most its fair share of each batch.
+    loop {
+        if out.len() >= max_frames || out_bytes >= max_bytes {
+            break;
+        }
+        let mut progressed = false;
+        for (_, conn_id) in bound {
+            if out.len() >= max_frames || out_bytes >= max_bytes {
+                break;
+            }
+            let remaining_frames = max_frames - out.len();
+            let remaining_bytes = max_bytes.saturating_sub(out_bytes);
+            // Drain at most one frame per visit for fairness; the
+            // budget-aware drain still honours a single large frame.
+            let frames = shared.conns.drain_qos0_with_budget(
+                *conn_id,
+                remaining_frames.min(1),
+                remaining_bytes,
+            );
+            if frames.is_empty() {
+                // No backlog or budget spent for this connection.
+                // A single large frame with an empty batch still drains
+                // alone via the budget-aware path above (which returns
+                // it even when over budget); empty here means truly
+                // empty, so keep scanning the rest.
+                continue;
+            }
+            for frame in frames {
+                out_bytes += frame.total_frame_len();
+                out.push(frame);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
+/// Merge guaranteed (`rx`) and QoS 0 batches into one socket write
+/// while preserving per-destination order. Frames carry independent
+/// per-connection sequence numbers, so grouping by `conn_id` and
+/// sorting each group by `sequence_no` restores publish order for a
+/// subscriber that receives mixed qualities; cross-connection order is
+/// irrelevant (different subscribers). Groups emit in `conn_id` order
+/// for determinism.
+fn merge_egress_batch(
+    rx_batch: Vec<BrokerFrame>,
+    qos0_batch: Vec<BrokerFrame>,
+) -> Vec<BrokerFrame> {
+    if qos0_batch.is_empty() {
+        return rx_batch;
+    }
+    if rx_batch.is_empty() {
+        return qos0_batch;
+    }
+    use std::collections::HashMap;
+    let mut by_conn: HashMap<u64, Vec<BrokerFrame>> = HashMap::new();
+    for frame in rx_batch.into_iter().chain(qos0_batch) {
+        by_conn.entry(frame.header.conn_id).or_default().push(frame);
+    }
+    let mut conn_ids: Vec<u64> = by_conn.keys().copied().collect();
+    conn_ids.sort_unstable();
+    let mut out = Vec::new();
+    for conn_id in conn_ids {
+        let mut frames = by_conn.remove(&conn_id).unwrap_or_default();
+        frames.sort_by_key(|frame| frame.header.sequence_no);
+        out.extend(frames);
+    }
+    out
 }
 
 /// Detach a dead transport: forget its mailbox and detach every
@@ -688,6 +927,7 @@ async fn handle_inbound_frame<S>(
     tx: &UnboundedSender<BrokerFrame>,
     transport: &FramedTransport<S>,
     bound: &mut Vec<(String, u64)>,
+    waker: &Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -711,6 +951,15 @@ where
                 // One entry per bind: this transport multiplexes its whole
                 // shard, and death must detach every client on it.
                 if let Ok(req) = decode_bind_meta(&frame.metadata) {
+                    // D1-02: label the mailbox for per-client shed
+                    // accounting and point it at this transport's directed
+                    // wakeup. Short writes on bind only; the per-message
+                    // publish path reads them without new work beyond its
+                    // existing shard lock.
+                    shared
+                        .conns
+                        .set_client_label(frame.header.conn_id, &req.client_id);
+                    shared.conns.set_waker(frame.header.conn_id, waker);
                     bound.push((req.client_id.clone(), frame.header.conn_id));
                     // Auto-subscribe hook (W1-39): only on accepted binds.
                     // Per-connect cost only; fan-out takes no new lock.
@@ -791,6 +1040,37 @@ where
             // ignored: at-most-once PUBACKs from a previous incarnation
             // must never disturb live state.
             apply_puback(&frame, shared);
+        }
+        OpCode::PubRelIn => {
+            // D1-01 inbound second phase: route once, reply PUBCOMP.
+            let (comp, deliveries) = apply_qos2_pubrel(&frame, shared).await;
+            if let Some(comp) = comp {
+                transport.send(comp).await?;
+            }
+            let mut enqueued = 0u64;
+            let mut enqueued_bytes = 0u64;
+            for (conn_id, routed) in deliveries {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(conn_id, routed) {
+                    enqueued += 1;
+                    enqueued_bytes += len;
+                }
+            }
+            shared.metrics.inc_messages_forwarded_by(enqueued);
+            shared.metrics.inc_publish_sent_by(enqueued);
+            shared.metrics.inc_delivered_by(enqueued);
+            shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+        }
+        OpCode::PubRecIn => {
+            // D1-01 outbound second phase: the subscriber answered our
+            // QoS 2 PUBLISH; send PUBREL. Unknown ids are ignored.
+            if let Some(rel) = apply_qos2_pubrec(&frame, shared) {
+                transport.send(rel).await?;
+            }
+        }
+        OpCode::PubCompIn => {
+            // D1-01 outbound completion: release the packet id.
+            apply_qos2_pubcomp(&frame, shared);
         }
         OpCode::UnbindConnection => {
             apply_unbind(&frame, shared);
@@ -944,6 +1224,23 @@ async fn apply_subscribe(
                     None => 1u16,
                 }
             };
+            // D1-01: retained QoS 2 deliveries enter the two-phase
+            // exchange like live ones (QoS 1 retained keeps its existing
+            // untracked behaviour).
+            if effective == 2 {
+                if let Some(session) = &session {
+                    let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
+                        packet_id: downlink_id,
+                        topic: msg.topic.clone(),
+                        retain: true,
+                        payload: msg.payload.clone(),
+                        rec_received: false,
+                    });
+                    if !tracked {
+                        shared.metrics.inc_inflight_dropped();
+                    }
+                }
+            }
             let topic_str = msg.topic.as_str();
             let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
             meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -969,7 +1266,9 @@ async fn apply_subscribe(
 
 /// Replay a resumed durable session's backlog onto its new connection:
 /// unacknowledged QoS 1 downlinks first (T-31, DUP set, original order,
-/// same packet ids), then the offline queue of never-routed messages.
+/// same packet ids), then uncompleted QoS 2 downlinks (D1-01, in queued
+/// order: PUBLISH with DUP set while waiting for PUBREC, PUBREL while
+/// waiting for PUBCOMP), then the offline queue of never-routed messages.
 /// Runs after the `SessionBinding` reply so the edge always observes
 /// binding before backlog. Returns the replayed frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
@@ -1010,6 +1309,38 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             }
         }
     }
+    // D1-01: uncompleted QoS 2 downlinks replay in queued order. Waiting
+    // for PUBREC resends PUBLISH with DUP set and the same packet id;
+    // waiting for PUBCOMP resends PUBREL. Entries stay held until their
+    // PUBCOMP, so a second reconnect without completion replays again.
+    for held in session.qos2_outbound_snapshot() {
+        if held.rec_received {
+            if let Some(routed) = encode_pubrel_out(frame.header.conn_id, held.packet_id) {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(frame.header.conn_id, routed) {
+                    replayed_bytes += len;
+                    replayed += 1;
+                }
+            }
+        } else {
+            let topic_str = held.topic.as_str();
+            if let Some(routed) = encode_publish_out_with_dup(
+                frame.header.conn_id,
+                topic_str,
+                held.packet_id,
+                2,
+                held.retain,
+                true,
+                &held.payload,
+            ) {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(frame.header.conn_id, routed) {
+                    replayed_bytes += len;
+                    replayed += 1;
+                }
+            }
+        }
+    }
     for queued in session.drain_offline() {
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
@@ -1031,6 +1362,21 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             Bytes::from(meta),
             queued.payload.clone(),
         ) {
+            // QoS 2 offline replays become live QoS 2 downlinks needing
+            // PUBREC/PUBCOMP, so track them (QoS 1 offline replays keep
+            // their existing untracked behaviour).
+            if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
+                let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
+                    packet_id: downlink_id,
+                    topic: queued.topic.clone(),
+                    retain: queued.retain,
+                    payload: queued.payload.clone(),
+                    rec_received: false,
+                });
+                if !tracked {
+                    shared.metrics.inc_inflight_dropped();
+                }
+            }
             // Only replays that reached the live mailbox count; a dead
             // mailbox is already counted inside `ConnTable::route`, never
             // a delivery.
@@ -1092,7 +1438,9 @@ async fn apply_publish(
     shared.metrics.inc_messages_received();
 
     // ACL: the publisher is whoever owns this edge connection. Denied
-    // publishes die here (QoS 1 still gets its PubAck, stamped 0x87).
+    // publishes die here (QoS 1 still gets its PubAck, stamped 0x87;
+    // QoS 2 completes its handshake with PUBREC so the publisher never
+    // stalls, but nothing is stored and the later PUBREL routes nothing).
     if let Some(publisher) = shared.sessions.client_id_for_conn(frame.header.conn_id) {
         if shared
             .auth
@@ -1100,10 +1448,10 @@ async fn apply_publish(
             .await
             .is_err()
         {
-            let ack = if qos == QoS::AtLeastOnce {
-                pub_ack_reply(frame, packet_id, 0x87)
-            } else {
-                None
+            let ack = match qos {
+                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
+                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
+                QoS::AtMostOnce => None,
             };
             return (ack, Vec::new());
         }
@@ -1111,16 +1459,25 @@ async fn apply_publish(
 
     // Rate policing (INDRA-128): token bucket per publishing client,
     // configured per user. Over quota the message dies here — QoS 0 is
-    // dropped and counted, QoS 1 gets its PubAck stamped 0x97.
+    // dropped and counted, QoS 1 gets its PubAck stamped 0x97, QoS 2
+    // completes its handshake with PUBREC but stores nothing.
     if !check_publish_quota(frame, shared).await {
         shared.metrics.inc_messages_dropped();
         shared.metrics.inc_overload_dropped();
-        let ack = if qos == QoS::AtLeastOnce {
-            pub_ack_reply(frame, packet_id, 0x97)
-        } else {
-            None
+        let ack = match qos {
+            QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x97),
+            QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
+            QoS::AtMostOnce => None,
         };
         return (ack, Vec::new());
+    }
+
+    // QoS 2 inbound first phase (D1-01): record the packet id against the
+    // publisher session and reply PUBREC. A repeat of the same id before
+    // PUBREL is a duplicate: reply PUBREC again without storing or
+    // routing a second time. Nothing routes until PUBREL arrives.
+    if qos == QoS::ExactlyOnce {
+        return apply_qos2_publish(frame, shared, &topic_str, topic, packet_id, retain).await;
     }
 
     // Delayed delivery: ack now (the publisher must not stall), defer
@@ -1206,6 +1563,213 @@ async fn apply_delayed_publish(
         forward_cluster(&shared, &inner_topic, qos, &payload).await;
     });
     (ack, Vec::new())
+}
+
+/// QoS 2 inbound first phase (D1-01): store the publish against the
+/// publisher session and reply PUBREC. Duplicates (same packet id held)
+/// reply PUBREC without storing or routing again. A zero packet id or a
+/// missing session yields no reply; a full inbound window yields no
+/// reply so the publisher retries. Nothing routes here: routing waits
+/// for PUBREL.
+async fn apply_qos2_publish(
+    frame: &BrokerFrame,
+    shared: &Shared,
+    topic_str: &str,
+    topic: Topic,
+    packet_id: u16,
+    retain: bool,
+) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
+    if packet_id == 0 {
+        return (None, Vec::new());
+    }
+    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        Some(client_id) => client_id,
+        None => return (None, Vec::new()),
+    };
+    let session = match shared.sessions.get(&client_id) {
+        Some(session) => session,
+        None => return (None, Vec::new()),
+    };
+    if session.has_qos2_inbound(packet_id) {
+        return (qos2_reply(OpCode::PubRecOut, frame, packet_id), Vec::new());
+    }
+    let stored = session.store_qos2_inbound(
+        packet_id,
+        Qos2InboundEntry {
+            topic,
+            retain,
+            payload: frame.payload.clone(),
+        },
+    );
+    if !stored {
+        // Full window (not a duplicate, checked above): no PUBREC so the
+        // publisher retries instead of wedging the session.
+        return (None, Vec::new());
+    }
+    let _ = topic_str;
+    (qos2_reply(OpCode::PubRecOut, frame, packet_id), Vec::new())
+}
+
+/// QoS 2 inbound second phase (D1-01): on PUBREL route the stored message
+/// exactly once, reply PUBCOMP and release the packet id. Unknown packet
+/// ids reply PUBCOMP with no routing so a retried PUBREL never stalls.
+async fn apply_qos2_pubrel(
+    frame: &BrokerFrame,
+    shared: &Shared,
+) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
+    let packet_id = match decode_qos2_meta(&frame.metadata) {
+        Some(packet_id) => packet_id,
+        None => return (None, Vec::new()),
+    };
+    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        Some(client_id) => client_id,
+        None => return (None, Vec::new()),
+    };
+    let session = match shared.sessions.get(&client_id) {
+        Some(session) => session,
+        None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
+    };
+    let stored = match session.take_qos2_inbound(packet_id) {
+        Some(stored) => stored,
+        None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
+    };
+    // Delayed targets defer everything except the PUBCOMP: the publisher
+    // must not stall past the timer.
+    if let Some((delay_secs, inner)) = strip_delayed_prefix(stored.topic.as_str()) {
+        let comp = qos2_reply(OpCode::PubCompOut, frame, packet_id);
+        if delay_secs > MAX_DELAYED_SECS {
+            warn!(
+                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
+                delay_secs, MAX_DELAYED_SECS
+            );
+            return (comp, Vec::new());
+        }
+        let Ok(inner_topic) = Topic::new(inner.to_string()) else {
+            warn!("Dropping delayed QoS 2 publish with bad inner topic");
+            return (comp, Vec::new());
+        };
+        if delay_secs == 0 {
+            let deliveries = ingress_pipeline(
+                shared,
+                &inner_topic,
+                QoS::ExactlyOnce,
+                stored.retain,
+                &stored.payload,
+            )
+            .await;
+            forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
+            return (comp, deliveries);
+        }
+        let shared_clone = shared.clone();
+        let payload = stored.payload.clone();
+        let retain = stored.retain;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            let deliveries = ingress_pipeline(
+                &shared_clone,
+                &inner_topic,
+                QoS::ExactlyOnce,
+                retain,
+                &payload,
+            )
+            .await;
+            let mut enqueued = 0u64;
+            let mut enqueued_bytes = 0u64;
+            for (conn_id, routed) in deliveries {
+                let len = routed.total_frame_len() as u64;
+                if shared_clone.conns.route(conn_id, routed) {
+                    enqueued += 1;
+                    enqueued_bytes += len;
+                }
+            }
+            shared_clone.metrics.inc_messages_forwarded_by(enqueued);
+            shared_clone.metrics.inc_publish_sent_by(enqueued);
+            shared_clone.metrics.inc_delivered_by(enqueued);
+            shared_clone.metrics.inc_bytes_sent_by(enqueued_bytes);
+            forward_cluster(&shared_clone, &inner_topic, QoS::ExactlyOnce, &payload).await;
+        });
+        return (comp, Vec::new());
+    }
+    let deliveries = ingress_pipeline(
+        shared,
+        &stored.topic,
+        QoS::ExactlyOnce,
+        stored.retain,
+        &stored.payload,
+    )
+    .await;
+    forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
+    (qos2_reply(OpCode::PubCompOut, frame, packet_id), deliveries)
+}
+
+/// QoS 2 outbound second phase (D1-01): on the subscriber's PUBREC send
+/// PUBREL and retain only the packet id until PUBCOMP. A duplicate
+/// PUBREC for an entry already waiting for PUBCOMP resends PUBREL (the
+/// PUBREL was lost). Unknown ids are ignored.
+fn apply_qos2_pubrec(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    let packet_id = decode_qos2_meta(&frame.metadata)?;
+    let client_id = shared.sessions.client_id_for_conn(frame.header.conn_id)?;
+    let session = shared.sessions.get(&client_id)?;
+    if session.complete_qos2_pubrec(packet_id) {
+        return qos2_reply(OpCode::PubRelOut, frame, packet_id);
+    }
+    if session
+        .qos2_outbound_snapshot()
+        .iter()
+        .any(|m| m.packet_id == packet_id)
+    {
+        return qos2_reply(OpCode::PubRelOut, frame, packet_id);
+    }
+    None
+}
+
+/// QoS 2 outbound completion (D1-01): on the subscriber's PUBCOMP release
+/// the packet id. Unknown ids are ignored: PUBCOMPs from a previous
+/// incarnation must never disturb live state.
+fn apply_qos2_pubcomp(frame: &BrokerFrame, shared: &Shared) {
+    let packet_id = match decode_qos2_meta(&frame.metadata) {
+        Some(packet_id) => packet_id,
+        None => return,
+    };
+    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
+        Some(client_id) => client_id,
+        None => return,
+    };
+    if let Some(session) = shared.sessions.get(&client_id) {
+        session.ack_qos2_pubcomp(packet_id);
+    }
+}
+
+/// Build one QoS 2 acknowledgement (`PubRecOut`, `PubRelOut`,
+/// `PubCompOut`) mirroring the request identity. Meta is the 2-byte
+/// packet id; a zero id yields no reply.
+fn qos2_reply(opcode: OpCode, frame: &BrokerFrame, packet_id: u16) -> Option<BrokerFrame> {
+    if packet_id == 0 {
+        return None;
+    }
+    BrokerFrame::new(
+        opcode,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(packet_id.to_be_bytes().to_vec()),
+        Bytes::new(),
+    )
+    .ok()
+}
+
+/// Decode QoS 2 acknowledgement metadata into the packet id. Layout is
+/// `PacketId:16be` (mirrors the MQTT packet id; the return code that
+/// `PubAckIn` carries has no QoS 2 equivalent). The id must be nonzero;
+/// trailing bytes are tolerated.
+fn decode_qos2_meta(meta: &[u8]) -> Option<u16> {
+    if meta.len() < 2 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+    if packet_id == 0 {
+        return None;
+    }
+    Some(packet_id)
 }
 
 /// The shared ingress pipeline: retained store/clear, rule execution,
@@ -1340,6 +1904,15 @@ fn build_downlink_frames(
 ) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
+    // D1-03: share one payload buffer across all N subscribers.
+    // `Bytes::clone` bumps a refcount without copying the bytes, so an
+    // 8 KB publish fanned out to N subscribers costs one 8 KB buffer
+    // plus N small handles. Per-subscriber memory stays bounded by the
+    // existing queue caps (`MAX_OFFLINE_QUEUE`, `MAX_QOS1_INFLIGHT`,
+    // `MAX_QOS2_INFLIGHT`, the `ConnTable` QoS 0 bound); it is never
+    // N copies of the payload. Clone once here so every per-subscriber
+    // `clone` below shares this single root.
+    let shared = payload.clone();
     let mut deliveries = Vec::new();
     for sub in router.matches(topic) {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
@@ -1359,13 +1932,30 @@ fn build_downlink_frames(
                         // per-session bound the frame still goes out live
                         // once but is left untracked (counted), so the
                         // live delivery rate never pays for the window.
+                        // QoS 0 never touches session state here.
                         if effective == 1 {
                             let tracked = session.track_inflight(InflightMessage {
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
-                                payload: payload.clone(),
+                                payload: shared.clone(),
+                            });
+                            if !tracked {
+                                metrics.inc_inflight_dropped();
+                            }
+                        }
+                        // D1-01: hold every QoS 2 downlink until its
+                        // PUBCOMP arrives (message until PUBREC, packet id
+                        // until PUBCOMP). Same overflow policy as QoS 1:
+                        // live delivery still goes out once, untracked.
+                        if effective == 2 {
+                            let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
+                                packet_id: downlink_id,
+                                topic: topic.clone(),
+                                retain,
+                                payload: shared.clone(),
+                                rec_received: false,
                             });
                             if !tracked {
                                 metrics.inc_inflight_dropped();
@@ -1377,7 +1967,7 @@ fn build_downlink_frames(
                             downlink_id,
                             effective,
                             retain,
-                            payload,
+                            &shared,
                         ) {
                             deliveries.push((conn_id, frame));
                         }
@@ -1394,7 +1984,7 @@ fn build_downlink_frames(
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
-                                payload: payload.clone(),
+                                payload: shared.clone(),
                             });
                             let evicted = (before + 1).saturating_sub(session.offline_len());
                             if evicted > 0 {
@@ -1416,7 +2006,7 @@ fn build_downlink_frames(
                     downlink_id,
                     effective,
                     retain,
-                    payload,
+                    &shared,
                 ) {
                     deliveries.push((sub.conn_id, frame));
                 }
@@ -1478,19 +2068,47 @@ fn encode_publish_out(
     retain: bool,
     payload: &Bytes,
 ) -> Option<BrokerFrame> {
+    encode_publish_out_with_dup(conn_id, topic, packet_id, qos, retain, false, payload)
+}
+
+/// Encode one `PublishOut` frame with explicit DUP (replays set DUP=1,
+/// fresh deliveries DUP=0). Sequence is stamped later per-destination by
+/// `ConnTable::route`.
+fn encode_publish_out_with_dup(
+    conn_id: u64,
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    dup: bool,
+    payload: &Bytes,
+) -> Option<BrokerFrame> {
     let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3);
     meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
     meta.extend_from_slice(topic.as_bytes());
     meta.extend_from_slice(&packet_id.to_be_bytes());
     meta.push(qos);
     meta.push(u8::from(retain));
-    meta.push(0u8); // dup: fresh downstream delivery
+    meta.push(u8::from(dup));
     BrokerFrame::new(
         OpCode::PublishOut,
         conn_id,
         0, // stamped per-destination by ConnTable::route
         Bytes::from(meta),
         payload.clone(),
+    )
+    .ok()
+}
+
+/// Encode one `PubRelOut` frame for `conn_id` (sequence stamped later
+/// per-destination by `ConnTable::route`). Meta is the 2-byte packet id.
+fn encode_pubrel_out(conn_id: u64, packet_id: u16) -> Option<BrokerFrame> {
+    BrokerFrame::new(
+        OpCode::PubRelOut,
+        conn_id,
+        0, // stamped per-destination by ConnTable::route
+        Bytes::from(packet_id.to_be_bytes().to_vec()),
+        Bytes::new(),
     )
     .ok()
 }
@@ -1756,6 +2374,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shared = Shared::new();
     shared.allow_anonymous = args.allow_anonymous;
     shared.node_id = args.node_id.clone();
+    // D1-02: apply the configured per-subscriber QoS 0 backlog bound to
+    // the shared delivery table before any edge binds. One atomic store
+    // at boot; the hot publish path pays a single relaxed load.
+    shared.conns.set_qos0_bound(args.qos0_backlog);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -2423,6 +3045,97 @@ mod tests {
         assert_eq!(pid_b, 0, "QoS 0 downlink carries no packet id");
     }
 
+    /// D1-03: an 8 KB payload fanned out to N subscribers must share one
+    /// buffer instead of copying N times. Fails if any delivery or queued
+    /// copy allocates its own 8 KB (e.g. via `to_vec` + `Bytes::from` per
+    /// subscriber); passes when every handle is a refcount clone of one
+    /// root (`Bytes::ptr_eq`).
+    #[tokio::test]
+    async fn large_payload_shares_single_buffer_across_subscribers() {
+        let shared_state = test_shared();
+        for (conn, client) in [(61u64, "large-a"), (62u64, "large-b"), (63u64, "large-c")] {
+            let frame = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("big/topic", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&frame, &shared_state).await;
+            reply.expect("subscribe replies");
+            let (session, _) = shared_state.sessions.get_or_create(client, true);
+            *session.conn_id.write() = Some(conn);
+        }
+        let big = Bytes::from(vec![0xABu8; 8192]);
+        let topic = Topic::new("big/topic").unwrap();
+        let deliveries = build_downlink_frames(
+            &shared_state.router,
+            &shared_state.sessions,
+            &shared_state.metrics,
+            &topic,
+            QoS::AtMostOnce,
+            false,
+            &big,
+        );
+        assert_eq!(deliveries.len(), 3, "one delivery per subscriber");
+        for (_, frame) in &deliveries {
+            assert_eq!(frame.payload.len(), 8192);
+        }
+        // Every delivery payload must point at the same 8 KB buffer.
+        for (_, frame) in deliveries.iter().skip(1) {
+            assert!(
+                deliveries[0].1.payload.as_ptr() == frame.payload.as_ptr(),
+                "D1-03: payload copied per subscriber instead of shared"
+            );
+        }
+        // The shared root itself must also be the same buffer: cloning
+        // the ingress once and refcounting N times costs 8 KB, not N*8 KB.
+        for (_, frame) in &deliveries {
+            assert!(
+                big.as_ptr() == frame.payload.as_ptr(),
+                "D1-03: delivery detached from the ingress buffer"
+            );
+        }
+    }
+
+    /// D1-03 companion: detached durable subscribers queue the same 8 KB
+    /// buffer instead of copying it per queue. Two offline queues holding
+    /// the same publish must be `ptr_eq`, proving one allocation.
+    #[test]
+    fn large_payload_offline_queues_share_single_buffer() {
+        let router = Router::new();
+        let sessions = SessionManager::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("big/topic").unwrap();
+        for (client, conn) in [("off-a", 71u64), ("off-b", 72u64)] {
+            router.subscribe(&filter, Subscription::new(client, conn, QoS::AtMostOnce));
+            let (session, _) = sessions.get_or_create(client, false);
+            *session.connected.write() = false;
+            *session.conn_id.write() = None;
+        }
+        let big = Bytes::from(vec![0xCDu8; 8192]);
+        let topic = Topic::new("big/topic").unwrap();
+        let deliveries = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtMostOnce,
+            false,
+            &big,
+        );
+        assert!(deliveries.is_empty(), "detached queues buffer, not deliver");
+        let a = sessions.get("off-a").expect("session a");
+        let b = sessions.get("off-b").expect("session b");
+        assert_eq!(a.offline_len(), 1);
+        assert_eq!(b.offline_len(), 1);
+        let qa = a.drain_offline();
+        let qb = b.drain_offline();
+        assert!(big.as_ptr() == qa[0].payload.as_ptr());
+        assert!(
+            qa[0].payload.as_ptr() == qb[0].payload.as_ptr(),
+            "D1-03: offline queues copied the 8 KB payload per subscriber"
+        );
+    }
+
     #[tokio::test]
     async fn publish_qos1_acks_publisher_and_routes() {
         let shared = test_shared();
@@ -2478,6 +3191,7 @@ mod tests {
             &tx,
             &server,
             &mut bound,
+            &Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("publish handling succeeds");
@@ -2527,6 +3241,7 @@ mod tests {
             &tx,
             &server,
             &mut bound,
+            &Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("publish handling succeeds");
@@ -2573,6 +3288,7 @@ mod tests {
             &tx,
             &server,
             &mut bound,
+            &Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("publish handling succeeds");
@@ -2602,9 +3318,16 @@ mod tests {
         meta.extend_from_slice(&1024u32.to_be_bytes());
         let credit = BrokerFrame::new(OpCode::Credit, 91, 3, Bytes::from(meta), Bytes::new())
             .expect("valid credit frame");
-        handle_inbound_frame(credit, &shared, &tx, &server, &mut bound)
-            .await
-            .expect("credit handling succeeds");
+        handle_inbound_frame(
+            credit,
+            &shared,
+            &tx,
+            &server,
+            &mut bound,
+            &Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("credit handling succeeds");
         assert_eq!(shared.metrics.credit_received(), 1);
         // Nothing gated, nothing delivered, no connection state touched.
         assert_eq!(shared.metrics.messages_forwarded(), 0);
@@ -2620,9 +3343,16 @@ mod tests {
             Bytes::new(),
         )
         .expect("valid credit frame");
-        handle_inbound_frame(bad, &shared, &tx, &server, &mut bound)
-            .await
-            .expect("malformed credit is ignored");
+        handle_inbound_frame(
+            bad,
+            &shared,
+            &tx,
+            &server,
+            &mut bound,
+            &Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("malformed credit is ignored");
         assert_eq!(shared.metrics.credit_received(), 1);
     }
 
@@ -4293,6 +5023,9 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         shared.conns.register(951, tx);
+        // D1-02: label for per-client shed accounting; QoS 0 delayed
+        // deliveries ride the bounded backlog, not the guaranteed mailbox.
+        shared.conns.set_client_label(951, "delayed-sub");
         let (session, _) = shared.sessions.get_or_create("delayed-sub", true);
         *session.conn_id.write() = Some(951);
         let sub = subscribe_frame(
@@ -4312,21 +5045,37 @@ mod tests {
         let shared = test_shared();
         let start = std::time::Instant::now();
         let (mut rx, ack) = delayed_setup(&shared).await;
-        // QoS 0: no ack, and crucially no immediate delivery.
+        // QoS 0: no ack, and crucially no immediate delivery on either
+        // mailbox (guaranteed `rx` stays empty; bounded QoS 0 backlog
+        // stays empty until the timer fires).
         assert!(ack.is_none());
         let early = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
         assert!(early.is_err(), "delayed message must not arrive early");
+        assert_eq!(
+            shared.conns.qos0_len(951),
+            0,
+            "bounded backlog must not hold the delayed frame early"
+        );
 
-        // ...but it arrives after the delay with the inner topic.
-        let routed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("delivery fires")
-            .expect("mailbox open");
+        // ...but it arrives after the delay with the inner topic on the
+        // bounded QoS 0 backlog (D1-02: QoS 0 no longer rides `rx`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let routed = loop {
+            if let Some(frame) = shared.conns.pop_qos0(951) {
+                break frame;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("delivery fires");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
         assert_eq!(routed.header.opcode, OpCode::PublishOut);
         assert!(start.elapsed() >= std::time::Duration::from_millis(900));
         let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
         assert_eq!(topic, "alerts");
         assert_eq!(routed.payload, Bytes::from_static(b"later"));
+        // Guaranteed mailbox never saw the QoS 0 frame.
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -4596,5 +5345,487 @@ mod tests {
                 .any(|f| f.as_str() == "cmd/w139-ph/z"),
             "placeholder must render per client"
         );
+    }
+
+    fn qos2_frame(opcode: OpCode, conn_id: u64, seq: u64, packet_id: u16) -> BrokerFrame {
+        BrokerFrame::new(
+            opcode,
+            conn_id,
+            seq,
+            Bytes::from(packet_id.to_be_bytes().to_vec()),
+            Bytes::new(),
+        )
+        .expect("valid QoS 2 ack frame")
+    }
+
+    fn decode_qos2_id(meta: &[u8]) -> u16 {
+        u16::from_be_bytes([meta[0], meta[1]])
+    }
+
+    /// D1-01 normal flow: PUBLISH QoS 2 stores and replies PUBREC with no
+    /// routing; PUBREL routes once and replies PUBCOMP; the downlink runs
+    /// PUBLISH/PUBREC/PUBREL/PUBCOMP to completion with the payload
+    /// delivered exactly once.
+    #[tokio::test]
+    async fn qos2_normal_flow_routes_once_on_pubrel() {
+        let shared = test_shared();
+        let bind_sub = bind_frame(51, 1, encode_bind_meta("q2-sub", false, 60));
+        reply_for_frame(&bind_sub, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(51, 2, encode_subscribe_meta(3, "q2-sub", &[("t", 2)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (session_sub, _) = shared.sessions.get_or_create("q2-sub", false);
+        *session_sub.conn_id.write() = Some(51);
+        let bind_pub = bind_frame(52, 1, encode_bind_meta("q2-pub", true, 60));
+        reply_for_frame(&bind_pub, &shared.sessions).expect("bind replies");
+
+        // Phase 1: PUBLISH QoS 2 stores, replies PUBREC, routes nothing.
+        let (meta, payload) = encode_publish_meta("t", 7, 2, false, b"exactly-once");
+        let (rec, deliveries) = apply_publish(&publish_frame(52, 8, meta, payload), &shared).await;
+        let rec = rec.expect("QoS 2 PUBLISH needs PUBREC");
+        assert_eq!(rec.header.opcode, OpCode::PubRecOut);
+        assert_eq!(rec.header.conn_id, 52);
+        assert_eq!(decode_qos2_id(&rec.metadata), 7);
+        assert!(deliveries.is_empty(), "nothing routes before PUBREL");
+        assert_eq!(
+            shared
+                .sessions
+                .get("q2-pub")
+                .expect("pub session")
+                .qos2_inbound_len(),
+            1
+        );
+
+        // Phase 2: PUBREL routes once and replies PUBCOMP.
+        let (comp, deliveries) =
+            apply_qos2_pubrel(&qos2_frame(OpCode::PubRelIn, 52, 9, 7), &shared).await;
+        let comp = comp.expect("PUBREL needs PUBCOMP");
+        assert_eq!(comp.header.opcode, OpCode::PubCompOut);
+        assert_eq!(decode_qos2_id(&comp.metadata), 7);
+        assert_eq!(deliveries.len(), 1, "PUBREL routes exactly once");
+        assert_eq!(deliveries[0].0, 51);
+        assert_eq!(deliveries[0].1.payload, Bytes::from_static(b"exactly-once"));
+        let (topic, downlink_pid, qos, _) = decode_publish_meta_parts(&deliveries[0].1.metadata);
+        assert_eq!(topic, "t");
+        assert_eq!(qos, 2, "effective QoS is min(pub 2, sub 2)");
+        assert_ne!(downlink_pid, 0);
+        assert_eq!(
+            shared
+                .sessions
+                .get("q2-pub")
+                .expect("pub session")
+                .qos2_inbound_len(),
+            0,
+            "packet id released on PUBREL"
+        );
+
+        // Outbound phase 1: subscriber PUBREC yields PUBREL.
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let session = shared.sessions.get("q2-sub").expect("sub session");
+        assert_eq!(session.qos2_outbound_len(), 1);
+        let rel = apply_qos2_pubrec(&qos2_frame(OpCode::PubRecIn, 51, 10, downlink_pid), &shared)
+            .expect("PUBREC needs PUBREL");
+        assert_eq!(rel.header.opcode, OpCode::PubRelOut);
+        assert_eq!(decode_qos2_id(&rel.metadata), downlink_pid);
+
+        // Outbound phase 2: subscriber PUBCOMP releases the id.
+        apply_qos2_pubcomp(
+            &qos2_frame(OpCode::PubCompIn, 51, 11, downlink_pid),
+            &shared,
+        );
+        assert_eq!(session.qos2_outbound_len(), 0);
+    }
+
+    /// D1-01 duplicate PUBLISH before PUBREL replies PUBREC without a
+    /// second route; a second PUBREL after release completes empty.
+    #[tokio::test]
+    async fn qos2_duplicate_publish_before_pubrel_no_second_route() {
+        let shared = test_shared();
+        let bind_sub = bind_frame(51, 1, encode_bind_meta("q2-dup-sub", false, 60));
+        reply_for_frame(&bind_sub, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(51, 2, encode_subscribe_meta(3, "q2-dup-sub", &[("t", 2)]));
+        apply_subscribe(&sub, &shared)
+            .await
+            .0
+            .expect("subscribe replies");
+        let (session_sub, _) = shared.sessions.get_or_create("q2-dup-sub", false);
+        *session_sub.conn_id.write() = Some(51);
+        let bind_pub = bind_frame(52, 1, encode_bind_meta("q2-dup-pub", true, 60));
+        reply_for_frame(&bind_pub, &shared.sessions).expect("bind replies");
+
+        let (meta, payload) = encode_publish_meta("t", 9, 2, false, b"dup");
+        let (first_rec, first_deliveries) =
+            apply_publish(&publish_frame(52, 2, meta, payload), &shared).await;
+        assert!(first_rec.is_some());
+        assert!(first_deliveries.is_empty());
+        // Repeat of the same packet id before PUBREL: duplicate.
+        let (meta, payload) = encode_publish_meta("t", 9, 2, false, b"dup");
+        let (second_rec, second_deliveries) =
+            apply_publish(&publish_frame(52, 3, meta, payload), &shared).await;
+        let second_rec = second_rec.expect("duplicate needs PUBREC again");
+        assert_eq!(second_rec.header.opcode, OpCode::PubRecOut);
+        assert!(
+            second_deliveries.is_empty(),
+            "duplicate must not route again"
+        );
+
+        // PUBREL routes exactly once; a retried PUBREL completes empty.
+        let (_, deliveries) =
+            apply_qos2_pubrel(&qos2_frame(OpCode::PubRelIn, 52, 4, 9), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        let (comp, redeliveries) =
+            apply_qos2_pubrel(&qos2_frame(OpCode::PubRelIn, 52, 5, 9), &shared).await;
+        assert!(comp.is_some(), "retried PUBREL still gets PUBCOMP");
+        assert!(redeliveries.is_empty(), "retried PUBREL routes nothing");
+    }
+
+    /// D1-01 PUBREL for an unknown packet id replies PUBCOMP and routes
+    /// nothing, so a retried PUBREL never stalls the publisher.
+    #[tokio::test]
+    async fn qos2_pubrel_unknown_id_replies_pubcomp_without_route() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q2-unknown", true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let (comp, deliveries) =
+            apply_qos2_pubrel(&qos2_frame(OpCode::PubRelIn, 61, 2, 1234), &shared).await;
+        let comp = comp.expect("unknown PUBREL needs PUBCOMP");
+        assert_eq!(comp.header.opcode, OpCode::PubCompOut);
+        assert_eq!(comp.header.conn_id, 61);
+        assert_eq!(decode_qos2_id(&comp.metadata), 1234);
+        assert!(deliveries.is_empty());
+        assert_eq!(decode_qos2_meta(&comp.metadata), Some(1234));
+    }
+
+    /// D1-01 resend after reconnect: uncompleted QoS 2 downlinks replay in
+    /// queued order (PUBLISH with DUP while waiting PUBREC, PUBREL while
+    /// waiting PUBCOMP).
+    #[tokio::test]
+    async fn qos2_uncompleted_downlink_resends_after_reconnect() {
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q2-replay", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q2-replay", &[("t", 2)]));
+        apply_subscribe(&sub, &shared)
+            .await
+            .0
+            .expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let bind_pub = bind_frame(62, 1, encode_bind_meta("q2-replay-pub", true, 60));
+        reply_for_frame(&bind_pub, &shared.sessions).expect("pub bind replies");
+        let (meta, payload) = encode_publish_meta("t", 7, 2, false, b"replay-me");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
+        // First phase alone routes nothing: complete it via PUBREL.
+        assert!(deliveries.is_empty());
+        let (_, deliveries) =
+            apply_qos2_pubrel(&qos2_frame(OpCode::PubRelIn, 62, 4, 7), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let first = rx61.try_recv().expect("downlink arrived");
+        let (_, first_pid, qos, _) = decode_publish_meta_parts(&first.metadata);
+        assert_eq!(qos, 2);
+        assert!(!decode_publish_dup(&first.metadata));
+
+        // Detach without completing, reconnect: PUBLISH replays with DUP.
+        let session = shared.sessions.get("q2-replay").expect("session known");
+        *session.conn_id.write() = Some(61);
+        apply_unbind(&unbind_frame(61, 5, "q2-replay"), &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q2-replay", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, 1);
+        let replayed = rx63.try_recv().expect("PUBLISH replay arrived");
+        assert_eq!(replayed.header.opcode, OpCode::PublishOut);
+        assert!(decode_publish_dup(&replayed.metadata));
+        let (_, replay_pid, _, _) = decode_publish_meta_parts(&replayed.metadata);
+        assert_eq!(replay_pid, first_pid);
+
+        // Subscriber answers PUBREC: the entry now waits for PUBCOMP.
+        let rel = apply_qos2_pubrec(&qos2_frame(OpCode::PubRecIn, 63, 2, first_pid), &shared)
+            .expect("PUBREC needs PUBREL");
+        assert_eq!(rel.header.opcode, OpCode::PubRelOut);
+        // Detach again before PUBCOMP, reconnect: PUBREL replays.
+        apply_unbind(&unbind_frame(63, 3, "q2-replay"), &shared);
+        let rebind2 = bind_frame(64, 1, encode_bind_meta("q2-replay", false, 60));
+        reply_for_frame(&rebind2, &shared.sessions).expect("rebind replies");
+        let (tx64, mut rx64) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(64, tx64);
+        assert_eq!(replay_offline(&rebind2, &shared).await, 1);
+        let rel_replay = rx64.try_recv().expect("PUBREL replay arrived");
+        assert_eq!(rel_replay.header.opcode, OpCode::PubRelOut);
+        assert_eq!(decode_qos2_id(&rel_replay.metadata), first_pid);
+
+        // PUBCOMP completes: a further reconnect replays nothing.
+        apply_qos2_pubcomp(&qos2_frame(OpCode::PubCompIn, 64, 4, first_pid), &shared);
+        assert_eq!(session.qos2_outbound_len(), 0);
+        apply_unbind(&unbind_frame(64, 5, "q2-replay"), &shared);
+        let rebind3 = bind_frame(65, 1, encode_bind_meta("q2-replay", false, 60));
+        reply_for_frame(&rebind3, &shared.sessions).expect("rebind replies");
+        let (tx65, mut rx65) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(65, tx65);
+        assert_eq!(replay_offline(&rebind3, &shared).await, 0);
+        assert!(rx65.try_recv().is_err());
+    }
+
+    /// D1-01 integration: a QoS 2 publish to a QoS 2 subscriber arrives
+    /// exactly once end to end, even when the publisher repeats PUBLISH
+    /// before PUBREL.
+    #[tokio::test]
+    async fn qos2_end_to_end_exactly_once() {
+        let shared = Shared::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect sub");
+        let sub = FramedTransport::new(sub_io);
+        sub.send(bind_frame(
+            101,
+            1,
+            encode_bind_meta("q2-e2e-sub", false, 60),
+        ))
+        .await
+        .expect("bind");
+        let _ = sub.recv().await.expect("recv binding");
+        sub.send(subscribe_frame(
+            101,
+            2,
+            encode_subscribe_meta(11, "q2-e2e-sub", &[("q2/e2e", 2)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        let pub_io = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect pub");
+        let publ = FramedTransport::new(pub_io);
+        publ.send(bind_frame(102, 1, encode_bind_meta("q2-e2e-pub", true, 60)))
+            .await
+            .expect("bind");
+        let _ = publ.recv().await.expect("recv binding");
+
+        // PUBLISH QoS 2, duplicated before PUBREL: both get PUBREC.
+        let (meta, payload) = encode_publish_meta("q2/e2e", 77, 2, false, b"once");
+        publ.send(publish_frame(102, 2, meta, payload))
+            .await
+            .expect("publish");
+        let rec1 = publ.recv().await.expect("recv pubrec");
+        assert_eq!(rec1.header.opcode, OpCode::PubRecOut);
+        assert_eq!(decode_qos2_id(&rec1.metadata), 77);
+        let (meta, payload) = encode_publish_meta("q2/e2e", 77, 2, false, b"once");
+        publ.send(publish_frame(102, 3, meta, payload))
+            .await
+            .expect("duplicate");
+        let rec2 = publ.recv().await.expect("recv second pubrec");
+        assert_eq!(rec2.header.opcode, OpCode::PubRecOut);
+
+        // PUBREL completes the inbound flow.
+        publ.send(qos2_frame(OpCode::PubRelIn, 102, 4, 77))
+            .await
+            .expect("pubrel");
+        let comp = publ.recv().await.expect("recv pubcomp");
+        assert_eq!(comp.header.opcode, OpCode::PubCompOut);
+        assert_eq!(decode_qos2_id(&comp.metadata), 77);
+
+        // Subscriber gets exactly one PUBLISH QoS 2.
+        let routed = sub.recv().await.expect("recv publish");
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        assert_eq!(routed.payload, Bytes::from_static(b"once"));
+        let (_, downlink_pid, qos, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(qos, 2);
+        assert_ne!(downlink_pid, 0);
+
+        // Outbound flow to completion.
+        sub.send(qos2_frame(OpCode::PubRecIn, 101, 3, downlink_pid))
+            .await
+            .expect("pubrec");
+        let rel = sub.recv().await.expect("recv pubrel");
+        assert_eq!(rel.header.opcode, OpCode::PubRelOut);
+        sub.send(qos2_frame(OpCode::PubCompIn, 101, 4, downlink_pid))
+            .await
+            .expect("pubcomp");
+
+        // No second delivery: the duplicate PUBLISH routed only once.
+        let nothing = tokio::time::timeout(std::time::Duration::from_millis(300), sub.recv()).await;
+        assert!(nothing.is_err(), "exactly-once: no second delivery");
+
+        server.abort();
+    }
+
+    /// D1-02: the bounded QoS 0 backlog drops oldest-first, counts every
+    /// drop labelled by client, and keeps a fast subscriber whole while
+    /// a stalled one sheds. Drives the real `apply_publish` fan-out plus
+    /// `ConnTable::route` (the production egress path), not a test-only
+    /// queue.
+    #[tokio::test]
+    async fn qos0_bounded_backlog_sheds_oldest_fast_keeps_receiving() {
+        let shared = test_shared();
+        shared.conns.set_qos0_bound(3);
+
+        for (conn, client) in [(61u64, "q0-fast"), (63u64, "q0-stalled")] {
+            let frame = subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[("q0/t", 0)]));
+            let (reply, _) = apply_subscribe(&frame, &shared).await;
+            reply.expect("subscribe replies");
+            let (session, _) = shared.sessions.get_or_create(client, true);
+            *session.conn_id.write() = Some(conn);
+            let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+            shared.conns.register(conn, tx);
+            shared.conns.set_client_label(conn, client);
+        }
+
+        let mut fast_got: Vec<Vec<u8>> = Vec::new();
+        for i in 0..6u8 {
+            let (meta, payload) =
+                encode_publish_meta("q0/t", 0, 0, false, std::slice::from_ref(&i));
+            let (_, deliveries) =
+                apply_publish(&publish_frame(99, u64::from(i), meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 2, "both subscribers match every publish");
+            for (conn_id, frame) in deliveries {
+                assert!(shared.conns.route(conn_id, frame));
+            }
+            // Fast drains immediately; stalled never drains until the end.
+            for frame in shared.conns.drain_qos0(61, 8) {
+                fast_got.push(frame.payload.to_vec());
+            }
+        }
+        for frame in shared.conns.drain_qos0(61, 8) {
+            fast_got.push(frame.payload.to_vec());
+        }
+        assert_eq!(
+            fast_got,
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4], vec![5]],
+            "fast subscriber sees every QoS 0 publish in order"
+        );
+        assert_eq!(shared.conns.qos0_len(61), 0);
+        assert_eq!(shared.conns.qos0_len(63), 3);
+        let stalled: Vec<Vec<u8>> = shared
+            .conns
+            .drain_qos0(63, 8)
+            .iter()
+            .map(|f| f.payload.to_vec())
+            .collect();
+        assert_eq!(
+            stalled,
+            vec![vec![3], vec![4], vec![5]],
+            "stalled keeps newest, oldest shed"
+        );
+        assert_eq!(shared.metrics.egress_qos0_shed(), 3);
+        assert_eq!(shared.metrics.egress_qos0_shed_for("q0-stalled"), 3);
+        assert_eq!(shared.metrics.egress_qos0_shed_for("q0-fast"), 0);
+    }
+
+    /// D1-02: publishers never block on a stalled subscriber. Ten
+    /// thousand synchronous QoS 0 publishes to a never-drained backlog
+    /// complete (each `route` returns true immediately) and the backlog
+    /// stays at its bound; the shed counter accounts for the rest.
+    #[tokio::test]
+    async fn qos0_stalled_subscriber_never_blocks_publisher() {
+        let shared = test_shared();
+        shared.conns.set_qos0_bound(8);
+        let frame = subscribe_frame(61, 1, encode_subscribe_meta(1, "q0-block", &[("q0/b", 0)]));
+        let (reply, _) = apply_subscribe(&frame, &shared).await;
+        reply.expect("subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("q0-block", true);
+        *session.conn_id.write() = Some(61);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx);
+        shared.conns.set_client_label(61, "q0-block");
+
+        for i in 0..10_000u32 {
+            let (meta, payload) = encode_publish_meta("q0/b", 0, 0, false, &[(i % 251) as u8]);
+            let (_, deliveries) = apply_publish(
+                &publish_frame(99, u64::from(i % 10_000), meta, payload),
+                &shared,
+            )
+            .await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                assert!(shared.conns.route(conn_id, frame));
+            }
+        }
+        assert_eq!(shared.conns.qos0_len(61), 8);
+        assert_eq!(shared.metrics.egress_qos0_shed(), 10_000 - 8);
+        assert_eq!(shared.metrics.egress_qos0_shed_for("q0-block"), 10_000 - 8);
+    }
+
+    /// D1-02: QoS 1 keeps its delivery guarantee under QoS 0 pressure.
+    /// Filling a subscriber's QoS 0 backlog must not drop, delay, or
+    /// recount its QoS 1 downlink (shared egress path, separate queues).
+    #[tokio::test]
+    async fn qos1_keeps_guarantee_under_qos0_pressure() {
+        let shared = test_shared();
+        shared.conns.set_qos0_bound(2);
+        let sub0 = subscribe_frame(
+            61,
+            1,
+            encode_subscribe_meta(1, "q01-mixed", &[("q01/t", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub0, &shared).await;
+        reply.expect("subscribe replies");
+        let sub1 = subscribe_frame(
+            61,
+            2,
+            encode_subscribe_meta(2, "q01-mixed", &[("q01/q1", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub1, &shared).await;
+        reply.expect("subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("q01-mixed", true);
+        *session.conn_id.write() = Some(61);
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx);
+        shared.conns.set_client_label(61, "q01-mixed");
+
+        for i in 0..4u8 {
+            let (meta, payload) =
+                encode_publish_meta("q01/t", 0, 0, false, std::slice::from_ref(&i));
+            let (_, deliveries) =
+                apply_publish(&publish_frame(99, u64::from(i), meta, payload), &shared).await;
+            for (conn_id, frame) in deliveries {
+                assert!(shared.conns.route(conn_id, frame));
+            }
+        }
+        let shed_before = shared.metrics.egress_qos0_shed();
+        assert_eq!(shed_before, 2);
+        assert_eq!(shared.conns.qos0_len(61), 2);
+
+        let (meta, payload) = encode_publish_meta("q01/q1", 41, 1, false, b"keep");
+        let (ack, deliveries) = apply_publish(&publish_frame(99, 50, meta, payload), &shared).await;
+        assert!(ack.is_some(), "QoS 1 publisher is acked");
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            assert!(shared.conns.route(conn_id, frame));
+        }
+        assert_eq!(
+            shared.conns.qos0_len(61),
+            2,
+            "QoS 1 must not disturb the QoS 0 backlog"
+        );
+        assert_eq!(
+            shared.metrics.egress_qos0_shed(),
+            shed_before,
+            "QoS 1 must not shed"
+        );
+        let qos1 = rx.try_recv().expect("QoS 1 via guaranteed mailbox");
+        assert_eq!(qos1.payload, Bytes::from_static(b"keep"));
+        assert_eq!(session.inflight_len(), 1, "QoS 1 tracked for redelivery");
     }
 }

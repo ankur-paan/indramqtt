@@ -71,6 +71,15 @@ max_offline_queue = 50000
 # Maximum inflight unacknowledged QoS 1 and QoS 2 messages
 max_inflight_messages = 65535
 
+# Per-subscriber QoS 0 egress backlog bound (D1-02). Each live
+# connection queues at most this many QoS 0 messages; past it the oldest
+# queued QoS 0 frame drops (counted via `egress_qos0_shed`, labelled by
+# client) so a slow consumer costs bounded memory and never slows
+# publishers. QoS 1/2 never shed. Default 1000 matches the detached
+# offline bound and caps per-subscriber QoS 0 memory near 1,000 small
+# frames. Override at boot with `indramqtt --qos0-backlog <n>`.
+max_qos0_backlog = 1000
+
 # Keep-alive grace multiplier (allows up to keep_alive * multiplier before disconnect)
 keep_alive_grace = 1.5
 

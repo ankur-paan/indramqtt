@@ -20,6 +20,9 @@
          encode_publish/4,
          encode_publish/6,
          encode_puback/1,
+         encode_pubrec/1,
+         encode_pubrel/1,
+         encode_pubcomp/1,
          packet_type_atom/1,
          packet_type_code/1]).
 
@@ -260,6 +263,25 @@ encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload)
 encode_puback(PacketId)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
     <<16#40, 16#02, PacketId:16/big>>.
+
+%% @doc Encode an MQTT PUBREC packet for a QoS 2 exchange (D1-01).
+-spec encode_pubrec(1..65535) -> binary().
+encode_pubrec(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<16#50, 16#02, PacketId:16/big>>.
+
+%% @doc Encode an MQTT PUBREL packet for a QoS 2 exchange (D1-01).
+%% Fixed-header flags are 0010 per MQTT 3.1.1 §3.6.1; there is no DUP bit.
+-spec encode_pubrel(1..65535) -> binary().
+encode_pubrel(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<16#62, 16#02, PacketId:16/big>>.
+
+%% @doc Encode an MQTT PUBCOMP packet for a QoS 2 exchange (D1-01).
+-spec encode_pubcomp(1..65535) -> binary().
+encode_pubcomp(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<16#70, 16#02, PacketId:16/big>>.
 
 %% @doc Map a 4-bit packet type code to its atom name.
 -spec packet_type_atom(0..15) -> atom().

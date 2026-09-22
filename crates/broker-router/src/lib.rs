@@ -1,12 +1,13 @@
 use ahash::{AHashMap, AHashSet};
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
-use brokerlink::BrokerFrame;
+use brokerlink::{BrokerFrame, OpCode};
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Notify;
 
 /// One client's subscription. `client_id` is reference-counted so fan-out
 /// matching clones pointers instead of heap strings. `group` carries a
@@ -105,6 +106,45 @@ struct TrieNode {
 /// proceeds) so one client cannot balloon the node. Management-plane
 /// only: the fan-out match path never touches this set.
 pub const MAX_KNOWN_TOPICS: usize = 100_000;
+
+/// Default bound for the per-subscriber QoS 0 egress backlog (D1-02).
+///
+/// Each live connection queues at most this many QoS 0 `PublishOut`
+/// frames in its [`ConnTable`] mailbox; past it the oldest queued QoS 0
+/// frame drops (counted via `egress_qos0_shed`, labelled by client) so a
+/// slow or absent consumer costs a bounded amount of memory and never
+/// slows publishers. QoS 1/2 never shed: they bypass this bound on the
+/// guaranteed path.
+///
+/// Rationale: 1,000 matches the existing detached offline bound
+/// (`MAX_OFFLINE_QUEUE` = 1024) so live and detached backlogs share one
+/// memory story, absorbs a ~1 s burst at 1k msg/s per subscriber without
+/// drops, and caps per-subscriber QoS 0 memory near 1,000 small frames
+/// (128 B payloads stay well under 1 MB with framing overhead). The
+/// symmetric QoS 0 load that motivated this task queued without limit
+/// (tens of seconds of latency, ~1M deep); 1,000 keeps p99 latency near
+/// the drain rate instead of the backlog depth. Override per table via
+/// [`ConnTable::with_qos0_bound`] / [`ConnTable::set_qos0_bound`].
+pub const DEFAULT_QOS0_BACKLOG: usize = 1_000;
+
+/// True when `frame` is a QoS 0 `PublishOut` (the only sheddable shape).
+/// Parses the `PublishOut` meta `TopicLen:16be | Topic | PacketId:16be |
+/// QoS:8 | Retain:8 | Dup:8`; anything unparseable is not QoS 0 so a
+/// malformed frame can never trigger a shed of guaranteed traffic.
+pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
+    if frame.header.opcode != OpCode::PublishOut {
+        return false;
+    }
+    let meta = &frame.metadata;
+    if meta.len() < 7 {
+        return false;
+    }
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    if meta.len() != 2 + topic_len + 5 {
+        return false;
+    }
+    meta[2 + topic_len + 2] == 0
+}
 
 pub struct Router {
     root: RwLock<TrieNode>,
@@ -652,6 +692,178 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
     }
+
+    #[test]
+    fn qos0_backlog_default_matches_documented_bound() {
+        assert_eq!(super::DEFAULT_QOS0_BACKLOG, 1_000);
+        assert_eq!(ConnTable::default().qos0_bound(), 1_000);
+        assert_eq!(ConnTable::with_qos0_bound(0).qos0_bound(), 1);
+        let table = ConnTable::default();
+        table.set_qos0_bound(0);
+        assert_eq!(table.qos0_bound(), 1);
+        table.set_qos0_bound(5);
+        assert_eq!(table.qos0_bound(), 5);
+    }
+
+    fn qos0_frame(conn_id: u64, payload_byte: u8) -> BrokerFrame {
+        let topic = "t";
+        let mut meta = Vec::with_capacity(2 + topic.len() + 5);
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&0u16.to_be_bytes());
+        meta.push(0u8);
+        meta.push(0u8);
+        meta.push(0u8);
+        BrokerFrame::new(
+            brokerlink::OpCode::PublishOut,
+            conn_id,
+            0,
+            meta,
+            vec![payload_byte],
+        )
+        .expect("valid QoS 0 frame")
+    }
+
+    fn qos1_frame(conn_id: u64, payload_byte: u8) -> BrokerFrame {
+        let topic = "t";
+        let mut meta = Vec::with_capacity(2 + topic.len() + 5);
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&7u16.to_be_bytes());
+        meta.push(1u8);
+        meta.push(0u8);
+        meta.push(0u8);
+        BrokerFrame::new(
+            brokerlink::OpCode::PublishOut,
+            conn_id,
+            0,
+            meta,
+            vec![payload_byte],
+        )
+        .expect("valid QoS 1 frame")
+    }
+
+    #[test]
+    fn is_qos0_publish_out_vectors() {
+        assert!(!super::is_qos0_publish_out(&BrokerFrame::ping(1, 0)));
+        assert!(super::is_qos0_publish_out(&qos0_frame(1, 9)));
+        assert!(!super::is_qos0_publish_out(&qos1_frame(1, 9)));
+    }
+
+    #[test]
+    fn qos0_sheds_oldest_and_counts_labelled() {
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::with_qos0_bound(3);
+        table.set_metrics(&metrics);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(11, tx);
+        table.set_client_label(11, "slow-1");
+
+        for byte in 0..5u8 {
+            assert!(
+                table.route(11, qos0_frame(11, byte)),
+                "QoS 0 enqueue never fails while registered"
+            );
+        }
+        assert_eq!(table.qos0_len(11), 3);
+        let drained = table.drain_qos0(11, 10);
+        let payloads: Vec<u8> = drained.iter().map(|f| f.payload[0]).collect();
+        assert_eq!(
+            payloads,
+            vec![2, 3, 4],
+            "overflow must drop oldest, keep newest in order"
+        );
+        assert_eq!(metrics.egress_qos0_shed(), 2);
+        assert_eq!(metrics.egress_qos0_shed_for("slow-1"), 2);
+        assert_eq!(metrics.unknown_conn_dropped(), 0);
+        assert_eq!(metrics.dead_mailbox_dropped(), 0);
+    }
+
+    #[test]
+    fn qos0_fast_alongside_stalled_keeps_receiving() {
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::with_qos0_bound(4);
+        table.set_metrics(&metrics);
+        let (tx_fast, _rx_fast) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_stalled, _rx_stalled) = tokio::sync::mpsc::unbounded_channel();
+        table.register(21, tx_fast);
+        table.register(22, tx_stalled);
+        table.set_client_label(21, "fast");
+        table.set_client_label(22, "stalled");
+
+        let mut fast_received: Vec<u8> = Vec::new();
+        for byte in 0..10u8 {
+            assert!(table.route(21, qos0_frame(21, byte)));
+            assert!(table.route(22, qos0_frame(22, byte)));
+            // Fast drains immediately (its edge keeps up); stalled never
+            // drains (its edge is gone but the mailbox stays registered).
+            fast_received.extend(table.drain_qos0(21, 8).iter().map(|f| f.payload[0]));
+        }
+        fast_received.extend(table.drain_qos0(21, 8).iter().map(|f| f.payload[0]));
+        assert_eq!(
+            fast_received,
+            (0..10u8).collect::<Vec<_>>(),
+            "fast subscriber must see every publish in order"
+        );
+        assert_eq!(table.qos0_len(21), 0);
+        assert_eq!(table.qos0_len(22), 4);
+        let stalled: Vec<u8> = table
+            .drain_qos0(22, 8)
+            .iter()
+            .map(|f| f.payload[0])
+            .collect();
+        assert_eq!(stalled, vec![6, 7, 8, 9], "stalled keeps newest");
+        assert_eq!(metrics.egress_qos0_shed_for("stalled"), 6);
+        assert_eq!(metrics.egress_qos0_shed_for("fast"), 0);
+        assert_eq!(metrics.egress_qos0_shed(), 6);
+    }
+
+    #[test]
+    fn qos0_bound_never_blocks_publisher() {
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::with_qos0_bound(16);
+        table.set_metrics(&metrics);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(31, tx);
+        table.set_client_label(31, "stalled-only");
+        // Ten thousand synchronous enqueues to a never-drained backlog:
+        // a blocking queue would hang here; the bounded drop-oldest
+        // queue returns immediately every time.
+        for byte in 0..10_000u32 {
+            assert!(table.route(31, qos0_frame(31, (byte % 251) as u8)));
+        }
+        assert_eq!(table.qos0_len(31), 16);
+        assert_eq!(metrics.egress_qos0_shed(), 10_000 - 16);
+        assert_eq!(metrics.egress_qos0_shed_for("stalled-only"), 10_000 - 16);
+    }
+
+    #[test]
+    fn qos1_never_sheds_on_qos0_pressure() {
+        let metrics = Arc::new(Metrics::new());
+        let table = ConnTable::with_qos0_bound(2);
+        table.set_metrics(&metrics);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        table.register(41, tx);
+        table.set_client_label(41, "mixed");
+
+        for byte in 0..4u8 {
+            assert!(table.route(41, qos0_frame(41, byte)));
+        }
+        assert_eq!(metrics.egress_qos0_shed(), 2);
+
+        // QoS 1 rides the guaranteed mailbox even while the QoS 0
+        // backlog is full: it is queued, never shed, and readable.
+        assert!(table.route(41, qos1_frame(41, 99)));
+        assert_eq!(
+            table.qos0_len(41),
+            2,
+            "QoS 1 must not touch the QoS 0 backlog"
+        );
+        assert_eq!(metrics.egress_qos0_shed(), 2, "QoS 1 must not shed");
+        let guaranteed = rx.try_recv().expect("QoS 1 via guaranteed mailbox");
+        assert_eq!(guaranteed.payload[0], 99);
+        assert!(rx.try_recv().is_err());
+    }
 }
 
 /// Ephemeral delivery table: edge `conn_id` -> mailbox of the task owning
@@ -674,6 +886,18 @@ pub struct ConnTable {
     /// `OnceLock` keeps the hot path to one atomic load: no per-route
     /// lock, no behaviour change when unset.
     metrics: std::sync::OnceLock<Arc<Metrics>>,
+    /// Per-subscriber QoS 0 backlog bound (D1-02). Read on every
+    /// `route_qos0` via one relaxed atomic load; writers use
+    /// [`ConnTable::set_qos0_bound`]. Floored at 1 on read so a zero
+    /// can never wedge a subscriber.
+    qos0_bound: AtomicUsize,
+    /// Signalled (via `notify_one`, which stores a permit when no task
+    /// is waiting) on every QoS 0 enqueue so an idle edge task draining
+    /// [`ConnTable::pop_qos0`] never sleeps through a backlog when its
+    /// `rx` (guaranteed traffic) is empty. Transports also drain
+    /// opportunistically after every inbound frame, so a notification
+    /// that lands while the owner is busy still arrives promptly.
+    qos0_notify: Arc<Notify>,
 }
 
 /// Number of `ConnTable` buckets. A power of two so the bucket mapping
@@ -686,7 +910,19 @@ impl Default for ConnTable {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             metrics: std::sync::OnceLock::new(),
+            qos0_bound: AtomicUsize::new(DEFAULT_QOS0_BACKLOG),
+            qos0_notify: Arc::new(Notify::new()),
         }
+    }
+}
+
+impl ConnTable {
+    /// Create a table with an explicit QoS 0 backlog bound (floored at
+    /// 1; see [`DEFAULT_QOS0_BACKLOG`] for the documented default).
+    pub fn with_qos0_bound(bound: usize) -> Self {
+        let table = Self::default();
+        table.set_qos0_bound(bound);
+        table
     }
 }
 
@@ -695,8 +931,28 @@ struct ConnSlot {
     tx: UnboundedSender<BrokerFrame>,
     /// Next `sequence_no` for frames routed to this connection. Starts at
     /// 1; direct replies (Pong, SessionBinding, SubAck, PubAck) mirror the
-    /// request sequence instead.
+    /// request sequence instead. Shared by the guaranteed (`route`) and
+    /// QoS 0 (`route_qos0`) paths so per-destination order stays total.
     next_seq: AtomicU64,
+    /// Bounded QoS 0 backlog for this subscriber (D1-02). Guaranteed
+    /// traffic (QoS 1/2, acks, control) never enters here: it rides
+    /// `tx` exactly as before. Only QoS 0 pushes here and only
+    /// `pop_qos0`/`drain_qos0` pops, so the queue length is the live
+    /// outstanding QoS 0 for this connection.
+    qos0: Mutex<VecDeque<BrokerFrame>>,
+    /// Client id owning this connection, for per-client shed labels.
+    /// Set by [`ConnTable::set_client_label`] on bind; `route` falls
+    /// back to the global shed counter alone when unset (tests that
+    /// never bind still count every drop).
+    client: RwLock<Option<Arc<str>>>,
+    /// Per-transport wakeup for QoS 0 arrivals (D1-02). The owning edge
+    /// task sets its own [`Notify`] via [`ConnTable::set_waker`] on
+    /// bind; `route`/`route_qos0` signal exactly this task
+    /// (`notify_one`, permit-storing) so a QoS 0 burst never wakes the
+    /// wrong transport while its owner sleeps. Unset (tests that drain
+    /// manually) means no directed wakeup; the global
+    /// [`ConnTable::qos0_notify`] still fires.
+    waker: RwLock<Option<Arc<Notify>>>,
 }
 
 impl ConnTable {
@@ -720,8 +976,194 @@ impl ConnTable {
             ConnSlot {
                 tx,
                 next_seq: AtomicU64::new(1),
+                qos0: Mutex::new(VecDeque::new()),
+                client: RwLock::new(None),
+                waker: RwLock::new(None),
             },
         );
+    }
+
+    /// Remember which client owns `conn_id` for per-client shed labels.
+    /// Called on bind/connect after [`ConnTable::register`]; re-binds
+    /// overwrite. Unknown connections are ignored. Never blocks the
+    /// matching path: one short shard read plus one short slot write.
+    pub fn set_client_label(&self, conn_id: u64, client_id: &str) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.client.write() = Some(Arc::<str>::from(client_id));
+        }
+    }
+
+    /// Remember which edge task owns `conn_id` for directed QoS 0
+    /// wakeups. Called on bind/connect after [`ConnTable::register`]
+    /// with the task's own [`Notify`]; re-binds overwrite. Unknown
+    /// connections are ignored. The task waits on its own `Notify`
+    /// alongside its guaranteed `rx`, so a QoS 0 burst wakes exactly
+    /// its owner (permit-storing `notify_one`, never lost) and never
+    /// the wrong transport.
+    pub fn set_waker(&self, conn_id: u64, waker: &Arc<Notify>) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.waker.write() = Some(waker.clone());
+        }
+    }
+
+    /// Configured QoS 0 backlog bound (floored at 1 on write).
+    pub fn qos0_bound(&self) -> usize {
+        self.qos0_bound.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the QoS 0 backlog bound (floored at 1; huge values have
+    /// no ceiling). Takes effect on the very next `route_qos0`.
+    pub fn set_qos0_bound(&self, bound: usize) {
+        self.qos0_bound.store(bound.max(1), Ordering::Relaxed);
+    }
+
+    /// Wakeup signalled on every QoS 0 enqueue. Edge tasks wait on this
+    /// alongside their guaranteed `rx` so a QoS-0-only burst never
+    /// sleeps through draining.
+    pub fn qos0_notify(&self) -> Arc<Notify> {
+        self.qos0_notify.clone()
+    }
+
+    /// Queued QoS 0 frames for `conn_id` (0 when unknown). Test and
+    /// drain-loop hook; never blocks.
+    pub fn qos0_len(&self, conn_id: u64) -> usize {
+        let shard = self.shard(conn_id).lock();
+        shard
+            .get(&conn_id)
+            .map(|slot| slot.qos0.lock().len())
+            .unwrap_or(0)
+    }
+
+    /// Pop one queued QoS 0 frame for `conn_id`, oldest-first. Returns
+    /// `None` when the backlog is empty or the destination is unknown.
+    /// Never blocks; the caller retries after [`ConnTable::qos0_notify`].
+    pub fn pop_qos0(&self, conn_id: u64) -> Option<BrokerFrame> {
+        let shard = self.shard(conn_id).lock();
+        shard
+            .get(&conn_id)
+            .and_then(|slot| slot.qos0.lock().pop_front())
+    }
+
+    /// Drain up to `max_frames` queued QoS 0 frames for `conn_id`,
+    /// oldest-first. Returns empty when the backlog is empty or the
+    /// destination is unknown. Never blocks.
+    pub fn drain_qos0(&self, conn_id: u64, max_frames: usize) -> Vec<BrokerFrame> {
+        let shard = self.shard(conn_id).lock();
+        let Some(slot) = shard.get(&conn_id) else {
+            return Vec::new();
+        };
+        let mut queue = slot.qos0.lock();
+        let take = max_frames.min(queue.len());
+        queue.drain(..take).collect()
+    }
+
+    /// Drain up to `max_frames` QoS 0 frames for `conn_id` within
+    /// `max_bytes` of encoded size, oldest-first. A single frame larger
+    /// than the whole budget still drains alone so a large payload can
+    /// never wedge its connection. Never blocks.
+    pub fn drain_qos0_with_budget(
+        &self,
+        conn_id: u64,
+        max_frames: usize,
+        max_bytes: usize,
+    ) -> Vec<BrokerFrame> {
+        let shard = self.shard(conn_id).lock();
+        let Some(slot) = shard.get(&conn_id) else {
+            return Vec::new();
+        };
+        let mut queue = slot.qos0.lock();
+        let mut out = Vec::new();
+        let mut out_bytes = 0usize;
+        while out.len() < max_frames && !queue.is_empty() {
+            let front_len = queue
+                .front()
+                .map(|frame| frame.total_frame_len())
+                .unwrap_or(0);
+            if out_bytes + front_len > max_bytes && !out.is_empty() {
+                break;
+            }
+            if let Some(frame) = queue.pop_front() {
+                out_bytes += front_len;
+                out.push(frame);
+                if out_bytes >= max_bytes {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Enqueue one QoS 0 `PublishOut` for `conn_id` on the bounded
+    /// per-subscriber backlog (D1-02). Stamps the per-destination
+    /// sequence number from the same counter as [`ConnTable::route`] so
+    /// order stays total per connection.
+    ///
+    /// When the backlog is full the oldest queued QoS 0 frame drops to
+    /// make room (counted once via `egress_qos0_shed` plus once under
+    /// `client_id`); the newest frame is always kept and the connection
+    /// is never dropped. QoS 1/2 and non-`PublishOut` frames must use
+    /// [`ConnTable::route`]: if one arrives here it bypasses shedding
+    /// and queues without bound so guarantees can never be shed by
+    /// misuse. Unknown destinations count `unknown_conn_dropped` and
+    /// return false, exactly like `route`.
+    ///
+    /// Never blocks and never awaits: publishers pay one shard lock
+    /// plus one short queue lock, so a stalled subscriber cannot slow
+    /// the publish path.
+    pub fn route_qos0(&self, conn_id: u64, client_id: &str, mut frame: BrokerFrame) -> bool {
+        let (shed, waker): (u64, Option<Arc<Notify>>) = {
+            let shard = self.shard(conn_id).lock();
+            let Some(slot) = shard.get(&conn_id) else {
+                drop(shard);
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.inc_unknown_conn_dropped();
+                }
+                return false;
+            };
+            let seq = slot.next_seq.fetch_add(1, Ordering::Relaxed);
+            frame.header.sequence_no = seq;
+            if !is_qos0_publish_out(&frame) {
+                let tx = slot.tx.clone();
+                drop(shard);
+                if tx.send(frame).is_ok() {
+                    return true;
+                }
+                self.unregister(conn_id);
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.inc_dead_mailbox_dropped();
+                }
+                return false;
+            }
+            let bound = self.qos0_bound.load(Ordering::Relaxed).max(1);
+            let mut queue = slot.qos0.lock();
+            let mut dropped = 0u64;
+            while queue.len() >= bound {
+                if queue.pop_front().is_some() {
+                    dropped += 1;
+                } else {
+                    break;
+                }
+            }
+            queue.push_back(frame);
+            let waker = slot.waker.read().clone();
+            (dropped, waker)
+        };
+        if shed > 0 {
+            if let Some(metrics) = self.metrics.get() {
+                for _ in 0..shed {
+                    metrics.inc_egress_qos0_shed_for(client_id);
+                }
+            }
+        }
+        if let Some(waker) = waker {
+            waker.notify_one();
+        }
+        self.qos0_notify.notify_one();
+        true
     }
 
     pub fn unregister(&self, conn_id: u64) {
@@ -752,7 +1194,66 @@ impl ConnTable {
     /// discarded. Drops that happened before still happen. Callers must
     /// not bump those counters themselves: one undeliverable frame
     /// increments exactly one counter by exactly one, inside this method.
+    ///
+    /// D1-02: QoS 0 `PublishOut` frames ride the bounded per-subscriber
+    /// backlog instead of the unbounded mailbox. When the backlog is
+    /// full the oldest queued QoS 0 frame drops (counted via
+    /// `egress_qos0_shed`, labelled by the stored client when
+    /// [`ConnTable::set_client_label`] ran on bind); the newest frame is
+    /// always kept, the connection is never dropped, and this method
+    /// never blocks, so publishers never stall on a slow subscriber.
+    /// QoS 1/2 and control frames keep the existing guaranteed path and
+    /// are never shed.
     pub fn route(&self, conn_id: u64, mut frame: BrokerFrame) -> bool {
+        if is_qos0_publish_out(&frame) {
+            let (shed, label, waker): (u64, Option<Arc<str>>, Option<Arc<Notify>>) = {
+                let shard = self.shard(conn_id).lock();
+                let Some(slot) = shard.get(&conn_id) else {
+                    drop(shard);
+                    if let Some(metrics) = self.metrics.get() {
+                        metrics.inc_unknown_conn_dropped();
+                    }
+                    return false;
+                };
+                let seq = slot.next_seq.fetch_add(1, Ordering::Relaxed);
+                frame.header.sequence_no = seq;
+                let bound = self.qos0_bound.load(Ordering::Relaxed).max(1);
+                let mut queue = slot.qos0.lock();
+                let mut dropped = 0u64;
+                while queue.len() >= bound {
+                    if queue.pop_front().is_some() {
+                        dropped += 1;
+                    } else {
+                        break;
+                    }
+                }
+                queue.push_back(frame);
+                let label = slot.client.read().clone();
+                let waker = slot.waker.read().clone();
+                (dropped, label, waker)
+            };
+            if shed > 0 {
+                if let Some(metrics) = self.metrics.get() {
+                    match &label {
+                        Some(client) => {
+                            for _ in 0..shed {
+                                metrics.inc_egress_qos0_shed_for(client);
+                            }
+                        }
+                        None => {
+                            for _ in 0..shed {
+                                metrics.inc_egress_qos0_shed();
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(waker) = waker {
+                waker.notify_one();
+            }
+            self.qos0_notify.notify_one();
+            return true;
+        }
         let tx = {
             let shard = self.shard(conn_id).lock();
             shard.get(&conn_id).map(|slot| {

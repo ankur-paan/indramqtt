@@ -55,6 +55,12 @@
          decode_publish_meta/1,
          encode_puback_meta/2,
          decode_puback_meta/1,
+         encode_pubrec_meta/1,
+         decode_pubrec_meta/1,
+         encode_pubrel_meta/1,
+         decode_pubrel_meta/1,
+         encode_pubcomp_meta/1,
+         decode_pubcomp_meta/1,
          encode_unbind_meta/1,
          decode_unbind_meta/1]).
 
@@ -442,6 +448,12 @@ decode_session_binding_meta(_) ->
 %% PubAckMeta (Opcodes 16#0023, Rust -> BEAM for QoS 1):
 %% {@code PacketId:16be | RC:8}.
 %%
+%% QoS 2 acknowledgement metas (D1-01, mirrored by the kernel
+%% `decode_qos2_meta'): `PacketId:16be' only, no return code. The MQTT
+%% PUBREC/PUBREL/PUBCOMP packets carry just the packet id, so the
+%% BrokerLink meta does the same. Opcodes 16#0024/16#0025 (PUBREC),
+%% 16#0026/16#0027 (PUBREL), 16#0028/16#0029 (PUBCOMP).
+%%
 %% UnbindMeta (Opcode 16#0012, BEAM -> Rust):
 %% {@code IdLen:16be | ClientId}.
 
@@ -546,6 +558,45 @@ decode_puback_meta(<<PacketId:16/big, RC:8>>) when PacketId =/= 0 ->
     {ok, #{packet_id => PacketId, return_code => RC}};
 decode_puback_meta(_) ->
     {error, malformed_puback_meta}.
+
+%% @doc Encode QoS 2 PUBREC metadata (packet id only, D1-01).
+-spec encode_pubrec_meta(1..65535) -> binary().
+encode_pubrec_meta(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<PacketId:16/big>>.
+
+%% @doc Decode QoS 2 PUBREC metadata.
+-spec decode_pubrec_meta(binary()) -> {ok, #{packet_id := 1..65535}} | {error, term()}.
+decode_pubrec_meta(<<PacketId:16/big>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId}};
+decode_pubrec_meta(_) ->
+    {error, malformed_pubrec_meta}.
+
+%% @doc Encode QoS 2 PUBREL metadata (packet id only, D1-01).
+-spec encode_pubrel_meta(1..65535) -> binary().
+encode_pubrel_meta(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<PacketId:16/big>>.
+
+%% @doc Decode QoS 2 PUBREL metadata.
+-spec decode_pubrel_meta(binary()) -> {ok, #{packet_id := 1..65535}} | {error, term()}.
+decode_pubrel_meta(<<PacketId:16/big>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId}};
+decode_pubrel_meta(_) ->
+    {error, malformed_pubrel_meta}.
+
+%% @doc Encode QoS 2 PUBCOMP metadata (packet id only, D1-01).
+-spec encode_pubcomp_meta(1..65535) -> binary().
+encode_pubcomp_meta(PacketId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    <<PacketId:16/big>>.
+
+%% @doc Decode QoS 2 PUBCOMP metadata.
+-spec decode_pubcomp_meta(binary()) -> {ok, #{packet_id := 1..65535}} | {error, term()}.
+decode_pubcomp_meta(<<PacketId:16/big>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId}};
+decode_pubcomp_meta(_) ->
+    {error, malformed_pubcomp_meta}.
 
 %% @doc Encode UnbindConnection metadata (client identity).
 -spec encode_unbind_meta(binary()) -> binary().
@@ -935,13 +986,16 @@ drain_buffer(State) ->
             State#{buffer => <<>>}
     end.
 
-%% Opcodes routed to the owning connection process.
--define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0031, 16#0041]).
+%% Opcodes routed to the owning connection process. QoS 2 control frames
+%% (PubRecOut, PubRelOut, PubCompOut) are small and rare like PubAckOut:
+%% they always pass straight through to the connection.
+-define(DISPATCH_OPCODES, [16#0011, 16#0021, 16#0023, 16#0025, 16#0027, 16#0029,
+                            16#0031, 16#0041]).
 
 %% Q3 per-connection egress bound, enforced here at dispatch (before a
 %% frame enters any mailbox), not in the mailbox. Control frames
-%% (SessionBinding, SubAck, PubAck, ConnClose) are small and rare: they
-%% always pass. PublishOut passes through the credit account: QoS 0 past
+%% (SessionBinding, SubAck, PubAck, PubRec, PubRel, PubComp, ConnClose)
+%% are small and rare: they always pass. PublishOut passes through the
 %% the cap is shed and counted (no delivery promise to break); QoS 1
 %% past the cap is still admitted and counted (no deferral exists yet,
 %% so shedding would be silent loss). Malformed PublishOut meta admits
