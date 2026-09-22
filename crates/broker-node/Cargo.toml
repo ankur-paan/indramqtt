@@ -32,6 +32,7 @@ broker-api = { workspace = true }
 broker-observability = { workspace = true }
 broker-gateway = { workspace = true }
 bytes = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }

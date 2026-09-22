@@ -2,14 +2,20 @@
 
 pub mod alarms;
 pub mod auth;
+pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
 pub mod gateways;
 pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
+pub mod retainer;
 pub mod rules;
 pub mod schemas;
+pub mod slow_subscriptions;
+pub mod status;
+pub mod trace;
+pub mod tracing;
 
 use crate::ApiState;
 use axum::{
@@ -74,6 +80,48 @@ pub fn protected_router() -> Router<ApiState> {
             get(monitoring::monitor_current_node),
         )
         .route("/stats", get(monitoring::get_stats))
+        .route("/status", get(status::get_status))
+        .route(
+            "/mqtt/auto_subscribe",
+            get(auto_subscribe::get_auto_subscribe).put(auto_subscribe::put_auto_subscribe),
+        )
+        .route(
+            "/mqtt/retainer",
+            get(retainer::get_retainer_config).put(retainer::put_retainer_config),
+        )
+        .route(
+            "/mqtt/retainer/message/:topic",
+            get(retainer::get_retainer_message).delete(retainer::delete_retainer_message),
+        )
+        .route(
+            "/mqtt/retainer/messages",
+            get(retainer::list_retainer_messages).delete(retainer::clear_retainer_messages),
+        )
+        .route(
+            "/slow_subscriptions",
+            get(slow_subscriptions::list_slow_subscriptions)
+                .delete(slow_subscriptions::clear_slow_subscriptions),
+        )
+        .route(
+            "/slow_subscriptions/settings",
+            get(slow_subscriptions::get_slow_subs_settings)
+                .put(slow_subscriptions::put_slow_subs_settings),
+        )
+        .route(
+            "/tracing",
+            get(tracing::get_tracing).put(tracing::put_tracing),
+        )
+        .route(
+            "/trace",
+            get(trace::list_traces)
+                .post(trace::create_trace)
+                .delete(trace::clear_traces),
+        )
+        .route("/trace/:name", delete(trace::delete_trace))
+        .route("/trace/:name/stop", put(trace::stop_trace))
+        .route("/trace/:name/download", get(trace::download_trace))
+        .route("/trace/:name/log", get(trace::get_trace_log))
+        .route("/trace/:name/log_detail", get(trace::get_trace_log_detail))
         // Cluster & Nodes
         .route("/nodes", get(nodes::list_nodes))
         .route("/nodes/:node", get(nodes::get_node))

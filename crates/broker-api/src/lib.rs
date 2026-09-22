@@ -7,7 +7,7 @@ use axum::{
 };
 use broker_auth::{AclAction, AclRule, MemoryAuth};
 use broker_config::ConfigRegistry;
-use broker_observability::{Metrics, StatsStore};
+use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router as SubscriptionRouter};
 use broker_rules::{Rule, RuleAction, RuleEngine, RuleEngineError};
@@ -79,6 +79,46 @@ pub struct ApiState {
     /// handlers below read one constant-time snapshot per request.
     /// Management-plane only; never touched on the per-message path.
     pub stats: Arc<StatsStore>,
+    /// Node readiness flag for `GET /api/v5/status` (W1-27): single
+    /// atomic bool shared with the kernel. The handler does one
+    /// constant-time load per request and reports the documented up
+    /// value while ready. Management-plane only; never touched on the
+    /// per-message path.
+    pub readiness: Arc<NodeReadiness>,
+    /// Retained-delivery settings for `GET/PUT /api/v5/mqtt/retainer`
+    /// (W1-28): single validated struct behind a short lock plus a
+    /// persistence hook. Management-plane only; never touched on the
+    /// per-message path.
+    pub retainer_config: Arc<crate::v5::retainer::RetainerConfigStore>,
+    /// Retained store for `GET /api/v5/mqtt/retainer/message/{topic}`
+    /// (W1-28): shared with the kernel so management reads observe the
+    /// same MQTT ingress state. Reads take only a short read lock and
+    /// clone at most one message, so they never block delivery.
+    /// Bounded by `broker_storage::MAX_RETAINED_MESSAGES`.
+    pub retained: Arc<dyn broker_storage::RetainedStore>,
+    /// Slow-subscription recorder for `GET/DELETE /api/v5/slow_subscriptions`
+    /// (W1-30): bounded ranked table of slow deliveries. Management-plane
+    /// only; never touched on the per-message path.
+    pub slow_subs: Arc<crate::v5::slow_subscriptions::SlowSubsStore>,
+    /// Slow-subscription thresholds for `GET/PUT
+    /// /api/v5/slow_subscriptions/settings` (W1-31): single validated
+    /// struct behind a short lock. Management-plane only; readers take a
+    /// snapshot clone and never touch the per-message path.
+    pub slow_subs_settings: Arc<crate::v5::slow_subscriptions::SlowSubsSettingsStore>,
+    /// Packet-tracing flag for `GET/PUT /api/v5/tracing` (W1-32):
+    /// single atomic bool. Management-plane only; never touched on the
+    /// per-message path.
+    pub tracing: Arc<crate::v5::tracing::TracingFlagStore>,
+    /// Trace-session registry for `GET/POST/DELETE /api/v5/trace` (W1-33)
+    /// plus `DELETE /api/v5/trace/{name}` (W1-34):
+    /// bounded map of capture sessions. Management-plane only; never
+    /// touched on the per-message path.
+    pub traces: Arc<crate::v5::trace::TraceStore>,
+    /// Auto-subscribe list for `GET/PUT /api/v5/mqtt/auto_subscribe`
+    /// (W1-39): bounded validated list plus the connect-time hook. The
+    /// routes read one bounded snapshot per request; the kernel hook
+    /// clones the same capped list once per bind, never per message.
+    pub auto_subscribe: Arc<crate::v5::auto_subscribe::AutoSubscribeStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -133,6 +173,16 @@ impl ApiState {
             alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
             stats: Arc::new(StatsStore::new()),
+            readiness: Arc::new(NodeReadiness::new()),
+            retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
+            retained: Arc::new(broker_storage::MemoryStore::new()),
+            slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
+            slow_subs_settings: Arc::new(
+                crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
+            ),
+            tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
+            traces: Arc::new(crate::v5::trace::TraceStore::new()),
+            auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -161,6 +211,16 @@ impl ApiState {
             alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
             stats: Arc::new(StatsStore::new()),
+            readiness: Arc::new(NodeReadiness::new()),
+            retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
+            retained: Arc::new(broker_storage::MemoryStore::new()),
+            slow_subs: Arc::new(crate::v5::slow_subscriptions::SlowSubsStore::new()),
+            slow_subs_settings: Arc::new(
+                crate::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
+            ),
+            tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
+            traces: Arc::new(crate::v5::trace::TraceStore::new()),
+            auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -6542,20 +6602,53 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_trace_slowsub_topicmetrics_routes_return_404() {
+        // W1-30 restores `GET`/`DELETE /api/v5/slow_subscriptions` on the
+        // real recorder, W1-31 restores `GET`/`PUT
+        // /api/v5/slow_subscriptions/settings` on the real thresholds and
+        // W1-33 restores `GET`/`POST`/`DELETE /api/v5/trace` on the real
+        // registry, so only the per-session trace reads and topic-metrics
+        // routes stay removed here; trace create-list-clear coverage lives
+        // with the registry tests.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/trace",
-            "/api/v5/trace/x/log",
-            "/api/v5/slow_subscriptions",
-            "/api/v5/slow_subscriptions/settings",
-            "/api/v5/mqtt/topic_metrics",
-        ] {
+        for path in ["/api/v5/trace/x/log", "/api/v5/mqtt/topic_metrics"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
-        let (status, _) = server.post_auth("/api/v5/trace", json!({}), &token).await;
-        assert_eq!(status, 404, "removed route POST /api/v5/trace must be 404");
+        let (status, _) = server.get_auth("/api/v5/trace", &token).await;
+        assert_eq!(status, 200, "kept route GET /api/v5/trace must be 200");
+        let (status, _) = server.delete_auth("/api/v5/trace", &token).await;
+        assert_eq!(status, 204, "kept route DELETE /api/v5/trace must be 204");
+        let (status, _) = server.get_auth("/api/v5/slow_subscriptions", &token).await;
+        assert_eq!(
+            status, 200,
+            "kept route GET /api/v5/slow_subscriptions must be 200"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/slow_subscriptions", &token)
+            .await;
+        assert_eq!(
+            status, 204,
+            "kept route DELETE /api/v5/slow_subscriptions must be 204"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/slow_subscriptions/settings", &token)
+            .await;
+        assert_eq!(
+            status, 200,
+            "kept route GET /api/v5/slow_subscriptions/settings must be 200"
+        );
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/slow_subscriptions/settings",
+                json!({"threshold": "1s"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "kept route PUT /api/v5/slow_subscriptions/settings must be 200"
+        );
     }
 
     #[tokio::test]

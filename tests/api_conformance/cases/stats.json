@@ -1,0 +1,23 @@
+[
+  {
+    "operation": "GET /stats",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-stats-1"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-stats-1"
+        }
+      }
+    ]
+  }
+]

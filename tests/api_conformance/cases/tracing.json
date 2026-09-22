@@ -1,0 +1,53 @@
+[
+  {
+    "operation": "GET /tracing",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /tracing",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "enable": true
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /tracing",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "enable": false
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /tracing",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "enable": "yes"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /tracing",
+    "path_params": {},
+    "query": {},
+    "body": {},
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  }
+]

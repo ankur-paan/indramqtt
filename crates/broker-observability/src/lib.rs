@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn init_tracing() {
@@ -662,6 +662,53 @@ impl Metrics {
             self.credit_exhausted(),
             self.credit_received(),
         )
+    }
+}
+
+/// Node readiness flag behind `GET /status`.
+///
+/// Single atomic bool, set once the management plane can answer. Reads are
+/// one relaxed atomic load per request (constant time), writes happen only
+/// at lifecycle points (boot ready, shutdown draining). Per-instance like
+/// [`Metrics`] (never global) so multi-node in-process tests stay isolated.
+///
+/// Store bounds: exactly one bool; no map, queue or buffer grows with
+/// connections, sessions or subscriptions. Management-plane only; never
+/// touched on the per-message path, so fan-out and fan-in take no new lock
+/// and no new buffering.
+#[derive(Debug)]
+pub struct NodeReadiness {
+    ready: AtomicBool,
+}
+
+impl NodeReadiness {
+    /// Ready flag, set: the node is up whenever the management plane
+    /// answers, which is exactly when this handler can run.
+    pub fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    /// Mark the node ready (up). Constant-time single store.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
+    }
+
+    /// Mark the node not ready (down). Constant-time single store.
+    pub fn mark_not_ready(&self) {
+        self.ready.store(false, Ordering::Relaxed);
+    }
+
+    /// Constant-time single load for the status handler.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for NodeReadiness {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

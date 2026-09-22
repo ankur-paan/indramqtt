@@ -1,0 +1,199 @@
+[
+  {
+    "operation": "GET /mqtt/retainer",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/retainer",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "max_payload_size": "2MB"
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/retainer",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "max_payload_size": "huge"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/retainer/message/{topic}",
+    "path_params": {
+      "topic": "conf/retainer/w128-hit"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w128-hit",
+            "payload": "hello-retainer",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      }
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/retainer/message/{topic}",
+    "path_params": {
+      "topic": "conf/retainer/w128-missing"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/retainer/message/{topic}",
+    "path_params": {
+      "topic": "conf/retainer/w129-del"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-del",
+            "payload": "hello-delete",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      }
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/retainer/message/{topic}",
+    "path_params": {
+      "topic": "conf/retainer/w129-missing"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/retainer/messages",
+    "path_params": {},
+    "query": {
+      "page": 1,
+      "limit": 1
+    },
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-a",
+            "payload": "hello-a",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-b",
+            "payload": "hello-b",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      }
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /mqtt/retainer/messages",
+    "path_params": {},
+    "query": {
+      "page": 2,
+      "limit": 1
+    },
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-a",
+            "payload": "hello-a",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-b",
+            "payload": "hello-b",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      }
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /mqtt/retainer/messages",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/publish",
+          "body": {
+            "topic": "conf/retainer/w129-clear",
+            "payload": "hello-clear",
+            "qos": 1,
+            "retain": true
+          }
+        }
+      }
+    ],
+    "cleanup": []
+  }
+]

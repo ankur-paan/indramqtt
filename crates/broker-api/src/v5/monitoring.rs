@@ -16,26 +16,6 @@ use crate::ApiState;
 /// (see `node_scope` docs); both name the same local node.
 const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 
-fn gather_stats(state: &ApiState) -> (usize, usize, usize, u64, u64) {
-    let conns = state.metrics.connections_active().max(0) as usize;
-    let active_ids = state.sessions.active_client_ids();
-    let mut subs = 0;
-    let mut topic_set = std::collections::HashSet::new();
-    for cid in &active_ids {
-        if let Some(s) = state.sessions.get(cid) {
-            let map = s.subscriptions.read();
-            subs += map.len();
-            for f in map.keys() {
-                topic_set.insert(f.as_str().to_string());
-            }
-        }
-    }
-    let topics = topic_set.len();
-    let msgs_recv = state.metrics.messages_received();
-    let msgs_sent = state.metrics.messages_forwarded();
-    (conns, subs, topics, msgs_recv, msgs_sent)
-}
-
 /// Live gauges for the current snapshot, read from the session
 /// directory and lock-free metrics. Management-plane only.
 fn live_counters(state: &ApiState) -> crate::v5::monitor::LiveCounters {
@@ -142,31 +122,26 @@ pub async fn monitor_current_node(
     (StatusCode::OK, Json(current_snapshot_value(&state))).into_response()
 }
 
+/// Documented `GET /stats` snapshot: aggregated resource and session statistics.
+///
+/// Single node, management-plane only: copies the same gauge-plus-high-water-mark
+/// store as `GET /nodes/{node}/stats` ([`stats_snapshot_value`], eight atomic loads)
+/// and renders the documented stat names from that copy, so one read costs a bounded
+/// copy of the gauge block and adds no work to the per-message path. All `set_*`
+/// updates already happen at kernel lifecycle points; this read only copies.
+/// Returned as a one-element array naming the local node, so the aggregated shape
+/// carries the same documented names as the per-node read. Every stat value is
+/// numeric and reflects live state.
+/// Management-plane only; never touched on fan-out or fan-in.
 pub async fn get_stats(State(state): State<ApiState>) -> Response {
-    let node_name = "indramqtt@127.0.0.1";
-    let (conns, subs, topics, _recv, _sent) = gather_stats(&state);
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            {
-                "node": node_name,
-                "connections.count": conns,
-                "connections.max": conns.max(100),
-                "live_connections.count": conns,
-                "live_connections.max": conns.max(100),
-                "subscriptions.count": subs,
-                "subscriptions.max": subs.max(100),
-                "subscriptions.shared.count": 0,
-                "subscriptions.shared.max": 0,
-                "topics.count": topics,
-                "topics.max": topics.max(100),
-                "retained.count": 0,
-                "retained.max": 0
-            }
-        ])),
-    )
-        .into_response()
+    let mut snapshot = stats_snapshot_value(&state);
+    if let Some(map) = snapshot.as_object_mut() {
+        map.insert(
+            "node".to_string(),
+            serde_json::Value::from(LEGACY_NODE_NAME),
+        );
+    }
+    (StatusCode::OK, Json(vec![snapshot])).into_response()
 }
 
 /// Shared snapshot read for `GET /nodes/{node}/stats`.
@@ -1043,5 +1018,98 @@ mod tests {
             message.contains("no-such-node"),
             "message names the unknown node: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn global_stats_returns_aggregated_numeric_fields_from_store() {
+        let state = standalone_state();
+        state.stats.set_connections(2);
+        state.stats.set_subscriptions(4);
+        state.stats.set_topics(3);
+        state.stats.set_retained(1);
+        let (status, body) = snapshot_body(get_stats(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("global stats is an array");
+        assert_eq!(rows.len(), 1, "aggregated snapshot has one row: {body}");
+        let row = &rows[0];
+        assert_eq!(row["node"], serde_json::json!(LEGACY_NODE_NAME));
+        for name in documented_stat_names() {
+            let value = row
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}: {body}"));
+            assert!(value.is_number(), "{name} is numeric: {value:?}");
+        }
+        // Session-related fields reflect the live store, not a fresh scan.
+        assert_eq!(row["connections.count"], serde_json::json!(2));
+        assert_eq!(row["live_connections.count"], serde_json::json!(2));
+        assert_eq!(row["channels.count"], serde_json::json!(2));
+        assert_eq!(row["sessions.count"], serde_json::json!(2));
+        assert_eq!(row["cluster_sessions.count"], serde_json::json!(2));
+        assert!(row["sessions.count"].as_u64().expect("sessions") >= 1);
+        assert_eq!(row["subscriptions.count"], serde_json::json!(4));
+        assert_eq!(row["suboptions.count"], serde_json::json!(4));
+        assert_eq!(row["topics.count"], serde_json::json!(3));
+        assert_eq!(row["retained.count"], serde_json::json!(1));
+        assert_eq!(row["subscriptions.shared.count"], serde_json::json!(0));
+        assert_eq!(row["delayed.count"], serde_json::json!(0));
+        for (count, max) in [
+            ("connections.count", "connections.max"),
+            ("subscriptions.count", "subscriptions.max"),
+            ("topics.count", "topics.max"),
+            ("retained.count", "retained.max"),
+        ] {
+            let current = row[count].as_u64().expect("count numeric");
+            let peak = row[max].as_u64().expect("max numeric");
+            assert!(
+                peak >= current,
+                "{max} ({peak}) must cover {count} ({current}): {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn global_stats_matches_node_stats_snapshot() {
+        let state = standalone_state();
+        state.stats.set_connections(3);
+        state.stats.set_subscriptions(7);
+        state.stats.set_topics(2);
+        state.stats.set_retained(1);
+        let (_, global) = snapshot_body(get_stats(State(state.clone())).await).await;
+        let row = &global.as_array().expect("global stats is an array")[0];
+        let (_, node) =
+            snapshot_body(get_stats_node(State(state), Path(LEGACY_NODE_NAME.to_string())).await)
+                .await;
+        for name in documented_stat_names() {
+            assert_eq!(&row[name], &node[name], "{name} matches the node read");
+        }
+    }
+
+    #[tokio::test]
+    async fn global_stats_maxima_come_from_store_and_never_fall() {
+        let state = standalone_state();
+        state.stats.set_connections(5);
+        state.stats.set_subscriptions(7);
+        state.stats.set_topics(3);
+        state.stats.set_retained(2);
+        let (_, first) = snapshot_body(get_stats(State(state.clone())).await).await;
+        let peak = &first.as_array().expect("global stats is an array")[0];
+        assert_eq!(peak["connections.max"], serde_json::json!(5));
+        assert_eq!(peak["subscriptions.max"], serde_json::json!(7));
+        // Gauges fall; maxima stay at the true peak from the store.
+        state.stats.set_connections(2);
+        state.stats.set_subscriptions(0);
+        state.stats.set_topics(1);
+        state.stats.set_retained(0);
+        let (status, body) = snapshot_body(get_stats(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &body.as_array().expect("global stats is an array")[0];
+        assert_eq!(row["connections.count"], serde_json::json!(2));
+        assert_eq!(row["connections.max"], serde_json::json!(5));
+        assert_eq!(row["subscriptions.count"], serde_json::json!(0));
+        assert_eq!(row["subscriptions.max"], serde_json::json!(7));
+        assert_eq!(row["topics.count"], serde_json::json!(1));
+        assert_eq!(row["topics.max"], serde_json::json!(3));
+        assert_eq!(row["retained.count"], serde_json::json!(0));
+        assert_eq!(row["retained.max"], serde_json::json!(2));
     }
 }
