@@ -714,38 +714,59 @@ pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParam
     (StatusCode::OK, Json(data)).into_response()
 }
 
-pub async fn list_topics(State(state): State<ApiState>) -> Response {
-    let mut topic_set = std::collections::HashSet::new();
-    for cid in state.sessions.active_client_ids() {
-        if let Some(s) = state.sessions.get(&cid) {
-            for filter in s.subscriptions.read().keys() {
-                topic_set.insert(filter.as_str().to_string());
-            }
-        }
-    }
-
-    let data: Vec<_> = topic_set
-        .into_iter()
+/// Topic list as a paged collection (W1-15).
+///
+/// Reads the topic index maintained on the router via
+/// [`broker_router::Router::record_topic`], not the session
+/// subscription mirror, so only concrete publish topics appear (a
+/// subscribe alone never creates a row). The snapshot is bounded by
+/// [`broker_router::MAX_KNOWN_TOPICS`] (100_000 names, sorted for a
+/// deterministic page order) and then sliced with the W0
+/// `page`/`limit` helper; unknown query keys are ignored by the
+/// extractor so new parameters degrade to the full first page instead
+/// of a 400. Management-plane only: list reads take a short lock on
+/// the topic set and never touch the subscription trie, fan-out or
+/// fan-in. Returns the documented envelope (`data` plus `meta`).
+pub async fn list_topics(State(state): State<ApiState>, params: PageParams) -> Response {
+    let rows = state.router.list_topics();
+    let total = rows.len();
+    let page_items = paginate(&rows, params.page, params.limit);
+    let data: Vec<serde_json::Value> = page_items
+        .iter()
         .map(|t| {
             serde_json::json!({
                 "topic": t,
-                "node": "indramqtt@127.0.0.1",
-                "msg_rate": 0
+                "node": "indramqtt@127.0.0.1"
             })
         })
         .collect();
-
-    let count = data.len();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 100,
-                "count": count,
-                "hasnext": false
-            }
+            "meta": meta_page(params.page, params.limit, total),
+        })),
+    )
+        .into_response()
+}
+
+/// Topic detail for one exact topic name (W1-15).
+///
+/// Looks up the topic index with an exact match on the percent-decoded
+/// path parameter: no wildcard, prefix or filter matching. Known
+/// topics return the documented record; unknown topics return the
+/// documented not-found shape (`NOT_FOUND`, 404). Management-plane
+/// read only: one short lock on the topic set, no work on fan-out or
+/// fan-in.
+pub async fn get_topic(State(state): State<ApiState>, Path(topic): Path<String>) -> Response {
+    if !state.router.contains_topic(&topic) {
+        return ApiError::NotFound("topic not found".to_string()).into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "topic": topic,
+            "node": "indramqtt@127.0.0.1"
         })),
     )
         .into_response()
@@ -1158,6 +1179,11 @@ async fn do_mgmt_publish(
         .dispatch_ingress(topic, payload, qos, &sink)
         .await;
     state.metrics.inc_rules_executed_by(rules_fired as u64);
+    // Topic index (W1-15): remember the concrete publish topic before
+    // fan-out so the list/detail reads observe it. Bounded short-lock
+    // insert; delivery proceeds even when the index is full.
+    // Management-plane index only, no work on fan-out or fan-in.
+    state.router.record_topic(topic.as_str());
     let (frames, _offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
     route_publish_frames(state, frames);
     matched

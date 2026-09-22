@@ -1,0 +1,24 @@
+[
+  {
+    "operation": "GET /nodes/{node}/metrics",
+    "path_params": {
+      "node": "$from:GET /nodes#/0/node"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /nodes/{node}/metrics",
+    "path_params": {
+      "node": "no-such-node-xyz"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  }
+]
