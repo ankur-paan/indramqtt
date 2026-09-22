@@ -5,13 +5,19 @@ Copyright (c) 2026 I-Dacs Labs (https://i-dacs.com). All rights reserved.
 
 1. SCOPE AND APPLICABILITY
 This License governs the use, copying, modification, and distribution of the
-IndraMQTT Distributed Clustering engine ("crates/broker-cluster") and any
-components explicitly designated under this License (the "Enterprise Software").
+IndraMQTT Distributed Clustering engine ("crates/broker-cluster"), the stateful
+windowed stream processing implementation (tumbling, hopping, sliding and count
+window operators and their background execution workers), the enterprise and
+industrial connectors, and any components explicitly designated under this
+License (the "Enterprise Software").
 
 All other components of the IndraMQTT repository (including single-node broker
 runtime, BEAM edge, BrokerLink IPC, Radix router, session engine, storage engine,
-and stream processing rules) remain dual-licensed under the MIT License and the
-Apache License, Version 2.0, and are unaffected by this License.
+stateless SQL rule evaluation, and the Community connectors) remain dual-licensed
+under the MIT License and the Apache License, Version 2.0, and are unaffected by
+this License. The embedded upstream SQL parser and evaluator ("rekuiper-sql") is a
+separate MIT OR Apache-2.0 dependency and this License does not restrict it; only
+the stateful windowing built on top of it in this repository is Enterprise Software.
 
 2. EVALUATION AND DEVELOPMENT USE
 Subject to the terms of this License, I-Dacs Labs grants you a non-exclusive,
