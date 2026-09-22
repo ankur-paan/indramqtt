@@ -7,7 +7,7 @@
 [![OTP Version](https://img.shields.io/badge/Erlang%2FOTP-26%2B-red.svg)](https://www.erlang.org)
 [![Automated Tests](https://img.shields.io/badge/Tests-388%20Passing%20(100%25)-brightgreen.svg)](https://indramqtt.com)
 
-**Official Website**: [indramqtt.com](https://indramqtt.com) | **Documentation**: [indramqtt.com/docs](https://indramqtt.com/docs)
+**Official Website**: [indramqtt.com](https://indramqtt.com) | **Documentation**: upcoming
 
 [Architecture](ARCHITECTURE.md) • [Benchmarks](BENCHMARKS.md) • [Roadmap](ROADMAP.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md) • [Docker](#one-click-evaluation-with-docker)
 
