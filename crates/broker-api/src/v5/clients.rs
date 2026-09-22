@@ -1148,6 +1148,78 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
 /// Publish one message through ingress accounting, rule execution then session-aware
 /// fan-out, mirroring kernel ingress order. Retain flag is preserved in delivery frames
 /// and offline/inflight entries; no extra per-message buffering is added. Returns match count.
+/// Retained store/clear for management publishes (W1-28), mirroring kernel ingress.
+///
+/// Stores (or clears on empty payload) before rules and fan-out observe the
+/// message. Oversized payloads past `max_payload_size` are delivered but
+/// not stored; new topics past `backend.max_retained_messages` (when
+/// non-zero) are dropped while replacements still land. Both are best-effort
+/// guards sharing the same `retainer_config` object the kernel ingress
+/// enforces; the authoritative bound is the hard cap in
+/// `broker_storage::MAX_RETAINED_MESSAGES`, enforced atomically inside the
+/// store write lock. After a write the retained gauge is recounted with the
+/// same helper the kernel uses, so `/stats` stays exact instead of
+/// drifting. Management-plane only (retained publishes are rare, so the
+/// scan never sits on fan-out or fan-in); one short-lock read plus at most
+/// one write per retained publish.
+async fn handle_mgmt_retained(
+    state: &ApiState,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+) {
+    if !retain {
+        return;
+    }
+    if payload.is_empty() {
+        if state.retained.clear_retained(topic).await.is_ok() {
+            sync_retained_count(state).await;
+        }
+        return;
+    }
+    let cfg = state.retainer_config.get();
+    let max_bytes =
+        crate::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size).unwrap_or(1_048_576);
+    if (payload.len() as u64) > max_bytes {
+        return;
+    }
+    let cap = cfg.backend.max_retained_messages;
+    if cap > 0 {
+        let already = state
+            .retained
+            .get_retained(topic)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !already && state.stats.retained() >= cap {
+            return;
+        }
+    }
+    if state
+        .retained
+        .set_retained(topic.clone(), qos, payload.clone())
+        .await
+        .is_ok()
+    {
+        sync_retained_count(state).await;
+    }
+}
+
+/// Recount retained topics into the stats gauge after a management retained
+/// write, mirroring the kernel lifecycle helper. One bounded scan per
+/// retained management publish (rare path); delivery never waits on it.
+async fn sync_retained_count(state: &ApiState) {
+    let filter = match TopicFilter::new("#") {
+        Ok(valid) => valid,
+        Err(_) => return,
+    };
+    if let Ok(matched) = state.retained.find_matching(&filter).await {
+        state.stats.set_retained(matched.len() as u64);
+    }
+}
+
 async fn do_mgmt_publish(
     state: &ApiState,
     topic: &Topic,
@@ -1168,6 +1240,7 @@ async fn do_mgmt_publish(
             state.metrics.inc_qos2_received();
         }
     }
+    handle_mgmt_retained(state, topic, qos, retain, payload).await;
     let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(ApiBrokerSink {
         router: state.router.clone(),
         sessions: state.sessions.clone(),

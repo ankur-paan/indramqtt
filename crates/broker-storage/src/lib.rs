@@ -50,6 +50,20 @@ pub trait SessionStore: Send + Sync {
     async fn get_cursor(&self, session_id: u64) -> Result<u64>;
 }
 
+/// Maximum retained topics held by [`MemoryStore`].
+///
+/// The map holds at most this many exact topics; inserts past the cap
+/// keep delivery working but drop the new topic (existing topics may still
+/// be replaced), so one client cannot balloon the node. Management-plane
+/// reads clone at most one entry (single lookup) or a bounded page (list),
+/// never scanning without a cap, and take only short read locks so they
+/// never block delivery.
+///
+/// 100_000 entries cover the documented unlimited default (`0`) while
+/// keeping per-entry memory (one shared topic string plus payload) under
+/// control on the 12 GB test host.
+pub const MAX_RETAINED_MESSAGES: usize = 100_000;
+
 /// In-memory storage engine for local fast tests and zero-disk development.
 #[derive(Default)]
 pub struct MemoryStore {
@@ -91,6 +105,9 @@ impl MessageStore for MemoryStore {
 impl RetainedStore for MemoryStore {
     async fn set_retained(&self, topic: Topic, qos: QoS, payload: Bytes) -> Result<()> {
         let mut map = self.retained.write();
+        if map.len() >= MAX_RETAINED_MESSAGES && !map.contains_key(&topic) {
+            return Ok(());
+        }
         map.insert(
             topic.clone(),
             StoredMessage {

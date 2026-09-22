@@ -1,0 +1,93 @@
+[
+  {
+    "operation": "GET /mqtt/auto_subscribe",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/auto_subscribe",
+    "path_params": {},
+    "query": {},
+    "body": [
+      {
+        "topic": "conf/auto/w139-round",
+        "qos": 1,
+        "rh": 0,
+        "rap": 0,
+        "nl": 0
+      }
+    ],
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/auto_subscribe",
+    "path_params": {},
+    "query": {},
+    "body": [
+      {
+        "topic": "conf/auto/w139-bad",
+        "qos": 5
+      }
+    ],
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/auto_subscribe",
+    "path_params": {},
+    "query": {},
+    "body": [
+      {
+        "topic": ""
+      }
+    ],
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /clients/{clientid}/subscriptions",
+    "path_params": {
+      "clientid": "conf-auto-w139"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "PUT",
+          "path": "/mqtt/auto_subscribe",
+          "body": [
+            {
+              "topic": "conf/auto/w139-hook",
+              "qos": 0,
+              "rh": 0,
+              "rap": 0,
+              "nl": 0
+            }
+          ]
+        }
+      },
+      {
+        "mqtt_connect": {
+          "clientid": "conf-auto-w139"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-auto-w139"
+        }
+      }
+    ]
+  }
+]

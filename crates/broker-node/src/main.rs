@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use broker_auth::{Authenticator, Authorizer, MemoryAuth};
 use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
 use broker_config::{ConfigError, ConfigRegistry};
-use broker_observability::{Metrics, StatsStore};
+use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
@@ -214,6 +214,59 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     reply
 }
 
+/// Whether a `SessionBinding` reply accepted the connection.
+///
+/// The reply metadata is `SessionId:64be | Present:8 | ReturnCode:8`;
+/// only return code 0 proceeds to the auto-subscribe hook. Malformed
+/// replies never trigger subscriptions.
+fn is_binding_accepted(reply: &BrokerFrame) -> bool {
+    reply.metadata.len() == 10 && reply.metadata[9] == 0
+}
+
+/// Subscribe one freshly bound connection to the configured
+/// auto-subscribe list (W1-39).
+///
+/// Runs once per successful bind, never on the per-message path: it
+/// clones the capped list once, renders `${clientid}`/`${username}`/
+/// `${host}` per entry, and registers each valid filter in the router
+/// plus the session mirror. Invalid rendered filters are skipped so one
+/// bad template can never fail a connect; the stored templates themselves
+/// are validated at the management write, so skips only cover
+/// placeholder edge cases.
+fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>, conn_id: u64) {
+    let entries = shared.auto_subscribe.list();
+    if entries.is_empty() {
+        return;
+    }
+    let mut applied = false;
+    for entry in &entries {
+        let rendered =
+            broker_api::v5::auto_subscribe::render_auto_topic(&entry.topic, client_id, username);
+        let Ok(filter) = TopicFilter::new(&rendered) else {
+            continue;
+        };
+        let Ok(qos) = QoS::try_from(entry.qos) else {
+            continue;
+        };
+        shared.router.subscribe(
+            &filter,
+            Subscription {
+                client_id: client_id.into(),
+                conn_id,
+                qos,
+                group: None,
+            },
+        );
+        shared
+            .sessions
+            .add_subscription_with_options(client_id, filter, qos, entry.nl, entry.rap, entry.rh);
+        applied = true;
+    }
+    if applied {
+        refresh_subscription_stats(shared);
+    }
+}
+
 /// Decode `BindConnection` metadata.
 ///
 /// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
@@ -284,6 +337,16 @@ struct Shared {
     engine: Arc<RuleEngine>,
     sink: Arc<dyn BrokerSink>,
     retained: Arc<dyn RetainedStore>,
+    /// Retained-delivery settings for W1-28: shared with the management
+    /// API so kernel ingress and management publishes enforce the same
+    /// configurable limits. One Arc clone at boot; reads take a short
+    /// lock on retained publishes only, never on the fan-out path.
+    retainer_config: Arc<broker_api::v5::retainer::RetainerConfigStore>,
+    /// Auto-subscribe list for W1-39: shared with the management API so
+    /// validated writes are visible to the connect hook without a
+    /// restart. One Arc clone; the hook clones the capped list once per
+    /// bind, never per message.
+    auto_subscribe: Arc<broker_api::v5::auto_subscribe::AutoSubscribeStore>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
@@ -292,6 +355,11 @@ struct Shared {
     /// Gauge-plus-high-water-mark store for EMQX `/stats` (W1 reads it;
     /// lifecycle points below keep it exact).
     stats: Arc<StatsStore>,
+    /// Node readiness flag for `GET /api/v5/status` (W1-27): single atomic
+    /// bool shared with the management API. Set at boot; the handler does
+    /// one constant-time load per request. Management-plane only; never
+    /// touched on the per-message path.
+    readiness: Arc<NodeReadiness>,
     auth: Arc<MemoryAuth>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
@@ -314,6 +382,7 @@ impl Shared {
         // exactly where it discards them.
         conns.set_metrics(&metrics);
         let stats = Arc::new(StatsStore::new());
+        let readiness = Arc::new(NodeReadiness::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
         // serves window-flush republish actions (INDRA-213).
@@ -363,9 +432,12 @@ impl Shared {
             engine,
             sink,
             retained: Arc::new(MemoryStore::new()),
+            retainer_config: Arc::new(broker_api::v5::retainer::RetainerConfigStore::new()),
+            auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             cluster: None,
             metrics,
             stats,
+            readiness,
             auth: Arc::new(MemoryAuth::new()),
             allow_anonymous: false,
             config: defaults_registry(),
@@ -628,6 +700,7 @@ where
         OpCode::BindConnection => {
             shared.metrics.inc_connect_received();
             if let Some(reply) = apply_bind(&frame, shared).await {
+                let accepted = is_binding_accepted(&reply);
                 shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
                 shared.conns.register(frame.header.conn_id, tx.clone());
@@ -638,7 +711,17 @@ where
                 // One entry per bind: this transport multiplexes its whole
                 // shard, and death must detach every client on it.
                 if let Ok(req) = decode_bind_meta(&frame.metadata) {
-                    bound.push((req.client_id, frame.header.conn_id));
+                    bound.push((req.client_id.clone(), frame.header.conn_id));
+                    // Auto-subscribe hook (W1-39): only on accepted binds.
+                    // Per-connect cost only; fan-out takes no new lock.
+                    if accepted {
+                        apply_auto_subscribe(
+                            shared,
+                            &req.client_id,
+                            req.username.as_deref(),
+                            frame.header.conn_id,
+                        );
+                    }
                 }
                 let replayed = replay_offline(&frame, shared).await;
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
@@ -1136,7 +1219,14 @@ async fn ingress_pipeline(
     payload: &Bytes,
 ) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
-    // payload) before rules and fan-out observe the message.
+    // payload) before rules and fan-out observe the message. Enforces
+    // the same configurable limits as the management publish path
+    // (W1-28): oversized payloads past max_payload_size are delivered
+    // but not stored, and new topics past backend.max_retained_messages
+    // (when non-zero) are dropped while replacements still land. The
+    // hard cap in broker_storage::MAX_RETAINED_MESSAGES always applies
+    // inside the store. Retained-only work; non-retained fan-out and
+    // fan-in never take the config lock.
     if retain {
         if payload.is_empty() {
             if let Err(e) = shared.retained.clear_retained(topic).await {
@@ -1144,14 +1234,40 @@ async fn ingress_pipeline(
             } else {
                 sync_retained_stat(shared).await;
             }
-        } else if let Err(e) = shared
-            .retained
-            .set_retained(topic.clone(), qos, payload.clone())
-            .await
-        {
-            warn!("Retained store failed for {}: {}", topic.as_str(), e);
         } else {
-            sync_retained_stat(shared).await;
+            let cfg = shared.retainer_config.get();
+            let max_bytes =
+                broker_api::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size)
+                    .unwrap_or(1_048_576);
+            let mut drop_new = false;
+            if (payload.len() as u64) > max_bytes {
+                drop_new = true;
+            } else {
+                let cap = cfg.backend.max_retained_messages;
+                if cap > 0 {
+                    let already = shared
+                        .retained
+                        .get_retained(topic)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if !already && shared.stats.retained() >= cap {
+                        drop_new = true;
+                    }
+                }
+            }
+            if drop_new {
+                // Delivered but not stored, matching the management path.
+            } else if let Err(e) = shared
+                .retained
+                .set_retained(topic.clone(), qos, payload.clone())
+                .await
+            {
+                warn!("Retained store failed for {}: {}", topic.as_str(), e);
+            } else {
+                sync_retained_stat(shared).await;
+            }
         }
     }
 
@@ -1599,6 +1715,22 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // node/global stats reads observe the lifecycle points above instead
     // of an empty per-request copy. One `Arc` clone, no new buffering.
     state.stats = shared.stats.clone();
+    // Share the kernel's readiness flag (W1-27) so `GET /status` reports
+    // the same atomic the kernel marks ready. One `Arc` clone, one load
+    // per request, no work on the per-message path.
+    state.readiness = shared.readiness.clone();
+    // Share the kernel retained store (W1-28) so the single-message read
+    // observes the same MQTT ingress state. One `Arc` clone, one short
+    // read lock per request, no work on the per-message path.
+    state.retained = shared.retained.clone();
+    // Share the validated retainer settings (W1-28) so management reads
+    // and writes observe the same object the kernel ingress enforces.
+    // One Arc clone; the persistence hook stays with the store.
+    state.retainer_config = shared.retainer_config.clone();
+    // Share the auto-subscribe list (W1-39) so validated management
+    // writes are visible to the connect hook without a restart.
+    // One Arc clone; reads take a short lock and clone at most 20 rows.
+    state.auto_subscribe = shared.auto_subscribe.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -4282,6 +4414,187 @@ mod tests {
         assert!(
             shared.engine.broker_sink().is_some(),
             "Shared::new must install the flush sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn kernel_ingress_enforces_retainer_limits_like_mgmt() {
+        // W1-28 parity: kernel ingress and management publishes share
+        // the same retainer_config object, so configurable limits apply
+        // on both paths. Oversized payloads deliver but are not stored;
+        // new topics past the cap are dropped while replacements land.
+        use axum::extract::State;
+        let shared = Shared::new();
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.retainer_config = shared.retainer_config.clone();
+        api_state.retained = shared.retained.clone();
+        api_state.stats = shared.stats.clone();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "max_payload_size": "10B",
+                "backend": {"max_retained_messages": 1},
+            }))
+            .expect("config is JSON"),
+        );
+        let resp =
+            broker_api::v5::retainer::put_retainer_config(State(api_state.clone()), body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        // Oversized retained publish is dropped from the store.
+        let big_topic = broker_protocol::Topic::new("w128/limit/big").expect("topic");
+        let big_payload = bytes::Bytes::from(vec![b'x'; 100]);
+        ingress_pipeline(
+            &shared,
+            &big_topic,
+            broker_protocol::QoS::AtMostOnce,
+            true,
+            &big_payload,
+        )
+        .await;
+        let stored = shared
+            .retained
+            .get_retained(&big_topic)
+            .await
+            .expect("store reads");
+        assert!(stored.is_none(), "oversized payload must not be stored");
+        // Reset to a generous size, then exercise the topic cap.
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"max_payload_size": "1MB"}))
+                .expect("config is JSON"),
+        );
+        let resp =
+            broker_api::v5::retainer::put_retainer_config(State(api_state.clone()), body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let first = broker_protocol::Topic::new("w128/limit/first").expect("topic");
+        ingress_pipeline(
+            &shared,
+            &first,
+            broker_protocol::QoS::AtMostOnce,
+            true,
+            &bytes::Bytes::from_static(b"one"),
+        )
+        .await;
+        assert!(shared
+            .retained
+            .get_retained(&first)
+            .await
+            .expect("read")
+            .is_some());
+        let second = broker_protocol::Topic::new("w128/limit/second").expect("topic");
+        ingress_pipeline(
+            &shared,
+            &second,
+            broker_protocol::QoS::AtMostOnce,
+            true,
+            &bytes::Bytes::from_static(b"two"),
+        )
+        .await;
+        assert!(
+            shared
+                .retained
+                .get_retained(&second)
+                .await
+                .expect("read")
+                .is_none(),
+            "new topic past the cap must be dropped"
+        );
+        // Replacements for an existing topic still land.
+        ingress_pipeline(
+            &shared,
+            &first,
+            broker_protocol::QoS::AtMostOnce,
+            true,
+            &bytes::Bytes::from_static(b"one-v2"),
+        )
+        .await;
+        let replaced = shared
+            .retained
+            .get_retained(&first)
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(replaced.payload, bytes::Bytes::from_static(b"one-v2"));
+    }
+
+    /// W1-39: a fresh bind receives the configured auto-subscriptions.
+    /// Fails before the change (empty list, no hook) and passes after:
+    /// write one entry via the management write, bind a new client, and
+    /// expect the subscription present in both the session mirror and
+    /// the router.
+    #[tokio::test]
+    async fn auto_subscribe_hook_subscribes_new_connection() {
+        use axum::extract::State;
+        let shared = test_shared();
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.auto_subscribe = shared.auto_subscribe.clone();
+        // Write one entry and read it back.
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!([
+                {"topic": "conf/auto/w139-hook", "qos": 1},
+            ]))
+            .expect("config is JSON"),
+        );
+        let resp =
+            broker_api::v5::auto_subscribe::put_auto_subscribe(State(api_state.clone()), body)
+                .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(shared.auto_subscribe.list().len(), 1);
+
+        // Fresh client binds successfully.
+        let bind = bind_frame(501, 1, encode_bind_meta("w139-fresh", true, 60));
+        let reply = apply_bind(&bind, &shared).await.expect("bind replies");
+        assert!(is_binding_accepted(&reply));
+        apply_auto_subscribe(&shared, "w139-fresh", None, 501);
+
+        // Session mirror and router both hold the new subscription.
+        let session = shared.sessions.get("w139-fresh").expect("session row");
+        assert!(
+            session
+                .subscriptions
+                .read()
+                .keys()
+                .any(|f| f.as_str() == "conf/auto/w139-hook"),
+            "fresh client must carry the auto subscription"
+        );
+        assert_eq!(
+            shared
+                .router
+                .matches(&Topic::new("conf/auto/w139-hook").unwrap())
+                .len(),
+            1
+        );
+
+        // Placeholder entries render per client.
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!([
+                {"topic": "cmd/${clientid}/z", "qos": 0},
+            ]))
+            .expect("config is JSON"),
+        );
+        let resp =
+            broker_api::v5::auto_subscribe::put_auto_subscribe(State(api_state.clone()), body)
+                .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bind = bind_frame(502, 1, encode_bind_meta("w139-ph", true, 60));
+        apply_bind(&bind, &shared).await.expect("bind replies");
+        apply_auto_subscribe(&shared, "w139-ph", None, 502);
+        assert!(
+            shared
+                .sessions
+                .get("w139-ph")
+                .expect("session row")
+                .subscriptions
+                .read()
+                .keys()
+                .any(|f| f.as_str() == "cmd/w139-ph/z"),
+            "placeholder must render per client"
         );
     }
 }

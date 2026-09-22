@@ -1,0 +1,164 @@
+[
+  {
+    "operation": "GET /trace",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "DELETE", "path": "/trace"}}],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /trace",
+    "path_params": {},
+    "query": {},
+    "body": {"name": "conf-trace-1", "type": "topic", "topic": "conf/trace/#"},
+    "expect_status": 200,
+    "setup": [{"api": {"method": "DELETE", "path": "/trace"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "GET /trace",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-list", "type": "topic", "topic": "conf/trace/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "POST /trace",
+    "path_params": {},
+    "query": {},
+    "body": {"name": "conf-trace-dup", "type": "topic", "topic": "conf/dup/#"},
+    "expect_status": 409,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-dup", "type": "topic", "topic": "conf/dup/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "POST /trace",
+    "path_params": {},
+    "query": {},
+    "body": {"name": "conf-trace-bad", "type": "topic"},
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /trace",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-clear", "type": "topic", "topic": "conf/clear/#"}}}],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /trace/{name}",
+    "path_params": {"name": "conf-trace-del"},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-del", "type": "topic", "topic": "conf/del/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "DELETE /trace/{name}",
+    "path_params": {"name": "conf-trace-missing"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /trace/{name}/download",
+    "path_params": {"name": "conf-trace-dl"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-dl", "type": "topic", "topic": "conf/dl/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "GET /trace/{name}/download",
+    "path_params": {"name": "conf-trace-dl-missing"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /trace/{name}/log",
+    "path_params": {"name": "conf-trace-log"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-log", "type": "topic", "topic": "conf/log/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "GET /trace/{name}/log",
+    "path_params": {"name": "conf-trace-log"},
+    "query": {"page": 1, "limit": 1},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-log", "type": "topic", "topic": "conf/log/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "GET /trace/{name}/log",
+    "path_params": {"name": "conf-trace-log-missing"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /trace/{name}/log_detail",
+    "path_params": {"name": "conf-trace-detail"},
+    "query": {"position": 0},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-detail", "type": "topic", "topic": "conf/detail/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "GET /trace/{name}/log_detail",
+    "path_params": {"name": "conf-trace-detail-missing"},
+    "query": {"position": 0},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /trace/{name}/log_detail",
+    "path_params": {"name": "conf-trace-detail"},
+    "query": {"position": 999999},
+    "body": null,
+    "expect_status": 404,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-detail", "type": "topic", "topic": "conf/detail/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "PUT /trace/{name}/stop",
+    "path_params": {"name": "conf-trace-stop"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-stop", "type": "topic", "topic": "conf/stop/#"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
+  },
+  {
+    "operation": "PUT /trace/{name}/stop",
+    "path_params": {"name": "conf-trace-stop-missing"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  }
+]

@@ -1,0 +1,75 @@
+[
+  {
+    "operation": "GET /slow_subscriptions",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /slow_subscriptions",
+    "path_params": {},
+    "query": {
+      "page": 1,
+      "limit": 1
+    },
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /slow_subscriptions",
+    "path_params": {},
+    "query": {
+      "page": 2,
+      "limit": 1
+    },
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "DELETE /slow_subscriptions",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /slow_subscriptions/settings",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /slow_subscriptions/settings",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "threshold": "1s"
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /slow_subscriptions/settings",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "threshold": "50ms"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  }
+]

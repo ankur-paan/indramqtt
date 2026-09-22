@@ -1,0 +1,11 @@
+[
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /status",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  }
+]
