@@ -306,9 +306,44 @@ impl CoapMessage {
 
 /// CoAP PubSub Translation Engine:
 /// Translates CoAP URI path requests (`/ps/<topic>`) into MQTT publish/read actions.
+///
+/// The handler is stateless with respect to message payloads: retained
+/// reads and writes live in the kernel (`broker-storage` retained store)
+/// and fan-out goes through the kernel router, so every CoAP publish
+/// reaches ordinary MQTT subscribers. This handler only validates the
+/// `/ps/<topic>` mapping and tracks CoAP observe registrations (bounded
+/// below). The previous in-crate `retained_messages` map has been
+/// deleted; a GET served without the kernel always answers NOT FOUND and
+/// the kernel replaces it with CONTENT when retained state exists.
 pub struct CoapGatewayHandler {
-    retained_messages: parking_lot::RwLock<HashMap<String, Bytes>>,
+    observers: parking_lot::RwLock<HashMap<String, Vec<CoapObserver>>>,
+    observe_seq: std::sync::atomic::AtomicU32,
 }
+
+/// One CoAP observer waiting for notifications on a topic.
+///
+/// Bounded by [`MAX_OBSERVERS_PER_TOPIC`] per topic and
+/// [`MAX_OBSERVED_TOPICS`] topics: both caps are checked on registration,
+/// so the table cannot grow without bound on the message path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoapObserver {
+    pub peer: SocketAddr,
+    pub token: Bytes,
+}
+
+/// Maximum observers kept per observed topic.
+///
+/// 32 observers cover constrained-device fan-out while keeping per-publish
+/// notify work to at most 32 small UDP datagrams, spawned off the hot
+/// path by the kernel.
+pub const MAX_OBSERVERS_PER_TOPIC: usize = 32;
+
+/// Maximum distinct topics with at least one observer.
+///
+/// 2048 topics bound the table to at most
+/// `2048 * 32` observer entries (each under 100 bytes), well within the
+/// 12 GB test-host budget and never on the fan-out fast path.
+pub const MAX_OBSERVED_TOPICS: usize = 2048;
 
 impl Default for CoapGatewayHandler {
     fn default() -> Self {
@@ -319,51 +354,179 @@ impl Default for CoapGatewayHandler {
 impl CoapGatewayHandler {
     pub fn new() -> Self {
         Self {
-            retained_messages: parking_lot::RwLock::new(HashMap::new()),
+            observers: parking_lot::RwLock::new(HashMap::new()),
+            observe_seq: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
-    /// Process a received CoAP message and produce a response packet (if ACK is needed).
-    pub fn handle_message(&self, req: &CoapMessage) -> Result<Option<CoapMessage>, CoapError> {
+    /// Extract the MQTT topic for a `/ps/<topic>` request.
+    ///
+    /// Returns `Some(topic)` only when the URI path is exactly
+    /// `ps/<topic>` with a non-empty `<topic>`; any other path
+    /// (including bare `ps`) yields `None` so the caller answers
+    /// BAD REQUEST instead of routing a malformed topic.
+    pub fn coap_topic(req: &CoapMessage) -> Option<String> {
         let path = req.uri_path();
+        path.strip_prefix("ps/")
+            .filter(|stripped| !stripped.is_empty())
+            .map(str::to_string)
+    }
 
-        // Path must start with "ps/" for pub/sub broker mapping
-        let topic = if let Some(stripped) = path.strip_prefix("ps/") {
-            stripped.to_string()
-        } else if path == "ps" {
-            "".to_string()
+    /// Whether this GET registers a CoAP observe relationship (RFC 7641).
+    ///
+    /// True when an Observe option (number 6) is present with an empty
+    /// value or a zero value, the registration encoding used by
+    /// constrained clients. Cancellation (Observe: 1) is not tracked:
+    /// it is treated as a plain GET.
+    pub fn is_observe_register(req: &CoapMessage) -> bool {
+        req.options
+            .iter()
+            .filter(|o| o.number == option_number::OBSERVE)
+            .any(|o| o.value.is_empty() || o.value.iter().all(|b| *b == 0))
+    }
+
+    /// Minimal big-endian encoding of an observe sequence number.
+    fn encode_observe_seq(seq: u32) -> Bytes {
+        let seq = seq & 0x00FF_FFFF;
+        if seq < 256 {
+            Bytes::copy_from_slice(&[seq as u8])
+        } else if seq < 65536 {
+            Bytes::copy_from_slice(&[(seq >> 8) as u8, seq as u8])
         } else {
-            path
-        };
+            Bytes::copy_from_slice(&[(seq >> 16) as u8, (seq >> 8) as u8, seq as u8])
+        }
+    }
 
+    /// Next observe sequence number (wraps at 24 bits per RFC 7641).
+    pub fn next_observe_seq(&self) -> u32 {
+        self.observe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            & 0x00FF_FFFF
+    }
+
+    /// Register `peer`/`token` as an observer of `topic`.
+    ///
+    /// Bounded: false when the per-topic cap or the distinct-topic cap
+    /// is hit, or when `topic` is empty. Duplicate `(peer, token)` pairs
+    /// refresh in place instead of growing the list. Short write lock
+    /// only on the registration path, never on fan-out.
+    pub fn register_observer(&self, topic: &str, peer: SocketAddr, token: Bytes) -> bool {
+        if topic.is_empty() || token.len() > 8 {
+            return false;
+        }
+        let mut table = self.observers.write();
+        if let Some(list) = table.get_mut(topic) {
+            if list.iter().any(|o| o.peer == peer && o.token == token) {
+                return true;
+            }
+            if list.len() >= MAX_OBSERVERS_PER_TOPIC {
+                return false;
+            }
+            list.push(CoapObserver { peer, token });
+            return true;
+        }
+        if table.len() >= MAX_OBSERVED_TOPICS {
+            return false;
+        }
+        table.insert(topic.to_string(), vec![CoapObserver { peer, token }]);
+        true
+    }
+
+    /// Snapshot the observers of one topic for a notify round.
+    pub fn observers_for(&self, topic: &str) -> Vec<CoapObserver> {
+        self.observers
+            .read()
+            .get(topic)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Cheap empty check for the publish hot path: one read lock that
+    /// returns after a length check when nobody observes anything.
+    pub fn has_observers(&self) -> bool {
+        !self.observers.read().is_empty()
+    }
+
+    /// Total observer entries (for tests and observability).
+    pub fn observer_count(&self) -> usize {
+        self.observers.read().values().map(Vec::len).sum()
+    }
+
+    /// Build the ACK for an observe registration carrying `payload`.
+    pub fn make_observe_response(
+        &self,
+        req: &CoapMessage,
+        payload: Bytes,
+        seq: u32,
+    ) -> CoapMessage {
+        CoapMessage {
+            message_type: CoapType::Acknowledgement,
+            code: CoapCode::CONTENT,
+            message_id: req.message_id,
+            token: req.token.clone(),
+            options: vec![CoapOption {
+                number: option_number::OBSERVE,
+                value: Self::encode_observe_seq(seq),
+            }],
+            payload,
+        }
+    }
+
+    /// Build one NON notification for `observer` carrying `payload`.
+    pub fn build_notify(&self, observer: &CoapObserver, payload: Bytes, seq: u32) -> CoapMessage {
+        CoapMessage {
+            message_type: CoapType::NonConfirmable,
+            code: CoapCode::CONTENT,
+            message_id: (seq & 0xFFFF) as u16,
+            token: observer.token.clone(),
+            options: vec![CoapOption {
+                number: option_number::OBSERVE,
+                value: Self::encode_observe_seq(seq),
+            }],
+            payload,
+        }
+    }
+
+    /// Encode every observer notification for `topic` (pure, for tests).
+    pub fn notify_encodings(
+        &self,
+        topic: &str,
+        payload: &Bytes,
+        seq: u32,
+    ) -> Vec<(SocketAddr, Bytes)> {
+        self.observers_for(topic)
+            .iter()
+            .map(|o| {
+                let msg = self.build_notify(o, payload.clone(), seq);
+                (o.peer, msg.encode())
+            })
+            .collect()
+    }
+
+    /// Validate a received CoAP message and produce the immediate response.
+    ///
+    /// POST/PUT with a valid `/ps/<topic>` answers CHANGED (the kernel
+    /// publishes the payload through the router and retained store);
+    /// POST/PUT without one answers BAD REQUEST. DELETE answers DELETED
+    /// (the kernel clears retained state). GET answers NOT FOUND here:
+    /// the kernel replaces it with CONTENT plus an Observe option when
+    /// retained state exists, registering the observer first when this
+    /// is an observe GET.
+    pub fn handle_message(&self, req: &CoapMessage) -> Result<Option<CoapMessage>, CoapError> {
         match req.code {
             CoapCode::POST | CoapCode::PUT => {
-                if topic.is_empty() {
+                if Self::coap_topic(req).is_none() {
                     return Ok(Some(req.make_ack(
                         CoapCode::BAD_REQUEST,
                         Bytes::from_static(b"Topic cannot be empty"),
                     )));
                 }
-                // Store/publish message
-                self.retained_messages
-                    .write()
-                    .insert(topic, req.payload.clone());
                 Ok(Some(req.make_ack(CoapCode::CHANGED, Bytes::new())))
             }
-            CoapCode::GET => {
-                if let Some(data) = self.retained_messages.read().get(&topic) {
-                    Ok(Some(req.make_ack(CoapCode::CONTENT, data.clone())))
-                } else {
-                    Ok(Some(req.make_ack(
-                        CoapCode::NOT_FOUND,
-                        Bytes::from_static(b"Not Found"),
-                    )))
-                }
-            }
-            CoapCode::DELETE => {
-                self.retained_messages.write().remove(&topic);
-                Ok(Some(req.make_ack(CoapCode::DELETED, Bytes::new())))
-            }
+            CoapCode::GET => Ok(Some(
+                req.make_ack(CoapCode::NOT_FOUND, Bytes::from_static(b"Not Found")),
+            )),
+            CoapCode::DELETE => Ok(Some(req.make_ack(CoapCode::DELETED, Bytes::new()))),
             _ => Ok(Some(
                 req.make_ack(CoapCode::METHOD_NOT_ALLOWED, Bytes::new()),
             )),
@@ -395,6 +558,11 @@ impl CoapListener {
     }
 
     /// Process a single inbound UDP datagram.
+    ///
+    /// Stateless with respect to payloads (retained state lives in the
+    /// kernel); observe GETs register the sender before answering so a
+    /// standalone listener still tracks observers. The kernel listener
+    /// replaces the GET answer with retained CONTENT when it exists.
     pub async fn receive_and_process_one(&self) -> Result<(SocketAddr, Option<Bytes>), CoapError> {
         let mut buf = [0u8; 2048];
         let (len, peer) = self
@@ -404,6 +572,12 @@ impl CoapListener {
             .map_err(|_| CoapError::PacketTooShort)?;
 
         let msg = CoapMessage::decode(&buf[..len])?;
+        if msg.code == CoapCode::GET && CoapGatewayHandler::is_observe_register(&msg) {
+            if let Some(topic) = CoapGatewayHandler::coap_topic(&msg) {
+                self.handler
+                    .register_observer(&topic, peer, msg.token.clone());
+            }
+        }
         let response = self.handler.handle_message(&msg)?;
 
         if let Some(resp_msg) = response {
@@ -456,10 +630,11 @@ mod tests {
     }
 
     #[test]
-    fn test_coap_pubsub_handler() {
+    fn test_coap_pubsub_handler_is_stateless() {
         let handler = CoapGatewayHandler::new();
 
-        // 1. Publish (PUT /ps/factory/temp)
+        // 1. Publish (PUT /ps/factory/temp) validates and answers CHANGED
+        // without storing: retained lives in the kernel.
         let put_req = CoapMessage {
             message_type: CoapType::Confirmable,
             code: CoapCode::PUT,
@@ -482,11 +657,32 @@ mod tests {
             payload: Bytes::from_static(b"42.8"),
         };
 
+        assert_eq!(
+            CoapGatewayHandler::coap_topic(&put_req).as_deref(),
+            Some("factory/temp")
+        );
         let resp = handler.handle_message(&put_req).unwrap().unwrap();
         assert_eq!(resp.code, CoapCode::CHANGED);
         assert_eq!(resp.message_id, 101);
 
-        // 2. Read (GET /ps/factory/temp)
+        // 2. Empty topic is BAD REQUEST, never routed.
+        let bad_req = CoapMessage {
+            message_type: CoapType::Confirmable,
+            code: CoapCode::PUT,
+            message_id: 103,
+            token: Bytes::from_static(b"t3"),
+            options: vec![CoapOption {
+                number: option_number::URI_PATH,
+                value: Bytes::from_static(b"ps"),
+            }],
+            payload: Bytes::from_static(b"42.8"),
+        };
+        assert_eq!(CoapGatewayHandler::coap_topic(&bad_req), None);
+        let bad_resp = handler.handle_message(&bad_req).unwrap().unwrap();
+        assert_eq!(bad_resp.code, CoapCode::BAD_REQUEST);
+
+        // 3. Read (GET /ps/factory/temp) answers NOT FOUND here: the
+        // kernel replaces it with CONTENT when retained state exists.
         let get_req = CoapMessage {
             message_type: CoapType::Confirmable,
             code: CoapCode::GET,
@@ -510,7 +706,88 @@ mod tests {
         };
 
         let get_resp = handler.handle_message(&get_req).unwrap().unwrap();
-        assert_eq!(get_resp.code, CoapCode::CONTENT);
-        assert_eq!(get_resp.payload, Bytes::from_static(b"42.8"));
+        assert_eq!(get_resp.code, CoapCode::NOT_FOUND);
+        assert!(!CoapGatewayHandler::is_observe_register(&get_req));
+    }
+
+    #[test]
+    fn test_coap_observe_registers_and_notifies() {
+        let handler = CoapGatewayHandler::new();
+        assert!(!handler.has_observers());
+        let peer: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+
+        let observe_req = CoapMessage {
+            message_type: CoapType::Confirmable,
+            code: CoapCode::GET,
+            message_id: 201,
+            token: Bytes::from_static(b"obs1"),
+            options: vec![
+                CoapOption {
+                    number: option_number::URI_PATH,
+                    value: Bytes::from_static(b"ps"),
+                },
+                CoapOption {
+                    number: option_number::URI_PATH,
+                    value: Bytes::from_static(b"sensors/temp"),
+                },
+                CoapOption {
+                    number: option_number::OBSERVE,
+                    value: Bytes::from_static(b"\x00"),
+                },
+            ],
+            payload: Bytes::new(),
+        };
+        assert!(CoapGatewayHandler::is_observe_register(&observe_req));
+        assert_eq!(
+            CoapGatewayHandler::coap_topic(&observe_req).as_deref(),
+            Some("sensors/temp")
+        );
+        assert!(handler.register_observer("sensors/temp", peer, Bytes::from_static(b"obs1")));
+        assert!(handler.has_observers());
+        assert_eq!(handler.observer_count(), 1);
+
+        // Duplicate registration refreshes instead of growing.
+        assert!(handler.register_observer("sensors/temp", peer, Bytes::from_static(b"obs1")));
+        assert_eq!(handler.observer_count(), 1);
+
+        let payload = Bytes::from_static(b"21.5");
+        let seq = handler.next_observe_seq();
+        let encodings = handler.notify_encodings("sensors/temp", &payload, seq);
+        assert_eq!(encodings.len(), 1);
+        assert_eq!(encodings[0].0, peer);
+        let decoded = CoapMessage::decode(&encodings[0].1).expect("decode notify");
+        assert_eq!(decoded.code, CoapCode::CONTENT);
+        assert_eq!(decoded.token, Bytes::from_static(b"obs1"));
+        assert_eq!(decoded.payload, payload);
+        assert!(
+            decoded
+                .options
+                .iter()
+                .any(|o| o.number == option_number::OBSERVE),
+            "notify must carry the Observe option"
+        );
+
+        // Unrelated topics notify nobody.
+        assert!(handler
+            .notify_encodings("other/topic", &payload, seq)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_coap_observer_table_is_bounded() {
+        let handler = CoapGatewayHandler::new();
+        let base: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        // Per-topic cap holds.
+        for i in 0..(MAX_OBSERVERS_PER_TOPIC + 8) {
+            let peer = SocketAddr::new(base.ip(), base.port().wrapping_add(i as u16).max(1024));
+            let token = Bytes::copy_from_slice(format!("t{i:04}").as_bytes());
+            let ok = handler.register_observer("bounded/topic", peer, token);
+            if i < MAX_OBSERVERS_PER_TOPIC {
+                assert!(ok, "first {MAX_OBSERVERS_PER_TOPIC} registrations fit");
+            } else {
+                assert!(!ok, "registrations past the per-topic cap refuse");
+            }
+        }
+        assert_eq!(handler.observer_count(), MAX_OBSERVERS_PER_TOPIC);
     }
 }

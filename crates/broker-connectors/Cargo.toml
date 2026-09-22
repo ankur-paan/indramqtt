@@ -25,6 +25,11 @@ uuid = { workspace = true }
 jsonwebtoken = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
+rustls = { version = "0.23" }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "1" }
+rustls-pki-types = { version = "1" }
+webpki-roots = { version = "0.25" }
 
 [dev-dependencies]
 axum = { workspace = true }

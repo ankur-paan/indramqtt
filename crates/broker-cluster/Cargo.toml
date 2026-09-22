@@ -8,12 +8,13 @@ repository.workspace = true
 [dependencies]
 broker-protocol = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
+ed25519-dalek = "2"
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-sha2 = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }

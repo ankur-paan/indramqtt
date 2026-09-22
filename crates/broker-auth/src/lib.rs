@@ -1,8 +1,8 @@
 pub mod kerberos;
 pub mod ldap;
 
-pub use kerberos::{KerberosAuthenticator, KerberosConfig, KerberosTicket};
-pub use ldap::{LdapAuthenticator, LdapConfig, LdapEntry};
+pub use kerberos::{KerberosAuthenticator, KerberosConfig};
+pub use ldap::{LdapAuthenticator, LdapConfig};
 
 use async_trait::async_trait;
 use broker_config::{AclConf, ConfigRegistry, MqttUser, MqttUsersConf};

@@ -1,5 +1,5 @@
 pub mod stream;
-pub use stream::{DurableStreamStore, StreamRecord};
+pub use stream::{DurableStreamStore, FsyncPolicy, StreamConfig, StreamRecord};
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
@@ -26,6 +26,21 @@ pub struct StoredMessage {
     pub qos: QoS,
     pub retain: bool,
     pub payload: Bytes,
+    /// Publish time recorded where the message is already being written
+    /// (retained store / append), as millis since the Unix epoch.
+    /// `None` means the message predates timestamp recording; API reads
+    /// must omit the field rather than substituting anything.
+    pub publish_at_ms: Option<u64>,
+}
+
+/// Current wall-clock time as millis since the Unix epoch. Read once per
+/// stored message on the write path (retained/appends are rare), never
+/// on the delivery hot path.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[async_trait]
@@ -89,6 +104,7 @@ impl MessageStore for MemoryStore {
             qos,
             retain,
             payload,
+            publish_at_ms: Some(now_ms()),
         });
         Ok(offset)
     }
@@ -116,6 +132,7 @@ impl RetainedStore for MemoryStore {
                 qos,
                 retain: true,
                 payload,
+                publish_at_ms: Some(now_ms()),
             },
         );
         Ok(())

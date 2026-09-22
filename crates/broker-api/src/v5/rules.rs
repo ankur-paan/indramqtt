@@ -2568,8 +2568,12 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 max_retries: Some(3),
                 timeout_ms,
+                connect_timeout_ms: None,
+                handshake_timeout_ms: None,
+                ca_bundle_pem: None,
+                alpn_protocols: None,
             };
-            if let Ok(transport) = broker_connectors::aws_iot::TcpAwsIotTransport::new(endpoint) {
+            if let Ok(transport) = broker_connectors::aws_iot::TlsAwsIotTransport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::aws_iot::AwsIotSink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -2748,8 +2752,12 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 max_retries: Some(3),
                 timeout_ms,
+                connect_timeout_ms: None,
+                handshake_timeout_ms: None,
+                ca_bundle_pem: None,
+                sas_ttl_secs: None,
             };
-            if let Ok(transport) = broker_connectors::azure_iot::TcpAzureIotTransport::new(hub_name)
+            if let Ok(transport) = broker_connectors::azure_iot::TlsAzureIotTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::azure_iot::AzureIotSink::new(config, transport)

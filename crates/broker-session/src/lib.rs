@@ -73,7 +73,28 @@ pub struct Session {
     /// Authenticated username that owns this session, if any. Maintained
     /// by the edge at bind time; drives per-user quota accounting.
     pub username: RwLock<Option<String>>,
+    /// Peer IP literal the edge saw on the client socket, if forwarded
+    /// in the bind. Maintained by the kernel at bind time (only
+    /// overwritten when a peer address arrives); drives `peerhost` and
+    /// `peerhost_net` ban checks on the publish path.
+    pub peerhost: RwLock<Option<String>>,
+    /// Wall-clock time of the last connect/bind, as millis since the Unix
+    /// epoch. Recorded where the session is already being written
+    /// (creation, reconnect, bind); surfaced read-only for observability.
+    /// `None` means the session predates timestamp recording; API reads
+    /// must omit the field rather than substituting anything.
+    pub connected_at_ms: RwLock<Option<u64>>,
     next_packet_id: AtomicU16,
+}
+
+/// Current wall-clock time as millis since the Unix epoch. Read once per
+/// queued message or session bind on the write path (offline buffering
+/// and connects are rare), never per live delivery.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// One buffered message for a detached durable session (LOG + CURSOR
@@ -84,6 +105,11 @@ pub struct QueuedMessage {
     pub qos: QoS,
     pub retain: bool,
     pub payload: Bytes,
+    /// Publish time recorded where the message is already being written
+    /// (offline queue insert), as millis since the Unix epoch.
+    /// `None` means the entry predates timestamp recording; API reads
+    /// must omit the field rather than substituting anything.
+    pub publish_at_ms: Option<u64>,
 }
 
 /// One QoS 1 downlink held from the moment it is written toward a
@@ -203,6 +229,8 @@ impl Session {
             qos2_outbound: RwLock::new(VecDeque::new()),
             keepalive_secs: RwLock::new(0),
             username: RwLock::new(None),
+            peerhost: RwLock::new(None),
+            connected_at_ms: RwLock::new(Some(now_ms())),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -368,8 +396,15 @@ impl Session {
 
     /// Buffer one message with an explicit cap: `Some(n)` evicts the
     /// oldest entries past `n` (floored at holding one), `None` queues
-    /// without bound (memory-bounded by the caller).
+    /// without bound (memory-bounded by the caller). The publish time is
+    /// recorded here where the message is already being written: an entry
+    /// arriving without one is stamped once, so the delivery hot path
+    /// never takes a clock.
     pub fn push_offline_with_limit(&self, message: QueuedMessage, limit: Option<usize>) {
+        let mut message = message;
+        if message.publish_at_ms.is_none() {
+            message.publish_at_ms = Some(now_ms());
+        }
         let mut queue = self.offline_queue.write();
         if let Some(limit) = limit {
             let limit = limit.max(1);
@@ -522,7 +557,9 @@ impl SessionManager {
     /// mapping. Replaces any previous `conn_id` for this client (the
     /// stale entry is removed) and overwrites a reused `conn_id` left
     /// by another client. Short locks only: session write, then index
-    /// write; never held across dispatch, routing, or I/O.
+    /// write; never held across dispatch, routing, or I/O. Records the
+    /// bind instant as the session connect time where the session is
+    /// already being written.
     pub fn bind_session(&self, session: &Arc<Session>, conn_id: u64) {
         let old = *session.conn_id.read();
         if old == Some(conn_id) {
@@ -541,6 +578,7 @@ impl SessionManager {
             return;
         }
         *session.conn_id.write() = Some(conn_id);
+        *session.connected_at_ms.write() = Some(now_ms());
         let mut index = self.conn_index.write();
         if let Some(prev) = old {
             let owned = index
@@ -698,6 +736,7 @@ impl SessionManager {
             let was_connected = *existing.connected.read();
             if !was_connected {
                 *existing.connected.write() = true;
+                *existing.connected_at_ms.write() = Some(now_ms());
                 self.connected_count.fetch_add(1, Ordering::SeqCst);
             }
             (existing.clone(), true)
@@ -1003,6 +1042,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![i]),
+                publish_at_ms: None,
             });
         }
         assert_eq!(session.offline_len(), 3);
@@ -1094,6 +1134,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtMostOnce,
                 retain: false,
                 payload: Bytes::from((i as u32).to_be_bytes().to_vec()),
+                publish_at_ms: None,
             });
         }
         assert_eq!(session.offline_len(), MAX_OFFLINE_QUEUE);
@@ -1115,6 +1156,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtMostOnce,
                 retain: false,
                 payload: Bytes::from(i.to_be_bytes().to_vec()),
+                publish_at_ms: None,
             }
         }
 

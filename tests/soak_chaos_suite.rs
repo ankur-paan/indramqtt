@@ -237,6 +237,7 @@ async fn test_chaos_brokerlink_socket_sever_and_resurrection() {
             qos: QoS::AtLeastOnce,
             retain: false,
             payload: Bytes::from(format!("data-{i}")),
+            publish_at_ms: None,
         });
     }
     assert_eq!(sess.offline_len(), 5);
@@ -2112,27 +2113,22 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
     }
 
     // ------------------------------------------------------------------------
-    // Part 4: Enterprise Authentication (Active Directory LDAP & Kerberos)
+    // Part 4: Enterprise Authentication (LDAP removed, refuses; Kerberos removed, refuses)
     // ------------------------------------------------------------------------
-    // 4A: LDAP Bind Authentication
+    // 4A: LDAP (B2-01, T-86): unreachable directory fails closed.
+    // A directory that cannot be reached never grants access.
     let ldap_config = LdapConfig {
         server_url: "ldap://ad.enterprise.corp:389".to_string(),
         base_dn: "dc=enterprise,dc=corp".to_string(),
-        bind_dn_template: "cn={username},ou=Operators,dc=enterprise,dc=corp".to_string(),
-        filter_template: "(&(objectClass=user)(sAMAccountName={username}))".to_string(),
-        timeout_ms: 5000,
+        bind_dn: "cn=reader,dc=enterprise,dc=corp".to_string(),
+        bind_password: "readerpw".to_string(),
+        connect_timeout_ms: 1_000,
+        read_timeout_ms: 1_000,
+        ..LdapConfig::default()
     };
     let ldap_auth = LdapAuthenticator::new(ldap_config);
-    let mut ldap_attrs = HashMap::new();
-    ldap_attrs.insert("sAMAccountName".to_string(), "ops_admin".to_string());
-    ldap_attrs.insert("department".to_string(), "DevOps".to_string());
-    ldap_auth.add_entry(
-        "cn=ops_admin,ou=Operators,dc=enterprise,dc=corp",
-        b"EnterpriseSecurePass2026!",
-        ldap_attrs,
-    );
 
-    // Valid credentials -> success
+    // Old fake success shape (valid-looking bind credentials) must be refused.
     assert!(ldap_auth
         .authenticate(
             "admin-console",
@@ -2140,7 +2136,7 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
             Some(b"EnterpriseSecurePass2026!")
         )
         .await
-        .is_ok());
+        .is_err());
 
     // Bad password -> fail
     assert!(ldap_auth
@@ -2154,35 +2150,29 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
         .await
         .is_err());
 
-    // 4B: Kerberos SPN and SPNEGO Ticket Authentication
+    // 4B: Kerberos removed (B1-01, T-77): every token is refused.
+    // The previous fake accepted self-described plaintext tokens; the stub
+    // below fails closed with "not supported" on every attempt.
     let krb_config = KerberosConfig {
         service_principal_name: "mqtt/broker.enterprise.corp@ENTERPRISE.CORP".to_string(),
         realm: "ENTERPRISE.CORP".to_string(),
         allowed_realms: vec!["ENTERPRISE.CORP".to_string()],
     };
     let krb_auth = KerberosAuthenticator::new(krb_config);
-    krb_auth.add_principal("operator@ENTERPRISE.CORP");
 
-    let valid_krb_ticket = KerberosAuthenticator::create_test_token(
-        "operator@ENTERPRISE.CORP",
-        "mqtt/broker.enterprise.corp@ENTERPRISE.CORP",
-        "ENTERPRISE.CORP",
-    );
-
-    // Valid Kerberos ticket -> success
+    // Old fake plaintext shape must be refused, not accepted.
+    let legacy_plaintext =
+        b"KRB5:operator@ENTERPRISE.CORP:mqtt/broker.enterprise.corp@ENTERPRISE.CORP:ENTERPRISE.CORP";
     assert!(krb_auth
-        .authenticate("workstation-1", Some("operator"), Some(&valid_krb_ticket))
+        .authenticate("workstation-1", Some("operator"), Some(legacy_plaintext))
         .await
-        .is_ok());
+        .is_err());
 
-    // Wrong SPN ticket -> fail
-    let bad_spn_ticket = KerberosAuthenticator::create_test_token(
-        "operator@ENTERPRISE.CORP",
-        "http/web.enterprise.corp@ENTERPRISE.CORP",
-        "ENTERPRISE.CORP",
-    );
+    // Old fake AP-REQ shape (first byte 0x6E) must be refused, not accepted.
+    let mut legacy_tagged = vec![0x6E, legacy_plaintext.len() as u8];
+    legacy_tagged.extend_from_slice(legacy_plaintext);
     assert!(krb_auth
-        .authenticate("workstation-1", Some("operator"), Some(&bad_spn_ticket))
+        .authenticate("workstation-1", Some("operator"), Some(&legacy_tagged))
         .await
         .is_err());
 
@@ -2200,13 +2190,15 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
         let mut headers = HashMap::new();
         headers.insert("seq".to_string(), i.to_string());
 
-        let offset = stream_store.append_with_timestamp(
-            stream_topic.clone(),
-            QoS::AtLeastOnce,
-            payload,
-            headers,
-            base_ts + (i * 100),
-        );
+        let offset = stream_store
+            .append_with_timestamp(
+                stream_topic.clone(),
+                QoS::AtLeastOnce,
+                payload,
+                headers,
+                base_ts + (i * 100),
+            )
+            .expect("stream append");
         assert_eq!(offset, i);
     }
 
@@ -2245,7 +2237,9 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
     assert_eq!(time_replayed[0].timestamp_ms, base_ts + 7600);
 
     // Retention policy purge: prune records older than base_ts + 5000ms (first 50 records)
-    let purged_count = stream_store.purge_retention("factory/line1/vibration", base_ts + 5000);
+    let purged_count = stream_store
+        .purge_retention("factory/line1/vibration", base_ts + 5000)
+        .expect("stream purge");
     assert_eq!(purged_count, 50);
     assert_eq!(stream_store.stream_len("factory/line1/vibration"), 50);
     assert_eq!(

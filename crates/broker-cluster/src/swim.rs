@@ -789,8 +789,12 @@ impl SwimMembership {
                     .unwrap_or_default()
                     .as_secs();
                 let lic_key = self.license_key.read().clone();
-                let status =
-                    ClusterLicense::evaluate(lic_key.as_deref(), current_count + 1, now_epoch);
+                let status = ClusterLicense::evaluate(
+                    lic_key.as_deref(),
+                    current_count + 1,
+                    now_epoch,
+                    self.local.0.as_str(),
+                );
 
                 match status {
                     LicenseStatus::QuotaExceeded {
@@ -813,6 +817,10 @@ impl SwimMembership {
                             from, customer, expired_at
                         );
                         return Err(ClusterError::Transport("License expired".into()));
+                    }
+                    LicenseStatus::InvalidSignature(reason) => {
+                        warn!("Rejecting node {} join: license invalid: {}", from, reason);
+                        return Err(ClusterError::Transport("License invalid".into()));
                     }
                     _ => {}
                 }
@@ -1181,16 +1189,11 @@ mod tests {
         let _t3 = net.register(node("node-3"));
         let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
 
-        // Create an enterprise license key limited to 2 nodes
-        let payload = crate::license::LicensePayload {
-            customer: "Acme Industrial IoT".into(),
-            max_nodes: 2,
-            issued_at: 1700000000,
-            expires_at: 2000000000,
-            features: vec!["clustering".into()],
-        };
-        let key = crate::license::ClusterLicense::generate_signed_token(&payload);
-        swim1.set_license_key(Some(key));
+        // Enterprise license minted offline with the shipped public key's
+        // private counterpart (max 2 nodes, bound to node-1). The private
+        // key was discarded; only this token remains in the tree.
+        let key = "INDRA-ENT-V1.eyJjdXN0b21lciI6IkFjbWUgSW5kdXN0cmlhbCBJb1QiLCJtYXhfbm9kZXMiOjIsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwiZXhwaXJlc19hdCI6MjAwMDAwMDAwMCwiZmVhdHVyZXMiOlsiY2x1c3RlcmluZyJdLCJub2RlX2lkIjoibm9kZS0xIn0.AWjBqrbps61WwM9EWby7YPlmRtOYbXasZ53B6vE0fwlEJhBZHpaQszfBdUR873dMkMyAbUpB1AHSsdRDQf4kBQ";
+        swim1.set_license_key(Some(key.to_string()));
 
         // Node-2 joins -> admitted (2/2 nodes)
         let join2 = SwimMessage::Join {
@@ -1210,6 +1213,22 @@ mod tests {
         let res3 = swim1.handle_message(node("node-3"), join3).await;
         assert!(res3.is_err());
         assert!(matches!(res3, Err(ClusterError::Transport(_))));
+    }
+
+    #[tokio::test]
+    async fn test_license_invalid_rejected() {
+        let net = ChannelSwimNetwork::new();
+        let t1 = net.register(node("node-1"));
+        let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
+
+        swim1.set_license_key(Some("INDRA-ENT-V1.forged.forged".to_string()));
+        let join = SwimMessage::Join {
+            from: node("node-2"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        let res = swim1.handle_message(node("node-2"), join).await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]
