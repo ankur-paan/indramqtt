@@ -1,0 +1,19 @@
+# Which management-API stores the broker actually drives.
+#
+#   wired  <field>            the broker reads or writes it outside crates/broker-api
+#   facade <field> <ticket>   the endpoints exist, nothing behind them is connected
+#
+# A facade line is an admission, not a licence. It exists so the gap is
+# visible in the tree and tied to a ticket, instead of being discovered by
+# someone whose banned client connected anyway.
+
+wired  auto_subscribe
+wired  retainer_config
+
+facade bans                T-70
+facade alarms              T-71
+facade monitor             T-72
+facade slow_subs           T-73
+facade slow_subs_settings  T-73
+facade traces              T-74
+facade tracing             T-74

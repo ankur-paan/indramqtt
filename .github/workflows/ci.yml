@@ -26,6 +26,9 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Check management API stores are driven by the broker
+        run: bash tools/wiring_check.sh
+
       - name: Check code formatting
         run: cargo fmt --all -- --check
 
