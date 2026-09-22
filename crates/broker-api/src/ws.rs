@@ -285,6 +285,9 @@ struct WsSession {
 async fn handle_socket(state: ApiState, mut socket: WebSocket) {
     let conn_id = state.next_ws_conn_id();
     let (tx, mut rx) = mpsc::unbounded_channel::<BrokerFrame>();
+    // Directed QoS 0 wakeup for this connection (D1-02): fan-out signals
+    // exactly this task, never another socket.
+    let waker = std::sync::Arc::new(tokio::sync::Notify::new());
     let mut session: Option<WsSession> = None;
     let mut carry: Vec<u8> = Vec::new();
 
@@ -301,7 +304,7 @@ async fn handle_socket(state: ApiState, mut socket: WebSocket) {
                     continue;
                 };
                 carry.extend_from_slice(&bytes);
-                match drive_packets(&state, &mut socket, &mut session, conn_id, &tx, &mut carry).await {
+                match drive_packets(&state, &mut socket, &mut session, conn_id, &tx, &waker, &mut carry).await {
                     Ok(()) => {}
                     Err(()) => break,
                 }
@@ -311,8 +314,68 @@ async fn handle_socket(state: ApiState, mut socket: WebSocket) {
                 }
             }
             outbound = rx.recv() => {
-                let Some(frame) = outbound else { break };
-                if !forward_to_browser(&mut socket, &frame).await {
+                let Some(first) = outbound else { break };
+                // Guaranteed frame first, then any queued QoS 0 for this
+                // connection in sequence order (D1-02): QoS 0 rides the
+                // bounded backlog, never the unbounded mailbox.
+                let mut frames = vec![first];
+                while let Ok(frame) = rx.try_recv() {
+                    frames.push(frame);
+                }
+                frames.extend(state.conns.drain_qos0(conn_id, usize::MAX));
+                frames.sort_by_key(|frame| frame.header.sequence_no);
+                let mut ok = true;
+                for frame in &frames {
+                    if !forward_to_browser(&mut socket, frame).await {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            () = waker.notified() => {
+                // QoS-0-only burst for this connection (directed wakeup).
+                // Drain both mailboxes in sequence order.
+                if state.conns.qos0_len(conn_id) == 0 {
+                    // Also opportunistically drain any guaranteed frames
+                    // that arrived between the select and the check.
+                    let mut extra = Vec::new();
+                    while let Ok(frame) = rx.try_recv() {
+                        extra.push(frame);
+                    }
+                    if extra.is_empty() {
+                        continue;
+                    }
+                    extra.extend(state.conns.drain_qos0(conn_id, usize::MAX));
+                    extra.sort_by_key(|frame| frame.header.sequence_no);
+                    let mut ok = true;
+                    for frame in &extra {
+                        if !forward_to_browser(&mut socket, frame).await {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    continue;
+                }
+                let mut frames = Vec::new();
+                while let Ok(frame) = rx.try_recv() {
+                    frames.push(frame);
+                }
+                frames.extend(state.conns.drain_qos0(conn_id, usize::MAX));
+                frames.sort_by_key(|frame| frame.header.sequence_no);
+                let mut ok = true;
+                for frame in &frames {
+                    if !forward_to_browser(&mut socket, frame).await {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
                     break;
                 }
             }
@@ -330,6 +393,7 @@ async fn drive_packets(
     session: &mut Option<WsSession>,
     conn_id: u64,
     tx: &mpsc::UnboundedSender<BrokerFrame>,
+    waker: &std::sync::Arc<tokio::sync::Notify>,
     carry: &mut Vec<u8>,
 ) -> Result<(), ()> {
     loop {
@@ -357,6 +421,7 @@ async fn drive_packets(
             session,
             conn_id,
             tx,
+            waker,
             WsPacket {
                 packet_type,
                 flags,
@@ -384,6 +449,7 @@ async fn handle_packet(
     session: &mut Option<WsSession>,
     conn_id: u64,
     tx: &mpsc::UnboundedSender<BrokerFrame>,
+    waker: &std::sync::Arc<tokio::sync::Notify>,
     packet: WsPacket<'_>,
 ) -> Result<(), ()> {
     let WsPacket {
@@ -444,6 +510,10 @@ async fn handle_packet(
             *stored.username.write() = conn.username.clone();
             state.metrics.inc_connections();
             state.conns.register(conn_id, tx.clone());
+            // D1-02: label the mailbox for per-client shed accounting and
+            // point it at this socket's directed wakeup.
+            state.conns.set_client_label(conn_id, &conn.client_id);
+            state.conns.set_waker(conn_id, waker);
             *session = Some(WsSession {
                 client_id: conn.client_id,
                 subscriptions: Vec::new(),

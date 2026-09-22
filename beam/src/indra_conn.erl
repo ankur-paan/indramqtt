@@ -63,6 +63,12 @@
 -define(PUBLISH_OUT, 16#0021).
 -define(PUBACK_IN, 16#0022).
 -define(PUBACK_OUT, 16#0023).
+-define(PUBREC_IN, 16#0024).
+-define(PUBREC_OUT, 16#0025).
+-define(PUBREL_IN, 16#0026).
+-define(PUBREL_OUT, 16#0027).
+-define(PUBCOMP_IN, 16#0028).
+-define(PUBCOMP_OUT, 16#0029).
 -define(SUBSCRIBE_IN, 16#0030).
 -define(SUBACK_OUT, 16#0031).
 -define(CONN_CLOSE, 16#0041).
@@ -175,6 +181,7 @@ init_shard(Sock, Opts, Shards) ->
              session_id => undefined,
              subs_pending => #{},
              pubs_pending => #{},
+             qos2_pending => #{},
              subs => #{},
              quiet_subs => #{},
              rebinding => false,
@@ -446,6 +453,12 @@ handle_event(cast, {broker_frame, Header, Meta, Payload}, connected, Data) ->
             egress_batch({Header, Meta, Payload}, Data);
         ?PUBACK_OUT ->
             handle_puback_out(Meta, Data);
+        ?PUBREC_OUT ->
+            egress_batch({Header, Meta, Payload}, Data);
+        ?PUBREL_OUT ->
+            egress_batch({Header, Meta, Payload}, Data);
+        ?PUBCOMP_OUT ->
+            egress_batch({Header, Meta, Payload}, Data);
         ?CONN_CLOSE ->
             %% Kernel-ordered close (W0-25): the kernel already unbound
             %% session state; the edge only closes the socket. terminate/3
@@ -552,7 +565,9 @@ handle_event(_Type, _Event, _State, Data) ->
 terminate(_Reason, _State, #{sock := Sock, sockmod := Mod, conn_id := ConnId} = Data) ->
     %% Attribution that survives the process: the stop cause, the
     %% queued PublishOut frames evaporating with the mailbox (labelled
-    %% by QoS), and the QoS 1 publishes accepted but never PUBACKed.
+    %% by QoS), and the QoS 1 publishes accepted but never PUBACKed plus
+    %% the QoS 2 publishes accepted but never PUBCOMPd (D1-01, folded
+    %% into the same counter so existing dashboards keep working).
     %% Delivery reconciles as: dispatched = received_by_tool +
     %% still_queued + shed_counted + discarded_at_close. Any future
     %% "delivery %" that does not print all four terms is a cutoff
@@ -562,7 +577,8 @@ terminate(_Reason, _State, #{sock := Sock, sockmod := Mod, conn_id := ConnId} = 
     {DiscQos0, DiscQos1} = drain_close_discards(),
     catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos0_total, DiscQos0),
     catch indra_edge_counters:inc(edge_egress_discarded_at_close_qos1_total, DiscQos1),
-    Unacked = map_size(maps:get(pubs_pending, Data, #{})),
+    Unacked = map_size(maps:get(pubs_pending, Data, #{}))
+        + map_size(maps:get(qos2_pending, Data, #{})),
     catch indra_edge_counters:inc(edge_puback_unacked_at_close_total, Unacked),
     catch indra_edge_counters:credit_delete(ConnId),
     catch indra_conn_registry:unregister(ConnId),
@@ -637,10 +653,11 @@ bump_send_failed(Data, N) ->
 
 %% @doc Drain the queued inbound BrokerLink frames at death and count
 %% the PublishOut frames evaporating with the mailbox, labelled by QoS.
-%% Returns `{Qos0, Qos1}'. Only matching casts are removed; everything
-%% else stays queued and dies with the process. Exported for EUnit (a
-%% full connection teardown around it would be timing-flaky); the
-%% production caller is terminate/3.
+%% Returns `{Qos0, Qos1}'. QoS 2 counts with QoS 1 (both need reliability;
+%% the counters predate QoS 2). Only matching casts are removed;
+%% everything else stays queued and dies with the process. Exported for
+%% EUnit (a full connection teardown around it would be timing-flaky);
+%% the production caller is terminate/3.
 -spec drain_close_discards() -> {non_neg_integer(), non_neg_integer()}.
 drain_close_discards() ->
     drain_close_discards(0, 0).
@@ -649,8 +666,8 @@ drain_close_discards(Qos0, Qos1) ->
     receive
         {'$gen_cast', {broker_frame, #{opcode := ?PUBLISH_OUT}, Meta, _Payload}} ->
             case catch indra_brokerlink:decode_publish_meta(Meta) of
-                {ok, #{qos := 1}} -> drain_close_discards(Qos0, Qos1 + 1);
-                {ok, _} -> drain_close_discards(Qos0 + 1, Qos1);
+                {ok, #{qos := 0}} -> drain_close_discards(Qos0 + 1, Qos1);
+                {ok, _} -> drain_close_discards(Qos0, Qos1 + 1);
                 _ -> drain_close_discards(Qos0, Qos1)
             end
     after 0 ->
@@ -757,6 +774,7 @@ start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
             {next_state, await_core, Data#{seq => Seq + 1,
                                            subs_pending => #{},
                                            pubs_pending => #{},
+                                           qos2_pending => #{},
                                            quiet_subs => #{},
                                            rebinding => true}};
         _ ->
@@ -887,6 +905,18 @@ handle_mqtt_packet(#{type := 4, payload := Payload}, Data) ->
     %% a failed forward keeps the connection up (the kernel simply
     %% replays on reconnect).
     handle_puback_in(Payload, Data);
+handle_mqtt_packet(#{type := 5, payload := Payload}, Data) ->
+    %% Inbound PUBREC for a QoS 2 downstream delivery (D1-01): forward
+    %% as PubRecIn so the kernel sends PUBREL. Malformed ids ignored.
+    handle_pubrec_in(Payload, Data);
+handle_mqtt_packet(#{type := 6, payload := Payload}, Data) ->
+    %% Inbound PUBREL for a QoS 2 upstream publish (D1-01): forward as
+    %% PubRelIn so the kernel routes once and replies PUBCOMP.
+    handle_pubrel_in(Payload, Data);
+handle_mqtt_packet(#{type := 7, payload := Payload}, Data) ->
+    %% Inbound PUBCOMP for a QoS 2 downstream delivery (D1-01): forward
+    %% as PubCompIn so the kernel releases the packet id.
+    handle_pubcomp_in(Payload, Data);
 handle_mqtt_packet(_Other, Data) ->
     %% CONNECT repeats, CONNACK/SUBACK from a client, UNSUBSCRIBE and any
     %% other unexpected packet: protocol violation, close.
@@ -919,12 +949,15 @@ handle_publish_packet(Payload, Flags, Data) ->
         {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
                retain := Retain, dup := Dup, payload := AppPayload}} ->
             #{broker := Broker, conn_id := ConnId, seq := Seq,
-              pubs_pending := Pending} = Data,
+              pubs_pending := Pending, qos2_pending := Qos2Pending} = Data,
             Meta = indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup),
             case catch indra_brokerlink:send(Broker, ?PUBLISH_IN, ConnId, Seq + 1, Meta, AppPayload) of
                 ok when QoS =:= 1 ->
                     {ok, Data#{seq => Seq + 1,
                                pubs_pending => Pending#{PacketId => true}}};
+                ok when QoS =:= 2 ->
+                    {ok, Data#{seq => Seq + 1,
+                               qos2_pending => Qos2Pending#{PacketId => true}}};
                 ok ->
                     {ok, Data#{seq => Seq + 1}};
                 %% PERF-09 bounded ingress: the owning shard is past
@@ -968,6 +1001,59 @@ handle_puback_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
             stop_with(Data, classify_send_error(Other))
     end;
 handle_puback_in(_, Data) ->
+    {ok, Data}.
+
+%% @private Forward one subscriber PUBREC to the kernel (D1-01 outbound:
+%% the kernel answers with PUBREL). Malformed ids are ignored; a failed
+%% forward keeps the connection up (the kernel replays PUBLISH on
+%% reconnect, preserving exactly-once).
+handle_pubrec_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
+                                        seq := Seq} = Data)
+  when PacketId =/= 0 ->
+    Meta = indra_brokerlink:encode_pubrec_meta(PacketId),
+    case catch indra_brokerlink:send(Broker, ?PUBREC_IN, ConnId, Seq + 1, Meta, <<>>) of
+        ok ->
+            {ok, Data#{seq => Seq + 1}};
+        {error, overloaded} ->
+            {ok, Data};
+        Other ->
+            stop_with(Data, classify_send_error(Other))
+    end;
+handle_pubrec_in(_, Data) ->
+    {ok, Data}.
+
+%% @private Forward one publisher PUBREL to the kernel (D1-01 inbound:
+%% the kernel routes once and replies PUBCOMP). Malformed ids ignored.
+handle_pubrel_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
+                                        seq := Seq} = Data)
+  when PacketId =/= 0 ->
+    Meta = indra_brokerlink:encode_pubrel_meta(PacketId),
+    case catch indra_brokerlink:send(Broker, ?PUBREL_IN, ConnId, Seq + 1, Meta, <<>>) of
+        ok ->
+            {ok, Data#{seq => Seq + 1}};
+        {error, overloaded} ->
+            {ok, Data};
+        Other ->
+            stop_with(Data, classify_send_error(Other))
+    end;
+handle_pubrel_in(_, Data) ->
+    {ok, Data}.
+
+%% @private Forward one subscriber PUBCOMP to the kernel (D1-01 outbound
+%% completion: the kernel releases the packet id). Malformed ids ignored.
+handle_pubcomp_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
+                                         seq := Seq} = Data)
+  when PacketId =/= 0 ->
+    Meta = indra_brokerlink:encode_pubcomp_meta(PacketId),
+    case catch indra_brokerlink:send(Broker, ?PUBCOMP_IN, ConnId, Seq + 1, Meta, <<>>) of
+        ok ->
+            {ok, Data#{seq => Seq + 1}};
+        {error, overloaded} ->
+            {ok, Data};
+        Other ->
+            stop_with(Data, classify_send_error(Other))
+    end;
+handle_pubcomp_in(_, Data) ->
     {ok, Data}.
 
 %%====================================================================
@@ -1123,6 +1209,45 @@ emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
                 {stop, _, _} = Stop ->
                     Stop
             end;
+        ?PUBREC_OUT ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    case handle_pubrec_out(Meta, Data1) of
+                        {keep_state, Data2} ->
+                            emit_frames(Rest, Data2, [], 0, 0);
+                        {stop, _, _} = Stop ->
+                            count_evaporated(Rest),
+                            Stop
+                    end;
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
+        ?PUBREL_OUT ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    case handle_pubrel_out(Meta, Data1) of
+                        {keep_state, Data2} ->
+                            emit_frames(Rest, Data2, [], 0, 0);
+                        {stop, _, _} = Stop ->
+                            count_evaporated(Rest),
+                            Stop
+                    end;
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
+        ?PUBCOMP_OUT ->
+            case flush_pending(Data, Pending, N, B, Rest) of
+                {ok, Data1} ->
+                    case handle_pubcomp_out(Meta, Data1) of
+                        {keep_state, Data2} ->
+                            emit_frames(Rest, Data2, [], 0, 0);
+                        {stop, _, _} = Stop ->
+                            count_evaporated(Rest),
+                            Stop
+                    end;
+                {stop, _, _} = Stop ->
+                    Stop
+            end;
         ?CONN_CLOSE ->
             case flush_pending(Data, Pending, N, B, Rest) of
                 {ok, Data1} ->
@@ -1203,16 +1328,17 @@ count_publish_frames(Rest) ->
 
 %% @private Reconcile a dequeued-but-unwalked drain remainder at a stop:
 %% every PublishOut in it evaporates here (never the socket, never the
-%% mailbox drain in terminate/3), so label each by QoS now. Best effort
-%% on decode: an undecodable remainder is still gone, just unlabelled.
+%% mailbox drain in terminate/3), so label each by QoS now. QoS 2 counts
+%% with QoS 1. Best effort on decode: an undecodable remainder is still
+%% gone, just unlabelled.
 count_evaporated(Rest) ->
     {Qos0, Qos1} = lists:foldl(
       fun({Header, Meta, _Payload}, {A0, A1}) ->
           case maps:get(opcode, Header, undefined) of
               ?PUBLISH_OUT ->
                   case catch indra_brokerlink:decode_publish_meta(Meta) of
-                      {ok, #{qos := 1}} -> {A0, A1 + 1};
-                      {ok, _} -> {A0 + 1, A1};
+                      {ok, #{qos := 0}} -> {A0 + 1, A1};
+                      {ok, _} -> {A0, A1 + 1};
                       _ -> {A0, A1}
                   end;
               _ ->
@@ -1237,6 +1363,55 @@ handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending}
                         {error, _} ->
                             stop_with(bump_send_failed(Data), send_failed)
                     end
+            end;
+        {error, _Reason} ->
+            stop_with(Data, protocol_error)
+    end.
+
+%% @private Forward one kernel PUBREC to the publishing client (D1-01
+%% inbound first phase). The pending entry stays until PUBCOMP so a
+%% duplicate PUBLISH still matches; unsolicited PUBRECs are still
+%% forwarded (the kernel only sends them for publishes it stored).
+handle_pubrec_out(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
+    case indra_brokerlink:decode_pubrec_meta(Meta) of
+        {ok, #{packet_id := PacketId}} ->
+            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrec(PacketId)) of
+                ok ->
+                    {keep_state, Data};
+                {error, _} ->
+                    stop_with(bump_send_failed(Data), send_failed)
+            end;
+        {error, _Reason} ->
+            stop_with(Data, protocol_error)
+    end.
+
+%% @private Forward one kernel PUBREL to the subscribing client (D1-01
+%% outbound second phase).
+handle_pubrel_out(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
+    case indra_brokerlink:decode_pubrel_meta(Meta) of
+        {ok, #{packet_id := PacketId}} ->
+            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrel(PacketId)) of
+                ok ->
+                    {keep_state, Data};
+                {error, _} ->
+                    stop_with(bump_send_failed(Data), send_failed)
+            end;
+        {error, _Reason} ->
+            stop_with(Data, protocol_error)
+    end.
+
+%% @private Forward one kernel PUBCOMP to the publishing client (D1-01
+%% inbound completion) and release the pending entry.
+handle_pubcomp_out(Meta, #{sock := Sock, sockmod := Mod,
+                           qos2_pending := Pending} = Data) ->
+    case indra_brokerlink:decode_pubcomp_meta(Meta) of
+        {ok, #{packet_id := PacketId}} ->
+            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubcomp(PacketId)) of
+                ok ->
+                    {keep_state, Data#{qos2_pending =>
+                                           maps:remove(PacketId, Pending)}};
+                {error, _} ->
+                    stop_with(bump_send_failed(Data), send_failed)
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)

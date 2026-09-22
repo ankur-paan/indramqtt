@@ -53,6 +53,20 @@ pub struct Session {
     /// resends oldest-first with DUP set. Bounded per session by
     /// [`MAX_QOS1_INFLIGHT`]; the kernel (not the edge) owns this state.
     pub inflight: RwLock<VecDeque<InflightMessage>>,
+    /// QoS 2 inbound publishes held between PUBLISH and PUBREL (D1-01).
+    /// Keyed by the publisher's packet id so a repeat of the same id
+    /// before PUBREL is recognised as a duplicate (PUBREC again, no
+    /// second route). Bounded by [`MAX_QOS2_INBOUND`]; the kernel owns
+    /// this state behind the same per-session lock family QoS 1 uses,
+    /// never on the QoS 0 path.
+    pub qos2_inbound: RwLock<HashMap<u16, Qos2InboundEntry>>,
+    /// QoS 2 downlinks written toward the subscriber and not yet
+    /// completed (D1-01). Held in delivery order so reconnect replay
+    /// resends oldest-first. `rec_received` is false while waiting for
+    /// PUBREC (message retained) and true while waiting for PUBCOMP
+    /// (packet id retained, payload dropped). Bounded by
+    /// [`MAX_QOS2_INFLIGHT`]; the kernel owns this state.
+    pub qos2_outbound: RwLock<VecDeque<Qos2OutboundEntry>>,
     /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
     /// the edge at bind time; surfaced read-only for observability.
     pub keepalive_secs: RwLock<u16>,
@@ -93,6 +107,43 @@ pub struct InflightMessage {
 /// more than skipping its redelivery; keeping the oldest entries
 /// preserves replay order for what is tracked.
 pub const MAX_QOS1_INFLIGHT: usize = 100;
+
+/// Maximum QoS 2 inbound publishes held per session between PUBLISH and
+/// PUBREL (D1-01). At the limit a new packet id is refused (the kernel
+/// sends no PUBREC, so the publisher retries); duplicates of held ids
+/// are still answered. Bounds per-connection memory on the QoS 2 path;
+/// the QoS 0 path never touches this map.
+pub const MAX_QOS2_INBOUND: usize = 100;
+
+/// Maximum uncompleted QoS 2 downlinks held per session (D1-01). Same
+/// overflow policy as QoS 1: the newest downlink is still delivered live
+/// once but left untracked (counted via `inflight_dropped`), so the live
+/// rate never pays for the window.
+pub const MAX_QOS2_INFLIGHT: usize = 100;
+
+/// One QoS 2 inbound publish held between PUBLISH and PUBREL (D1-01).
+/// Routed exactly once on PUBREL, then released.
+#[derive(Debug, Clone)]
+pub struct Qos2InboundEntry {
+    pub topic: Topic,
+    pub retain: bool,
+    pub payload: Bytes,
+}
+
+/// One QoS 2 downlink held from the moment it is written toward a
+/// subscriber until its PUBCOMP arrives (D1-01). `rec_received` is false
+/// while waiting for PUBREC (full message retained) and true while
+/// waiting for PUBCOMP (payload dropped, packet id retained for dedup).
+/// Replay reuses the packet id in order; PUBLISH replays carry DUP set
+/// while PUBREL replays carry the fixed PUBREL flags.
+#[derive(Debug, Clone)]
+pub struct Qos2OutboundEntry {
+    pub packet_id: u16,
+    pub topic: Topic,
+    pub retain: bool,
+    pub payload: Bytes,
+    pub rec_received: bool,
+}
 
 /// Maximum buffered messages per detached session; beyond this the
 /// oldest entry drops so one dead client cannot balloon the node.
@@ -148,6 +199,8 @@ impl Session {
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
             inflight: RwLock::new(VecDeque::new()),
+            qos2_inbound: RwLock::new(HashMap::new()),
+            qos2_outbound: RwLock::new(VecDeque::new()),
             keepalive_secs: RwLock::new(0),
             username: RwLock::new(None),
             next_packet_id: AtomicU16::new(1),
@@ -160,11 +213,14 @@ impl Session {
             if pid == 0 {
                 continue;
             }
-            // Never hand out an id already held inflight: a resumed
-            // session's unacked ids stay reserved until their PUBACK.
-            // The store is bounded (<= MAX_QOS1_INFLIGHT of 65535 ids),
-            // so this scan always terminates.
+            // Never hand out an id already held inflight or QoS 2
+            // outbound: a resumed session's unacked ids stay reserved
+            // until their PUBACK/PUBCOMP. Both stores are bounded, so
+            // this scan always terminates.
             if self.inflight.read().iter().any(|m| m.packet_id == pid) {
+                continue;
+            }
+            if self.qos2_outbound.read().iter().any(|m| m.packet_id == pid) {
                 continue;
             }
             return pid;
@@ -207,6 +263,101 @@ impl Session {
 
     pub fn clear_inflight(&self) {
         self.inflight.write().clear();
+    }
+
+    /// Store one QoS 2 inbound publish between PUBLISH and PUBREL.
+    /// Returns false when the id is already held (duplicate: the caller
+    /// must reply PUBREC without routing again) or when the per-session
+    /// bound is full (the caller sends no PUBREC, so the publisher
+    /// retries). True means newly stored.
+    pub fn store_qos2_inbound(&self, packet_id: u16, entry: Qos2InboundEntry) -> bool {
+        let mut inbound = self.qos2_inbound.write();
+        if inbound.contains_key(&packet_id) {
+            return false;
+        }
+        if inbound.len() >= MAX_QOS2_INBOUND {
+            return false;
+        }
+        inbound.insert(packet_id, entry);
+        true
+    }
+
+    /// Whether a QoS 2 inbound packet id is already held (duplicate
+    /// PUBLISH before PUBREL).
+    pub fn has_qos2_inbound(&self, packet_id: u16) -> bool {
+        self.qos2_inbound.read().contains_key(&packet_id)
+    }
+
+    /// Take one QoS 2 inbound publish on PUBREL for exactly-once routing.
+    /// `None` means unknown packet id (the caller answers nothing).
+    pub fn take_qos2_inbound(&self, packet_id: u16) -> Option<Qos2InboundEntry> {
+        self.qos2_inbound.write().remove(&packet_id)
+    }
+
+    /// Number of QoS 2 inbound publishes currently held.
+    pub fn qos2_inbound_len(&self) -> usize {
+        self.qos2_inbound.read().len()
+    }
+
+    /// Drop all QoS 2 inbound state (clean disconnect only).
+    pub fn clear_qos2_inbound(&self) {
+        self.qos2_inbound.write().clear();
+    }
+
+    /// Hold one QoS 2 downlink for the two-phase exchange. True means
+    /// tracked; false means the per-session bound was full (the caller
+    /// still delivers live once and counts `inflight_dropped`). Never
+    /// grows past [`MAX_QOS2_INFLIGHT`].
+    pub fn track_qos2_outbound(&self, entry: Qos2OutboundEntry) -> bool {
+        let mut outbound = self.qos2_outbound.write();
+        if outbound.len() >= MAX_QOS2_INFLIGHT {
+            return false;
+        }
+        outbound.push_back(entry);
+        true
+    }
+
+    /// Mark one QoS 2 downlink as PUBREC-received (waiting for PUBCOMP).
+    /// Drops the retained payload; only the packet id is kept until
+    /// PUBCOMP. True when an entry was waiting for PUBREC.
+    pub fn complete_qos2_pubrec(&self, packet_id: u16) -> bool {
+        let mut outbound = self.qos2_outbound.write();
+        if let Some(entry) = outbound.iter_mut().find(|m| m.packet_id == packet_id) {
+            if !entry.rec_received {
+                entry.rec_received = true;
+                entry.payload = Bytes::new();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Release one QoS 2 downlink on its PUBCOMP. True when an entry was
+    /// held (in either phase).
+    pub fn ack_qos2_pubcomp(&self, packet_id: u16) -> bool {
+        let mut outbound = self.qos2_outbound.write();
+        if let Some(pos) = outbound.iter().position(|m| m.packet_id == packet_id) {
+            outbound.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    /// Ordered snapshot of uncompleted QoS 2 downlinks for reconnect
+    /// replay. Entries stay held until their PUBCOMP, so a second
+    /// reconnect without completion replays them again.
+    pub fn qos2_outbound_snapshot(&self) -> Vec<Qos2OutboundEntry> {
+        self.qos2_outbound.read().iter().cloned().collect()
+    }
+
+    /// Number of QoS 2 downlinks currently held.
+    pub fn qos2_outbound_len(&self) -> usize {
+        self.qos2_outbound.read().len()
+    }
+
+    /// Drop all QoS 2 outbound state (clean disconnect only).
+    pub fn clear_qos2_outbound(&self) {
+        self.qos2_outbound.write().clear();
     }
 
     /// Buffer one message for later replay, evicting the oldest entry
@@ -614,11 +765,13 @@ impl SessionManager {
                         let was_connected = *session.connected.read();
                         *current_conn = None;
                         *session.connected.write() = false;
-                        // Clean sessions keep no inflight state across a
-                        // disconnect (T-31); durable sessions keep theirs
-                        // for reconnect replay.
+                        // Clean sessions keep no inflight or QoS 2 state
+                        // across a disconnect (T-31, D1-01); durable
+                        // sessions keep theirs for reconnect replay.
                         if session.clean_start {
                             session.clear_inflight();
+                            session.clear_qos2_inbound();
+                            session.clear_qos2_outbound();
                         }
                         let swept = if session.clean_start {
                             session

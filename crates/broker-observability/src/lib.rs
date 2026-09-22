@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -57,10 +58,16 @@ pub struct Metrics {
     // shed_counted + discarded_at_close`, never from `forwarded` alone.
     transport_sent: AtomicU64,
     transport_send_failed: AtomicU64,
-    // Egress queue bounds (fired by the kernel queue split, a later
-    // stage; defined now so the API surface is stable and dashboards
-    // can reference them). Until then they read zero.
+    // Egress queue bounds (D1-02 bounded QoS 0 backlog; the remaining
+    // credit stages still read zero until their split lands).
     egress_qos0_shed: AtomicU64,
+    /// QoS 0 sheds labelled by client id (D1-02). Every increment of
+    /// [`Metrics::egress_qos0_shed`] through
+    /// [`Metrics::inc_egress_qos0_shed_for`] also bumps the caller's
+    /// entry here, so a drop is always visible per subscriber and never
+    /// silent. Guarded by a plain mutex: bumps happen only when a drop
+    /// happens (not on the fast delivery path), reads clone the map.
+    qos0_shed_by_client: std::sync::RwLock<HashMap<String, u64>>,
     puback_deferred: AtomicU64,
     puback_deferred_released: AtomicU64,
     credit_clamped: AtomicU64,
@@ -394,10 +401,39 @@ impl Metrics {
         self.transport_send_failed.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// QoS 0 frames shed at route time by the per-connection egress
-    /// bound (fires with the kernel queue split; zero until then).
+    /// QoS 0 frames shed at route time by the per-subscriber egress
+    /// bound (D1-02). Counts every oldest-dropped frame; the per-client
+    /// label is recorded separately via
+    /// [`Metrics::inc_egress_qos0_shed_for`].
     pub fn inc_egress_qos0_shed(&self) -> u64 {
         self.egress_qos0_shed.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Count one QoS 0 shed for `client_id`: bumps the global
+    /// `egress_qos0_shed` and the per-client entry together so the two
+    /// can never drift. Returns the new global total.
+    pub fn inc_egress_qos0_shed_for(&self, client_id: &str) -> u64 {
+        let total = self.egress_qos0_shed.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut by_client) = self.qos0_shed_by_client.write() {
+            *by_client.entry(client_id.to_string()).or_insert(0) += 1;
+        }
+        total
+    }
+
+    /// Sheds recorded for one client id, if any.
+    pub fn egress_qos0_shed_for(&self, client_id: &str) -> u64 {
+        self.qos0_shed_by_client
+            .read()
+            .map(|by_client| by_client.get(client_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Snapshot of every per-client shed count, keyed by client id.
+    pub fn egress_qos0_shed_by_client(&self) -> HashMap<String, u64> {
+        self.qos0_shed_by_client
+            .read()
+            .map(|by_client| by_client.clone())
+            .unwrap_or_default()
     }
 
     /// QoS 1 publishes whose PUBACK is deferred for credit (fires with
@@ -1019,6 +1055,29 @@ mod tests {
         assert!(text.contains("indramqtt_credit_clamped_total 1\n"));
         assert!(text.contains("indramqtt_credit_exhausted_total 1\n"));
         assert!(text.contains("indramqtt_credit_received_total 1\n"));
+    }
+
+    #[test]
+    fn test_egress_qos0_shed_labelled_by_client() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.egress_qos0_shed_for("ghost"), 0);
+        assert!(metrics.egress_qos0_shed_by_client().is_empty());
+
+        assert_eq!(metrics.inc_egress_qos0_shed_for("slow-1"), 1);
+        assert_eq!(metrics.inc_egress_qos0_shed_for("slow-1"), 2);
+        assert_eq!(metrics.inc_egress_qos0_shed_for("fast-1"), 3);
+
+        assert_eq!(metrics.egress_qos0_shed(), 3);
+        assert_eq!(metrics.egress_qos0_shed_for("slow-1"), 2);
+        assert_eq!(metrics.egress_qos0_shed_for("fast-1"), 1);
+        assert_eq!(metrics.egress_qos0_shed_for("ghost"), 0);
+        let by_client = metrics.egress_qos0_shed_by_client();
+        assert_eq!(by_client.len(), 2);
+        assert_eq!(by_client.get("slow-1"), Some(&2));
+        assert_eq!(by_client.get("fast-1"), Some(&1));
+
+        let other = Metrics::new();
+        assert!(other.egress_qos0_shed_by_client().is_empty());
     }
 
     #[test]
