@@ -256,10 +256,11 @@ IndraMQTT is distributed under a dual-licensing structure:
 1. **Community Edition (Open Source)**:
    - Licensed under the **MIT License** ([`LICENSE-MIT`](LICENSE-MIT)) OR **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE)).
    - Covers all core broker crates, BEAM edge, BrokerLink IPC, session engine, storage engine, embedded stateless SQL rules, and Community connectors.
+   - **Free for commercial and production use**, including inside revenue-generating products and services. No subscription, license key or registration, now or later. The MIT and Apache-2.0 terms are the only conditions.
 2. **Enterprise Edition (Commercial / Free Community Evaluation)**:
    - Governed by the **Indra Enterprise Commercial License** ([`LICENSE-ENTERPRISE`](LICENSE-ENTERPRISE)).
-   - Covers distributed QUIC clustering (`crates/broker-cluster`), stateful windowed stream processing, and specialized enterprise/industrial connectors.
-   - Royalty-free for personal, development, testing, and evaluation purposes. Production deployments require a commercial subscription.
+   - Covers distributed QUIC clustering (`crates/broker-cluster`) and any other components that the license explicitly designates.
+   - Royalty-free for personal, development, testing, educational and internal evaluation use. A commercial subscription is required only to run **these components** in production, and does not affect anything in the Community Edition.
 
 For commercial licensing, enterprise clustering support, and cloud subscriptions:
 🌐 **Website**: [indramqtt.com](https://indramqtt.com) | ✉️ **Contact**: [sales@i-dacs.com](mailto:sales@i-dacs.com)
