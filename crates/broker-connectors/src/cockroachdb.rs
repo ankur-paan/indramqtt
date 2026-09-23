@@ -4,6 +4,12 @@
 //! parameter binding (`$1`, `$2`, ...), native `UPSERT INTO` syntax with
 //! multi-row parameter renumbering, and transaction retry on SQLSTATE `40001`
 //! serialization failure.
+//!
+//! The write path runs on the maintained `tokio-postgres` driver with a
+//! `rustls` TLS connector (`tokio-postgres-rustls`, system trust store).
+//! The legacy hand-written `TcpCockroachDbTransport` is retained for offline
+//! unit tests only; production wiring uses `PgDriverCockroachDbTransport`
+//! below.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -578,6 +584,267 @@ impl CockroachDbTransport for TcpCockroachDbTransport {
 
         Ok(CockroachQueryResult {
             rows_affected,
+            status: "SUCCESS".into(),
+            sqlstate: None,
+            error_message: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Maintained-driver transport (`tokio-postgres` + `rustls`).
+// ---------------------------------------------------------------------------
+
+/// Parsed CockroachDB endpoint: the same `postgresql://` connection string
+/// the legacy TCP transport accepts, plus the password and TLS mode the
+/// driver needs to authenticate.
+fn cockroach_query_param(conn_str: &str, key: &str) -> Option<String> {
+    let query = conn_str.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k.eq_ignore_ascii_case(key) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn parse_cockroach_endpoint(
+    conn_str: &str,
+) -> (String, u16, String, String, String, Option<String>) {
+    let (host, port, user, db) = parse_cr_conn_str(conn_str);
+    let base = conn_str.split_once('?').map(|(b, _)| b).unwrap_or(conn_str);
+    let after_scheme = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    let password = after_scheme
+        .rsplit_once('@')
+        .map(|(auth, _)| auth)
+        .and_then(|auth| auth.split_once(':').map(|(_, p)| p.to_string()))
+        .unwrap_or_default();
+    let sslmode = cockroach_query_param(conn_str, "sslmode");
+    (host, port, user, password, db, sslmode)
+}
+
+/// Whether the driver must wrap the connection in TLS.
+///
+/// An explicit `sslmode=disable` (the insecure local-cluster setting) means
+/// plaintext; any other explicit `sslmode` means TLS. A missing `sslmode`
+/// fails closed to TLS so a server that expects TLS is never silently
+/// downgraded; stored insecure-cluster configuration must set
+/// `sslmode=disable` explicitly.
+pub fn cockroach_use_tls(config: &CockroachDbConfig) -> bool {
+    match cockroach_query_param(&config.connection_string, "sslmode")
+        .map(|m| m.to_ascii_lowercase())
+    {
+        None => true,
+        Some(mode) => mode != "disable",
+    }
+}
+
+/// Build a `tokio-postgres` connection config from a CockroachDB config.
+///
+/// Field-by-field construction (never the driver's own URL parser) so the
+/// default port stays 26257 and `sslmode` handling stays in
+/// [`cockroach_use_tls`].
+pub fn cockroach_connect_config(config: &CockroachDbConfig) -> tokio_postgres::Config {
+    let (host, port, user, password, db, _) = parse_cockroach_endpoint(&config.connection_string);
+    // TODO(parity): the password travels percent-encoded in a URL but is used
+    // verbatim here; does any stored configuration rely on encoded characters
+    // that must be decoded first?
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host(&host);
+    cfg.port(port);
+    cfg.dbname(&db);
+    cfg.user(&user);
+    if !password.is_empty() {
+        cfg.password(&password);
+    }
+    cfg.connect_timeout(config.timeout());
+    cfg
+}
+
+/// Convert a [`CockroachValue`] into an owned `ToSql` parameter.
+///
+/// `Null` becomes `None::<String>` so the driver binds SQL NULL; numbers,
+/// integers, booleans and strings keep their native PostgreSQL types and
+/// travel out-of-band, so quoting bugs are structurally impossible.
+pub fn cockroach_value_to_boxed(
+    value: &CockroachValue,
+) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
+    match value {
+        CockroachValue::Null => Box::new(None::<String>),
+        CockroachValue::String(s) => Box::new(s.clone()),
+        CockroachValue::Integer(i) => Box::new(*i),
+        CockroachValue::Number(n) => Box::new(*n),
+        CockroachValue::Boolean(b) => Box::new(*b),
+    }
+}
+
+/// Map a `tokio-postgres` error onto [`ConnectorError`], preserving the
+/// SQLSTATE text so [`classify_cockroach_sqlstate`] keeps working.
+///
+/// Serialization failures (`40001`, the sink retries these) and connection
+/// loss become `Connection` so the sink restores the batch and backs off;
+/// everything else becomes `Dispatch` for per-row handling.
+pub fn map_cockroach_driver_error(err: &tokio_postgres::Error) -> ConnectorError {
+    let mut detail = err.to_string();
+    let mut code_text: Option<String> = None;
+    if let Some(db) = err.as_db_error() {
+        let code_str = db.code().code().to_string();
+        code_text = Some(code_str.clone());
+        let message = db.message();
+        detail = format!("{code_str}: {message}");
+    }
+    let probe = if let Some(code) = code_text {
+        format!("{code} {detail}")
+    } else {
+        detail.clone()
+    };
+    match classify_cockroach_sqlstate(&probe) {
+        CockroachErrorClassification::SerializationFailure
+        | CockroachErrorClassification::ConnectionFailure => {
+            ConnectorError::Connection(format!("cockroachdb driver error: {detail}"))
+        }
+        _ => ConnectorError::Dispatch(format!("cockroachdb driver error: {detail}")),
+    }
+}
+
+fn install_cockroach_tls_provider() {
+    // The TLS connector below needs a process-default crypto provider.
+    // The workspace enables exactly one rustls provider (`aws-lc-rs` via
+    // the default features), so installing it explicitly is a no-op when
+    // already installed and keeps the call safe under feature
+    // unification.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Root store for CockroachDB TLS: the OS system trust store. Fail closed
+/// when nothing trusted anything: no bundled fallback, so an unreachable
+/// system store denies the connection instead of silently trusting a
+/// stale list.
+fn cockroach_root_store() -> Result<rustls::RootCertStore> {
+    let mut store = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = store.add(cert);
+    }
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            errors = native.errors.len(),
+            "cockroachdb system trust store reported load errors"
+        );
+    }
+    if store.is_empty() {
+        return Err(ConnectorError::Connection(
+            "cockroachdb TLS trust store is empty: system store unreadable".into(),
+        ));
+    }
+    Ok(store)
+}
+
+/// TLS connector for the `tokio-postgres` driver built from the system
+/// trust store.
+fn cockroach_tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    install_cockroach_tls_provider();
+    let roots = cockroach_root_store()?;
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
+}
+
+/// Production transport for CockroachDB.
+///
+/// Speaks the PostgreSQL-compatible wire protocol through the maintained
+/// `tokio-postgres` driver with a `rustls` TLS connector (system trust
+/// store), or plaintext when the connection string sets `sslmode=disable`
+/// for insecure local clusters. Parameters travel bound (`$1`, `$2`, ...)
+/// via the driver; `UPSERT INTO` and `INSERT ... ON CONFLICT` text built by
+/// [`build_native_upsert_query`] / [`build_on_conflict_upsert_query`] is
+/// sent as the statement.
+pub struct PgDriverCockroachDbTransport {
+    config: CockroachDbConfig,
+}
+
+impl PgDriverCockroachDbTransport {
+    pub fn new(config: &CockroachDbConfig) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+
+    pub fn config(&self) -> &CockroachDbConfig {
+        &self.config
+    }
+
+    async fn connect_client(&self) -> Result<tokio_postgres::Client> {
+        let pg_config = cockroach_connect_config(&self.config);
+        // PERF(parity): one TCP (+TLS) connection per execute; a pooled client
+        // would be the fast version. Kept per-call so a kernel restart never
+        // inherits a half-open server session.
+        // Hot-path numbers (per execute, P bound params): before (legacy TCP
+        // Simple Query): 1 TCP connect + 1 formatted SQL String over P
+        // substitutions + 2 protocol writes; after (driver): 1 TCP (+1 TLS
+        // handshake when TLS) connect + 1 spawned connection task + P boxed
+        // params + 2 Vec allocations (owned P + refs P). Example P=6 (3 cols
+        // x 2 rows): before ~3 heap allocs, after 2 Vec allocs + 6 boxed
+        // params. No locks held across await; queue/backoff Mutex held only
+        // for take/restore outside the I/O.
+        if cockroach_use_tls(&self.config) {
+            let tls = cockroach_tls_connector()?;
+            let connect = pg_config.connect(tls);
+            let (client, connection) = tokio::time::timeout(self.config.timeout(), connect)
+                .await
+                .map_err(|_| ConnectorError::Connection("cockroachdb connect timeout".to_string()))?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("cockroachdb connect failed: {e}"))
+                })?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!(error = %e, "cockroachdb driver connection closed");
+                }
+            });
+            Ok(client)
+        } else {
+            let connect = pg_config.connect(tokio_postgres::NoTls);
+            let (client, connection) = tokio::time::timeout(self.config.timeout(), connect)
+                .await
+                .map_err(|_| ConnectorError::Connection("cockroachdb connect timeout".to_string()))?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("cockroachdb connect failed: {e}"))
+                })?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!(error = %e, "cockroachdb driver connection closed");
+                }
+            });
+            Ok(client)
+        }
+    }
+}
+
+#[async_trait]
+impl CockroachDbTransport for PgDriverCockroachDbTransport {
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[CockroachValue],
+    ) -> Result<CockroachQueryResult> {
+        let client = self.connect_client().await?;
+        // Hot-path allocation numbers: exactly 2 Vec allocations per execute
+        // (owned: P boxed params, refs: P borrows) plus P box allocations,
+        // where P = params.len(); e.g. P=2 -> 2 Vec allocs + 2 boxes.
+        // Parameters travel bound out-of-band so no per-value SQL string is
+        // formatted on this path.
+        let owned: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            params.iter().map(cockroach_value_to_boxed).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            owned.iter().map(|b| b.as_ref() as _).collect();
+        let rows = tokio::time::timeout(self.config.timeout(), client.execute(query, &refs))
+            .await
+            .map_err(|_| ConnectorError::Connection("cockroachdb query timeout".to_string()))?
+            .map_err(|e| map_cockroach_driver_error(&e))?;
+        Ok(CockroachQueryResult {
+            rows_affected: rows as usize,
             status: "SUCCESS".into(),
             sqlstate: None,
             error_message: None,
@@ -1539,5 +1806,459 @@ mod tests {
             classify_cockroach_sqlstate("42P01"),
             CockroachErrorClassification::Terminal
         );
+    }
+
+    #[test]
+    fn test_driver_tls_mode_selection() {
+        let mut cfg = sample_config();
+        // Explicit insecure-cluster opt-out stays plaintext.
+        assert!(!cockroach_use_tls(&cfg));
+        cfg.connection_string =
+            "postgresql://root@localhost:26257/defaultdb?sslmode=require".to_string();
+        assert!(cockroach_use_tls(&cfg));
+        cfg.connection_string =
+            "postgresql://root@localhost:26257/defaultdb?sslmode=verify-full".to_string();
+        assert!(cockroach_use_tls(&cfg));
+        cfg.connection_string = "postgresql://root@localhost:26257/defaultdb".to_string();
+        // Missing sslmode fails closed to TLS; insecure clusters must opt out
+        // explicitly with sslmode=disable.
+        assert!(cockroach_use_tls(&cfg));
+    }
+
+    #[test]
+    fn test_driver_connect_config_carries_endpoint() {
+        let cfg = CockroachDbConfig {
+            connection_string: "postgresql://root@db.internal:26257/telemetry?sslmode=disable"
+                .to_string(),
+            table: "telemetry".to_string(),
+            upsert_conflict_columns: Vec::new(),
+            batch_size: Some(100),
+            max_retry_attempts: 5,
+            buffer_capacity: None,
+            timeout_ms: Some(7000),
+        };
+        let pg = cockroach_connect_config(&cfg);
+        // Observable endpoint state via the driver's typed getters (no Debug
+        // text): host, port, dbname, user and connect timeout must survive
+        // construction, and the write below must bind them.
+        use tokio_postgres::config::Host;
+        assert_eq!(pg.get_hosts(), &[Host::Tcp("db.internal".to_string())]);
+        assert_eq!(pg.get_ports(), &[26257]);
+        assert_eq!(pg.get_dbname(), Some("telemetry"));
+        assert_eq!(pg.get_user(), Some("root"));
+        assert_eq!(pg.get_connect_timeout(), Some(&Duration::from_millis(7000)));
+        assert!(cfg.timeout() == Duration::from_millis(7000));
+    }
+
+    #[test]
+    fn test_driver_error_text_stays_classifiable() {
+        // The driver wrapper prefixes SQLSTATE text; classification must survive it.
+        assert_eq!(
+            classify_cockroach_sqlstate(
+                "cockroachdb driver error: 40001: restart transaction: TransactionRetryWithProtoRefreshError"
+            ),
+            CockroachErrorClassification::SerializationFailure
+        );
+        assert_eq!(
+            classify_cockroach_sqlstate("cockroachdb driver error: 08006: connection failure"),
+            CockroachErrorClassification::ConnectionFailure
+        );
+        assert_eq!(
+            classify_cockroach_sqlstate("cockroachdb driver error: 23514: check violated"),
+            CockroachErrorClassification::DataRejected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_write_path_through_connector_manager() {
+        // Broker path (connect, publish, deliver): ConnectorManager::send ->
+        // Sink::send -> flush -> PgDriverCockroachDbTransport::execute.
+        // Points at an unroutable port with a short timeout so the offline
+        // gate stays green while still driving the production driver
+        // transport; the connection must fail closed, never grant access.
+        use super::super::ConnectorManager;
+        let cfg = CockroachDbConfig {
+            connection_string: "postgresql://root@127.0.0.1:1/defaultdb?sslmode=disable"
+                .to_string(),
+            table: "telemetry".to_string(),
+            upsert_conflict_columns: Vec::new(),
+            batch_size: Some(1),
+            max_retry_attempts: 1,
+            buffer_capacity: None,
+            timeout_ms: Some(200),
+        };
+        let transport = Arc::new(PgDriverCockroachDbTransport::new(&cfg));
+        let sink = Arc::new(CockroachDbSink::new(cfg, transport).expect("valid sink"));
+        let manager = ConnectorManager::new();
+        manager.register("cockroach_sink", sink);
+        let topic = Topic::new("sensors/broker").unwrap();
+        let res = manager
+            .send(
+                "cockroach_sink",
+                &topic,
+                &Bytes::from_static(br#"{"device_id":"cr-broker","temp":1.0}"#),
+                QoS::AtLeastOnce,
+            )
+            .await;
+        assert!(res.is_err(), "unreachable driver must fail closed");
+        let err = res.expect_err("must fail");
+        assert!(
+            err.to_string().contains("cockroachdb"),
+            "driver error must be observable, got: {err}"
+        );
+    }
+
+    /// Qualification against a real CockroachDB server.
+    ///
+    /// Starts its own server for the test: uses `COCKROACHDB_*` env when set,
+    /// otherwise launches an ephemeral insecure single-node via the
+    /// `cockroach` binary and stops it at the end. Skips gracefully when no
+    /// server is reachable and no binary is available so offline
+    /// `cargo test -p broker-connectors` stays green.
+    ///
+    /// Run with e.g.:
+    /// `cargo test -p broker-connectors --lib cockroachdb::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    /// (`COCKROACHDB_HOST/PORT/DATABASE/USER/PASSWORD/SSLMODE/TABLE` override
+    /// the auto-started server).
+    ///
+    /// Creates the table, streams 1000 rows through [`CockroachDbSink`] on
+    /// [`PgDriverCockroachDbTransport`], asserts the row count, re-upserts
+    /// the same keys with new values and asserts conflict resolution (same
+    /// count, updated values), exercises the `ON CONFLICT` variant, asserts
+    /// the sink retries a server-generated `40001` serialization failure,
+    /// simulates a broker restart, then drops the table and stops the
+    /// auto-started server.
+    #[tokio::test]
+    #[ignore = "needs a real CockroachDB server (started for the test, see COCKROACHDB_* env)"]
+    async fn test_qualify_driver_write_path() {
+        async fn qual_connect(config: &CockroachDbConfig) -> Option<tokio_postgres::Client> {
+            let pg_config = cockroach_connect_config(config);
+            let connect_fut = async {
+                if cockroach_use_tls(config) {
+                    let tls = cockroach_tls_connector().ok()?;
+                    let (client, conn) = pg_config.connect(tls).await.ok()?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Some(client)
+                } else {
+                    let (client, conn) = pg_config.connect(tokio_postgres::NoTls).await.ok()?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Some(client)
+                }
+            };
+            tokio::time::timeout(config.timeout(), connect_fut)
+                .await
+                .ok()
+                .flatten()
+        }
+
+        let explicit_server = std::env::var("COCKROACHDB_HOST").is_ok();
+        let host = std::env::var("COCKROACHDB_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let port: u16 = std::env::var("COCKROACHDB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(26257);
+        let database = std::env::var("COCKROACHDB_DATABASE").unwrap_or_else(|_| "defaultdb".into());
+        let username = std::env::var("COCKROACHDB_USER").unwrap_or_else(|_| "root".into());
+        let password = std::env::var("COCKROACHDB_PASSWORD").unwrap_or_default();
+        let sslmode = std::env::var("COCKROACHDB_SSLMODE").unwrap_or_else(|_| "disable".into());
+        let table =
+            std::env::var("COCKROACHDB_TABLE").unwrap_or_else(|_| "cockroach_qual_b309".into());
+
+        let userinfo = if password.is_empty() {
+            username.clone()
+        } else {
+            format!("{username}:{password}")
+        };
+        let mut config = CockroachDbConfig {
+            connection_string: format!(
+                "postgresql://{userinfo}@{host}:{port}/{database}?sslmode={sslmode}"
+            ),
+            table: table.clone(),
+            upsert_conflict_columns: Vec::new(),
+            batch_size: Some(100),
+            max_retry_attempts: 5,
+            buffer_capacity: None,
+            timeout_ms: Some(10_000),
+        };
+        config.validate().expect("qual config validates");
+
+        // Direct driver client for DDL and assertions; start an ephemeral
+        // insecure single-node for the test when no env server is set.
+        let mut _qual_child: Option<std::process::Child> = None;
+        let mut client_opt = qual_connect(&config).await;
+        if client_opt.is_none() && !explicit_server {
+            let version_ok = std::process::Command::new("cockroach")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !version_ok {
+                eprintln!(
+                    "qual skipped: no CockroachDB server at {host}:{port} and no `cockroach` binary to start one"
+                );
+                return;
+            }
+            config.connection_string =
+                format!("postgresql://root@127.0.0.1:{port}/defaultdb?sslmode=disable");
+            let mut child = std::process::Command::new("cockroach")
+                .args([
+                    "start-single-node",
+                    "--insecure",
+                    &format!("--listen-addr=127.0.0.1:{port}"),
+                    "--http-addr=127.0.0.1:18080",
+                    "--store=type=mem,size=256MiB",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ephemeral cockroachdb");
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Some(client) = qual_connect(&config).await {
+                    client_opt = Some(client);
+                    break;
+                }
+                if child.try_wait().expect("poll ephemeral server").is_some() {
+                    break;
+                }
+            }
+            if client_opt.is_some() {
+                _qual_child = Some(child);
+            } else {
+                let _ = child.kill();
+                eprintln!("qual skipped: ephemeral CockroachDB server failed to start");
+                return;
+            }
+        }
+        let Some(client) = client_opt else {
+            if explicit_server {
+                panic!("qual connect failed to explicit COCKROACHDB_HOST server");
+            }
+            eprintln!("qual skipped: no CockroachDB server reachable");
+            return;
+        };
+        let server_version: String = client
+            .query_one("SELECT version()", &[])
+            .await
+            .expect("server version")
+            .get(0);
+        eprintln!("qual server: {server_version}");
+        assert!(
+            server_version.contains("CockroachDB"),
+            "qualification must run against CockroachDB, got: {server_version}"
+        );
+
+        client
+            .execute(&format!("CREATE DATABASE IF NOT EXISTS {database}"), &[])
+            .await
+            .expect("create qual database");
+        client
+            .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+            .await
+            .expect("drop qual table");
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {table} (device_id TEXT PRIMARY KEY, temp FLOAT8 NOT NULL, seq INT8 NOT NULL)"
+                ),
+                &[],
+            )
+            .await
+            .expect("create qual table");
+
+        // 1000 rows through the sink on the maintained driver transport.
+        let transport = Arc::new(PgDriverCockroachDbTransport::new(&config));
+        let sink = CockroachDbSink::new(config.clone(), transport).expect("qual sink");
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":{temp},"seq":{seq}}}"#,
+                temp = seq as f64
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_count(), 1000);
+
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual count")
+            .get(0);
+        assert_eq!(count, 1000);
+
+        // Conflict resolution: same keys, new values; UPSERT must update in
+        // place, not duplicate.
+        for seq in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":{temp},"seq":{seq}}}"#,
+                temp = 5000.0 + seq as f64
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual conflict send");
+        }
+        sink.flush().await.expect("qual conflict flush");
+        assert_eq!(sink.sent_count(), 2000);
+
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual recount")
+            .get(0);
+        assert_eq!(count, 1000);
+        let temp: f64 = client
+            .query_one(
+                &format!("SELECT temp FROM {table} WHERE device_id = 'dev-0424'"),
+                &[],
+            )
+            .await
+            .expect("qual sample")
+            .get(0);
+        assert!((temp - 5424.0).abs() < 0.001);
+
+        // ON CONFLICT variant: same assertion through the fallback syntax.
+        let mut conflict_config = config.clone();
+        conflict_config.upsert_conflict_columns = vec!["device_id".to_string()];
+        let conflict_transport = Arc::new(PgDriverCockroachDbTransport::new(&conflict_config));
+        let conflict_sink =
+            CockroachDbSink::new(conflict_config, conflict_transport).expect("qual conflict sink");
+        for seq in 0..10 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":200.0,"seq":{seq}}}"#
+            ));
+            conflict_sink
+                .send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual on-conflict send");
+        }
+        conflict_sink.flush().await.expect("qual on-conflict flush");
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual on-conflict count")
+            .get(0);
+        assert_eq!(count, 1000);
+        let temp: f64 = client
+            .query_one(
+                &format!("SELECT temp FROM {table} WHERE device_id = 'dev-0007'"),
+                &[],
+            )
+            .await
+            .expect("qual on-conflict sample")
+            .get(0);
+        assert!((temp - 200.0).abs() < 0.001);
+
+        // Transaction retry on 40001: the first execute fails with a
+        // server-generated serialization failure (via force_retry), then
+        // delegates to the real driver transport. The 40001 text below comes
+        // from the live server, never from a fabricated string.
+        let force_retry_err = client
+            .execute(
+                "SELECT crdb_internal.force_retry(CAST('100ms' AS INTERVAL))",
+                &[],
+            )
+            .await
+            .expect_err("force_retry must produce a server-side retry error");
+        let force_probe = if let Some(db) = force_retry_err.as_db_error() {
+            format!("{}: {}", db.code().code(), db.message())
+        } else {
+            force_retry_err.to_string()
+        };
+        assert_eq!(
+            classify_cockroach_sqlstate(&force_probe),
+            CockroachErrorClassification::SerializationFailure,
+            "force_retry must yield SQLSTATE 40001, got: {force_probe}"
+        );
+        eprintln!("qual server-generated 40001: {force_probe}");
+        let server_retry_text = format!("cockroachdb driver error: {force_probe}");
+
+        struct FailOnceThenDriver {
+            inner: Arc<PgDriverCockroachDbTransport>,
+            first_error: String,
+            failed: std::sync::atomic::AtomicBool,
+            calls: std::sync::atomic::AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl CockroachDbTransport for FailOnceThenDriver {
+            async fn execute(
+                &self,
+                query: &str,
+                params: &[CockroachValue],
+            ) -> Result<CockroachQueryResult> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ConnectorError::Connection(self.first_error.clone()));
+                }
+                self.inner.execute(query, params).await
+            }
+        }
+
+        let retry_inner = Arc::new(PgDriverCockroachDbTransport::new(&config));
+        let retry_transport = Arc::new(FailOnceThenDriver {
+            inner: retry_inner,
+            first_error: server_retry_text,
+            failed: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        let retry_sink =
+            CockroachDbSink::new(config.clone(), retry_transport.clone()).expect("qual retry sink");
+        retry_sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"device_id":"dev-retry","temp":1.0,"seq":1}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual retry row buffers");
+        retry_sink
+            .flush()
+            .await
+            .expect("qual retry flush succeeds after 40001");
+        assert_eq!(
+            retry_transport
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual retry count")
+            .get(0);
+        assert_eq!(count, 1001);
+
+        // Simulate a broker restart: a fresh sink must not duplicate rows.
+        drop(sink);
+        drop(conflict_sink);
+        drop(retry_sink);
+        let transport2 = Arc::new(PgDriverCockroachDbTransport::new(&config));
+        let sink2 = CockroachDbSink::new(config, transport2).expect("qual sink2");
+        sink2.flush().await.expect("post-restart flush is a no-op");
+        let count2: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual final count")
+            .get(0);
+        assert_eq!(count2, 1001);
+
+        client
+            .execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .expect("qual cleanup");
+        eprintln!("qual cleanup: dropped table {table}");
+        if let Some(mut child) = _qual_child {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("qual cleanup: stopped ephemeral server");
+        }
     }
 }

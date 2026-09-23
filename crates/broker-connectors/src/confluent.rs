@@ -13,6 +13,18 @@
 //! RecordBatch-v2 encoding, Produce framing and the ApiVersions probe
 //! reuse the shared Kafka framing in [`super::kafka`]; error codes
 //! classify per the task contract (58 terminal, 7/19 retryable).
+//!
+//! The production write path runs on the maintained `rdkafka` driver
+//! ([`RdkafkaConfluentTransport`] below): Kafka wire plus SASL/PLAIN
+//! and SASL/SCRAM over TLS to Confluent Cloud endpoints, delivered
+//! through `FutureProducer` futures. Schema Registry attachment runs
+//! on the maintained `schema-registry-client` driver
+//! ([`RegistrySchemaClient`] below): schemas register under
+//! `{topic}-value` subjects and values carry the documented wire
+//! header (magic `0x00` + big-endian schema id, see
+//! [`frame_schema_registry`]). The legacy hand-written
+//! `TcpConfluentTransport` is retained for offline unit tests only;
+//! production wiring uses the driver transport.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -24,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as AsyncRwLock;
 
 use super::kafka::{
     decode_api_versions_response, encode_api_versions_request, encode_produce_request,
@@ -998,6 +1011,285 @@ impl ConfluentTransport for TcpConfluentTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (production write path).
+// ---------------------------------------------------------------------------
+
+/// Build the maintained `rdkafka` client configuration for Confluent
+/// Cloud endpoints: SASL_SSL with the configured mechanism (PLAIN by
+/// default, SCRAM-SHA-256/512), the API key/secret as the SASL
+/// credentials, `request.required.acks=all` and the configured timeout
+/// as `message.timeout.ms`.
+///
+/// Building the config opens no socket and spawns no thread; the
+/// driver connects lazily on first publish (see
+/// [`RdkafkaConfluentTransport`]). Management-plane validation therefore
+/// stays offline-safe: creating the sink never touches the network.
+pub fn rdkafka_client_config(config: &ConfluentKafkaConfig) -> rdkafka::config::ClientConfig {
+    let mut client = rdkafka::config::ClientConfig::new();
+    client
+        .set("bootstrap.servers", config.bootstrap_servers.join(","))
+        .set("security.protocol", "SASL_SSL")
+        .set(
+            "sasl.mechanisms",
+            match config.auth_mechanism {
+                SaslMechanism::Plain => "PLAIN",
+                SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
+                SaslMechanism::ScramSha512 => "SCRAM-SHA-512",
+            },
+        )
+        .set("sasl.username", config.api_key.clone())
+        .set("sasl.password", config.api_secret.clone())
+        .set("client.id", format!("indra-confluent-{}", config.api_key))
+        .set("request.required.acks", "all")
+        .set(
+            "message.timeout.ms",
+            config.timeout().as_millis().to_string(),
+        )
+        .set(
+            "socket.timeout.ms",
+            config.timeout().as_millis().to_string(),
+        );
+    client
+}
+
+/// Whether a driver failure message is terminal (`true`) or retryable
+/// (`false`). Authentication/authorisation failures and oversize
+/// records can never succeed on retry, so they are terminal; timeouts,
+/// transport loss, unknown topics and queue pressure retry with
+/// backoff through the sink.
+///
+/// TODO(parity): librdkafka reports a wider taxonomy than these
+/// substrings; which further codes must be terminal versus retryable
+/// for exactly-once billing on Confluent Cloud?
+pub fn is_terminal_driver_message(message: &str) -> bool {
+    let text = message.to_lowercase();
+    text.contains("sasl")
+        || text.contains("auth")
+        || text.contains("ssl")
+        || text.contains("message too large")
+        || text.contains("msg_size_too_large")
+}
+
+/// Classify a driver delivery failure into the sink's error contract:
+/// terminal failures become `Dispatch` (drop, never retry), everything
+/// else becomes `Connection` (restore the batch, back off, retry).
+pub fn classify_driver_error(error: &rdkafka::error::KafkaError) -> ConnectorError {
+    if is_terminal_driver_message(&format!("{error:?}")) {
+        ConnectorError::Dispatch(format!(
+            "confluent driver delivery failed terminally: {error}"
+        ))
+    } else {
+        ConnectorError::Connection(format!(
+            "confluent driver delivery failed retryably: {error}"
+        ))
+    }
+}
+
+/// Production transport on the maintained `rdkafka` driver.
+///
+/// The `FutureProducer` is created lazily on first publish and cached;
+/// creation validates the librdkafka keys without opening any socket,
+/// and the driver dials on first delivery. Records publish
+/// sequentially, one delivery future at a time, so the driver queue
+/// holds at most one flush in flight: no new unbounded buffer on the
+/// publish path, no lock held across I/O (the producer handle is
+/// cloned under a short read lock, then used lock-free).
+pub struct RdkafkaConfluentTransport {
+    config: ConfluentKafkaConfig,
+    producer: AsyncRwLock<Option<rdkafka::producer::FutureProducer>>,
+}
+
+impl RdkafkaConfluentTransport {
+    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            producer: AsyncRwLock::new(None),
+        })
+    }
+
+    pub fn config(&self) -> &ConfluentKafkaConfig {
+        &self.config
+    }
+
+    async fn producer(&self) -> Result<rdkafka::producer::FutureProducer> {
+        if let Some(producer) = self.producer.read().await.clone() {
+            return Ok(producer);
+        }
+        let mut guard = self.producer.write().await;
+        if let Some(producer) = guard.clone() {
+            return Ok(producer);
+        }
+        // PERF(parity): one driver producer per transport, created once
+        // and shared by every flush. A pooled producer set would be the
+        // fast version under very high partition fan-out; kept singular
+        // so a kernel restart never inherits half-open broker sessions.
+        // Hot-path numbers (per publish of R records): before (legacy
+        // TCP): R framed copies into one Produce body + 1 socket write;
+        // after (driver): R queue copies + R delivery futures, no new
+        // locks (the handle clones under a short read lock, then runs
+        // lock-free) and at most one flush in flight.
+        let producer: rdkafka::producer::FutureProducer = rdkafka_client_config(&self.config)
+            .create()
+            .map_err(|error: rdkafka::error::KafkaError| {
+                ConnectorError::Dispatch(format!("confluent driver config rejected: {error}"))
+            })?;
+        *guard = Some(producer.clone());
+        Ok(producer)
+    }
+
+    /// Drop the cached driver producer so the next publish redials with
+    /// the current configuration. Used by qualification to prove the
+    /// driver recovers after a credential rotation.
+    pub async fn reconnect(&self) -> Result<()> {
+        *self.producer.write().await = None;
+        self.producer().await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl ConfluentTransport for RdkafkaConfluentTransport {
+    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let producer = self.producer().await?;
+        let timeout = self.config.timeout();
+        for record in records {
+            // `&[u8]` bindings: the driver converts `&[u8]` with no
+            // copy (`ToBytes for [u8]`), so framing stays zero-copy.
+            let payload: &[u8] = record.value.as_ref();
+            let mut headers = rdkafka::message::OwnedHeaders::new();
+            for (name, value) in &record.headers {
+                let content: &[u8] = value.as_ref();
+                headers = headers.insert(rdkafka::message::Header {
+                    key: name.as_str(),
+                    value: Some(content),
+                });
+            }
+            let mut wire: rdkafka::producer::FutureRecord<'_, [u8], [u8]> =
+                rdkafka::producer::FutureRecord::to(record.topic.as_str())
+                    .partition(record.partition)
+                    .payload(payload)
+                    .headers(headers);
+            if let Some(key) = record.key.as_ref() {
+                let key_bytes: &[u8] = key.as_ref();
+                wire = wire.key(key_bytes);
+            }
+            producer
+                .send(wire, rdkafka::util::Timeout::After(timeout))
+                .await
+                .map_err(|(error, _)| classify_driver_error(&error))?;
+        }
+        Ok(())
+    }
+}
+
+/// Default `{topic}-value` subject name (the documented
+/// TopicNameStrategy default) for a destination topic.
+pub fn registry_subject_for_topic(topic: &str) -> String {
+    format!("{topic}-value")
+}
+
+/// Schema Registry client on the maintained `schema-registry-client`
+/// driver: registers Avro/JSON schemas under `{topic}-value` subjects
+/// with Basic auth and resolves the schema ids the sink frames ahead
+/// of every value (see [`frame_schema_registry`]).
+///
+/// The client holds the driver's bounded caches only (capacity from
+/// the driver defaults); it keeps no per-message state, so nothing
+/// accumulates on the publish path. Registry I/O happens at
+/// registration/rotation time, never per record.
+pub struct RegistrySchemaClient {
+    client: schema_registry_client::rest::schema_registry_client::SchemaRegistryClient,
+}
+
+impl RegistrySchemaClient {
+    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let registry = config.schema_registry.as_ref().ok_or_else(|| {
+            ConnectorError::Dispatch("confluent schema registry is not configured".to_string())
+        })?;
+        let mut client_config =
+            schema_registry_client::rest::client_config::ClientConfig::new(vec![registry
+                .endpoint
+                .clone()]);
+        client_config.basic_auth =
+            Some((registry.api_key.clone(), Some(registry.api_secret.clone())));
+        Ok(Self {
+            client: schema_registry_client::rest::schema_registry_client::SchemaRegistryClient::new(
+                client_config,
+            ),
+        })
+    }
+
+    /// Register `schema_json` (schema type `AVRO` or `JSON`) under
+    /// `subject` and return the schema id to frame values with.
+    /// Re-registering identical content returns the same id.
+    pub async fn register(
+        &self,
+        subject: &str,
+        schema_type: &str,
+        schema_json: &str,
+    ) -> Result<u32> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let schema = schema_registry_client::rest::models::schema::Schema::new(
+            Some(schema_type.to_string()),
+            schema_json.to_string(),
+        );
+        let registered = self
+            .client
+            .register_schema(subject, &schema, false)
+            .await
+            .map_err(|error| {
+                ConnectorError::Connection(format!(
+                    "confluent schema registry register failed: {error:?}"
+                ))
+            })?;
+        registered
+            .id
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| {
+                ConnectorError::Connection(
+                    "confluent schema registry returned no schema id".to_string(),
+                )
+            })
+    }
+
+    /// Look up the id of an already-registered schema without creating
+    /// a new version.
+    pub async fn schema_id(
+        &self,
+        subject: &str,
+        schema_type: &str,
+        schema_json: &str,
+    ) -> Result<u32> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let schema = schema_registry_client::rest::models::schema::Schema::new(
+            Some(schema_type.to_string()),
+            schema_json.to_string(),
+        );
+        let registered = self
+            .client
+            .get_by_schema(subject, &schema, false, false)
+            .await
+            .map_err(|error| {
+                ConnectorError::Connection(format!(
+                    "confluent schema registry lookup failed: {error:?}"
+                ))
+            })?;
+        registered
+            .id
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| {
+                ConnectorError::Connection(
+                    "confluent schema registry returned no schema id".to_string(),
+                )
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -1560,5 +1852,482 @@ mod tests {
     fn read_kafka_string(frame: &[u8]) -> String {
         let len = i16::from_be_bytes([frame[0], frame[1]]) as usize;
         String::from_utf8_lossy(&frame[2..2 + len]).to_string()
+    }
+
+    #[test]
+    fn test_driver_config_mapping() {
+        // The driver config must accept every SASL mechanism we
+        // advertise: `create` validates the librdkafka keys without
+        // opening any socket, so this stays offline.
+        for mechanism in [
+            SaslMechanism::Plain,
+            SaslMechanism::ScramSha256,
+            SaslMechanism::ScramSha512,
+        ] {
+            let mut config = test_config();
+            config.auth_mechanism = mechanism;
+            let client = rdkafka_client_config(&config);
+            let producer: std::result::Result<
+                rdkafka::producer::FutureProducer,
+                rdkafka::error::KafkaError,
+            > = client.create();
+            assert!(
+                producer.is_ok(),
+                "driver must accept {mechanism:?} without I/O"
+            );
+        }
+    }
+
+    #[test]
+    fn test_driver_error_classification() {
+        // Terminal: authentication/authorisation and oversize records.
+        for message in [
+            "SASL authentication failed: bad credentials",
+            "SaslAuthFailedError: invalid username",
+            "ssl handshake failed: certificate verify",
+            "Message production error: MessageTooLarge (MSG_SIZE_TOO_LARGE)",
+            "msg_size_too_large: record exceeds the limit",
+        ] {
+            assert!(
+                is_terminal_driver_message(message),
+                "{message:?} must be terminal"
+            );
+        }
+        // Retryable: timeouts, transport loss, unknown topics, pressure.
+        for message in [
+            "Message timed out (MSG_TIMED_OUT)",
+            "Broker transport failure: connection reset",
+            "Unknown topic or partition",
+            "Queue full: would block",
+            "success",
+        ] {
+            assert!(
+                !is_terminal_driver_message(message),
+                "{message:?} must be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_subject_naming() {
+        assert_eq!(
+            registry_subject_for_topic("telemetry-sensors"),
+            "telemetry-sensors-value"
+        );
+    }
+
+    #[test]
+    fn test_registry_client_construction_offline() {
+        // Construction only stores endpoint + Basic auth: no I/O, so
+        // this stays offline. The failure case is fail-closed.
+        assert!(RegistrySchemaClient::new(&test_config()).is_ok());
+        let mut bare = test_config();
+        bare.schema_registry = None;
+        assert!(RegistrySchemaClient::new(&bare).is_err());
+    }
+
+    #[test]
+    fn test_avro_datum_framing_roundtrip() {
+        // Honest Avro binary (maintained `apache-avro` encoder) framed
+        // with a registry id must split back to the same id and the
+        // same bytes, with the device id embedded as length-prefixed
+        // UTF-8 per the Avro string encoding.
+        const SCHEMA: &str = r#"{"type":"record","name":"QualReading","namespace":"indra.qual","fields":[{"name":"client_id","type":"string"},{"name":"seq","type":"long"},{"name":"temp","type":"double"}]}"#;
+        let schema = apache_avro::Schema::parse_str(SCHEMA).expect("schema parses");
+        let value = apache_avro::types::Value::Record(vec![
+            (
+                "client_id".to_string(),
+                apache_avro::types::Value::String("dev-0007".to_string()),
+            ),
+            ("seq".to_string(), apache_avro::types::Value::Long(7)),
+            ("temp".to_string(), apache_avro::types::Value::Double(21.5)),
+        ]);
+        let datum = apache_avro::to_avro_datum(&schema, value).expect("avro encode");
+        assert!(
+            datum.windows(b"dev-0007".len()).any(|w| w == b"dev-0007"),
+            "avro string bytes embedded"
+        );
+        let framed = frame_schema_registry(1001, &datum);
+        let (id, body) = split_schema_registry(&framed).expect("framing splits");
+        assert_eq!(id, 1001);
+        assert_eq!(body, datum.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_driver_transport_validates_without_io() {
+        // `new` validates our config only; `reconnect` builds (and
+        // caches) the driver producer, which dials lazily, so neither
+        // touches the network.
+        let transport =
+            RdkafkaConfluentTransport::new(&test_config()).expect("valid driver transport");
+        transport
+            .reconnect()
+            .await
+            .expect("reconnect builds the producer offline");
+        let mut bad = test_config();
+        bad.bootstrap_servers.clear();
+        assert!(RdkafkaConfluentTransport::new(&bad).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Confluent Cloud server via the
+    /// maintained `rdkafka` + `schema-registry-client` drivers.
+    ///
+    /// Run with e.g.:
+    /// `CONFLUENT_BOOTSTRAP_SERVERS=pkc-xxxx.us-east-1.aws.confluent.cloud:9092 \
+    ///  CONFLUENT_API_KEY=... CONFLUENT_API_SECRET=... \
+    ///  CONFLUENT_SCHEMA_REGISTRY_URL=https://psrc-xxxx.us-east-1.aws.confluent.cloud \
+    ///  CONFLUENT_SCHEMA_REGISTRY_KEY=... CONFLUENT_SCHEMA_REGISTRY_SECRET=... \
+    ///  cargo test -p broker-connectors --lib confluent::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// Creates two topics (`<base>-avro`, `<base>-json`), registers an
+    /// Avro and a JSON schema under their `-value` subjects, streams
+    /// 2000 keyed records through [`ConfluentKafkaSink`] on
+    /// [`RdkafkaConfluentTransport`] (SASL/PLAIN over TLS, via the
+    /// shared [`crate::ConnectorManager`] path the broker uses),
+    /// reads all 2000 back with a driver consumer asserting delivery
+    /// counts and schema-id framing, rotates to a wrong secret and
+    /// asserts the driver fails closed, then reconnects with the right
+    /// secret and asserts writes resume. Deletes both topics
+    /// afterwards; registry subjects are retained (the registry keeps
+    /// no cheap hard-delete in the qualification window) and named in
+    /// the report.
+    #[tokio::test]
+    #[ignore = "needs a real Confluent Cloud server (see CONFLUENT_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use rdkafka::consumer::Consumer as _;
+        use rdkafka::message::Message as _;
+
+        const AVRO_SCHEMA: &str = r#"{"type":"record","name":"QualReading","namespace":"indra.qual","fields":[{"name":"client_id","type":"string"},{"name":"seq","type":"long"},{"name":"temp","type":"double"}]}"#;
+        const JSON_SCHEMA: &str = r#"{"type":"object","properties":{"client_id":{"type":"string"},"seq":{"type":"integer"},"temp":{"type":"number"}},"required":["client_id","seq"]}"#;
+
+        let Some(bootstrap) = qual_env("CONFLUENT_BOOTSTRAP_SERVERS") else {
+            eprintln!("CONFLUENT_BOOTSTRAP_SERVERS is empty; skipping qualification");
+            return;
+        };
+        let Some(api_key) = qual_env("CONFLUENT_API_KEY") else {
+            eprintln!("CONFLUENT_API_KEY is empty; skipping qualification");
+            return;
+        };
+        let Some(api_secret) = qual_env("CONFLUENT_API_SECRET") else {
+            eprintln!("CONFLUENT_API_SECRET is empty; skipping qualification");
+            return;
+        };
+        let Some(registry_url) = qual_env("CONFLUENT_SCHEMA_REGISTRY_URL") else {
+            eprintln!("CONFLUENT_SCHEMA_REGISTRY_URL is empty; skipping qualification");
+            return;
+        };
+        let Some(registry_key) = qual_env("CONFLUENT_SCHEMA_REGISTRY_KEY") else {
+            eprintln!("CONFLUENT_SCHEMA_REGISTRY_KEY is empty; skipping qualification");
+            return;
+        };
+        let Some(registry_secret) = qual_env("CONFLUENT_SCHEMA_REGISTRY_SECRET") else {
+            eprintln!("CONFLUENT_SCHEMA_REGISTRY_SECRET is empty; skipping qualification");
+            return;
+        };
+        let base = qual_env("CONFLUENT_TOPIC").unwrap_or_else(|| "confluent_qual_b310".to_string());
+        let partitions: i32 = qual_env("CONFLUENT_PARTITIONS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6)
+            .max(1);
+        let avro_topic = format!("{base}-avro");
+        let json_topic = format!("{base}-json");
+        eprintln!("qual server: bootstrap={bootstrap} registry={registry_url}");
+
+        // Best-effort registry version line for the report.
+        match reqwest::Client::new()
+            .get(format!("{registry_url}/"))
+            .basic_auth(&registry_key, Some(&registry_secret))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let version: serde_json::Value =
+                    response.json().await.unwrap_or(serde_json::Value::Null);
+                eprintln!("qual registry version: {version}");
+            }
+            Err(error) => eprintln!("qual registry version unavailable: {error:?}"),
+        }
+
+        let admin_config = ConfluentKafkaConfig {
+            bootstrap_servers: vec![bootstrap],
+            api_key,
+            api_secret,
+            auth_mechanism: SaslMechanism::Plain,
+            topic_template: base.clone(),
+            partition_key_template: Some("${client_id}".to_string()),
+            schema_registry: Some(ConfluentSchemaRegistryConfig {
+                endpoint: registry_url,
+                api_key: registry_key,
+                api_secret: registry_secret,
+                schema_id: 0,
+            }),
+            partitions: partitions.max(1) as u32,
+            batch_size: Some(100),
+            buffer_capacity: None,
+            timeout_ms: Some(30_000),
+        };
+        admin_config.validate().expect("qual config validates");
+
+        // Create both topics (idempotent: already-exists is fine).
+        let admin: rdkafka::admin::AdminClient<rdkafka::client::DefaultClientContext> =
+            rdkafka_client_config(&admin_config)
+                .create()
+                .expect("qual admin client");
+        let new_avro = rdkafka::admin::NewTopic::new(
+            &avro_topic,
+            partitions,
+            rdkafka::admin::TopicReplication::Fixed(3),
+        );
+        let new_json = rdkafka::admin::NewTopic::new(
+            &json_topic,
+            partitions,
+            rdkafka::admin::TopicReplication::Fixed(3),
+        );
+        let created = admin
+            .create_topics(
+                [&new_avro, &new_json],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+            .expect("qual create topics rpc");
+        for result in created {
+            if let Err(error) = result {
+                let text = format!("{error:?}");
+                if !text.contains("AlreadyExists")
+                    && !text.contains("already exists")
+                    && !text.contains("ALREADY_EXISTS")
+                {
+                    panic!("qual create topic failed: {error:?}");
+                }
+            }
+        }
+
+        // Register both schemas; re-registration returns the same id.
+        let registry = RegistrySchemaClient::new(&admin_config).expect("qual registry client");
+        let avro_subject = registry_subject_for_topic(&avro_topic);
+        let json_subject = registry_subject_for_topic(&json_topic);
+        let avro_id = registry
+            .register(&avro_subject, "AVRO", AVRO_SCHEMA)
+            .await
+            .expect("qual register avro");
+        let json_id = registry
+            .register(&json_subject, "JSON", JSON_SCHEMA)
+            .await
+            .expect("qual register json");
+        assert!(avro_id > 0 && json_id > 0, "registry must return ids");
+        assert_eq!(
+            registry
+                .register(&avro_subject, "AVRO", AVRO_SCHEMA)
+                .await
+                .expect("qual re-register avro"),
+            avro_id,
+            "re-registration must be idempotent"
+        );
+        eprintln!(
+            "qual schemas: avro {avro_subject} id={avro_id}, json {json_subject} id={json_id}"
+        );
+
+        // One sink per encoding. Avro payloads are binary, so the key
+        // derives from the device MQTT subtopic; JSON payloads carry
+        // `client_id` for the key template.
+        let mut avro_config = admin_config.clone();
+        avro_config.topic_template = avro_topic.clone();
+        avro_config.partition_key_template = Some("${topic_segment_3}".to_string());
+        avro_config
+            .schema_registry
+            .as_mut()
+            .expect("registry")
+            .schema_id = avro_id;
+        let avro_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&avro_config).expect("qual avro transport"));
+        let avro_sink = Arc::new(
+            ConfluentKafkaSink::new(avro_config, avro_transport.clone()).expect("qual avro sink"),
+        );
+        assert_eq!(avro_sink.kind(), "confluent");
+
+        let mut json_config = admin_config.clone();
+        json_config.topic_template = json_topic.clone();
+        json_config
+            .schema_registry
+            .as_mut()
+            .expect("registry")
+            .schema_id = json_id;
+        let json_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&json_config).expect("qual json transport"));
+        let json_sink =
+            Arc::new(ConfluentKafkaSink::new(json_config, json_transport).expect("qual json sink"));
+        assert_eq!(json_sink.kind(), "confluent");
+
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = crate::ConnectorManager::new();
+        manager.register("qual-avro", avro_sink.clone());
+        manager.register("qual-json", json_sink.clone());
+
+        let parsed_avro =
+            apache_avro::Schema::parse_str(AVRO_SCHEMA).expect("qual avro schema parses");
+        for seq in 0..1000i32 {
+            let device = format!("dev-{seq:04}");
+            let temp = 20.0 + f64::from(seq) * 0.01;
+            let value = apache_avro::types::Value::Record(vec![
+                (
+                    "client_id".to_string(),
+                    apache_avro::types::Value::String(device.clone()),
+                ),
+                (
+                    "seq".to_string(),
+                    apache_avro::types::Value::Long(i64::from(seq)),
+                ),
+                ("temp".to_string(), apache_avro::types::Value::Double(temp)),
+            ]);
+            let datum = apache_avro::to_avro_datum(&parsed_avro, value).expect("qual avro encode");
+            let mqtt_topic = Topic::new(format!("sensors/qual/{device}")).expect("qual topic");
+            manager
+                .send(
+                    "qual-avro",
+                    &mqtt_topic,
+                    &Bytes::from(datum),
+                    QoS::AtLeastOnce,
+                )
+                .await
+                .expect("qual avro send");
+
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","seq":{seq},"temp":{temp}}}"#
+            ));
+            manager
+                .send(
+                    "qual-json",
+                    &Topic::new("sensors/qual").expect("qual topic"),
+                    &payload,
+                    QoS::AtLeastOnce,
+                )
+                .await
+                .expect("qual json send");
+        }
+        avro_sink.flush().await.expect("qual avro flush");
+        json_sink.flush().await.expect("qual json flush");
+        assert_eq!(avro_sink.sent_records(), 1000);
+        assert_eq!(json_sink.sent_records(), 1000);
+
+        // Read everything back: delivery counts plus schema-id framing.
+        let mut consumer_config = rdkafka_client_config(&admin_config);
+        consumer_config.set(
+            "group.id",
+            format!("indra-qual-b310-{}", super::super::now_millis()),
+        );
+        consumer_config.set("enable.auto.commit", "false");
+        consumer_config.set("auto.offset.reset", "earliest");
+        let consumer: rdkafka::consumer::StreamConsumer =
+            consumer_config.create().expect("qual consumer");
+        consumer
+            .subscribe(&[avro_topic.as_str(), json_topic.as_str()])
+            .expect("qual subscribe");
+        let mut avro_seen = 0usize;
+        let mut json_seen = 0usize;
+        while avro_seen < 1000 || json_seen < 1000 {
+            let message = tokio::time::timeout(Duration::from_secs(180), consumer.recv())
+                .await
+                .expect("qual recv timeout")
+                .expect("qual recv");
+            let payload = message.payload().expect("qual payload");
+            let (id, _) = split_schema_registry(payload).expect("qual framing");
+            if message.topic() == avro_topic.as_str() {
+                assert_eq!(id, avro_id, "avro record carries the avro id");
+                avro_seen += 1;
+            } else if message.topic() == json_topic.as_str() {
+                assert_eq!(id, json_id, "json record carries the json id");
+                json_seen += 1;
+            } else {
+                panic!("qual unexpected topic {}", message.topic());
+            }
+            assert!(message.key().is_some(), "qual records are keyed");
+        }
+        assert_eq!(avro_seen, 1000);
+        assert_eq!(json_seen, 1000);
+        eprintln!("qual delivery: avro={avro_seen} json={json_seen}");
+
+        // Rotate to a wrong secret: the driver must fail closed, never
+        // deliver.
+        let mut bad_config = admin_config.clone();
+        bad_config.api_secret = "rotated-wrong-secret".to_string();
+        let bad_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&bad_config).expect("qual bad transport"));
+        let bad_result = bad_transport
+            .publish(&[ConfluentRecord {
+                topic: avro_topic.clone(),
+                partition: 0,
+                key: None,
+                value: Bytes::from_static(b"probe"),
+                headers: Vec::new(),
+            }])
+            .await;
+        assert!(bad_result.is_err(), "wrong secret must fail, got ok");
+        eprintln!("qual rotation: wrong secret refused as expected");
+
+        // Reconnect with the right secret: writes resume.
+        avro_transport.reconnect().await.expect("qual reconnect");
+        let device = "dev-0000".to_string();
+        let resume_value = apache_avro::types::Value::Record(vec![
+            (
+                "client_id".to_string(),
+                apache_avro::types::Value::String(device.clone()),
+            ),
+            ("seq".to_string(), apache_avro::types::Value::Long(1000)),
+            ("temp".to_string(), apache_avro::types::Value::Double(30.0)),
+        ]);
+        let resume_datum =
+            apache_avro::to_avro_datum(&parsed_avro, resume_value).expect("qual resume encode");
+        manager
+            .send(
+                "qual-avro",
+                &Topic::new(format!("sensors/qual/{device}")).expect("qual topic"),
+                &Bytes::from(resume_datum),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual resume send");
+        avro_sink.flush().await.expect("qual resume flush");
+        assert_eq!(avro_sink.sent_records(), 1001);
+        let resumed = tokio::time::timeout(Duration::from_secs(180), consumer.recv())
+            .await
+            .expect("qual resume recv timeout")
+            .expect("qual resume recv");
+        let (resume_id, _) = split_schema_registry(resumed.payload().expect("qual resume payload"))
+            .expect("qual resume framing");
+        assert_eq!(resumed.topic(), avro_topic.as_str());
+        assert_eq!(resume_id, avro_id);
+        eprintln!("qual rotation: reconnect resumed delivery");
+
+        // Cleanup: delete both topics; subjects stay registered.
+        match admin
+            .delete_topics(
+                &[avro_topic.as_str(), json_topic.as_str()],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+        {
+            Ok(results) => {
+                for result in results {
+                    if let Err(error) = result {
+                        eprintln!("qual delete topic note: {error:?}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("qual delete topics rpc failed: {error}"),
+        }
+        eprintln!(
+            "qual cleanup: deleted topics {avro_topic}, {json_topic}; \
+             registry subjects {avro_subject}, {json_subject} retained"
+        );
     }
 }

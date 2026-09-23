@@ -3287,21 +3287,26 @@ mod tests {
         );
         engine.connectors().register("mysql-an", mysql.clone());
 
-        // ClickHouse (axum fake).
-        let ch_body = Arc::new(parking_lot::Mutex::new(String::new()));
-        let ch_port = serve_capture("/", ch_body.clone()).await;
+        // ClickHouse (mock driver transport, offline).
+        let ch_transport = Arc::new(broker_connectors::MockClickHouseTransport::new(
+            "indra",
+            "mqtt_events",
+            "JSONEachRow",
+        ));
         let clickhouse = Arc::new(
             ClickHouseSink::new(
                 ClickHouseSinkConfig {
-                    endpoint: format!("http://127.0.0.1:{ch_port}"),
+                    endpoint: "http://127.0.0.1:8123".to_string(),
                     database: "indra".to_string(),
                     table: "mqtt_events".to_string(),
                     format: "JSONEachRow".to_string(),
                     batch_size: 100,
                     batch_timeout_ms: 100,
+                    username: "default".to_string(),
+                    password: String::new(),
                     request_timeout_ms: None,
                 },
-                reqwest::Client::new(),
+                ch_transport.clone(),
             )
             .expect("valid sink"),
         );
@@ -3389,11 +3394,11 @@ mod tests {
             projected
         );
 
-        let ch_lines: Vec<String> = ch_body.lock().lines().map(str::to_string).collect();
-        assert_eq!(ch_lines.len(), 1);
-        let ch_row: serde_json::Value = serde_json::from_str(&ch_lines[0]).unwrap();
-        assert_eq!(ch_row["topic"], "sensors/kitchen");
-        assert_eq!(ch_row["payload"], projected.to_string());
+        let ch_captured = ch_transport.captured();
+        assert_eq!(ch_captured.len(), 1);
+        assert_eq!(ch_captured[0].rows.len(), 1);
+        assert_eq!(ch_captured[0].rows[0].topic, "sensors/kitchen");
+        assert_eq!(ch_captured[0].rows[0].payload, projected.to_string());
 
         let influx_lines: Vec<String> = influx_body.lock().lines().map(str::to_string).collect();
         assert_eq!(influx_lines.len(), 1);
@@ -3420,7 +3425,7 @@ mod tests {
         assert_eq!(kafka_transport.records_flat().len(), 1);
         assert_eq!(redis_transport.commands().len(), 1);
         assert_eq!(mysql_transport.batches().len(), 1);
-        assert_eq!(ch_body.lock().lines().count(), 1);
+        assert_eq!(ch_transport.captured().len(), 1);
         assert_eq!(influx_body.lock().lines().count(), 1);
     }
 

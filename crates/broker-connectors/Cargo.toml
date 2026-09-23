@@ -37,8 +37,12 @@ tokio-postgres-rustls = { version = "0.14", features = ["native-certs"] }
 google-cloud-auth = { version = "1" }
 gcp-bigquery-client = { version = "0.28", default-features = false, features = ["native-tls", "aws-lc-rs"] }
 scylla = { version = "1.9" }
+clickhouse = { version = "0.15", features = ["native-tls"] }
 aws-sigv4 = { version = "1" }
 futures = { workspace = true }
+rdkafka = { version = "0.39", features = ["ssl"] }
+schema-registry-client = { version = "0.4" }
 
 [dev-dependencies]
 axum = { workspace = true }
+apache-avro = { version = "0.15" }
