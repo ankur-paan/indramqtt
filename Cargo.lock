@@ -680,6 +680,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "broker-api",
  "broker-auth",
  "broker-cluster",
@@ -736,6 +737,7 @@ dependencies = [
  "broker-protocol",
  "brokerlink",
  "parking_lot",
+ "regex",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

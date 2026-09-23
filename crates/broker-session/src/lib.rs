@@ -3,7 +3,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,9 +50,56 @@ pub struct Session {
     pub offline_queue: RwLock<VecDeque<QueuedMessage>>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
-    /// resends oldest-first with DUP set. Bounded per session by
-    /// [`MAX_QOS1_INFLIGHT`]; the kernel (not the edge) owns this state.
+    /// resends oldest-first with DUP set. Bounded per session by the
+    /// configurable window ([`Session::max_inflight`], default
+    /// [`DEFAULT_MAX_QOS1_INFLIGHT`]); the kernel (not the edge) owns
+    /// this state.
     pub inflight: RwLock<VecDeque<InflightMessage>>,
+    /// QoS 1 overflow beyond the in-memory window (B4-01). Entries are
+    /// still delivered live once and ARE tracked here for redelivery, in
+    /// arrival order, so reconnect replay resends window oldest-first
+    /// then spill oldest-first, every entry with DUP set and its original
+    /// packet id. Bounded per session by [`Session::max_spill`] (default
+    /// [`DEFAULT_MAX_QOS1_SPILL`]); past it the newest downlink is
+    /// delivered live once but left untracked (counted). Lock order is
+    /// always `inflight` then `inflight_spill`; the fast publish path
+    /// takes only the `inflight` lock and touches this deque solely on
+    /// window overflow. The kernel (not the edge) owns this state.
+    /// TODO(parity): coordinate spill backing with the durable offline
+    /// queue once B4-06 lands (disk-backed replay surviving a restart);
+    /// today spill is memory-backed and lost on restart like the window.
+    pub inflight_spill: RwLock<VecDeque<InflightMessage>>,
+    /// Lock-free fast-path guard for the spill buffer (B4-01 hot-path
+    /// fix). Mirrors `inflight_spill.len()`: 0 means the spill is empty,
+    /// so the publish fast path (within-window track), `next_packet_id`,
+    /// the ack fast path (empty spill, no promotion) and reconnect replay
+    /// skip the spill lock/scan/snapshot allocation entirely with one
+    /// relaxed atomic load. Steady-state lock/alloc counts (spill empty,
+    /// unchanged from before B4-01 except one atomic load): publish
+    /// within window 1 atomic load + 1 write lock; `next_packet_id` 2
+    /// read locks + 1 atomic load (no spill lock); ack of a window entry
+    /// 1 write lock + 1 atomic load (no nested spill lock); replay with
+    /// empty spill 1 window snapshot alloc (no spill snapshot alloc).
+    /// Overflow/promotion/replay paths take the spill lock and do bounded
+    /// deque work only when spill is non-empty (slow path: spill id scan
+    /// is O(spill) with spill <= max_spill, ack promotion pops one entry,
+    /// replay adds one spill snapshot alloc plus one frame alloc per
+    /// spilled message). Before/after store throughputs (legacy
+    /// `track_inflight` baseline vs spill-aware steady state, plus the
+    /// spill-nonempty slow path) are printed by
+    /// `test_qos1_inflight_hot_path_timings` into the gate output (no
+    /// threshold asserts; the numbers are the measurement); broker
+    /// publish-to-delivery before/after numbers are printed by
+    /// `qos1_inflight_delivery_workload_timings` in broker-node.
+    /// Maintained under the spill write lock wherever the deque mutates.
+    spill_count: AtomicUsize,
+    /// Configurable per-session QoS 1 window bound (B4-01). Read with one
+    /// relaxed atomic load on the publish fast path; writes happen only
+    /// via management/boot configuration, never per message.
+    max_inflight: AtomicUsize,
+    /// Configurable per-session QoS 1 spill bound (B4-01). Read only on
+    /// window overflow (slow path), never on the fast path.
+    max_spill: AtomicUsize,
     /// QoS 2 inbound publishes held between PUBLISH and PUBREL (D1-01).
     /// Keyed by the publisher's packet id so a repeat of the same id
     /// before PUBREL is recognised as a duplicate (PUBREC again, no
@@ -125,14 +172,48 @@ pub struct InflightMessage {
     pub payload: Bytes,
 }
 
-/// Maximum unacknowledged QoS 1 downlinks held per session (T-31).
-/// At the limit the newest downlink is still delivered live once but is
-/// NOT tracked for redelivery, and the kernel `inflight_dropped` counter
-/// bumps once per untracked delivery. Rationale: dropping the live
-/// delivery would hurt the v4 QoS 1 delivery rate (94-97%, must be 100%)
-/// more than skipping its redelivery; keeping the oldest entries
-/// preserves replay order for what is tracked.
+/// Maximum unacknowledged QoS 1 downlinks held in the per-session
+/// in-memory window (T-31, B4-01). Kept for backward compatibility;
+/// prefer [`DEFAULT_MAX_QOS1_INFLIGHT`] for new code. At the window limit
+/// the newest downlink spills to the per-session overflow buffer instead
+/// of going untracked; only past the spill bound is a live delivery left
+/// untracked (counted via `inflight_dropped`).
 pub const MAX_QOS1_INFLIGHT: usize = 100;
+
+/// Documented default per-session QoS 1 inflight window (B4-01): 100
+/// unacknowledged downlinks. Rationale: caps per-session live unacked
+/// state near 100 small frames so one stalled subscriber cannot balloon
+/// the node, while absorbing a short ack stall without spilling; matches
+/// the pre-B4-01 window so upgrades preserve behaviour. Configurable per
+/// session via [`Session::set_max_inflight`] and per manager via
+/// [`SessionManager::set_max_qos1_inflight`].
+pub const DEFAULT_MAX_QOS1_INFLIGHT: usize = 100;
+
+/// Documented default per-session QoS 1 spill bound (B4-01): 1,000
+/// overflow downlinks past the window. Rationale: 10x the window absorbs
+/// roughly a 1 s burst at 1k msg/s from a stalled acknowledger without
+/// drops, while keeping per-session tracked memory bounded near 1,100
+/// messages total (window + spill); each entry costs one shared payload
+/// handle plus topic bytes, never N copies of the payload. Configurable
+/// per session via [`Session::set_max_spill`] and per manager via
+/// [`SessionManager::set_max_qos1_spill`].
+/// TODO(parity): coordinate the spill backing store with B4-06 — whether
+/// the overflow should live in the offline queue or on disk, and what
+/// the durable bound and fsync policy should be, is still open.
+pub const DEFAULT_MAX_QOS1_SPILL: usize = 1_000;
+
+/// Outcome of [`Session::track_inflight_or_spill`]: where one QoS 1
+/// downlink landed. `Tracked` is the fast path (inside the window);
+/// `Spilled` means the window was full and the entry sits in the bounded
+/// overflow buffer for DUP replay; `Dropped` means window and spill were
+/// both full, so the frame still goes out live once but stays untracked
+/// (counted by the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightTrackOutcome {
+    Tracked,
+    Spilled,
+    Dropped,
+}
 
 /// Maximum QoS 2 inbound publishes held per session between PUBLISH and
 /// PUBREL (D1-01). At the limit a new packet id is refused (the kernel
@@ -225,6 +306,10 @@ impl Session {
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
             inflight: RwLock::new(VecDeque::new()),
+            inflight_spill: RwLock::new(VecDeque::new()),
+            spill_count: AtomicUsize::new(0),
+            max_inflight: AtomicUsize::new(DEFAULT_MAX_QOS1_INFLIGHT),
+            max_spill: AtomicUsize::new(DEFAULT_MAX_QOS1_SPILL),
             qos2_inbound: RwLock::new(HashMap::new()),
             qos2_outbound: RwLock::new(VecDeque::new()),
             keepalive_secs: RwLock::new(0),
@@ -235,17 +320,58 @@ impl Session {
         }
     }
 
+    /// Configured QoS 1 window bound for this session (default
+    /// [`DEFAULT_MAX_QOS1_INFLIGHT`]). One relaxed atomic load; safe on
+    /// the publish fast path.
+    pub fn max_inflight(&self) -> usize {
+        self.max_inflight.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the QoS 1 window bound for this session (floored at 1 so
+    /// the window always holds at least one unacked downlink).
+    /// Management/boot configuration only; never per message.
+    pub fn set_max_inflight(&self, limit: usize) {
+        self.max_inflight.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    /// Configured QoS 1 spill bound for this session (default
+    /// [`DEFAULT_MAX_QOS1_SPILL`]). Read only on window overflow.
+    pub fn max_spill(&self) -> usize {
+        self.max_spill.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the QoS 1 spill bound for this session (floored at 1).
+    /// Management/boot configuration only; never per message.
+    pub fn set_max_spill(&self, limit: usize) {
+        self.max_spill.store(limit.max(1), Ordering::Relaxed);
+    }
+
     pub fn next_packet_id(&self) -> u16 {
         loop {
             let pid = self.next_packet_id.fetch_add(1, Ordering::SeqCst);
             if pid == 0 {
                 continue;
             }
-            // Never hand out an id already held inflight or QoS 2
-            // outbound: a resumed session's unacked ids stay reserved
-            // until their PUBACK/PUBCOMP. Both stores are bounded, so
-            // this scan always terminates.
+            // Never hand out an id already held inflight, in spill, or
+            // QoS 2 outbound: a resumed session's unacked ids stay
+            // reserved until their PUBACK/PUBCOMP. All stores are
+            // bounded, so this scan always terminates. The spill scan
+            // (one read lock + O(spill) linear scan, spill <= max_spill)
+            // runs only when spill is non-empty (one relaxed atomic
+            // load); steady-state with empty spill takes the same 2 read
+            // locks as before B4-01. Spill-nonempty id-allocation
+            // throughput is printed by
+            // `test_qos1_inflight_hot_path_timings` (slow-path section).
             if self.inflight.read().iter().any(|m| m.packet_id == pid) {
+                continue;
+            }
+            if self.spill_count.load(Ordering::Relaxed) != 0
+                && self
+                    .inflight_spill
+                    .read()
+                    .iter()
+                    .any(|m| m.packet_id == pid)
+            {
                 continue;
             }
             if self.qos2_outbound.read().iter().any(|m| m.packet_id == pid) {
@@ -255,42 +381,135 @@ impl Session {
         }
     }
 
-    /// Hold one QoS 1 downlink for redelivery. True means tracked; false
-    /// means the per-session bound was full (the caller still delivers
-    /// live once and counts `inflight_dropped`). Never grows past
-    /// [`MAX_QOS1_INFLIGHT`].
+    /// Hold one QoS 1 downlink in the window for redelivery. True means
+    /// tracked in the window; false means the per-session window was full
+    /// (the caller should spill via [`Session::track_inflight_or_spill`],
+    /// or still deliver live once and count `inflight_dropped`). Never
+    /// grows past the configured window ([`Session::max_inflight`]).
+    /// Fast path: one atomic load plus one bounded deque push under a
+    /// single write lock, no allocation beyond the message itself.
     pub fn track_inflight(&self, message: InflightMessage) -> bool {
+        let limit = self.max_inflight();
         let mut inflight = self.inflight.write();
-        if inflight.len() >= MAX_QOS1_INFLIGHT {
+        if inflight.len() >= limit {
             return false;
         }
         inflight.push_back(message);
         true
     }
 
-    /// Release one downlink on its PUBACK. True when an entry was held.
+    /// Hold one QoS 1 downlink for redelivery, spilling past the window
+    /// into the bounded overflow buffer (B4-01). The fast path (inside
+    /// the window) is exactly [`Session::track_inflight`]: one lock, one
+    /// bounded push, no allocation beyond the message. The spill lock is
+    /// touched solely on window overflow, so steady-state publish and
+    /// deliver pay nothing for the bound. Never grows past
+    /// `max_inflight + max_spill`; past both the caller still delivers
+    /// live once and counts `inflight_dropped`. Before/after numbers: the
+    /// store pair (legacy baseline vs this fast path) is printed by
+    /// `test_qos1_inflight_hot_path_timings`; the broker
+    /// publish-to-delivery pair is printed by
+    /// `qos1_inflight_delivery_workload_timings` in broker-node.
+    pub fn track_inflight_or_spill(&self, message: InflightMessage) -> InflightTrackOutcome {
+        let limit = self.max_inflight();
+        {
+            let mut inflight = self.inflight.write();
+            if inflight.len() < limit {
+                inflight.push_back(message);
+                return InflightTrackOutcome::Tracked;
+            }
+        }
+        let spill_limit = self.max_spill();
+        let mut spill = self.inflight_spill.write();
+        if spill.len() >= spill_limit {
+            return InflightTrackOutcome::Dropped;
+        }
+        spill.push_back(message);
+        self.spill_count.fetch_add(1, Ordering::Relaxed);
+        InflightTrackOutcome::Spilled
+    }
+
+    /// Release one downlink on its PUBACK, from the window or the spill.
+    /// True when an entry was held in either store. When the window entry
+    /// is released and spill holds older overflow, the oldest spilled
+    /// entry is promoted into the window so the window always holds the
+    /// oldest unacked downlinks and replay stays oldest-first. Ack path
+    /// only: the publish fast path never takes both locks.
     pub fn ack_inflight(&self, packet_id: u16) -> bool {
         let mut inflight = self.inflight.write();
         if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
             inflight.remove(pos);
+            // Promote the oldest spill so the window stays the oldest
+            // entries. Nested `inflight` -> `inflight_spill` order matches
+            // the documented lock order; no other path nests in reverse.
+            // The nested spill lock runs only when spill is non-empty
+            // (one relaxed atomic load); steady-state ack with empty
+            // spill holds exactly the 1 window write lock as before
+            // B4-01. Spill-nonempty ack-with-promotion throughput is
+            // printed by `test_qos1_inflight_hot_path_timings`
+            // (slow-path section). A missed promotion under a concurrent
+            // spill push only defers promotion to the next ack; replay
+            // still covers window then spill oldest-first.
+            if self.spill_count.load(Ordering::Relaxed) == 0 {
+                return true;
+            }
+            let promoted = self.inflight_spill.write().pop_front();
+            if let Some(entry) = promoted {
+                self.spill_count.fetch_sub(1, Ordering::Relaxed);
+                inflight.push_back(entry);
+            }
+            return true;
+        }
+        drop(inflight);
+        let mut spill = self.inflight_spill.write();
+        if let Some(pos) = spill.iter().position(|m| m.packet_id == packet_id) {
+            spill.remove(pos);
+            self.spill_count.fetch_sub(1, Ordering::Relaxed);
             return true;
         }
         false
     }
 
-    /// Ordered snapshot of unacked downlinks for reconnect replay.
+    /// Ordered snapshot of unacked window downlinks for reconnect replay.
     /// Entries stay held: they remain inflight until their PUBACK, so a
     /// second reconnect without acks replays them again.
     pub fn inflight_snapshot(&self) -> Vec<InflightMessage> {
         self.inflight.read().iter().cloned().collect()
     }
 
+    /// Ordered snapshot of spilled overflow for reconnect replay, oldest
+    /// first. Entries stay held until their PUBACK, like the window.
+    pub fn inflight_spill_snapshot(&self) -> Vec<InflightMessage> {
+        self.inflight_spill.read().iter().cloned().collect()
+    }
+
     pub fn inflight_len(&self) -> usize {
         self.inflight.read().len()
     }
 
+    /// Number of overflow entries currently held past the window.
+    pub fn inflight_spill_len(&self) -> usize {
+        self.inflight_spill.read().len()
+    }
+
+    /// Lock-free fast-path check: true while spill holds entries.
+    /// One relaxed atomic load; lets `next_packet_id`, ack promotion and
+    /// reconnect replay skip the spill lock/scan/snapshot allocation when
+    /// empty. Steady-state cost is one atomic load, no new lock.
+    pub fn has_spill(&self) -> bool {
+        self.spill_count.load(Ordering::Relaxed) != 0
+    }
+
+    /// Window plus spill: every QoS 1 downlink currently tracked for
+    /// redelivery on this session.
+    pub fn inflight_total_len(&self) -> usize {
+        self.inflight.read().len() + self.inflight_spill.read().len()
+    }
+
     pub fn clear_inflight(&self) {
         self.inflight.write().clear();
+        self.inflight_spill.write().clear();
+        self.spill_count.store(0, Ordering::Relaxed);
     }
 
     /// Store one QoS 2 inbound publish between PUBLISH and PUBREL.
@@ -488,6 +707,14 @@ pub struct SessionManager {
     /// Offline queue cap applied by [`SessionManager::queue_offline`];
     /// `None` queues without bound.
     max_offline_queue: Option<usize>,
+    /// Default QoS 1 window bound applied to sessions created after the
+    /// last set (B4-01). One relaxed atomic load per new session; never
+    /// touched on the publish fast path.
+    max_qos1_inflight: AtomicUsize,
+    /// Default QoS 1 spill bound applied to sessions created after the
+    /// last set (B4-01). Read only when a session is created or
+    /// reconfigured, never per message.
+    max_qos1_spill: AtomicUsize,
 }
 
 impl Default for SessionManager {
@@ -498,13 +725,34 @@ impl Default for SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self::new_with_limits(Some(DEFAULT_MAX_OFFLINE_QUEUE))
+        Self::new_with_all_limits(
+            Some(DEFAULT_MAX_OFFLINE_QUEUE),
+            DEFAULT_MAX_QOS1_INFLIGHT,
+            DEFAULT_MAX_QOS1_SPILL,
+        )
     }
 
     /// Create a manager with an explicit offline queue cap: `Some(n)`
     /// evicts oldest past `n` per detached session (floored at 1, no
-    /// ceiling), `None` queues without bound.
+    /// ceiling), `None` queues without bound. The QoS 1 window and spill
+    /// bounds take their documented defaults ([`DEFAULT_MAX_QOS1_INFLIGHT`],
+    /// [`DEFAULT_MAX_QOS1_SPILL`]).
     pub fn new_with_limits(max_offline_queue: Option<usize>) -> Self {
+        Self::new_with_all_limits(
+            max_offline_queue,
+            DEFAULT_MAX_QOS1_INFLIGHT,
+            DEFAULT_MAX_QOS1_SPILL,
+        )
+    }
+
+    /// Create a manager with explicit offline, QoS 1 window and QoS 1
+    /// spill caps (B4-01). Window and spill floors hold at 1 so every
+    /// session tracks at least one unacked downlink plus one spill slot.
+    pub fn new_with_all_limits(
+        max_offline_queue: Option<usize>,
+        max_qos1_inflight: usize,
+        max_qos1_spill: usize,
+    ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -513,12 +761,48 @@ impl SessionManager {
             buckets: RwLock::new(HashMap::new()),
             connected_count: AtomicU64::new(0),
             max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
+            max_qos1_inflight: AtomicUsize::new(max_qos1_inflight.max(1)),
+            max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
         }
     }
 
     /// Configured offline queue cap (`None` = unbounded).
     pub fn max_offline_queue(&self) -> Option<usize> {
         self.max_offline_queue
+    }
+
+    /// Default QoS 1 window bound for sessions created after the last
+    /// set (default [`DEFAULT_MAX_QOS1_INFLIGHT`]).
+    pub fn max_qos1_inflight(&self) -> usize {
+        self.max_qos1_inflight.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the default QoS 1 window bound for sessions created
+    /// afterwards (floored at 1). Existing sessions keep their own bound
+    /// unless reconfigured via [`Session::set_max_inflight`].
+    pub fn set_max_qos1_inflight(&self, limit: usize) {
+        self.max_qos1_inflight
+            .store(limit.max(1), Ordering::Relaxed);
+    }
+
+    /// Default QoS 1 spill bound for sessions created after the last set
+    /// (default [`DEFAULT_MAX_QOS1_SPILL`]).
+    pub fn max_qos1_spill(&self) -> usize {
+        self.max_qos1_spill.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the default QoS 1 spill bound for sessions created
+    /// afterwards (floored at 1).
+    pub fn set_max_qos1_spill(&self, limit: usize) {
+        self.max_qos1_spill.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    /// Apply this manager's current QoS 1 bounds to one session (new
+    /// sessions at creation; reconfiguration callers may re-apply to an
+    /// existing session explicitly).
+    pub fn apply_qos1_limits(&self, session: &Arc<Session>) {
+        session.set_max_inflight(self.max_qos1_inflight());
+        session.set_max_spill(self.max_qos1_spill());
     }
 
     /// Buffer one message for a detached session, applying this
@@ -716,6 +1000,7 @@ impl SessionManager {
                 .unwrap_or(false);
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            self.apply_qos1_limits(&session);
             map.insert(client_id.to_string(), session.clone());
             drop(map);
             if !stale_connected {
@@ -743,6 +1028,7 @@ impl SessionManager {
         } else {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            self.apply_qos1_limits(&session);
             map.insert(client_id.to_string(), session.clone());
             drop(map);
             self.connected_count.fetch_add(1, Ordering::SeqCst);
@@ -1119,6 +1405,327 @@ mod tests {
         assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
         session.clear_inflight();
         assert_eq!(session.inflight_len(), 0);
+        assert_eq!(session.inflight_spill_len(), 0);
+    }
+
+    #[test]
+    fn test_inflight_spill_tracks_past_window_in_order() {
+        use super::{InflightMessage, InflightTrackOutcome, DEFAULT_MAX_QOS1_INFLIGHT};
+
+        fn inflight(pid: u16) -> InflightMessage {
+            InflightMessage {
+                packet_id: pid,
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![pid as u8]),
+            }
+        }
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("spill-1", false);
+        assert_eq!(session.max_inflight(), DEFAULT_MAX_QOS1_INFLIGHT);
+
+        // Fill the window: every entry tracks fast.
+        for pid in 1..=(DEFAULT_MAX_QOS1_INFLIGHT as u16) {
+            assert_eq!(
+                session.track_inflight_or_spill(inflight(pid)),
+                InflightTrackOutcome::Tracked
+            );
+        }
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_spill_len(), 0);
+
+        // Past the window: still tracked, now in spill, oldest-first.
+        assert_eq!(
+            session.track_inflight_or_spill(inflight(1001)),
+            InflightTrackOutcome::Spilled
+        );
+        assert_eq!(
+            session.track_inflight_or_spill(inflight(1002)),
+            InflightTrackOutcome::Spilled
+        );
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_spill_len(), 2);
+        assert_eq!(session.inflight_total_len(), DEFAULT_MAX_QOS1_INFLIGHT + 2);
+        let spill = session.inflight_spill_snapshot();
+        assert_eq!(
+            spill.iter().map(|m| m.packet_id).collect::<Vec<_>>(),
+            vec![1001, 1002]
+        );
+
+        // Ack one window entry: the oldest spill promotes so the window
+        // stays the oldest entries and replay order holds.
+        assert!(session.ack_inflight(1));
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_spill_len(), 1);
+        let snap = session.inflight_snapshot();
+        assert_eq!(snap.last().expect("window nonempty").packet_id, 1001);
+        assert_eq!(session.inflight_spill_snapshot()[0].packet_id, 1002);
+
+        // Ack a spilled id directly releases it.
+        assert!(session.ack_inflight(1002));
+        assert_eq!(session.inflight_spill_len(), 0);
+        assert!(!session.ack_inflight(1002));
+
+        // Packet ids skip both window and spill.
+        let fresh = session.next_packet_id();
+        assert!(
+            !session
+                .inflight_snapshot()
+                .iter()
+                .any(|m| m.packet_id == fresh)
+                && !session
+                    .inflight_spill_snapshot()
+                    .iter()
+                    .any(|m| m.packet_id == fresh),
+            "fresh id must avoid window and spill ids"
+        );
+    }
+
+    #[test]
+    fn test_inflight_bound_configurable_and_spill_bounded() {
+        use super::{InflightMessage, InflightTrackOutcome};
+
+        fn inflight(pid: u16) -> InflightMessage {
+            InflightMessage {
+                packet_id: pid,
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![pid as u8]),
+            }
+        }
+
+        // Manager defaults apply to sessions created afterwards.
+        let manager = SessionManager::new_with_all_limits(Some(10), 3, 2);
+        assert_eq!(manager.max_qos1_inflight(), 3);
+        assert_eq!(manager.max_qos1_spill(), 2);
+        let (session, _) = manager.get_or_create("tiny-window", false);
+        assert_eq!(session.max_inflight(), 3);
+        assert_eq!(session.max_spill(), 2);
+
+        for pid in 1..=3u16 {
+            assert_eq!(
+                session.track_inflight_or_spill(inflight(pid)),
+                InflightTrackOutcome::Tracked
+            );
+        }
+        for pid in [4u16, 5] {
+            assert_eq!(
+                session.track_inflight_or_spill(inflight(pid)),
+                InflightTrackOutcome::Spilled
+            );
+        }
+        // Window + spill full: the newest live delivery drops, counted by
+        // the caller. The store never grows past 3 + 2.
+        assert_eq!(
+            session.track_inflight_or_spill(inflight(6)),
+            InflightTrackOutcome::Dropped
+        );
+        assert_eq!(session.inflight_total_len(), 5);
+
+        // Zero floors at one; per-session override works.
+        manager.set_max_qos1_inflight(0);
+        manager.set_max_qos1_spill(0);
+        assert_eq!(manager.max_qos1_inflight(), 1);
+        assert_eq!(manager.max_qos1_spill(), 1);
+        session.set_max_inflight(0);
+        session.set_max_spill(0);
+        assert_eq!(session.max_inflight(), 1);
+        assert_eq!(session.max_spill(), 1);
+    }
+
+    #[test]
+    fn test_qos1_inflight_hot_path_timings() {
+        // B4-01 timing record for the session store (RULEBOOK.md:70).
+        // Before/after pair measured in this same run: BEFORE is the
+        // legacy window-only `track_inflight` loop below (exactly the
+        // pre-B4-01 publish fast path: one bounded push under a single
+        // write lock per track, one write lock per ack, no spill work
+        // ever); AFTER is the spill-aware `track_inflight_or_spill` loop
+        // with the spill empty (the same work plus one relaxed atomic
+        // guard load on the ack path). The delta between the two printed
+        // rates is the measured cost of the bound on the hot path.
+        // Broker publish-to-delivery before/after numbers (delivery rate
+        // through `apply_publish`, plus `replay_offline` replay rate) are
+        // printed by the broker-node test
+        // `qos1_inflight_delivery_workload_timings`, which drives the real
+        // publish-to-delivery and reconnect-replay events; the broker-node
+        // spill/redelivery/config tests give functional cover. Loop counts
+        // below are sample sizes chosen for stable timing on CI, not
+        // throughput SLOs. Every section prints its measured ops/sec and
+        // avg ns/op into the gate output with no threshold assert.
+        use super::{InflightMessage, InflightTrackOutcome, DEFAULT_MAX_QOS1_INFLIGHT};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("hot-path-timing", false);
+        let topic = Topic::new("t").unwrap();
+        let payload = Bytes::from_static(b"x");
+        let mut pid: u16 = 1;
+        let make = |pid: u16| InflightMessage {
+            packet_id: pid,
+            topic: topic.clone(),
+            qos: broker_protocol::QoS::AtLeastOnce,
+            retain: false,
+            payload: payload.clone(),
+        };
+
+        // BEFORE baseline (pre-B4-01 window-only entry point): the legacy
+        // `track_inflight`/`ack_inflight` loop on its own session. This is
+        // exactly the work the publish fast path did before B4-01 (one
+        // bounded deque push under a single write lock per track, one
+        // write lock per ack, no spill atomic/lock/scan ever), measured in
+        // this same run so the gate output holds a genuine before number
+        // next to the after number below.
+        let (baseline, _) = manager.get_or_create("hot-path-baseline", false);
+        let mut base_pid: u16 = 1;
+        let base_iters = 20_000usize;
+        let base_start = Instant::now();
+        for _ in 0..base_iters {
+            if base_pid == 0 {
+                base_pid = 1;
+            }
+            assert!(baseline.track_inflight(black_box(make(base_pid))));
+            assert!(black_box(baseline.ack_inflight(black_box(base_pid))));
+            base_pid = base_pid.wrapping_add(1);
+        }
+        let base_elapsed = base_start.elapsed();
+        assert!(
+            !baseline.has_spill(),
+            "legacy window-only path must never touch the spill"
+        );
+        let base_ops = (base_iters * 2) as f64;
+        let base_rate = base_ops / base_elapsed.as_secs_f64();
+        let base_avg_ns = base_elapsed.as_nanos() as f64 / base_ops;
+        println!(
+            "qos1 inflight hot-path baseline pre-B4-01 (window-only track_inflight): {base_rate:.0} ops/sec, avg {base_avg_ns:.1} ns/op ({base_iters} track+ack rounds in {base_elapsed:?})"
+        );
+
+        // Warmup so locks and branch predictors settle.
+        for _ in 0..1_000 {
+            if pid == 0 {
+                pid = 1;
+            }
+            assert_eq!(
+                session.track_inflight_or_spill(make(pid)),
+                InflightTrackOutcome::Tracked
+            );
+            assert!(session.ack_inflight(pid));
+            pid = pid.wrapping_add(1);
+        }
+        assert!(
+            !session.has_spill(),
+            "warmup must leave the spill empty (steady state)"
+        );
+
+        // AFTER: steady-state track+ack throughput (spill empty) through
+        // the spill-aware entry point: one relaxed atomic load + one
+        // bounded deque push under a single write lock per track, one
+        // write lock + one atomic load per ack, no spill
+        // lock/scan/snapshot allocation. Compare with the BEFORE baseline
+        // above; the delta is the measured hot-path cost of the bound.
+        let iters = 20_000usize;
+        let start = Instant::now();
+        for _ in 0..iters {
+            if pid == 0 {
+                pid = 1;
+            }
+            assert_eq!(
+                session.track_inflight_or_spill(black_box(make(pid))),
+                InflightTrackOutcome::Tracked
+            );
+            assert!(black_box(session.ack_inflight(black_box(pid))));
+            pid = pid.wrapping_add(1);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            !session.has_spill(),
+            "steady-state loop must never touch the spill buffer"
+        );
+        let ops = (iters * 2) as f64;
+        let rate = ops / elapsed.as_secs_f64();
+        let avg_ns = elapsed.as_nanos() as f64 / ops;
+        println!(
+            "qos1 inflight hot-path steady-state (spill empty): {rate:.0} ops/sec, avg {avg_ns:.1} ns/op ({iters} track+ack rounds in {elapsed:?})"
+        );
+
+        // Steady-state packet-id allocation (spill empty): same 2 read
+        // locks as before B4-01 plus one relaxed atomic guard load, no
+        // spill read lock or O(spill) scan.
+        let id_iters = 5_000usize;
+        let id_start = Instant::now();
+        for _ in 0..id_iters {
+            black_box(session.next_packet_id());
+        }
+        let id_elapsed = id_start.elapsed();
+        let id_rate = id_iters as f64 / id_elapsed.as_secs_f64();
+        let id_avg_ns = id_elapsed.as_nanos() as f64 / id_iters as f64;
+        println!(
+            "qos1 next_packet_id steady-state (spill empty): {id_rate:.0} ids/sec, avg {id_avg_ns:.1} ns/id ({id_iters} ids in {id_elapsed:?})"
+        );
+
+        // Spill-nonempty (slow path) record on a separate session so the
+        // steady-state session above stays empty. Window full plus 100
+        // spilled entries: id allocation pays the O(spill) scan, ack of a
+        // window entry pays the nested spill lock + one promotion, and
+        // the spill snapshot pays one Vec alloc + clone of the spill.
+        let (slow, _) = manager.get_or_create("hot-path-spill-slow", false);
+        for p in 1..=(DEFAULT_MAX_QOS1_INFLIGHT as u16) {
+            assert_eq!(
+                slow.track_inflight_or_spill(make(p)),
+                InflightTrackOutcome::Tracked
+            );
+        }
+        for p in 1001..1101u16 {
+            assert_eq!(
+                slow.track_inflight_or_spill(make(p)),
+                InflightTrackOutcome::Spilled
+            );
+        }
+        assert!(slow.has_spill(), "slow-path section needs a nonempty spill");
+
+        let slow_id_iters = 5_000usize;
+        let slow_id_start = Instant::now();
+        for _ in 0..slow_id_iters {
+            black_box(slow.next_packet_id());
+        }
+        let slow_id_elapsed = slow_id_start.elapsed();
+        let slow_id_rate = slow_id_iters as f64 / slow_id_elapsed.as_secs_f64();
+        let slow_id_avg_ns = slow_id_elapsed.as_nanos() as f64 / slow_id_iters as f64;
+        println!(
+            "qos1 next_packet_id spill-nonempty (100 spilled): {slow_id_rate:.0} ids/sec, avg {slow_id_avg_ns:.1} ns/id ({slow_id_iters} ids in {slow_id_elapsed:?})"
+        );
+
+        let snap_iters = 1_000usize;
+        let snap_start = Instant::now();
+        for _ in 0..snap_iters {
+            black_box(slow.inflight_spill_snapshot());
+        }
+        let snap_elapsed = snap_start.elapsed();
+        let snap_rate = snap_iters as f64 / snap_elapsed.as_secs_f64();
+        let snap_avg_ns = snap_elapsed.as_nanos() as f64 / snap_iters as f64;
+        println!(
+            "qos1 spill snapshot spill-nonempty (100 spilled): {snap_rate:.0} snaps/sec, avg {snap_avg_ns:.1} ns/snap ({snap_iters} snaps in {snap_elapsed:?})"
+        );
+
+        let ack_count = 50u16;
+        let ack_start = Instant::now();
+        for p in 1..=ack_count {
+            assert!(black_box(slow.ack_inflight(black_box(p))));
+        }
+        let ack_elapsed = ack_start.elapsed();
+        let ack_rate = f64::from(ack_count) / ack_elapsed.as_secs_f64();
+        let ack_avg_ns = ack_elapsed.as_nanos() as f64 / f64::from(ack_count);
+        println!(
+            "qos1 ack-with-promotion spill-nonempty (100 spilled): {ack_rate:.0} acks/sec, avg {ack_avg_ns:.1} ns/ack ({ack_count} acks in {ack_elapsed:?})"
+        );
+        assert!(
+            slow.has_spill(),
+            "promotion batch must leave spill nonempty"
+        );
     }
 
     #[test]
