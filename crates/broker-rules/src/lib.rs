@@ -5166,6 +5166,204 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(redshift_transport.captured().len(), 1);
     }
 
+    /// B3-06 broker proof: 1000 rule-shaped rows stream via
+    /// `dispatch_ingress` through `BigQuerySink` on the maintained
+    /// `SdkBigQueryTransport` to a loopback `insertAll` fake. Row count is
+    /// asserted on the fake (not just the sink counters), plus selective
+    /// requeue of only failed rows through the same rule path.
+    #[tokio::test]
+    async fn test_bigquery_sdk_sink_via_rule_against_fake() {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        use broker_connectors::{BigQuerySink, BigQuerySinkConfig, SdkBigQueryTransport, Sink};
+
+        #[derive(Default)]
+        struct FakeBigQuery {
+            bodies: parking_lot::Mutex<Vec<serde_json::Value>>,
+            script: parking_lot::Mutex<std::collections::VecDeque<(u16, serde_json::Value)>>,
+        }
+
+        async fn serve_fake(fake: Arc<FakeBigQuery>) -> String {
+            async fn handler(
+                State(fake): State<Arc<FakeBigQuery>>,
+                body: String,
+            ) -> (StatusCode, String) {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                fake.bodies.lock().push(parsed);
+                let next = fake.script.lock().pop_front();
+                match next {
+                    Some((status, value)) => (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                        value.to_string(),
+                    ),
+                    None => (StatusCode::OK, "{}".to_string()),
+                }
+            }
+            let app = Router::new()
+                .route("/*rest", post(handler))
+                .with_state(fake);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake bigquery");
+            let port = listener.local_addr().expect("fake addr").port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve fake");
+            });
+            format!("http://127.0.0.1:{port}")
+        }
+
+        let fake = Arc::new(FakeBigQuery::default());
+        let endpoint = serve_fake(fake.clone()).await;
+        let config = BigQuerySinkConfig {
+            project_id: "my-iot-project".to_string(),
+            dataset_id: "telemetry".to_string(),
+            table_template: "sensor_logs".to_string(),
+            endpoint: Some(endpoint),
+            auth: broker_connectors::GcpAuth::None,
+            ignore_unknown_values: true,
+            skip_invalid_rows: false,
+            template_suffix: None,
+            batch_size: Some(100),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(15_000),
+        };
+        let transport = Arc::new(
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("sdk transport"),
+        );
+        let bigquery = Arc::new(BigQuerySink::new(config, transport).expect("sink"));
+        assert_eq!(bigquery.kind(), "bigquery");
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine
+            .connectors()
+            .register("bigquery-sdk-sink", bigquery.clone());
+        engine
+            .create_rule(
+                "bq-sdk-rule".to_string(),
+                TopicFilter::new("sensors/qual").unwrap(),
+                Some(
+                    r#"SELECT device_id, temp, seq FROM "sensors/qual" INTO connector("bigquery-sdk-sink")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+
+        let probe: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        for seq in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":{temp},"seq":{seq}}}"#,
+                temp = 20.0 + f64::from(seq) * 0.01
+            ));
+            engine
+                .dispatch_ingress(
+                    &Topic::new("sensors/qual").unwrap(),
+                    &payload,
+                    QoS::AtLeastOnce,
+                    &probe,
+                )
+                .await;
+        }
+        bigquery.flush().await.expect("flush");
+        assert_eq!(bigquery.sent_records(), 1000);
+        let total: usize = fake
+            .bodies
+            .lock()
+            .iter()
+            .map(|body| body["rows"].as_array().map_or(0, |rows| rows.len()))
+            .sum();
+        assert_eq!(total, 1000);
+        let first = fake.bodies.lock()[0].clone();
+        assert_eq!(
+            first["rows"][0]["json"]["device_id"]
+                .as_str()
+                .expect("device"),
+            "dev-0000"
+        );
+
+        // Partial-failure retry through the same rule path requeues only
+        // the failed row.
+        let partial_fake = Arc::new(FakeBigQuery {
+            bodies: parking_lot::Mutex::new(Vec::new()),
+            script: parking_lot::Mutex::new(
+                vec![
+                    (
+                        200,
+                        serde_json::json!({
+                            "insertErrors": [{"index": 1, "errors": [{"reason": "rateLimitExceeded"}]}]
+                        }),
+                    ),
+                    (200, serde_json::json!({})),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        });
+        let partial_endpoint = serve_fake(partial_fake.clone()).await;
+        let partial_config = BigQuerySinkConfig {
+            project_id: "my-iot-project".to_string(),
+            dataset_id: "telemetry".to_string(),
+            table_template: "sensor_logs".to_string(),
+            endpoint: Some(partial_endpoint),
+            auth: broker_connectors::GcpAuth::None,
+            ignore_unknown_values: true,
+            skip_invalid_rows: false,
+            template_suffix: None,
+            batch_size: Some(10),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(15_000),
+        };
+        let partial_transport = Arc::new(
+            SdkBigQueryTransport::new(&partial_config, reqwest::Client::new())
+                .expect("partial transport"),
+        );
+        let partial_sink =
+            Arc::new(BigQuerySink::new(partial_config, partial_transport).expect("sink"));
+        let partial_engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        partial_engine
+            .connectors()
+            .register("bq-partial-sink", partial_sink.clone());
+        partial_engine
+            .create_rule(
+                "bq-partial-rule".to_string(),
+                TopicFilter::new("sensors/retry").unwrap(),
+                Some(
+                    r#"SELECT temp FROM "sensors/retry" INTO connector("bq-partial-sink")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        for temp in [20.5, 21.5] {
+            partial_engine
+                .dispatch_ingress(
+                    &Topic::new("sensors/retry").unwrap(),
+                    &Bytes::from(format!(r#"{{"temp":{temp}}}"#)),
+                    QoS::AtMostOnce,
+                    &probe,
+                )
+                .await;
+        }
+        partial_sink.flush().await.expect("retry flush");
+        assert_eq!(partial_fake.bodies.lock().len(), 2);
+        let retry_bodies = partial_fake.bodies.lock().clone();
+        assert_eq!(retry_bodies[1]["rows"].as_array().expect("rows").len(), 1);
+        assert_eq!(
+            retry_bodies[1]["rows"][0]["json"]["temp"],
+            serde_json::json!(21.5)
+        );
+    }
+
     #[tokio::test]
     async fn test_into_malformed_rejected_at_creation() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
@@ -5568,6 +5766,255 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(rmq_transport.envelopes().len(), 1);
     }
 
+    /// Azure Blob REST write via the broker: one ingress publish
+    /// routes through `ForwardConnector` into `AzureBlobSink` on
+    /// `HttpAzureBlobTransport`, whose idempotent container create plus
+    /// block-blob upload land on a local HTTP fake. Every request pins
+    /// x-ms-version 2021-08-06.
+    #[tokio::test]
+    async fn test_azure_blob_rest_write_via_dispatch_against_loopback() {
+        use broker_connectors::{
+            AzureBlobAuth, AzureBlobSink, AzureBlobSinkConfig, HttpAzureBlobTransport, Sink as _,
+            AZURE_STORAGE_VERSION,
+        };
+
+        #[derive(Debug, Default)]
+        struct Captured {
+            inner: parking_lot::Mutex<Vec<CapturedPut>>,
+        }
+        #[derive(Debug)]
+        struct CapturedPut {
+            path: String,
+            query: Option<String>,
+            version: Option<String>,
+            auth: Option<String>,
+        }
+
+        let captured = Arc::new(Captured::default());
+        let app = axum::Router::new().fallback(axum::routing::put({
+            let captured = captured.clone();
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, _body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    captured.inner.lock().push(CapturedPut {
+                        path: uri.path().to_string(),
+                        query: uri.query().map(str::to_string),
+                        version: headers
+                            .get("x-ms-version")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                        auth: headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    });
+                    (
+                        axum::http::StatusCode::CREATED,
+                        [
+                            ("x-ms-request-id", "00000000-0000-0000-0000-000000000000"),
+                            ("x-ms-version", AZURE_STORAGE_VERSION),
+                            ("ETag", "\"0x8DD000000000000\""),
+                            ("Last-Modified", "Tue, 22 Sep 2026 20:00:00 GMT"),
+                            ("Date", "Tue, 22 Sep 2026 20:00:00 GMT"),
+                            ("x-ms-request-server-encrypted", "false"),
+                        ],
+                        "",
+                    )
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let config = AzureBlobSinkConfig {
+            account_name: "mydeviceblobs".to_string(),
+            container_name: "telemetry".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{port}/devstoreaccount1")),
+            auth: AzureBlobAuth::SharedKey {
+                account_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+            },
+            blob_path_template: "telemetry/${batch_id}.json".to_string(),
+            compression: broker_connectors::AzureBlobCompression::None,
+            max_records_per_blob: Some(1),
+            max_bytes_per_blob: None,
+            flush_interval_secs: 60,
+            buffer_capacity: None,
+            timeout_ms: Some(5_000),
+        };
+        let transport = Arc::new(
+            HttpAzureBlobTransport::new(&config, reqwest::Client::new())
+                .expect("rest builds with loopback"),
+        );
+        let sink = Arc::new(AzureBlobSink::new(config, transport).expect("valid sink"));
+        engine.connectors().register("rest_blob", sink.clone());
+        engine
+            .create_rule(
+                "rest-blob-rule".to_string(),
+                TopicFilter::new("sdk/blob/#").unwrap(),
+                Some(
+                    r#"SELECT client_id FROM "sdk/blob/#" INTO connector("rest_blob")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+
+        let broker_sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sdk/blob/line1").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor-42" }"#),
+                QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.kind(), "azure_blob");
+
+        let puts = captured.inner.lock();
+        // One flush = idempotent container create + one blob upload.
+        assert_eq!(puts.len(), 2, "got {puts:?}");
+        assert!(
+            puts.iter().any(|p| p
+                .query
+                .as_deref()
+                .unwrap_or("")
+                .contains("restype=container")),
+            "container create missing: {puts:?}"
+        );
+        for put in puts.iter() {
+            assert_eq!(put.version.as_deref(), Some(AZURE_STORAGE_VERSION));
+            assert!(put.path.contains("telemetry"), "got {put:?}");
+            assert!(
+                put.auth
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with("SharedKey mydeviceblobs:"),
+                "SharedKey missing: {put:?}"
+            );
+        }
+        server.abort();
+    }
+
+    /// Azure Event Hubs REST write via the broker: one ingress publish
+    /// routes through `ForwardConnector` into `AzureEventHubsSink` on
+    /// `HttpAzureEventHubsTransport`, whose signed `POST {hub}/messages`
+    /// lands on a local HTTP fake. The SAS header carries the key name
+    /// (never a pre-formed token in config), so the sink renews it from
+    /// the stored key on every attempt.
+    #[tokio::test]
+    async fn test_azure_eventhubs_rest_write_via_dispatch_against_loopback() {
+        use broker_connectors::{
+            AzureEventHubsSink, AzureEventHubsSinkConfig, HttpAzureEventHubsTransport, Sink as _,
+        };
+
+        #[derive(Debug, Default)]
+        struct Captured {
+            inner: parking_lot::Mutex<Vec<CapturedPost>>,
+        }
+        #[derive(Debug)]
+        struct CapturedPost {
+            path: String,
+            auth: Option<String>,
+            body: Vec<u8>,
+        }
+
+        let captured = Arc::new(Captured::default());
+        let app = axum::Router::new().fallback(axum::routing::post({
+            let captured = captured.clone();
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    captured.inner.lock().push(CapturedPost {
+                        path: uri.path().to_string(),
+                        auth: headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                        body: body.to_vec(),
+                    });
+                    axum::http::StatusCode::CREATED
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let config = AzureEventHubsSinkConfig {
+            namespace: "my-eventhub-ns".to_string(),
+            event_hub: "telemetry-hub".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{port}")),
+            shared_access_key_name: "SendPolicy".to_string(),
+            shared_access_key: "dGVzdC1rZXktbWF0ZXJpYWwtMzItYnl0ZXMhIU9L".to_string(),
+            partition_key_template: Some("${client_id}".to_string()),
+            user_properties: std::collections::HashMap::new(),
+            token_ttl_secs: 3_600,
+            batch_size: Some(1),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(2),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(5_000),
+        };
+        let transport = Arc::new(
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new())
+                .expect("rest builds offline"),
+        );
+        let sink = Arc::new(AzureEventHubsSink::new(config, transport).expect("valid sink"));
+        engine.connectors().register("rest_eventhubs", sink.clone());
+        engine
+            .create_rule(
+                "rest-eventhubs-rule".to_string(),
+                TopicFilter::new("sdk/eh/#").unwrap(),
+                Some(
+                    r#"SELECT client_id FROM "sdk/eh/#" INTO connector("rest_eventhubs")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+
+        let broker_sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sdk/eh/line1").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "sensor-42" }"#),
+                QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        // The publish travelled the broker into the sink and flushed
+        // (batch of 1): one signed POST landed on the fake.
+        assert_eq!(sink.kind(), "azure_eventhubs");
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+
+        let posts = captured.inner.lock();
+        assert_eq!(posts.len(), 1, "got {posts:?}");
+        assert_eq!(posts[0].path, "/telemetry-hub/messages");
+        let auth = posts[0].auth.as_deref().expect("SAS header");
+        assert!(auth.starts_with("SharedAccessSignature sr="));
+        assert!(auth.contains("&skn=SendPolicy"));
+        let doc: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&posts[0].body).unwrap()).unwrap();
+        assert_eq!(doc[0]["BrokerProperties"]["PartitionKey"], "sensor-42");
+        server.abort();
+    }
+
     /// Sprint 26 studio fanout (INDRA-225): one ingress event routes
     /// through six streaming SQL `INTO connector(...)` rules and lands
     /// simultaneously in the Oracle, CockroachDB, AlloyDB, OpenTSDB,
@@ -5656,6 +6103,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     batch_size: Some(1),
                     buffer_capacity: None,
                     timeout_ms: None,
+                    tls: None,
+                    ca_bundle_pem: None,
+                    tls_ca_file: None,
                 },
                 alloydb_transport.clone(),
             )

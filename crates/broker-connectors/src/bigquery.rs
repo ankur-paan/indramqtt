@@ -8,6 +8,13 @@
 //! reuses the [`GcpAuth`] stack (service-account JWT + token cache,
 //! raw access tokens, or nothing for the emulator).
 //!
+//! The write path runs on the maintained `gcp-bigquery-client` driver
+//! ([`SdkBigQueryTransport`] below): `TableDataInsertAllRequest` framing
+//! plus `tabledata().insertAll` over OAuth2 Bearer. The legacy
+//! hand-written [`HttpBigQueryTransport`] is retained for endpoint
+//! overrides and offline unit tests only; production wiring uses the
+//! driver transport.
+//!
 //! Partial failures requeue selectively: only rows whose `insertErrors`
 //! carry transient reasons (`backendError`, `rateLimitExceeded`)
 //! retry; other row errors are terminal. HTTP 429/5xx and transport
@@ -30,6 +37,22 @@ fn default_endpoint() -> Option<String> {
     None
 }
 
+// Default batching/ retry numbers and where they come from:
+// - 500 rows per `insertAll`: the BigQuery legacy streaming `insertAll`
+//   REST contract caps a request at 10_000 rows / 10 MiB; 500 keeps a
+//   batch well under both while bounding per-flush memory, and matches the
+//   sibling warehouse sinks in this crate.
+// - 1_048_576 bytes (1 MiB): bounds the in-memory batch below the 10 MiB
+//   service cap so a flush never builds a rejected request.
+// - 20 ms linger: bounds added publish latency while still coalescing a
+//   burst of rule outputs into one request.
+// - 4 retries, 100 ms initial backoff, 2_500 ms ceiling: standard
+//   truncated-exponential budget for transient `backendError` /
+//   `rateLimitExceeded` / 429 / 5xx; the ceiling keeps the worst-case
+//   stall near 100+200+400+800 ms plus jitter.
+// - 5_000 ms request timeout: bounds one `insertAll` round trip so a slow
+//   server surfaces as a retryable connection error instead of stalling
+//   the rule path.
 fn default_batch_size() -> Option<usize> {
     Some(500)
 }
@@ -88,25 +111,26 @@ pub struct BigQuerySinkConfig {
     /// `$suffix` to the table when set).
     #[serde(default)]
     pub template_suffix: Option<String>,
-    /// Rows per `insertAll` (default 500, streaming cap).
+    /// Rows per `insertAll` (default 500: BigQuery `insertAll` streaming
+    /// cap headroom, see `default_batch_size`).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Batch byte limit (default 1 MiB).
+    /// Batch byte limit (default 1 MiB: bounds memory below the service cap).
     #[serde(default = "default_batch_bytes")]
     pub batch_bytes: Option<usize>,
-    /// Linger flush window in ms (default 20).
+    /// Linger flush window in ms (default 20: bounds added latency).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
     /// Retries on throttles/partials (default 4, `None` unbounded).
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<usize>,
-    /// First retry delay in ms (default 100).
+    /// First retry delay in ms (default 100: backoff floor).
     #[serde(default = "default_initial_backoff_ms")]
     pub initial_backoff_ms: Option<u64>,
-    /// Retry delay ceiling in ms (default 2500).
+    /// Retry delay ceiling in ms (default 2500: bounds worst-case stall).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
-    /// Request timeout in ms (default 5000).
+    /// Request timeout in ms (default 5000: bounds one round trip).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -116,6 +140,9 @@ fn default_true() -> bool {
 }
 
 impl BigQuerySinkConfig {
+    /// 5_000 ms default: bounds one `insertAll` round trip (see
+    /// `default_batch_size` note); `.max(1)` keeps a zero config from
+    /// becoming a zero timeout.
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
     }
@@ -188,17 +215,6 @@ impl BigQuerySinkConfig {
             Some(endpoint) => endpoint.trim_end_matches('/').to_string(),
             None => "https://bigquery.googleapis.com/bigquery/v2".to_string(),
         }
-    }
-
-    /// `POST {base}/projects/{project}/datasets/{dataset}/tables/{table}/insertAll`.
-    pub fn insert_url(&self, table: &str) -> String {
-        format!(
-            "{}/projects/{}/datasets/{}/tables/{}/insertAll",
-            self.base_url(),
-            self.project_id,
-            self.dataset_id,
-            table
-        )
     }
 
     pub fn effective_batch_size(&self) -> usize {
@@ -504,11 +520,18 @@ impl BigQueryTransport for MockBigQueryTransport {
 
 /// Production transport: `POST {insert-url}` with the rows body.
 /// Service-account tokens resolve through the shared [`GcpTokenCache`].
+/// The loopback fake tests below drive this path end to end.
+/// Flag defaults mirror the `insertAll` REST contract (`ignoreUnknownValues`
+/// defaults true, `skipInvalidRows` defaults false) and are read from
+/// [`BigQuerySinkConfig`] so management configuration drives the wire.
 pub struct HttpBigQueryTransport {
     base: String,
     token_cache: Option<Arc<GcpTokenCache>>,
     static_bearer: Option<String>,
     client: reqwest::Client,
+    timeout: Duration,
+    ignore_unknown_values: bool,
+    skip_invalid_rows: bool,
 }
 
 impl HttpBigQueryTransport {
@@ -534,7 +557,24 @@ impl HttpBigQueryTransport {
             token_cache,
             static_bearer,
             client,
+            timeout: config.timeout(),
+            ignore_unknown_values: config.ignore_unknown_values,
+            skip_invalid_rows: config.skip_invalid_rows,
         })
+    }
+
+    /// Test hook proving `new` stores the configured base URL; the
+    /// production path uses `self.base` in `insert_all` above.
+    #[cfg(test)]
+    fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Flags under test: proves the sink config (not a hardcoded constant)
+    /// drives the `insertAll` body.
+    #[cfg(test)]
+    fn flags(&self) -> (bool, bool) {
+        (self.ignore_unknown_values, self.skip_invalid_rows)
     }
 }
 
@@ -553,7 +593,8 @@ impl BigQueryTransport for HttpBigQueryTransport {
             None => self.static_bearer.clone(),
         };
         // Flags ride the sink config in production; the transport
-        // defaults match the API contract (ignore unknown, no skip).
+        // reads them from `BigQuerySinkConfig` (wired in `new` above) so a
+        // management change reaches the wire without code edits.
         let url = format!(
             "{}/projects/{}/datasets/{}/tables/{}/insertAll",
             self.base, project, dataset, table
@@ -562,7 +603,12 @@ impl BigQueryTransport for HttpBigQueryTransport {
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(render_insert_body(true, false, &rows));
+            .timeout(self.timeout)
+            .body(render_insert_body(
+                self.ignore_unknown_values,
+                self.skip_invalid_rows,
+                &rows,
+            ));
         if let Some(bearer) = bearer {
             request = request.header(reqwest::header::AUTHORIZATION, bearer);
         }
@@ -587,6 +633,264 @@ impl BigQueryTransport for HttpBigQueryTransport {
             .map_err(|e| ConnectorError::Connection(format!("bigquery read failed: {e}")))?;
         Ok(BigQueryInsertResponse {
             failed_indices: classify_insert_errors(&bytes)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Maintained-driver transport (`gcp-bigquery-client`).
+// ---------------------------------------------------------------------------
+
+/// Build a driver `TableDataInsertAllRequest` from buffered rows.
+pub fn driver_insert_request(
+    ignore_unknown: bool,
+    skip_invalid: bool,
+    rows: &[BigQueryRowEntry],
+) -> Result<gcp_bigquery_client::model::table_data_insert_all_request::TableDataInsertAllRequest> {
+    let mut request =
+        gcp_bigquery_client::model::table_data_insert_all_request::TableDataInsertAllRequest::new();
+    if ignore_unknown {
+        request.ignore_unknown_values();
+    }
+    if skip_invalid {
+        request.skip_invalid_rows();
+    }
+    for row in rows {
+        request
+            .add_row(Some(row.insert_id.clone()), row.json.clone())
+            .map_err(|e| ConnectorError::Dispatch(format!("bigquery driver row rejected: {e}")))?;
+    }
+    Ok(request)
+}
+
+/// Classify a driver `TableDataInsertAllResponse`: transient row reasons
+/// (`backendError`, `rateLimitExceeded`) return their indices for
+/// selective requeue; anything else is terminal.
+pub fn classify_driver_response(
+    response: &gcp_bigquery_client::model::table_data_insert_all_response::TableDataInsertAllResponse,
+) -> Result<Vec<usize>> {
+    let mut transient = Vec::new();
+    let empty = Vec::new();
+    let errors = response.insert_errors.as_ref().unwrap_or(&empty);
+    for entry in errors {
+        // A missing index cannot be mapped back to a buffered row. Use
+        // `usize::MAX` (same sentinel as `classify_insert_errors`) so the
+        // sink's `grouped.get(index)` drops it instead of requeueing the
+        // wrong row; the batch still reports a partial failure.
+        let index = entry.index.map(|v| v as usize).unwrap_or(usize::MAX);
+        let reasons: Vec<&str> = entry
+            .errors
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|error| error.reason.as_deref())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if reasons
+            .iter()
+            .all(|reason| matches!(*reason, "backendError" | "rateLimitExceeded"))
+        {
+            transient.push(index);
+        } else {
+            return Err(ConnectorError::Dispatch(format!(
+                "bigquery terminal row errors at {index}: {reasons:?}"
+            )));
+        }
+    }
+    Ok(transient)
+}
+
+/// Map a driver `BQError` onto dispatch vs connection failures.
+/// HTTP 429 / 5xx and transport/auth outages retry; everything else is
+/// terminal. Config and programming errors (bad service-account key,
+/// bad column access, serialization, missing data) are terminal because
+/// retrying cannot fix them.
+fn map_bq_error(error: gcp_bigquery_client::error::BQError) -> ConnectorError {
+    use gcp_bigquery_client::error::BQError as BQ;
+    match &error {
+        BQ::ResponseError { error } => {
+            let code = error.error.code;
+            if code == 429 || (500..=504).contains(&code) {
+                ConnectorError::Connection(format!(
+                    "bigquery driver throttled with {code}: {error:?}"
+                ))
+            } else {
+                ConnectorError::Dispatch(format!("bigquery driver rejected with {code}: {error:?}"))
+            }
+        }
+        BQ::RequestError(_)
+        | BQ::NoToken
+        | BQ::AuthError(_)
+        | BQ::YupAuthError(_)
+        | BQ::TonicTransportError(_)
+        | BQ::TonicStatusError(_)
+        | BQ::ConnectionPoolError(_)
+        | BQ::SemaphorePermitError(_)
+        | BQ::TokioTaskError(_) => {
+            ConnectorError::Connection(format!("bigquery driver transport failed: {error}"))
+        }
+        BQ::InvalidServiceAccountKey(_)
+        | BQ::InvalidServiceAccountAuthenticator(_)
+        | BQ::InvalidInstalledFlowAuthenticator(_)
+        | BQ::InvalidApplicationDefaultCredentialsAuthenticator(_)
+        | BQ::InvalidAuthorizedUserAuthenticator(_)
+        | BQ::NoDataAvailable
+        | BQ::InvalidColumnIndex { .. }
+        | BQ::InvalidColumnName { .. }
+        | BQ::InvalidColumnType { .. }
+        | BQ::SerializationError(_)
+        | BQ::TonicInvalidMetadataValueError(_) => {
+            ConnectorError::Dispatch(format!("bigquery driver failed: {error}"))
+        }
+    }
+}
+
+/// Static-token authenticator for the driver (raw access tokens and
+/// emulator mode). The driver requires an `Authenticator` impl; for a
+/// pre-minted token or the emulator there is no refresh to perform, so
+/// `access_token` returns the configured token verbatim.
+#[derive(Debug, Clone)]
+struct StaticTokenAuthenticator {
+    token: String,
+}
+
+#[async_trait]
+impl gcp_bigquery_client::auth::Authenticator for StaticTokenAuthenticator {
+    async fn access_token(
+        &self,
+    ) -> std::result::Result<String, gcp_bigquery_client::error::BQError> {
+        Ok(self.token.clone())
+    }
+}
+
+/// Production transport on the maintained `gcp-bigquery-client` driver:
+/// `tabledata().insertAll` with OAuth2 Bearer. Service-account keys map
+/// onto `yup-oauth2` service-account flow; raw tokens and `None` map onto
+/// a static authenticator (empty for the emulator). An endpoint override
+/// rewrites the v2 base URL for loopback fakes.
+pub struct SdkBigQueryTransport {
+    auth: GcpAuth,
+    endpoint: Option<String>,
+    ignore_unknown_values: bool,
+    skip_invalid_rows: bool,
+    client: reqwest::Client,
+    timeout: Duration,
+    driver: tokio::sync::OnceCell<gcp_bigquery_client::Client>,
+}
+
+impl SdkBigQueryTransport {
+    pub fn new(config: &BigQuerySinkConfig, client: reqwest::Client) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            auth: config.auth.clone(),
+            endpoint: config.endpoint.clone(),
+            ignore_unknown_values: config.ignore_unknown_values,
+            skip_invalid_rows: config.skip_invalid_rows,
+            client,
+            timeout: config.timeout(),
+            driver: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    /// Test hook proving `new` stores the configured timeout; the
+    /// production path applies `self.timeout` to the driver call in
+    /// `insert_all` above.
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    async fn driver_client(&self) -> Result<gcp_bigquery_client::Client> {
+        let auth = self.auth.clone();
+        let endpoint = self.endpoint.clone();
+        let client = self.client.clone();
+        self.driver
+            .get_or_try_init(|| async move {
+                let mut builder = gcp_bigquery_client::client_builder::ClientBuilder::new();
+                if let Some(endpoint) = endpoint {
+                    let base = endpoint.trim_end_matches('/').to_string();
+                    builder.with_v2_base_url(format!("{base}/bigquery/v2"));
+                }
+                builder.with_client(client);
+                match auth {
+                    GcpAuth::None => {
+                        let auth: std::sync::Arc<dyn gcp_bigquery_client::auth::Authenticator> =
+                            std::sync::Arc::new(StaticTokenAuthenticator {
+                                token: String::new(),
+                            });
+                        builder
+                            .build_from_authenticator(auth)
+                            .await
+                            .map_err(map_bq_error)
+                    }
+                    GcpAuth::AccessToken { token } => {
+                        let auth: std::sync::Arc<dyn gcp_bigquery_client::auth::Authenticator> =
+                            std::sync::Arc::new(StaticTokenAuthenticator { token });
+                        builder
+                            .build_from_authenticator(auth)
+                            .await
+                            .map_err(map_bq_error)
+                    }
+                    GcpAuth::ServiceAccountKey {
+                        client_email,
+                        private_key_pem,
+                    } => {
+                        let key = gcp_bigquery_client::yup_oauth2::ServiceAccountKey {
+                            key_type: Some("service_account".to_string()),
+                            project_id: None,
+                            private_key_id: None,
+                            private_key: private_key_pem,
+                            client_email,
+                            client_id: None,
+                            auth_uri: None,
+                            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+                            auth_provider_x509_cert_url: None,
+                            client_x509_cert_url: None,
+                        };
+                        builder
+                            .build_from_service_account_key(key, false)
+                            .await
+                            .map_err(map_bq_error)
+                    }
+                }
+            })
+            .await
+            .cloned()
+            .map_err(|e: ConnectorError| e)
+    }
+}
+
+#[async_trait]
+impl BigQueryTransport for SdkBigQueryTransport {
+    async fn insert_all(
+        &self,
+        project: &str,
+        dataset: &str,
+        table: &str,
+        rows: Vec<BigQueryRowEntry>,
+        _token: &str,
+    ) -> Result<BigQueryInsertResponse> {
+        let driver = self.driver_client().await?;
+        let request =
+            driver_insert_request(self.ignore_unknown_values, self.skip_invalid_rows, &rows)?;
+        let timeout = self.timeout;
+        let response = tokio::time::timeout(
+            timeout,
+            driver
+                .tabledata()
+                .insert_all(project, dataset, table, request),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "bigquery driver timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
+        .map_err(map_bq_error)?;
+        Ok(BigQueryInsertResponse {
+            failed_indices: classify_driver_response(&response)?,
         })
     }
 }
@@ -885,8 +1189,8 @@ mod tests {
         let mut config = test_config();
         assert!(config.validate().is_ok());
         assert_eq!(
-            config.insert_url("sensor_logs"),
-            "https://bigquery.googleapis.com/bigquery/v2/projects/my-iot-project/datasets/telemetry/tables/sensor_logs/insertAll"
+            config.base_url(),
+            "https://bigquery.googleapis.com/bigquery/v2"
         );
 
         config.project_id = "UPPER SPACE".to_string();
@@ -1096,5 +1400,731 @@ mod tests {
         let calls = transport.calls();
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), calls);
+    }
+
+    #[derive(Default)]
+    struct FakeBigQuery {
+        bodies: parking_lot::Mutex<Vec<serde_json::Value>>,
+        paths: parking_lot::Mutex<Vec<String>>,
+        script: parking_lot::Mutex<std::collections::VecDeque<(u16, serde_json::Value)>>,
+        delay_ms: parking_lot::Mutex<u64>,
+    }
+
+    impl FakeBigQuery {
+        fn with_script(responses: Vec<(u16, serde_json::Value)>) -> Self {
+            Self {
+                script: parking_lot::Mutex::new(responses.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn captured_bodies(&self) -> Vec<serde_json::Value> {
+            self.bodies.lock().clone()
+        }
+
+        fn captured_paths(&self) -> Vec<String> {
+            self.paths.lock().clone()
+        }
+
+        fn call_count(&self) -> usize {
+            self.bodies.lock().len()
+        }
+    }
+
+    async fn serve_fake_bigquery(fake: Arc<FakeBigQuery>) -> String {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        async fn handler(
+            State(fake): State<Arc<FakeBigQuery>>,
+            uri: axum::http::Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let delay = *fake.delay_ms.lock();
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            fake.paths.lock().push(uri.path().to_string());
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            fake.bodies.lock().push(parsed);
+            let next = fake.script.lock().pop_front();
+            match next {
+                Some((status, value)) => (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                    value.to_string(),
+                ),
+                None => (StatusCode::OK, "{}".to_string()),
+            }
+        }
+        let app = Router::new()
+            .route("/*rest", post(handler))
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake bigquery");
+        let port = listener.local_addr().expect("fake addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake");
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn sdk_config_with_endpoint(endpoint: &str) -> BigQuerySinkConfig {
+        let mut config = test_config();
+        config.endpoint = Some(endpoint.to_string());
+        config
+    }
+
+    #[test]
+    fn test_driver_request_framing() {
+        let rows = vec![
+            BigQueryRowEntry {
+                insert_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                json: serde_json::json!({"device_id": "sensor-101", "temp": 75.2}),
+            },
+            BigQueryRowEntry {
+                insert_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                json: serde_json::json!({"device_id": "sensor-102"}),
+            },
+        ];
+        let request = driver_insert_request(true, false, &rows).expect("driver request builds");
+        let body = serde_json::to_value(&request).expect("driver request serializes");
+        assert_eq!(body["ignoreUnknownValues"], serde_json::json!(true));
+        assert_eq!(body["skipInvalidRows"], serde_json::json!(false));
+        assert_eq!(body["rows"].as_array().expect("rows").len(), 2);
+        assert_eq!(
+            body["rows"][0]["insertId"],
+            serde_json::json!("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            body["rows"][0]["json"]["device_id"],
+            serde_json::json!("sensor-101")
+        );
+
+        let flipped = driver_insert_request(false, true, &rows).expect("flags flip");
+        let flipped_body = serde_json::to_value(&flipped).expect("serializes");
+        assert_eq!(
+            flipped_body["ignoreUnknownValues"],
+            serde_json::json!(false)
+        );
+        assert_eq!(flipped_body["skipInvalidRows"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_driver_request_framing_reaches_fake() {
+        let fake = Arc::new(FakeBigQuery::default());
+        let endpoint = serve_fake_bigquery(fake.clone()).await;
+        let config = sdk_config_with_endpoint(&endpoint);
+        let transport =
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("sdk transport");
+        let rows = vec![
+            BigQueryRowEntry {
+                insert_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                json: serde_json::json!({"device_id": "sensor-101", "temp": 75.2}),
+            },
+            BigQueryRowEntry {
+                insert_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                json: serde_json::json!({"device_id": "sensor-102"}),
+            },
+        ];
+        let response = transport
+            .insert_all("my-iot-project", "telemetry", "telemetry_t", rows, "")
+            .await
+            .expect("fake insert");
+        assert!(response.failed_indices.is_empty());
+        assert_eq!(fake.call_count(), 1);
+        let captured = fake.captured_bodies();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["ignoreUnknownValues"], serde_json::json!(true));
+        assert_eq!(captured[0]["skipInvalidRows"], serde_json::json!(false));
+        assert_eq!(captured[0]["rows"].as_array().expect("rows").len(), 2);
+        assert_eq!(
+            captured[0]["rows"][0]["insertId"],
+            serde_json::json!("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            captured[0]["rows"][0]["json"]["device_id"],
+            serde_json::json!("sensor-101")
+        );
+        let path = fake.captured_paths().pop().expect("path");
+        assert!(
+            path.ends_with(
+                "/projects/my-iot-project/datasets/telemetry/tables/telemetry_t/insertAll"
+            ),
+            "unexpected path {path}"
+        );
+    }
+
+    #[test]
+    fn test_driver_response_classification() {
+        use gcp_bigquery_client::model::table_data_insert_all_response::TableDataInsertAllResponse;
+        let transient: TableDataInsertAllResponse = serde_json::from_value(serde_json::json!({
+            "insertErrors": [
+                {"index": 2, "errors": [{"reason": "backendError"}]},
+                {"index": 5, "errors": [{"reason": "rateLimitExceeded"}]},
+            ]
+        }))
+        .expect("transient parses");
+        assert_eq!(classify_driver_response(&transient).unwrap(), vec![2, 5]);
+
+        let terminal: TableDataInsertAllResponse = serde_json::from_value(serde_json::json!({
+            "insertErrors": [{"index": 0, "errors": [{"reason": "invalid"}]}]
+        }))
+        .expect("terminal parses");
+        assert!(classify_driver_response(&terminal).is_err());
+
+        let empty: TableDataInsertAllResponse =
+            serde_json::from_value(serde_json::json!({})).expect("empty parses");
+        assert_eq!(
+            classify_driver_response(&empty).unwrap(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_response_classification_reaches_fake() {
+        // Transient row errors surface as retryable indices through the
+        // driver transport, not just the pure classifier.
+        let fake = Arc::new(FakeBigQuery::with_script(vec![(
+            200,
+            serde_json::json!({
+                "insertErrors": [
+                    {"index": 1, "errors": [{"reason": "backendError"}]},
+                ]
+            }),
+        )]));
+        let endpoint = serve_fake_bigquery(fake.clone()).await;
+        let config = sdk_config_with_endpoint(&endpoint);
+        let transport =
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("sdk transport");
+        let rows = vec![
+            BigQueryRowEntry {
+                insert_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                json: serde_json::json!({"temp": 20.5}),
+            },
+            BigQueryRowEntry {
+                insert_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                json: serde_json::json!({"temp": 21.5}),
+            },
+        ];
+        let response = transport
+            .insert_all("my-iot-project", "telemetry", "t", rows, "")
+            .await
+            .expect("partial maps to indices");
+        assert_eq!(response.failed_indices, vec![1]);
+
+        // Terminal row reasons surface as dispatch errors through the
+        // same path.
+        let terminal_fake = Arc::new(FakeBigQuery::with_script(vec![(
+            200,
+            serde_json::json!({
+                "insertErrors": [{"index": 0, "errors": [{"reason": "invalid"}]}]
+            }),
+        )]));
+        let terminal_endpoint = serve_fake_bigquery(terminal_fake).await;
+        let terminal_config = sdk_config_with_endpoint(&terminal_endpoint);
+        let terminal_transport =
+            SdkBigQueryTransport::new(&terminal_config, reqwest::Client::new())
+                .expect("sdk transport");
+        let terminal_rows = vec![BigQueryRowEntry {
+            insert_id: "cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+            json: serde_json::json!({"temp": 22.5}),
+        }];
+        let err = terminal_transport
+            .insert_all("my-iot-project", "telemetry", "t", terminal_rows, "")
+            .await
+            .expect_err("terminal must fail");
+        assert!(matches!(err, ConnectorError::Dispatch(_)));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_transport_builds_offline() {
+        let config = test_config();
+        let transport =
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("sdk builds");
+        assert_eq!(transport.timeout(), config.timeout());
+
+        let mut bad = test_config();
+        bad.project_id = "UPPER SPACE".to_string();
+        assert!(SdkBigQueryTransport::new(&bad, reqwest::Client::new()).is_err());
+
+        // The driver initializes without a real server: an endpoint
+        // override plus static auth builds a client and performs a
+        // round trip against the loopback fake.
+        let fake = Arc::new(FakeBigQuery::default());
+        let endpoint = serve_fake_bigquery(fake.clone()).await;
+        let fake_config = sdk_config_with_endpoint(&endpoint);
+        let fake_transport = SdkBigQueryTransport::new(&fake_config, reqwest::Client::new())
+            .expect("fake transport builds");
+        let client = fake_transport
+            .driver_client()
+            .await
+            .expect("driver initializes offline");
+        let _ = client.tabledata();
+        assert_eq!(fake_transport.timeout(), fake_config.timeout());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sink_flush_against_fake() {
+        // Offline qualification mirror: 1000 rule-shaped rows through
+        // `BigQuerySink` on `SdkBigQueryTransport`, row count asserted
+        // on the fake plus selective requeue of only failed rows.
+        let fake = Arc::new(FakeBigQuery::default());
+        let endpoint = serve_fake_bigquery(fake.clone()).await;
+        let mut config = sdk_config_with_endpoint(&endpoint);
+        config.batch_size = Some(100);
+        config.batch_bytes = Some(1_048_576);
+        config.linger_ms = Some(20);
+        config.max_retries = Some(4);
+        config.initial_backoff_ms = Some(1);
+        config.max_backoff_ms = Some(2);
+        config.timeout_ms = Some(15_000);
+        assert_eq!(config.timeout(), Duration::from_millis(15_000));
+        let transport = Arc::new(
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("sink transport"),
+        );
+        let sink = BigQuerySink::new(config, transport).expect("sink");
+        assert_eq!(sink.kind(), "bigquery");
+        let topic = Topic::new("sensors/qual").expect("topic");
+        for seq in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":{temp},"seq":{seq}}}"#,
+                temp = 20.0 + f64::from(seq) * 0.01
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("send");
+        }
+        sink.flush().await.expect("flush");
+        assert_eq!(sink.sent_records(), 1000);
+        let total: usize = fake
+            .captured_bodies()
+            .iter()
+            .map(|body| body["rows"].as_array().map_or(0, |rows| rows.len()))
+            .sum();
+        assert_eq!(total, 1000);
+        let bodies = fake.captured_bodies();
+        let first = bodies.first().expect("first batch");
+        assert_eq!(
+            first["rows"][0]["json"]["device_id"]
+                .as_str()
+                .expect("device"),
+            "dev-0000"
+        );
+
+        // Partial-failure retry requeues only failed rows through the
+        // same sink path.
+        let partial_fake = Arc::new(FakeBigQuery::with_script(vec![
+            (
+                200,
+                serde_json::json!({
+                    "insertErrors": [{"index": 1, "errors": [{"reason": "rateLimitExceeded"}]}]
+                }),
+            ),
+            (200, serde_json::json!({})),
+        ]));
+        let partial_endpoint = serve_fake_bigquery(partial_fake.clone()).await;
+        let mut partial_config = sdk_config_with_endpoint(&partial_endpoint);
+        partial_config.batch_size = Some(10);
+        partial_config.initial_backoff_ms = Some(1);
+        partial_config.max_backoff_ms = Some(2);
+        let partial_transport = Arc::new(
+            SdkBigQueryTransport::new(&partial_config, reqwest::Client::new())
+                .expect("partial transport"),
+        );
+        let partial_sink = BigQuerySink::new(partial_config, partial_transport).expect("sink");
+        let retry_topic = Topic::new("t").expect("topic");
+        for temp in [20.5, 21.5] {
+            partial_sink
+                .send(
+                    &retry_topic,
+                    &Bytes::from(format!("{{\"temp\":{temp}}}")),
+                    QoS::AtMostOnce,
+                )
+                .await
+                .expect("send");
+        }
+        partial_sink.flush().await.expect("retry flush");
+        assert_eq!(partial_fake.call_count(), 2);
+        let retry_bodies = partial_fake.captured_bodies();
+        let second = retry_bodies.get(1).expect("retry body");
+        assert_eq!(second["rows"].as_array().expect("rows").len(), 1);
+        assert_eq!(second["rows"][0]["json"]["temp"], serde_json::json!(21.5));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_throttle_and_timeout_wire_config() {
+        // HTTP 429 from the fake maps to a retryable connection error.
+        let throttle_fake = Arc::new(FakeBigQuery::with_script(vec![(
+            429,
+            serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "throttled",
+                    "errors": [],
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            }),
+        )]));
+        let throttle_endpoint = serve_fake_bigquery(throttle_fake).await;
+        let throttle_config = sdk_config_with_endpoint(&throttle_endpoint);
+        let throttle_transport =
+            SdkBigQueryTransport::new(&throttle_config, reqwest::Client::new()).expect("transport");
+        let err = throttle_transport
+            .insert_all(
+                "my-iot-project",
+                "telemetry",
+                "t",
+                vec![BigQueryRowEntry {
+                    insert_id: "dddddddd-dddd-dddd-dddd-dddddddddddd".to_string(),
+                    json: serde_json::json!({"temp": 1.0}),
+                }],
+                "",
+            )
+            .await
+            .expect_err("429 must retry");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+
+        // A slow fake plus a short `timeout_ms` surfaces as a timeout
+        // connection error, proving `timeout()` is read.
+        let slow_fake = Arc::new(FakeBigQuery::default());
+        *slow_fake.delay_ms.lock() = 500;
+        let slow_endpoint = serve_fake_bigquery(slow_fake).await;
+        let mut slow_config = sdk_config_with_endpoint(&slow_endpoint);
+        slow_config.timeout_ms = Some(50);
+        assert_eq!(slow_config.timeout(), Duration::from_millis(50));
+        let slow_transport =
+            SdkBigQueryTransport::new(&slow_config, reqwest::Client::new()).expect("transport");
+        assert_eq!(slow_transport.timeout(), Duration::from_millis(50));
+        let slow_err = slow_transport
+            .insert_all(
+                "my-iot-project",
+                "telemetry",
+                "t",
+                vec![BigQueryRowEntry {
+                    insert_id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".to_string(),
+                    json: serde_json::json!({"temp": 2.0}),
+                }],
+                "",
+            )
+            .await
+            .expect_err("slow fake must time out");
+        assert!(matches!(slow_err, ConnectorError::Connection(_)));
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_insert_all_against_fake() {
+        // The retained hand-written transport stays wired: it posts the
+        // legacy body to `{base}/projects/.../insertAll` with the
+        // configured timeout and the sink-config flags (no hardcoded
+        // `ignoreUnknownValues` / `skipInvalidRows`).
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        #[derive(Default)]
+        struct CapturedHttp {
+            path: parking_lot::Mutex<String>,
+            body: parking_lot::Mutex<String>,
+        }
+        async fn handler(
+            State(captured): State<Arc<CapturedHttp>>,
+            uri: axum::http::Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            *captured.path.lock() = uri.path().to_string();
+            *captured.body.lock() = body;
+            (StatusCode::OK, "{}".to_string())
+        }
+        let captured = Arc::new(CapturedHttp::default());
+        let app = Router::new()
+            .route("/*rest", post(handler))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let mut config = test_config();
+        config.endpoint = Some(format!("http://127.0.0.1:{port}"));
+        config.timeout_ms = Some(5_000);
+        let transport =
+            HttpBigQueryTransport::new(&config, reqwest::Client::new()).expect("http transport");
+        assert_eq!(transport.base(), config.base_url());
+        let rows = vec![BigQueryRowEntry {
+            insert_id: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+            json: serde_json::json!({"device_id": "sensor-101"}),
+        }];
+        let response = transport
+            .insert_all("my-iot-project", "telemetry", "sensor_logs", rows, "")
+            .await
+            .expect("http fake insert");
+        assert!(response.failed_indices.is_empty());
+        assert!(
+            captured.path.lock().ends_with(
+                "/projects/my-iot-project/datasets/telemetry/tables/sensor_logs/insertAll"
+            ),
+            "unexpected {}",
+            captured.path.lock()
+        );
+        assert!(captured.body.lock().contains("sensor-101"));
+        assert_eq!(transport.flags(), (true, false));
+        assert!(captured
+            .body
+            .lock()
+            .contains("\"ignoreUnknownValues\":true"));
+        assert!(captured.body.lock().contains("\"skipInvalidRows\":false"));
+
+        // Flipped flags also reach the wire (proves no hardcoded constants).
+        let mut flipped_config = test_config();
+        flipped_config.endpoint = Some(config.endpoint.clone().expect("endpoint"));
+        flipped_config.ignore_unknown_values = false;
+        flipped_config.skip_invalid_rows = true;
+        let flipped =
+            HttpBigQueryTransport::new(&flipped_config, reqwest::Client::new()).expect("flipped");
+        assert_eq!(flipped.flags(), (false, true));
+        let flipped_rows = vec![BigQueryRowEntry {
+            insert_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            json: serde_json::json!({"device_id": "sensor-102"}),
+        }];
+        flipped
+            .insert_all(
+                "my-iot-project",
+                "telemetry",
+                "sensor_logs",
+                flipped_rows,
+                "",
+            )
+            .await
+            .expect("flipped fake insert");
+        assert!(captured
+            .body
+            .lock()
+            .contains("\"ignoreUnknownValues\":false"));
+        assert!(captured.body.lock().contains("\"skipInvalidRows\":true"));
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real BigQuery server via the maintained
+    /// `gcp-bigquery-client` driver.
+    ///
+    /// Run with e.g.:
+    /// `BIGQUERY_PROJECT=my-project BIGQUERY_DATASET=qual_b306
+    ///  BIGQUERY_TABLE=qual_rows
+    ///  GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json \
+    ///  cargo test -p broker-connectors --lib bigquery::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// Creates the dataset/table, streams 1000 rows through [`BigQuerySink`]
+    /// on [`SdkBigQueryTransport`] (rule-shaped JSON), asserts row count and
+    /// schema through the driver, then proves the mock partial-failure path
+    /// requeues only failed rows. Cleans up the table it created and removes
+    /// the dataset when it created it.
+    #[tokio::test]
+    #[ignore = "needs a real BigQuery server (see BIGQUERY_* env)"]
+    async fn test_qualify_driver_write_path() {
+        let project = qual_env("BIGQUERY_PROJECT").unwrap_or_default();
+        if project.is_empty() {
+            eprintln!("BIGQUERY_PROJECT is empty; skipping qualification");
+            return;
+        }
+        let dataset_id = qual_env("BIGQUERY_DATASET").unwrap_or_else(|| "bq_qual_b306".to_string());
+        let table_id = qual_env("BIGQUERY_TABLE").unwrap_or_else(|| "qual_rows".to_string());
+        let sa_key_file = qual_env("GOOGLE_APPLICATION_CREDENTIALS")
+            .or_else(|| qual_env("BIGQUERY_SA_KEY_FILE"))
+            .unwrap_or_default();
+        let endpoint = qual_env("BIGQUERY_ENDPOINT");
+        if sa_key_file.is_empty() && endpoint.is_none() {
+            eprintln!("no service-account key and no BIGQUERY_ENDPOINT; skipping qualification");
+            return;
+        }
+
+        let driver_client: gcp_bigquery_client::Client = if sa_key_file.is_empty() {
+            let auth: std::sync::Arc<dyn gcp_bigquery_client::auth::Authenticator> =
+                std::sync::Arc::new(StaticTokenAuthenticator {
+                    token: qual_env("BIGQUERY_TOKEN").unwrap_or_default(),
+                });
+            let mut builder = gcp_bigquery_client::client_builder::ClientBuilder::new();
+            if let Some(endpoint) = endpoint.clone() {
+                builder.with_v2_base_url(format!("{}/bigquery/v2", endpoint.trim_end_matches('/')));
+            }
+            builder
+                .build_from_authenticator(auth)
+                .await
+                .expect("qual driver client")
+        } else {
+            eprintln!("qual server: sa_key_file set, project={project}");
+            gcp_bigquery_client::Client::from_service_account_key_file(&sa_key_file)
+                .await
+                .expect("qual driver client from key file")
+        };
+        eprintln!("qual server: project={project} dataset={dataset_id} table={table_id}");
+
+        // Ensure dataset (remember whether we created it for cleanup).
+        let mut created_dataset = false;
+        if driver_client
+            .dataset()
+            .get(&project, &dataset_id)
+            .await
+            .is_err()
+        {
+            driver_client
+                .dataset()
+                .create(gcp_bigquery_client::model::dataset::Dataset::new(
+                    &project,
+                    &dataset_id,
+                ))
+                .await
+                .expect("qual create dataset");
+            created_dataset = true;
+        }
+        driver_client
+            .table()
+            .delete_if_exists(&project, &dataset_id, &table_id)
+            .await;
+        let schema = gcp_bigquery_client::model::table_schema::TableSchema::new(vec![
+            gcp_bigquery_client::model::table_field_schema::TableFieldSchema::new(
+                "device_id",
+                gcp_bigquery_client::model::field_type::FieldType::String,
+            ),
+            gcp_bigquery_client::model::table_field_schema::TableFieldSchema::new(
+                "temp",
+                gcp_bigquery_client::model::field_type::FieldType::Float,
+            ),
+            gcp_bigquery_client::model::table_field_schema::TableFieldSchema::new(
+                "seq",
+                gcp_bigquery_client::model::field_type::FieldType::Integer,
+            ),
+        ]);
+        let table = gcp_bigquery_client::model::table::Table::from_dataset(
+            &gcp_bigquery_client::model::dataset::Dataset::new(&project, &dataset_id),
+            &table_id,
+            schema,
+        );
+        driver_client
+            .table()
+            .create(table)
+            .await
+            .expect("qual create table");
+
+        let config = BigQuerySinkConfig {
+            project_id: project.clone(),
+            dataset_id: dataset_id.clone(),
+            table_template: table_id.clone(),
+            endpoint: endpoint.clone(),
+            auth: GcpAuth::None,
+            ignore_unknown_values: true,
+            skip_invalid_rows: false,
+            template_suffix: None,
+            batch_size: Some(100),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(15_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(
+            SdkBigQueryTransport::new(&config, reqwest::Client::new()).expect("qual transport"),
+        );
+        let sink = BigQuerySink::new(config, transport).expect("qual sink");
+        assert_eq!(sink.kind(), "bigquery");
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"dev-{seq:04}","temp":{temp},"seq":{seq}}}"#,
+                temp = 20.0 + f64::from(seq) * 0.01
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1000);
+
+        // Row count through the driver (paginated list).
+        let mut counted = 0usize;
+        let mut page_token: Option<String> = None;
+        loop {
+            let params = gcp_bigquery_client::tabledata::ListQueryParameters {
+                start_index: None,
+                max_results: Some(1000),
+                page_token: page_token.clone(),
+                selected_fields: None,
+                format_options: None,
+            };
+            let page = driver_client
+                .tabledata()
+                .list(&project, &dataset_id, &table_id, params)
+                .await
+                .expect("qual list rows");
+            counted += page.rows.unwrap_or_default().len();
+            let next = page.page_token.unwrap_or_default();
+            if next.is_empty() {
+                break;
+            }
+            page_token = Some(next);
+        }
+        assert_eq!(counted, 1000);
+
+        // Schema through the driver.
+        let fetched = driver_client
+            .table()
+            .get(&project, &dataset_id, &table_id, None)
+            .await
+            .expect("qual get table");
+        let names: Vec<String> = fetched
+            .schema
+            .fields
+            .unwrap_or_default()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        for expected in ["device_id", "temp", "seq"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "schema has {expected}"
+            );
+        }
+
+        // Partial-failure retry still requeues only failed rows (mock path).
+        let mut mock_config = test_config();
+        mock_config.batch_size = Some(10);
+        mock_config.initial_backoff_ms = Some(1);
+        mock_config.max_backoff_ms = Some(2);
+        let (mock_sink, mock_transport) = test_sink(mock_config);
+        mock_transport.script_outcomes(vec![
+            MockBigQueryOutcome::PartialFailed(vec![1]),
+            MockBigQueryOutcome::Accepted,
+        ]);
+        let mock_topic = Topic::new("t").unwrap();
+        for temp in [20.5, 21.5] {
+            mock_sink
+                .send(
+                    &mock_topic,
+                    &Bytes::from(format!("{{\"temp\":{temp}}}")),
+                    QoS::AtMostOnce,
+                )
+                .await
+                .unwrap();
+        }
+        mock_sink.flush().await.unwrap();
+        assert_eq!(mock_transport.calls(), 2);
+        assert_eq!(mock_transport.captured()[1].rows.len(), 1);
+
+        // Cleanup the rows we inserted.
+        driver_client
+            .table()
+            .delete(&project, &dataset_id, &table_id)
+            .await
+            .expect("qual cleanup table");
+        if created_dataset {
+            driver_client
+                .dataset()
+                .delete(&project, &dataset_id, true)
+                .await
+                .expect("qual cleanup dataset");
+        }
     }
 }

@@ -1265,11 +1265,8 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid azure_blob config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpAzureBlobTransport::new(
-                        &config,
-                        reqwest::Client::new(),
-                    )
-                    .map_err(|e| format!("invalid azure_blob transport: {e}"))?,
+                    broker_connectors::HttpAzureBlobTransport::new(&config, reqwest::Client::new())
+                        .map_err(|e| format!("invalid azure_blob transport: {e}"))?,
                 );
                 let sink = broker_connectors::AzureBlobSink::new(config, transport)
                     .map_err(|e| format!("invalid azure_blob sink: {e}"))?;
@@ -1386,7 +1383,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid cassandra config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::NativeCassandraTransport::new(&config)
+                    broker_connectors::ScyllaCassandraTransport::new(&config)
                         .map_err(|e| format!("invalid cassandra transport: {e}"))?,
                 );
                 let sink = broker_connectors::CassandraSink::new(config, transport)
@@ -1530,7 +1527,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid bigquery config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpBigQueryTransport::new(&config, reqwest::Client::new())
+                    broker_connectors::SdkBigQueryTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid bigquery transport: {e}"))?,
                 );
                 let sink = broker_connectors::BigQuerySink::new(config, transport)
@@ -1592,7 +1589,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid alloydb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpAlloydbTransport::new(&config),
+                    broker_connectors::PgDriverAlloydbTransport::new(&config),
                 );
                 let sink = broker_connectors::AlloydbSink::new(config, transport)
                     .map_err(|e| format!("invalid alloydb sink: {e}"))?;
@@ -5483,7 +5480,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("oci_streaming"));
 
-        // AWS IoT Core sink: validated without opening any socket.
+        // AWS IoT Core sink: mTLS-only build, validated without opening any socket.
+        // SigV4/WebSocket is intentionally not built (no licence-compliant
+        // WebSocket client); SigV4 configs are rejected at registration.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -5492,10 +5491,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                        "config": {"endpoint": "abc-ats.iot.us-east-1.amazonaws.com",
                                   "region": "us-east-1",
                                   "client_id": "indra-bridge-1",
-                                  "auth": {"type": "sigv4",
-                                            "access_key_id": "AKID",
-                                            "secret_access_key": "secret",
-                                            "session_token": null},
+                                  "auth": {"type": "mtls",
+                                            "ca_cert_pem": include_str!("../../broker-connectors/testdata/ca-cert.pem"),
+                                            "client_cert_pem": include_str!("../../broker-connectors/testdata/client-cert.pem"),
+                                            "client_key_pem": include_str!("../../broker-connectors/testdata/client-key.pem")},
                                   "topic_mappings": [{"local_topic": "sensors/+",
                                                       "remote_topic": "indra/up",
                                                       "direction": "localtoremote"}],
@@ -6054,6 +6053,339 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body.as_array().expect("list").len(), 48);
+    }
+
+    #[tokio::test]
+    async fn s101_no_default_credentials_rejects_and_accepts() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Runtime-generated test RSA key (never stored, never deployed).
+        // Test-only fixture; no shipped path can reach it (`#[cfg(test)]` only).
+        // `rsa` 0.9 expects `rand_core` 0.6 while the workspace uses `rand`
+        // 0.10: bridge the two with a thin adapter over the workspace RNG
+        // (a CSPRNG, so marking it `CryptoRng` is sound).
+        struct CompatRng(rand::rngs::ThreadRng);
+        impl rsa::rand_core::RngCore for CompatRng {
+            fn next_u32(&mut self) -> u32 {
+                rand::Rng::next_u32(&mut self.0)
+            }
+            fn next_u64(&mut self) -> u64 {
+                rand::Rng::next_u64(&mut self.0)
+            }
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                rand::Rng::fill_bytes(&mut self.0, dest)
+            }
+            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+                rand::Rng::fill_bytes(&mut self.0, dest);
+                Ok(())
+            }
+        }
+        impl rsa::rand_core::CryptoRng for CompatRng {}
+        let mut rng = CompatRng(rand::rng());
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let test_pem =
+            rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&private_key, rsa::pkcs8::LineEnding::LF)
+                .expect("encode test key")
+                .to_string();
+
+        // gcp_iot without a key is 400 naming the field, and registers nothing.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-gcp-no-key", "type": "gcp_iot",
+                       "project_id": "e2e-project", "cloud_region": "us-central1",
+                       "registry_id": "e2e-registry", "device_id": "e2e-device"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("private_key_pem"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-gcp-no-key").is_none());
+
+        // gcp_iot with a key is 201 and live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-gcp-1", "type": "gcp_iot",
+                       "project_id": "e2e-project", "cloud_region": "us-central1",
+                       "registry_id": "e2e-registry", "device_id": "e2e-device",
+                       "private_key_pem": test_pem}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-gcp-1").is_some());
+
+        // snowflake without a key is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-snow-no-key", "type": "snowflake",
+                       "account": "xy12345.us-east-1", "user": "indra_loader",
+                       "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("private_key_pem"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-snow-no-key").is_none());
+
+        // snowflake with a key is 201 and live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-snow-1", "type": "snowflake",
+                       "account": "xy12345.us-east-1", "user": "indra_loader",
+                       "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY",
+                       "private_key_pem": test_pem}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-snow-1").is_some());
+
+        // oci without a key is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-oci-no-key", "type": "oci_streaming",
+                       "stream_pool_id": "ocid1.streampool.oc1..testpool",
+                       "stream_id": "ocid1.stream.oc1..teststream",
+                       "tenancy_ocid": "ocid1.tenancy.oc1..test",
+                       "user_ocid": "ocid1.user.oc1..test",
+                       "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("private_key_pem"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-oci-no-key").is_none());
+
+        // oci with a key is 201 and live (dummy loopback endpoint so the
+        // reachability probe passes without touching any cloud).
+        let oci_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dummy");
+        let oci_endpoint = format!(
+            "http://127.0.0.1:{}",
+            oci_listener.local_addr().expect("addr").port()
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-oci-1", "type": "oci_streaming",
+                       "stream_pool_id": "ocid1.streampool.oc1..testpool",
+                       "stream_id": "ocid1.stream.oc1..teststream",
+                       "tenancy_ocid": "ocid1.tenancy.oc1..test",
+                       "user_ocid": "ocid1.user.oc1..test",
+                       "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55",
+                       "private_key_pem": test_pem,
+                       "endpoint": oci_endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-oci-1").is_some());
+        drop(oci_listener);
+
+        // databricks without a token is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-db-no-token", "type": "databricks",
+                       "host": "my-workspace.cloud.databricks.com",
+                       "catalog": "main", "schema": "default", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("token"),
+            "missing token must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-db-no-token").is_none());
+
+        // databricks with a token is 201 and live (dummy loopback target so
+        // the reachability probe passes without touching any workspace).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dummy");
+        let port = listener.local_addr().expect("addr").port();
+        let host = format!("127.0.0.1:{port}");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-db-1", "type": "databricks",
+                       "host": host, "token": "dapi-test-token",
+                       "catalog": "main", "schema": "default", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-db-1").is_some());
+        drop(listener);
+
+        // tablestore without secrets is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-ots-no-key", "type": "tablestore",
+                       "instance_name": "test-instance-1", "table_name": "sensor_data",
+                       "access_key_id": "test-ak-1"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("access_key_secret"),
+            "missing secret must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-ots-no-key").is_none());
+
+        // tablestore with secrets is 201 and live (dummy loopback endpoint
+        // so the reachability probe passes without touching any cloud).
+        let ots_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dummy");
+        let ots_endpoint = format!(
+            "http://127.0.0.1:{}",
+            ots_listener.local_addr().expect("addr").port()
+        );
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-ots-1", "type": "tablestore",
+                       "instance_name": "test-instance-1", "table_name": "sensor_data",
+                       "access_key_id": "test-ak-1", "access_key_secret": "test-sk-1",
+                       "endpoint": ots_endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-ots-1").is_some());
+        drop(ots_listener);
+
+        // confluent without credentials is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-conf-no-key", "type": "confluent",
+                       "bootstrap_servers": "127.0.0.1:9092",
+                       "topic": "telemetry-events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("api_key"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-conf-no-key").is_none());
+
+        // confluent with credentials is 201 and live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-conf-1", "type": "confluent",
+                       "bootstrap_servers": "127.0.0.1:9092",
+                       "topic": "telemetry-events",
+                       "api_key": "s101-cc-key",
+                       "api_secret": "s101-cc-secret"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-conf-1").is_some());
+
+        // azure_eventhubs without a key is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-eh-no-key", "type": "azure_eventhubs",
+                       "namespace": "s101ns", "event_hub": "s101hub"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("shared_access_key"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-eh-no-key").is_none());
+
+        // azure_eventhubs with a key is 201 and live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-eh-1", "type": "azure_eventhubs",
+                       "namespace": "s101ns", "event_hub": "s101hub",
+                       "shared_access_key_name": "SendPolicy",
+                       "shared_access_key": "dGVzdC1rZXktb3BlcmF0b3Itc3VwcGxpZWQ="}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-eh-1").is_some());
+
+        // azure_iot without a key is 400 naming the field.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-aiot-no-key", "type": "azure_iot",
+                       "iot_hub_name": "127.0.0.1:8883",
+                       "device_id": "s101-device"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("shared_access_key"),
+            "missing key must be named, got: {body}"
+        );
+        assert!(state.engine.connectors().get("s101-aiot-no-key").is_none());
+
+        // azure_iot with a key is 201 and live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "s101-aiot-1", "type": "azure_iot",
+                       "iot_hub_name": "127.0.0.1:8883",
+                       "device_id": "s101-device",
+                       "shared_access_key": "dGVzdC1rZXktb3BlcmF0b3Itc3VwcGxpZWQ="}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("s101-aiot-1").is_some());
     }
 
     #[tokio::test]

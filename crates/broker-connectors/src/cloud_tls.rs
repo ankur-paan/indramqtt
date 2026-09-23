@@ -97,18 +97,27 @@ pub(crate) fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> 
     ))
 }
 
-/// Root store: platform Mozilla roots plus one optional extra bundle.
+/// Root store: OS system trust store plus one optional extra bundle.
+/// Falls back to bundled Mozilla roots when the OS store is empty or
+/// unreadable so loopback/offline tests still build.
 pub(crate) fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> {
     let mut store = RootCertStore::empty();
-    store.extend(
-        webpki_roots::TLS_SERVER_ROOTS
-            .iter()
-            .map(|ta| rustls::pki_types::TrustAnchor {
+    let native = rustls_native_certs::load_native_certs();
+    let mut loaded = 0usize;
+    for cert in native.certs {
+        if store.add(cert).is_ok() {
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::pki_types::TrustAnchor {
                 subject: ta.subject.to_vec().into(),
                 subject_public_key_info: ta.spki.to_vec().into(),
                 name_constraints: ta.name_constraints.map(|nc| nc.to_vec().into()),
-            }),
-    );
+            }
+        }));
+    }
     if let Some(pem) = extra_pem {
         if pem.trim().is_empty() {
             return Ok(store);

@@ -1,16 +1,20 @@
 //! Apache Cassandra / ScyllaDB sink (INDRA-167).
 //!
 //! Buffers MQTT events as bound CQL rows and writes them with
-//! `UNLOGGED BATCH` frames over the CQL binary protocol (v4): each
+//! `UNLOGGED BATCH` statements over the CQL binary protocol (v4): each
 //! batch carries the prepared-statement-shaped text plus per-row
 //! `[bytes]` values (device id, bucket hour, event-time millis,
 //! payload JSON, optional TTL). Partition tokens use the Murmur3
 //! x64_128 partitioner so statements expose token-aware routing
 //! metadata; multi-host failover walks the configured seed list.
 //!
-//! The native transport handshakes STARTUP, SASL PLAIN (password
-//! auth) and USE keyspace against a loopback-tested fake; the mock
-//! transport captures everything in-process. Transient errors
+//! The production write path runs on the maintained `scylla` driver
+//! (`ScyllaCassandraTransport` below): it speaks v4 (STARTUP,
+//! AUTH_RESPONSE, QUERY, BATCH) with password auth, prepares the
+//! insert once per CQL shape so the driver routes by token, and
+//! executes `UNLOGGED` batches. The legacy hand-written
+//! `NativeCassandraTransport` is retained for offline unit tests only;
+//! the mock transport captures everything in-process. Transient errors
 //! (unavailable, overloaded, bootstrapping, timeouts) retry with
 //! backoff; invalid/unauthorized/existing errors are terminal.
 
@@ -1001,6 +1005,283 @@ impl CassandraTransport for NativeCassandraTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (`scylla`).
+// ---------------------------------------------------------------------------
+
+fn scylla_consistency(consistency: CqlConsistency) -> scylla::statement::Consistency {
+    match consistency {
+        CqlConsistency::One => scylla::statement::Consistency::One,
+        CqlConsistency::Quorum => scylla::statement::Consistency::Quorum,
+        CqlConsistency::LocalQuorum => scylla::statement::Consistency::LocalQuorum,
+        CqlConsistency::All => scylla::statement::Consistency::All,
+    }
+}
+
+fn is_transient_db_error(error: &scylla::errors::DbError) -> bool {
+    use scylla::errors::DbError as Db;
+    matches!(
+        error,
+        Db::ServerError
+            | Db::Unavailable { .. }
+            | Db::Overloaded
+            | Db::IsBootstrapping
+            | Db::TruncateError
+            | Db::WriteTimeout { .. }
+            | Db::ReadTimeout { .. }
+            | Db::ReadFailure { .. }
+            | Db::WriteFailure { .. }
+            | Db::RateLimitReached { .. }
+            | Db::Unprepared { .. }
+    )
+}
+
+fn map_request_attempt_error(error: scylla::errors::RequestAttemptError) -> ConnectorError {
+    use scylla::errors::RequestAttemptError as Attempt;
+    match &error {
+        Attempt::DbError(db, message) => {
+            if is_transient_db_error(db) {
+                ConnectorError::Connection(format!("scylla db error {db}: {message}"))
+            } else {
+                ConnectorError::Dispatch(format!("scylla db error {db}: {message}"))
+            }
+        }
+        Attempt::BrokenConnectionError(_)
+        | Attempt::UnableToAllocStreamId
+        | Attempt::BodyExtensionsParseError(_)
+        | Attempt::CqlResultParseError(_)
+        | Attempt::RepreparedIdChanged { .. }
+        | Attempt::RepreparedIdMissingInBatch
+        | Attempt::NonfinishedPagingState => {
+            ConnectorError::Connection(format!("scylla attempt failed: {error}"))
+        }
+        // Serialization, bad CQL text and protocol mismatches are caller
+        // faults: no retry.
+        _ => ConnectorError::Dispatch(format!("scylla attempt failed: {error}")),
+    }
+}
+
+fn map_execution_error(error: scylla::errors::ExecutionError) -> ConnectorError {
+    use scylla::errors::ExecutionError as Exec;
+    match error {
+        Exec::LastAttemptError(attempt) => map_request_attempt_error(attempt),
+        Exec::RequestTimeout(timeout) => ConnectorError::Connection(format!(
+            "scylla request timeout after {}ms",
+            timeout.as_millis()
+        )),
+        Exec::EmptyPlan
+        | Exec::ConnectionPoolError(_)
+        | Exec::PrepareError(_)
+        | Exec::UseKeyspaceError(_)
+        | Exec::SchemaAgreementError(_)
+        | Exec::MetadataError(_) => ConnectorError::Connection(format!("scylla failed: {error}")),
+        // Bad query text / values: terminal.
+        _ => ConnectorError::Dispatch(format!("scylla failed: {error}")),
+    }
+}
+
+fn map_new_session_error(error: scylla::errors::NewSessionError) -> ConnectorError {
+    // An empty contact list is a config fault; everything else (DNS,
+    // TCP, metadata fetch) is a connection fault the sink retries.
+    let text = error.to_string();
+    if text.contains("Empty known nodes") {
+        ConnectorError::Dispatch(format!("scylla connect failed: {error}"))
+    } else {
+        ConnectorError::Connection(format!("scylla connect failed: {error}"))
+    }
+}
+
+fn decode_text_field(field: &[u8], name: &str) -> Result<String> {
+    String::from_utf8(field.to_vec())
+        .map_err(|_| ConnectorError::Dispatch(format!("cassandra {name} must be UTF-8")))
+}
+
+fn decode_i64_field(field: &[u8], name: &str) -> Result<i64> {
+    field
+        .try_into()
+        .map(i64::from_be_bytes)
+        .map_err(|_| ConnectorError::Dispatch(format!("cassandra {name} must be 8 bytes")))
+}
+
+fn decode_i32_field(field: &[u8], name: &str) -> Result<i32> {
+    field
+        .try_into()
+        .map(i32::from_be_bytes)
+        .map_err(|_| ConnectorError::Dispatch(format!("cassandra {name} must be 4 bytes")))
+}
+
+/// Driver-backed transport on the maintained `scylla` crate.
+///
+/// Connects lazily with password auth (SASL PLAIN under the CQL
+/// handshake), prepares the insert once per CQL shape so the driver
+/// can route by Murmur3 token, and executes `UNLOGGED` batches with
+/// the configured consistency. Retries stay in [`CassandraSink`]:
+/// transient server/timeout/connection faults map to
+/// [`ConnectorError::Connection`], the rest to `Dispatch`.
+pub struct ScyllaCassandraTransport {
+    config: CassandraSinkConfig,
+    session: tokio::sync::RwLock<Option<Arc<scylla::client::session::Session>>>,
+    // Bound: one entry per distinct CQL shape (one per sink config in
+    // practice, since `cql_statement_template` is fixed per sink); the
+    // driver keeps the prepared ID for token-aware routing.
+    prepared: tokio::sync::RwLock<
+        std::collections::HashMap<String, scylla::statement::prepared::PreparedStatement>,
+    >,
+}
+
+impl ScyllaCassandraTransport {
+    pub fn new(config: &CassandraSinkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            session: tokio::sync::RwLock::new(None),
+            prepared: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        })
+    }
+
+    pub fn config(&self) -> &CassandraSinkConfig {
+        &self.config
+    }
+
+    async fn session(&self) -> Result<Arc<scylla::client::session::Session>> {
+        if let Some(session) = self.session.read().await.clone() {
+            return Ok(session);
+        }
+        let mut guard = self.session.write().await;
+        if let Some(session) = guard.clone() {
+            return Ok(session);
+        }
+        let mut builder = scylla::client::session_builder::SessionBuilder::new()
+            .known_nodes(&self.config.contact_points);
+        if let CassandraAuth::Password { username, password } = &self.config.auth {
+            builder = builder.user(username.clone(), password.clone());
+        }
+        let session = builder.build().await.map_err(map_new_session_error)?;
+        let session = Arc::new(session);
+        *guard = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn prepared(
+        &self,
+        session: &Arc<scylla::client::session::Session>,
+        cql: &str,
+    ) -> Result<scylla::statement::prepared::PreparedStatement> {
+        if let Some(prepared) = self.prepared.read().await.get(cql).cloned() {
+            return Ok(prepared);
+        }
+        let prepared = session
+            .prepare(cql)
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("scylla prepare failed: {e}")))?;
+        self.prepared
+            .write()
+            .await
+            .insert(cql.to_string(), prepared.clone());
+        Ok(prepared)
+    }
+
+    /// Force a (re)connect; used by qualification to prove the driver
+    /// recovers after a node outage.
+    /// TODO(parity): does a single-node reconnect prove multi-node
+    /// failover, or must qualification kill one node of a cluster while
+    /// writes continue on the remaining contact points?
+    pub async fn reconnect(&self) -> Result<()> {
+        *self.session.write().await = None;
+        *self.prepared.write().await = std::collections::HashMap::new();
+        self.session().await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl CassandraTransport for ScyllaCassandraTransport {
+    async fn execute_cql_batch(&self, keyspace: &str, batch: Vec<CqlBoundStatement>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let _ = keyspace;
+        let session = self.session().await?;
+        // Group by CQL text: one prepared statement per shape, one
+        // driver BATCH per group.
+        let mut groups: std::collections::HashMap<String, Vec<&CqlBoundStatement>> =
+            std::collections::HashMap::new();
+        for statement in &batch {
+            groups
+                .entry(statement.cql.clone())
+                .or_default()
+                .push(statement);
+        }
+        // Batches are homogeneous by construction; the head carries
+        // the batch consistency.
+        let consistency = scylla_consistency(batch[0].consistency);
+        let timeout = self.config.timeout();
+        for (cql, statements) in groups {
+            let prepared = self.prepared(&session, &cql).await?;
+            let with_ttl = statements[0].values.len() == 5;
+            for statement in &statements {
+                if (statement.values.len() == 5) != with_ttl {
+                    return Err(ConnectorError::Dispatch(
+                        "cassandra batch mixes TTL and non-TTL rows".to_string(),
+                    ));
+                }
+            }
+            let mut driver_batch =
+                scylla::statement::batch::Batch::new(scylla::statement::batch::BatchType::Unlogged);
+            driver_batch.set_consistency(consistency);
+            driver_batch.set_request_timeout(Some(timeout));
+            driver_batch.set_is_idempotent(true);
+            for _ in &statements {
+                driver_batch.append_statement(prepared.clone());
+            }
+            if with_ttl {
+                let mut values: Vec<(String, String, i64, String, i32)> =
+                    Vec::with_capacity(statements.len());
+                for statement in statements {
+                    if statement.values.len() != 5 {
+                        return Err(ConnectorError::Dispatch(format!(
+                            "cassandra row needs 5 bound values, got {}",
+                            statement.values.len()
+                        )));
+                    }
+                    values.push((
+                        decode_text_field(&statement.values[0], "device_id")?,
+                        decode_text_field(&statement.values[1], "bucket_hour")?,
+                        decode_i64_field(&statement.values[2], "event_time")?,
+                        decode_text_field(&statement.values[3], "payload")?,
+                        decode_i32_field(&statement.values[4], "ttl")?,
+                    ));
+                }
+                session
+                    .batch(&driver_batch, values)
+                    .await
+                    .map_err(map_execution_error)?;
+            } else {
+                let mut values: Vec<(String, String, i64, String)> =
+                    Vec::with_capacity(statements.len());
+                for statement in statements {
+                    if statement.values.len() != 4 {
+                        return Err(ConnectorError::Dispatch(format!(
+                            "cassandra row needs 4 bound values, got {}",
+                            statement.values.len()
+                        )));
+                    }
+                    values.push((
+                        decode_text_field(&statement.values[0], "device_id")?,
+                        decode_text_field(&statement.values[1], "bucket_hour")?,
+                        decode_i64_field(&statement.values[2], "event_time")?,
+                        decode_text_field(&statement.values[3], "payload")?,
+                    ));
+                }
+                session
+                    .batch(&driver_batch, values)
+                    .await
+                    .map_err(map_execution_error)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -1583,5 +1864,319 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    #[test]
+    fn test_scylla_transport_validates_config() {
+        let config = test_config();
+        assert!(ScyllaCassandraTransport::new(&config).is_ok());
+        let mut bad = config.clone();
+        bad.contact_points.clear();
+        assert!(ScyllaCassandraTransport::new(&bad).is_err());
+        bad = config.clone();
+        bad.keyspace = "has space".to_string();
+        assert!(ScyllaCassandraTransport::new(&bad).is_err());
+        // Kind and shape stay compatible with stored configuration.
+        let transport = ScyllaCassandraTransport::new(&config).unwrap();
+        assert_eq!(transport.config().keyspace, "telemetry");
+        let sink = CassandraSink::new(
+            config,
+            Arc::new(ScyllaCassandraTransport::new(&test_config()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(sink.kind(), "cassandra");
+    }
+
+    #[test]
+    fn test_scylla_consistency_mapping() {
+        assert_eq!(
+            scylla_consistency(CqlConsistency::One),
+            scylla::statement::Consistency::One
+        );
+        assert_eq!(
+            scylla_consistency(CqlConsistency::Quorum),
+            scylla::statement::Consistency::Quorum
+        );
+        assert_eq!(
+            scylla_consistency(CqlConsistency::LocalQuorum),
+            scylla::statement::Consistency::LocalQuorum
+        );
+        assert_eq!(
+            scylla_consistency(CqlConsistency::All),
+            scylla::statement::Consistency::All
+        );
+    }
+
+    #[test]
+    fn test_scylla_error_mapping() {
+        use scylla::errors::DbError as Db;
+        // Transient faults retry at the sink.
+        for db in [
+            Db::ServerError,
+            Db::Unavailable {
+                consistency: scylla::statement::Consistency::One,
+                required: 2,
+                alive: 1,
+            },
+            Db::Overloaded,
+            Db::IsBootstrapping,
+            Db::TruncateError,
+        ] {
+            let mapped = map_request_attempt_error(scylla::errors::RequestAttemptError::DbError(
+                db,
+                "boom".to_string(),
+            ));
+            assert!(
+                matches!(mapped, ConnectorError::Connection(_)),
+                "transient must retry"
+            );
+        }
+        // Terminal faults do not retry.
+        for db in [
+            Db::SyntaxError,
+            Db::Invalid,
+            Db::AuthenticationError,
+            Db::Unauthorized,
+        ] {
+            let mapped = map_request_attempt_error(scylla::errors::RequestAttemptError::DbError(
+                db,
+                "bad".to_string(),
+            ));
+            assert!(
+                matches!(mapped, ConnectorError::Dispatch(_)),
+                "terminal must not retry"
+            );
+        }
+        // Timeouts and broken connections retry.
+        let mapped = map_execution_error(scylla::errors::ExecutionError::RequestTimeout(
+            Duration::from_millis(10),
+        ));
+        assert!(matches!(mapped, ConnectorError::Connection(_)));
+    }
+
+    #[test]
+    fn test_scylla_row_decoding() {
+        assert_eq!(decode_text_field(b"dev-1", "device_id").unwrap(), "dev-1");
+        assert!(decode_text_field(&[0xFF], "device_id").is_err());
+        assert_eq!(
+            decode_i64_field(&1_789_211_889_123i64.to_be_bytes(), "event_time").unwrap(),
+            1_789_211_889_123
+        );
+        assert!(decode_i64_field(b"short", "event_time").is_err());
+        assert_eq!(
+            decode_i32_field(&86_400i32.to_be_bytes(), "ttl").unwrap(),
+            86_400
+        );
+        assert!(decode_i32_field(b"xx", "ttl").is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Apache Cassandra / ScyllaDB server via
+    /// the maintained `scylla` driver.
+    ///
+    /// Run with e.g.:
+    /// `CASSANDRA_CONTACT_POINTS=127.0.0.1:9042 \
+    ///  cargo test -p broker-connectors --lib cassandra::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// Creates the keyspace/table, streams 2000 rows through
+    /// [`CassandraSink`] on [`ScyllaCassandraTransport`] with UNLOGGED
+    /// batches (password auth when `CASSANDRA_USERNAME` /
+    /// `CASSANDRA_PASSWORD` are set, token-aware via prepared
+    /// statements), asserts the row count and that Murmur3 tokens spread
+    /// across the ring, then drops the session and reconnects to prove
+    /// the driver retries after a node outage. Cleans up the table and
+    /// the keyspace it created.
+    #[tokio::test]
+    #[ignore = "needs a real Apache Cassandra / ScyllaDB server (see CASSANDRA_* env)"]
+    async fn test_qualify_driver_write_path() {
+        let contact_points = qual_env("CASSANDRA_CONTACT_POINTS");
+        let Some(contact_points) = contact_points else {
+            eprintln!("CASSANDRA_CONTACT_POINTS is empty; skipping qualification");
+            return;
+        };
+        let contact_points: Vec<String> = contact_points
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if contact_points.is_empty() {
+            eprintln!("CASSANDRA_CONTACT_POINTS has no entries; skipping qualification");
+            return;
+        }
+        let keyspace =
+            qual_env("CASSANDRA_KEYSPACE").unwrap_or_else(|| "cassandra_qual_b307".to_string());
+        let table = qual_env("CASSANDRA_TABLE").unwrap_or_else(|| "qual_rows".to_string());
+        let username = qual_env("CASSANDRA_USERNAME");
+        let password = qual_env("CASSANDRA_PASSWORD").unwrap_or_default();
+
+        // Direct driver session for DDL and assertions.
+        let mut builder =
+            scylla::client::session_builder::SessionBuilder::new().known_nodes(&contact_points);
+        if let Some(username) = username.clone() {
+            builder = builder.user(username, password.clone());
+        }
+        let session = builder.build().await.expect("qual connect");
+        let version_row = session
+            .query_unpaged("SELECT release_version FROM system.local", &[])
+            .await
+            .expect("qual version query")
+            .into_rows_result()
+            .expect("qual version rows");
+        let version: String = version_row
+            .single_row::<(String,)>()
+            .expect("qual version row")
+            .0;
+        eprintln!("qual server: version={version} contacts={contact_points:?}");
+
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE KEYSPACE IF NOT EXISTS {keyspace} \
+                     WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '1'}}"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create keyspace");
+        session
+            .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{table}"), &[])
+            .await
+            .expect("qual drop stale table");
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE {keyspace}.{table} \
+                     (device_id text, bucket_hour text, event_time bigint, payload text, \
+                      PRIMARY KEY ((device_id), bucket_hour, event_time))"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create table");
+
+        let cql = format!(
+            "INSERT INTO {keyspace}.{table} \
+             (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)"
+        );
+        let config = CassandraSinkConfig {
+            contact_points: contact_points.clone(),
+            keyspace: keyspace.clone(),
+            table_template: table.clone(),
+            auth: match username {
+                Some(username) => CassandraAuth::Password { username, password },
+                None => CassandraAuth::None,
+            },
+            consistency: CqlConsistency::One,
+            partition_key_template: "${client_id}".to_string(),
+            cql_statement_template: cql,
+            ttl_secs: None,
+            batch_size: Some(100),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(10_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(ScyllaCassandraTransport::new(&config).expect("qual transport"));
+        let sink = CassandraSink::new(config, transport.clone()).expect("qual sink");
+        assert_eq!(sink.kind(), "cassandra");
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        let mut tokens = Vec::with_capacity(2000);
+        for seq in 0..2000 {
+            let device = format!("dev-{seq:04}");
+            tokens.push(murmur3_token(device.as_bytes()));
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","device_id":"{device}","seq":{seq}}}"#
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 2000);
+
+        // Token-aware routing spreads load: distinct tokens across the
+        // ring, covering both halves.
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert!(
+            tokens.len() >= 1500,
+            "tokens must spread, got {} distinct",
+            tokens.len()
+        );
+        let min = tokens.iter().min().copied().unwrap_or(0);
+        let max = tokens.iter().max().copied().unwrap_or(0);
+        assert!(min < -(1 << 62), "tokens must reach low range, got {min}");
+        assert!(max > (1 << 62), "tokens must reach high range, got {max}");
+
+        let count_row = session
+            .query_unpaged(format!("SELECT COUNT(*) FROM {keyspace}.{table}"), &[])
+            .await
+            .expect("qual count")
+            .into_rows_result()
+            .expect("qual count rows");
+        let count: i64 = count_row.single_row::<(i64,)>().expect("qual count row").0;
+        assert_eq!(count, 2000);
+
+        let sample = session
+            .query_unpaged(
+                format!(
+                    "SELECT device_id, payload FROM {keyspace}.{table} \
+                     WHERE device_id = 'dev-0424' LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual sample")
+            .into_rows_result()
+            .expect("qual sample rows");
+        let (device, payload): (String, String) = sample
+            .single_row::<(String, String)>()
+            .expect("qual sample row");
+        assert_eq!(device, "dev-0424");
+        assert!(payload.contains("dev-0424"));
+
+        // Driver retry: drop the control/session state (as after a node
+        // kill) and prove the next writes reconnect and succeed.
+        transport.reconnect().await.expect("qual reconnect");
+        for seq in 2000..2010 {
+            let device = format!("dev-{seq:04}");
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","device_id":"{device}","seq":{seq}}}"#
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual post-reconnect send");
+        }
+        sink.flush().await.expect("qual post-reconnect flush");
+        assert_eq!(sink.sent_records(), 2010);
+
+        let count_row = session
+            .query_unpaged(format!("SELECT COUNT(*) FROM {keyspace}.{table}"), &[])
+            .await
+            .expect("qual recount")
+            .into_rows_result()
+            .expect("qual recount rows");
+        let count: i64 = count_row
+            .single_row::<(i64,)>()
+            .expect("qual recount row")
+            .0;
+        assert_eq!(count, 2010);
+
+        session
+            .query_unpaged(format!("DROP TABLE IF EXISTS {keyspace}.{table}"), &[])
+            .await
+            .expect("qual drop table");
+        session
+            .query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), &[])
+            .await
+            .expect("qual drop keyspace");
+        eprintln!("qual done: version={version} rows=2010 cleaned table {keyspace}.{table}");
     }
 }

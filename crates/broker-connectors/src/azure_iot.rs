@@ -6,11 +6,20 @@
 //! resource URI), X.509 validation at config time, Device Twin
 //! reported/desired patch topics, and Direct Method invocation
 //! routing with response framing. MQTT travels over TLS: server
-//! certificates verify against the configured CA bundle plus the
-//! platform roots, SAS tokens ride as the MQTT password, and X.509
+//! certificates verify against the configured CA bundle plus the OS
+//! system trust store, SAS tokens ride as the MQTT password, and X.509
 //! devices additionally authenticate with a client certificate.
 //! Missing credentials are a dispatch error, never a cleartext
 //! fallback.
+//!
+//! Production traffic runs on the hand-written `TlsAzureIotTransport`
+//! below over `tokio-rustls` with `rustls` TLS: SAS tokens ride as
+//! the MQTT password, X.509 devices authenticate with a client
+//! certificate, and D2C telemetry, twin reported patches and
+//! direct-method responses share one QoS 1 publish path with PUBACK
+//! tracking. Downlink filters (`direct_methods_enabled` /
+//! `twin_sync_enabled`) are subscribed on connect; inbound downlink
+//! dispatch to the broker is still TODO (egress-only data path).
 //!
 //! SAS tokens renew proactively before expiry; a 401 ExpiredToken
 //! forces one renewal + retry, 429 QuotaExceeded backs off, and 404
@@ -21,10 +30,10 @@ use base64::Engine;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::cloud_tls;
 use super::{now_millis, BackoffState, BatchQueue, ConnectorError, Result, Sink};
@@ -111,9 +120,14 @@ pub struct AzureIotConfig {
     #[serde(default = "default_api_version")]
     pub api_version: String,
     /// Subscribe to direct method invocations (default true).
+    /// Consulted on connect: the TLS transport SUBSCRIBEs
+    /// `$iothub/methods/POST/#` when true.
     #[serde(default = "default_true")]
     pub direct_methods_enabled: bool,
     /// Sync device twin reported/desired (default true).
+    /// Consulted on connect: the TLS transport SUBSCRIBEs the
+    /// twin-desired filter when true. Inbound downlink dispatch is
+    /// still TODO; egress (reported patches) already flows.
     #[serde(default = "default_true")]
     pub twin_sync_enabled: bool,
     /// Flush trigger row count (default 500).
@@ -138,7 +152,7 @@ pub struct AzureIotConfig {
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: Option<u64>,
     /// Extra CA bundle PEM for server verification, in addition to
-    /// the platform roots.
+    /// the OS system trust store.
     #[serde(default)]
     pub ca_bundle_pem: Option<String>,
     /// SAS token lifetime in seconds for `SharedAccessKey` auth
@@ -478,14 +492,19 @@ impl TwinTopics {
         format!("$iothub/twin/PATCH/properties/reported/?$rid={rid}")
     }
 
-    /// Desired-properties subscription filter.
+    /// Desired-properties subscription filter. Subscribed by the TLS
+    /// transport on connect when `twin_sync_enabled` is set.
     pub fn desired_filter() -> &'static str {
         "$iothub/twin/PATCH/properties/desired/#"
     }
 
-    /// Direct-method invocation filter for one method.
-    pub fn method_filter(method: &str) -> String {
-        format!("$iothub/methods/POST/{method}/#")
+    /// Direct-method invocation filter for all methods. Subscribed by
+    /// the TLS transport on connect when `direct_methods_enabled` is
+    /// set; invocations then arrive over the same connection.
+    /// Inbound dispatch to the broker is TODO(parity): the transport
+    /// is egress-only for data until the ingress reader is built.
+    pub fn method_requests_filter() -> &'static str {
+        "$iothub/methods/POST/#"
     }
 
     /// Parse `$iothub/methods/POST/{method}/?$rid={rid}`.
@@ -605,22 +624,27 @@ impl AzureIotTransport for MockAzureIotTransport {
 }
 
 /// TLS transport: MQTT over TLS to Azure IoT Hub (port 8883 by
-/// default). Server certificates verify against the configured CA
-/// bundle plus the platform roots. SAS variants send the token as
-/// the MQTT password; X.509 devices authenticate with a client
-/// certificate. The TCP socket is only ever the TLS underlay: there
-/// is no cleartext path and a missing credential is a dispatch
-/// error.
+/// default). Server certificates verify
+/// against the configured CA bundle plus the OS system trust store. SAS
+/// variants send the token as the MQTT password; X.509 devices
+/// authenticate with a client certificate. The TCP socket is only ever
+/// the TLS underlay: there is no cleartext path and a missing
+/// credential is a dispatch error. QoS 1 publishes carry an allocated
+/// packet id and wait for the matching PUBACK; downlink filters are
+/// subscribed on connect when the config flags enable them.
 pub struct TlsAzureIotTransport {
     host: String,
     port: u16,
     client_id: String,
     username: String,
     expect_password: bool,
+    direct_methods_enabled: bool,
+    twin_sync_enabled: bool,
     tls: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
     handshake_timeout: Duration,
     io_timeout: Duration,
+    packet_id: AtomicU32,
     stream: tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>,
 }
 
@@ -666,12 +690,32 @@ impl TlsAzureIotTransport {
             client_id: config.mqtt_client_id(),
             username: config.mqtt_username(),
             expect_password,
+            direct_methods_enabled: config.direct_methods_enabled,
+            twin_sync_enabled: config.twin_sync_enabled,
             tls,
             connect_timeout: config.connect_timeout(),
             handshake_timeout: config.handshake_timeout(),
             io_timeout: config.timeout(),
+            packet_id: AtomicU32::new(0),
             stream: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Next packet identifier, cycling 1..=65535 and never yielding 0.
+    fn next_packet_id(&self) -> u16 {
+        (self.packet_id.fetch_add(1, Ordering::SeqCst) % 65_535 + 1) as u16
+    }
+
+    /// Filters subscribed on connect from the config flags.
+    fn downlink_filters(&self) -> Vec<&'static str> {
+        let mut filters = Vec::new();
+        if self.twin_sync_enabled {
+            filters.push(TwinTopics::desired_filter());
+        }
+        if self.direct_methods_enabled {
+            filters.push(TwinTopics::method_requests_filter());
+        }
+        filters
     }
 
     async fn ensure_connected(&self, sas_token: &str) -> Result<()> {
@@ -706,8 +750,60 @@ impl TlsAzureIotTransport {
         )?;
         cloud_tls::mqtt_connect_over_tls(&mut stream, &connect, "azure-iot", self.io_timeout)
             .await?;
+        let filters = self.downlink_filters();
+        if !filters.is_empty() {
+            let packet_id = self.next_packet_id();
+            let subscribe = encode_mqtt_subscribe(packet_id, &filters)?;
+            tokio::time::timeout(self.io_timeout, stream.write_all(&subscribe))
+                .await
+                .map_err(|_| ConnectorError::Connection("azure-iot SUBSCRIBE timeout".to_string()))?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("azure-iot SUBSCRIBE failed: {e}"))
+                })?;
+            let mut head = [0u8; 2];
+            tokio::time::timeout(self.io_timeout, stream.read_exact(&mut head))
+                .await
+                .map_err(|_| ConnectorError::Connection("azure-iot SUBACK timeout".to_string()))?
+                .map_err(|e| ConnectorError::Connection(format!("azure-iot SUBACK failed: {e}")))?;
+            if head[0] != 0x90 {
+                return Err(ConnectorError::Connection(
+                    "azure-iot malformed SUBACK".to_string(),
+                ));
+            }
+            let remaining = head[1] as usize;
+            if remaining < 3 {
+                return Err(ConnectorError::Connection(
+                    "azure-iot malformed SUBACK".to_string(),
+                ));
+            }
+            let mut rest = vec![0u8; remaining];
+            tokio::time::timeout(self.io_timeout, stream.read_exact(&mut rest))
+                .await
+                .map_err(|_| ConnectorError::Connection("azure-iot SUBACK timeout".to_string()))?
+                .map_err(|e| ConnectorError::Connection(format!("azure-iot SUBACK failed: {e}")))?;
+            let got = u16::from_be_bytes([rest[0], rest[1]]);
+            if got != packet_id {
+                return Err(ConnectorError::Connection(format!(
+                    "azure-iot SUBACK id mismatch: got {got}, want {packet_id}"
+                )));
+            }
+            if rest[2..].contains(&0x80) {
+                return Err(ConnectorError::Connection(
+                    "azure-iot subscribe rejected".to_string(),
+                ));
+            }
+            // TODO(parity): inbound twin-desired / direct-method publishes
+            // arriving on these subscriptions are not yet dispatched to the
+            // broker; the transport is egress-only for data until the
+            // ingress reader is built.
+        }
         *self.stream.lock().await = Some(stream);
         Ok(())
+    }
+
+    /// Drop the TLS stream. The next publish dials again.
+    pub async fn disconnect(&self) {
+        *self.stream.lock().await = None;
     }
 }
 
@@ -715,8 +811,15 @@ impl TlsAzureIotTransport {
 impl AzureIotTransport for TlsAzureIotTransport {
     async fn publish(&self, publish: &AzureIotPublish, sas_token: &str) -> Result<()> {
         self.ensure_connected(sas_token).await?;
-        let bytes =
-            super::mqtt_bridge::encode_publish(&publish.topic, 1, false, 1, &publish.body, false)?;
+        let packet_id = self.next_packet_id();
+        let bytes = super::mqtt_bridge::encode_publish(
+            &publish.topic,
+            1,
+            false,
+            packet_id,
+            &publish.body,
+            false,
+        )?;
         let mut guard = self.stream.lock().await;
         let stream = guard
             .as_mut()
@@ -725,8 +828,54 @@ impl AzureIotTransport for TlsAzureIotTransport {
             .await
             .map_err(|_| ConnectorError::Connection("azure-iot publish timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("azure-iot publish failed: {e}")))?;
+        let mut ack = [0u8; 4];
+        tokio::time::timeout(self.io_timeout, stream.read_exact(&mut ack))
+            .await
+            .map_err(|_| ConnectorError::Connection("azure-iot PUBACK timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("azure-iot PUBACK failed: {e}")))?;
+        if ack[0] != 0x40 || ack[1] != 0x02 {
+            return Err(ConnectorError::Connection(
+                "azure-iot malformed PUBACK".to_string(),
+            ));
+        }
+        let got = u16::from_be_bytes([ack[2], ack[3]]);
+        if got != packet_id {
+            return Err(ConnectorError::Connection(format!(
+                "azure-iot PUBACK id mismatch: got {got}, want {packet_id}"
+            )));
+        }
         Ok(())
     }
+}
+
+/// Encode one MQTT 3.1.1 SUBSCRIBE frame for `filters` at QoS 1.
+fn encode_mqtt_subscribe(packet_id: u16, filters: &[&str]) -> Result<Vec<u8>> {
+    if packet_id == 0 {
+        return Err(ConnectorError::Dispatch(
+            "azure-iot subscribe needs a nonzero packet id".to_string(),
+        ));
+    }
+    if filters.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "azure-iot subscribe needs at least one filter".to_string(),
+        ));
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&packet_id.to_be_bytes());
+    for filter in filters {
+        if filter.is_empty() || filter.len() > u16::MAX as usize {
+            return Err(ConnectorError::Dispatch(
+                "azure-iot subscribe filter must be 1..=65535 bytes".to_string(),
+            ));
+        }
+        body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        body.extend_from_slice(filter.as_bytes());
+        body.push(0x01);
+    }
+    let mut frame = vec![0x82];
+    super::mqtt_bridge::encode_remaining_length(body.len(), &mut frame)?;
+    frame.extend_from_slice(&body);
+    Ok(frame)
 }
 
 /// Azure IoT transport with an explicit connect step.
@@ -754,6 +903,7 @@ impl AzureIotConnectTransport for TlsAzureIotTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
 /// One buffered row: D2C topic + body.
 #[derive(Debug, Clone)]
 struct AzureIotRow {
@@ -822,7 +972,9 @@ impl AzureIotSink {
     }
 
     /// Current SAS token (minted, or the verbatim pre-minted one).
-    fn sas_token(&self) -> Result<String> {
+    /// Qualification tooling calls this for out-of-band twin/method
+    /// frames sent straight through the transport.
+    pub(crate) fn sas_token(&self) -> Result<String> {
         match &self.config.auth {
             AzureIotAuth::SharedAccessKey { .. } => Ok(self
                 .sas_cache
@@ -908,8 +1060,15 @@ impl AzureIotSink {
         Err(error)
     }
 
-    /// Validate + buffer one D2C event. Returns true when the batch
-    /// is full or stale (caller flushes).
+    /// Validate + buffer one publish. Returns true when the batch
+    /// is full or stale (caller flushes). Local topic routes the hub
+    /// frame, so D2C telemetry, twin reported patches and
+    /// direct-method responses share one publish path:
+    /// - `twin/reported/<rid>` with a JSON payload becomes
+    ///   `$iothub/twin/PATCH/properties/reported/?$rid=<rid>`;
+    /// - `methods/res/<status>/<rid>` with a JSON payload becomes
+    ///   `$iothub/methods/res/<status>/?$rid=<rid>`;
+    /// - everything else becomes D2C telemetry for this device.
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<bool> {
         if topic.as_str().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -921,15 +1080,60 @@ impl AzureIotSink {
                 "azure-iot buffer limit reached".to_string(),
             ));
         }
+        let row = self.route_row(topic.as_str(), payload)?;
+        Ok(self.buffer.lock().push(row))
+    }
+
+    /// Map one local `(topic, payload)` to the hub MQTT frame.
+    fn route_row(&self, local_topic: &str, payload: &Bytes) -> Result<AzureIotRow> {
+        if let Some(rid) = local_topic
+            .strip_prefix("twin/reported/")
+            .or_else(|| local_topic.strip_prefix("$twin/reported/"))
+        {
+            if rid.is_empty() || rid.contains(['/', '#', '+']) {
+                return Err(ConnectorError::Dispatch(format!(
+                    "azure-iot twin reported rid must be a concrete segment: {rid:?}"
+                )));
+            }
+            let value: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
+                ConnectorError::Dispatch(format!("azure-iot twin payload must be JSON: {e}"))
+            })?;
+            return Ok(AzureIotRow {
+                topic: TwinTopics::reported_patch(rid),
+                body: TwinTopics::reported_patch_document(&value),
+            });
+        }
+        if let Some(rest) = local_topic.strip_prefix("methods/res/") {
+            let (status, rid) = rest.split_once('/').ok_or_else(|| {
+                ConnectorError::Dispatch(
+                    "azure-iot method response needs methods/res/<status>/<rid>".to_string(),
+                )
+            })?;
+            let status: u16 = status.parse().map_err(|_| {
+                ConnectorError::Dispatch(format!(
+                    "azure-iot method response status must be numeric: {status:?}"
+                ))
+            })?;
+            if rid.is_empty() || rid.contains(['/', '#', '+']) {
+                return Err(ConnectorError::Dispatch(format!(
+                    "azure-iot method response rid must be a concrete segment: {rid:?}"
+                )));
+            }
+            let value: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
+                ConnectorError::Dispatch(format!("azure-iot method payload must be JSON: {e}"))
+            })?;
+            let (topic, body) = TwinTopics::method_response(status, rid, &value);
+            return Ok(AzureIotRow { topic, body });
+        }
         let d2c = d2c_topic(
             &self.config.device_id,
             self.config.module_id.as_deref(),
             &[],
         );
-        Ok(self.buffer.lock().push(AzureIotRow {
+        Ok(AzureIotRow {
             topic: d2c,
             body: payload.to_vec(),
-        }))
+        })
     }
 }
 
@@ -944,31 +1148,6 @@ impl Sink for AzureIotSink {
 
     fn kind(&self) -> &'static str {
         "azure_iot"
-    }
-}
-
-/// Management connector handle pairing an id with an Azure IoT sink.
-pub struct AzureIotConnector {
-    id: String,
-    sink: Arc<AzureIotSink>,
-}
-
-impl AzureIotConnector {
-    pub fn new(id: impl Into<String>, sink: Arc<AzureIotSink>) -> Self {
-        Self {
-            id: id.into(),
-            sink,
-        }
-    }
-}
-
-impl super::Connector for AzureIotConnector {
-    fn connector_id(&self) -> &str {
-        &self.id
-    }
-
-    fn kind(&self) -> &'static str {
-        self.sink.kind()
     }
 }
 
@@ -1109,8 +1288,8 @@ mod tests {
             "$iothub/twin/PATCH/properties/desired/#"
         );
         assert_eq!(
-            TwinTopics::method_filter("reboot"),
-            "$iothub/methods/POST/reboot/#"
+            TwinTopics::method_requests_filter(),
+            "$iothub/methods/POST/#"
         );
         assert_eq!(
             TwinTopics::parse_method_invocation("$iothub/methods/POST/reboot/?$rid=rid-9"),
@@ -1234,6 +1413,55 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sink_routes_twin_and_method_through_broker_path() {
+        // The broker-facing `Sink::send` path must carry twin reported
+        // patches and direct-method responses, not just D2C: local
+        // `twin/reported/<rid>` and `methods/res/<status>/<rid>` frame
+        // the hub topics through the same buffer/flush path.
+        let (sink, transport) = test_sink(test_config());
+        sink.send(
+            &Topic::new("twin/reported/rid-1").unwrap(),
+            &Bytes::from_static(br#"{"temp":21.5}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("methods/res/200/rid-2").unwrap(),
+            &Bytes::from_static(br#"{"ok":true}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from_static(br#"{"temp":1}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(
+            captured[0].topic,
+            "$iothub/twin/PATCH/properties/reported/?$rid=rid-1"
+        );
+        assert_eq!(captured[0].body, br#"{"temp":21.5}"#.to_vec());
+        assert_eq!(captured[1].topic, "$iothub/methods/res/200/?$rid=rid-2");
+        assert_eq!(captured[1].body, br#"{"ok":true}"#.to_vec());
+        assert!(captured[2]
+            .topic
+            .starts_with("devices/edge-1/messages/events/"));
+        assert_eq!(sink.sent_records(), 3);
+        // Hub-format method invocations parse on the read path.
+        assert_eq!(
+            TwinTopics::parse_method_invocation("$iothub/methods/POST/reboot/?$rid=rid-2"),
+            Some(("reboot".to_string(), "rid-2".to_string()))
+        );
     }
 
     #[test]
@@ -1406,6 +1634,64 @@ mod tests {
         crate::mqtt_bridge::decode_publish(&frame, false).expect("decode")
     }
 
+    async fn read_subscribe_and_ack<S>(tls: &mut S, expected_filters: usize)
+    where
+        S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+    {
+        let mut head = [0u8; 1];
+        tls.read_exact(&mut head).await.expect("subscribe head");
+        assert_eq!(head[0], 0x82);
+        let mut len_buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            tls.read_exact(&mut byte).await.expect("subscribe len");
+            len_buf.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+        }
+        let (remaining, _) =
+            crate::mqtt_bridge::decode_remaining_length(&len_buf).expect("subscribe remaining");
+        let mut rest = vec![0u8; remaining];
+        tls.read_exact(&mut rest).await.expect("subscribe body");
+        assert!(rest.len() >= 2);
+        let packet_id = u16::from_be_bytes([rest[0], rest[1]]);
+        assert_ne!(packet_id, 0);
+        // Count filters to size the SUBACK.
+        let mut cursor = &rest[2..];
+        let mut count = 0usize;
+        while cursor.len() >= 2 {
+            let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + len + 1 {
+                break;
+            }
+            cursor = &cursor[2 + len + 1..];
+            count += 1;
+        }
+        assert_eq!(count, expected_filters);
+        let mut ack = vec![0x90];
+        crate::mqtt_bridge::encode_remaining_length(2 + count, &mut ack).expect("suback len");
+        ack.extend_from_slice(&packet_id.to_be_bytes());
+        ack.extend(std::iter::repeat_n(0x01, count));
+        tls.write_all(&ack).await.expect("SUBACK");
+    }
+
+    async fn read_publish_and_ack<S>(tls: &mut S) -> crate::mqtt_bridge::DecodedPublish
+    where
+        S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+    {
+        let decoded = read_publish_frame(tls).await;
+        assert_ne!(decoded.packet_id, 0);
+        let ack = [
+            0x40,
+            0x02,
+            (decoded.packet_id >> 8) as u8,
+            (decoded.packet_id & 0xFF) as u8,
+        ];
+        tls.write_all(&ack).await.expect("PUBACK");
+        decoded
+    }
+
     #[tokio::test]
     async fn test_tls_handshake_with_sas_password() {
         use tokio::io::AsyncWriteExt;
@@ -1434,7 +1720,9 @@ mod tests {
             tls.write_all(&[0x20, 0x02, 0x00, 0x00])
                 .await
                 .expect("CONNACK");
-            let decoded = read_publish_frame(&mut tls).await;
+            // Downlink filters subscribed on connect (both flags true).
+            read_subscribe_and_ack(&mut tls, 2).await;
+            let decoded = read_publish_and_ack(&mut tls).await;
             assert!(decoded.topic.starts_with("devices/edge-1/messages/events/"));
             assert_eq!(decoded.payload, b"{}");
         });
@@ -1510,7 +1798,8 @@ mod tests {
             tls.write_all(&[0x20, 0x02, 0x00, 0x00])
                 .await
                 .expect("CONNACK");
-            let decoded = read_publish_frame(&mut tls).await;
+            read_subscribe_and_ack(&mut tls, 2).await;
+            let decoded = read_publish_and_ack(&mut tls).await;
             assert!(decoded.topic.starts_with("devices/edge-1/messages/events/"));
             assert_eq!(decoded.payload, b"{}");
         });
@@ -1560,5 +1849,314 @@ mod tests {
             .expect_err("plain listener must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         server.abort();
+    }
+
+    #[test]
+    fn test_tls_constructs_offline() {
+        // TLS construction validates offline and never dials, so
+        // management validation stays offline for every auth mode.
+        let sas = sas_test_config("127.0.0.1:8883");
+        assert!(TlsAzureIotTransport::new(&sas).is_ok());
+        let x509 = x509_test_config("127.0.0.1:8883");
+        assert!(TlsAzureIotTransport::new(&x509).is_ok());
+        // Missing SAS material fails before any I/O.
+        let mut bad = sas_test_config("127.0.0.1:8883");
+        bad.auth = AzureIotAuth::SharedAccessKey {
+            key: "   ".to_string(),
+            key_name: None,
+        };
+        assert!(TlsAzureIotTransport::new(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tls_sink_buffers_through_broker() {
+        // The write path goes through the broker-facing `Sink`
+        // interface: `send` buffers, `flush` publishes through the real
+        // TLS transport. With no hub reachable (loopback port closed)
+        // the flush must fail as a retryable connection error and
+        // retain the rows.
+        let mut config = sas_test_config("127.0.0.1:1");
+        config.max_retries = Some(0);
+        config.connect_timeout_ms = Some(200);
+        config.handshake_timeout_ms = Some(200);
+        config.timeout_ms = Some(200);
+        let transport = Arc::new(TlsAzureIotTransport::new(&config).expect("tls builds offline"));
+        let sink = Arc::new(AzureIotSink::new(config, transport).expect("sink builds"));
+        assert_eq!(sink.kind(), "azure_iot");
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from_static(br#"{"temp":21.5}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        let err = sink.flush().await.expect_err("closed port must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        assert_eq!(sink.sent_records(), 0);
+        assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_subscribe_encoding_filters() {
+        let frame = encode_mqtt_subscribe(7, &[TwinTopics::desired_filter()]).unwrap();
+        assert_eq!(frame[0], 0x82);
+        assert!(frame.windows(7).any(|w| w == b"$iothub"));
+        assert!(encode_mqtt_subscribe(0, &[TwinTopics::desired_filter()]).is_err());
+        assert!(encode_mqtt_subscribe(1, &[]).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Azure IoT Hub server.
+    ///
+    /// Run with e.g.:
+    /// `AZURE_IOT_HUB_HOST=my-hub.azure-devices.net
+    ///  AZURE_IOT_DEVICE_ID=qual-device-1
+    ///  AZURE_IOT_SHARED_KEY=<base64 device key>
+    ///  AZURE_IOT_SERVICE_KEY=<base64 iothubowner key>
+    ///  AZURE_IOT_KEY_NAME=iothubowner \
+    ///  cargo test -p broker-connectors --lib azure_iot::tests::test_qualify_tls_write_path -- --ignored --nocapture`
+    ///
+    /// For pre-minted tokens set `AZURE_IOT_SAS_TOKEN` (starting with
+    /// `SharedAccessSignature `) instead of `AZURE_IOT_SHARED_KEY`;
+    /// for X.509 set `AZURE_IOT_CLIENT_CERT_FILE` /
+    /// `AZURE_IOT_CLIENT_KEY_FILE` (PEM files) instead. `AZURE_IOT_MODULE_ID`
+    /// is optional; `AZURE_IOT_CA_FILE` adds an extra CA bundle.
+    /// `AZURE_IOT_SERVICE_KEY` (hub policy key) enables hub-side
+    /// verification: device registration, device GET and twin GET.
+    /// Without it the test still proves the TLS transport speaks the hub
+    /// filters but can only assert transport QoS 1 acknowledgements.
+    ///
+    /// The test registers the device through the hub service REST API
+    /// when a service key is present (otherwise the device must exist
+    /// out of band), forwards 500 D2C publishes through
+    /// [`AzureIotSink`] on [`TlsAzureIotTransport`], asserts 500
+    /// sent records plus hub-side device/twin reads, sends one twin
+    /// reported patch plus one direct-method response, subscribes to
+    /// the twin-desired and direct-method filters (also subscribed
+    /// automatically on dial when the config flags are set), then
+    /// disconnects. Hub-side receipt is asserted by the transport
+    /// acknowledging all QoS 1 publishes without error and, when a
+    /// service key is present, by reading the device and twin back
+    /// through the service API. Cleans up by disconnecting and, when
+    /// `AZURE_IOT_DELETE_DEVICE=1`, deleting the test device; no
+    /// retained cloud state beyond the ephemeral `indra/qual` payloads.
+    #[tokio::test]
+    #[ignore = "needs a real Azure IoT Hub server (see AZURE_IOT_* env)"]
+    async fn test_qualify_tls_write_path() {
+        let hub = qual_env("AZURE_IOT_HUB_HOST").unwrap_or_default();
+        if hub.is_empty() {
+            eprintln!("AZURE_IOT_HUB_HOST is empty; skipping qualification");
+            return;
+        }
+        let device_id =
+            qual_env("AZURE_IOT_DEVICE_ID").unwrap_or_else(|| "qual-device-1".to_string());
+        let module_id = qual_env("AZURE_IOT_MODULE_ID");
+        let api_version =
+            qual_env("AZURE_IOT_API_VERSION").unwrap_or_else(|| "2021-04-12".to_string());
+        let ca_bundle =
+            qual_env("AZURE_IOT_CA_FILE").and_then(|path| std::fs::read_to_string(path).ok());
+        let auth = if let Some(token) = qual_env("AZURE_IOT_SAS_TOKEN") {
+            AzureIotAuth::SasToken { token }
+        } else if let (Some(cert_file), Some(key_file)) = (
+            qual_env("AZURE_IOT_CLIENT_CERT_FILE"),
+            qual_env("AZURE_IOT_CLIENT_KEY_FILE"),
+        ) {
+            let cert_pem = std::fs::read_to_string(cert_file).expect("read client cert");
+            let key_pem = std::fs::read_to_string(key_file).expect("read client key");
+            AzureIotAuth::X509 { cert_pem, key_pem }
+        } else {
+            let key = qual_env("AZURE_IOT_SHARED_KEY").unwrap_or_default();
+            if key.is_empty() {
+                eprintln!("no AZURE_IOT_SHARED_KEY/SAS_TOKEN/client certs; skipping");
+                return;
+            }
+            AzureIotAuth::SharedAccessKey {
+                key,
+                key_name: qual_env("AZURE_IOT_KEY_NAME"),
+            }
+        };
+        let config = AzureIotConfig {
+            iot_hub_name: hub.clone(),
+            device_id: device_id.clone(),
+            module_id: module_id.clone(),
+            auth,
+            api_version: api_version.clone(),
+            direct_methods_enabled: true,
+            twin_sync_enabled: true,
+            batch_size: Some(500),
+            buffer_capacity: None,
+            linger_ms: Some(50),
+            max_retries: Some(5),
+            timeout_ms: Some(10_000),
+            connect_timeout_ms: Some(10_000),
+            handshake_timeout_ms: Some(10_000),
+            ca_bundle_pem: ca_bundle,
+            sas_ttl_secs: Some(3600),
+        };
+        config.validate().expect("qual config validates");
+        eprintln!("qual server: hub={hub} device={device_id} api={api_version}");
+
+        let transport = Arc::new(TlsAzureIotTransport::new(&config).expect("qual transport"));
+        let sink =
+            Arc::new(AzureIotSink::new(config.clone(), transport.clone()).expect("qual sink"));
+
+        // Hub-side verification uses the service REST API when a hub
+        // policy key is present. The device key signs MQTT; the
+        // service key signs `sr={hub}` for registry/twin reads.
+        let service_key = qual_env("AZURE_IOT_SERVICE_KEY");
+        let policy_name =
+            qual_env("AZURE_IOT_KEY_NAME").unwrap_or_else(|| "iothubowner".to_string());
+        let service_token = service_key.as_deref().and_then(|key| {
+            if key.trim().is_empty() {
+                None
+            } else {
+                let now_secs = now_millis().max(0) as u64 / 1_000;
+                Some(sas_token(
+                    &hub.to_lowercase(),
+                    Some(&policy_name),
+                    key,
+                    now_secs.saturating_add(3600),
+                ))
+            }
+        });
+        let http = reqwest::Client::new();
+        let device_url = format!("https://{hub}/devices/{device_id}?api-version={api_version}");
+        let twin_url = format!("https://{hub}/twins/{device_id}?api-version={api_version}");
+        // Register the device when the service API is available;
+        // otherwise it must already exist out of band.
+        if let Some(service_sas) = service_token.as_deref() {
+            let mut body = serde_json::json!({
+                "deviceId": device_id,
+                "status": "enabled",
+            });
+            if let AzureIotAuth::SharedAccessKey { key, .. } = &config.auth {
+                body["authentication"] = serde_json::json!({
+                    "type": "sas",
+                    "symmetricKey": { "primaryKey": key },
+                });
+            }
+            let res = http
+                .put(&device_url)
+                .header("Authorization", service_sas)
+                .json(&body)
+                .send()
+                .await
+                .expect("qual register device");
+            assert!(
+                res.status().is_success(),
+                "qual register device failed: {}",
+                res.status()
+            );
+            eprintln!("qual device registered: {device_id}");
+        }
+
+        // 500 D2C telemetry publishes through the broker-facing sink path.
+        // This is the same path the rule engine drives:
+        // `ConnectorManager::send` -> `Sink::send` -> `flush` ->
+        // `TlsAzureIotTransport::publish`.
+        let topic = Topic::new("sensors/qual-1").unwrap();
+        for seq in 0..500 {
+            let payload = Bytes::from(format!(
+                "{{\"seq\":{seq},\"device\":\"{device_id}\",\"temp\":{temp}}}",
+                temp = 20.0 + (seq as f64) * 0.01
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 500);
+        assert!(sink.sent_batches() >= 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        eprintln!(
+            "qual rows asserted: d2c=500 batches={}",
+            sink.sent_batches()
+        );
+        // Hub-side D2C receipt is the transport acknowledging every QoS 1
+        // publish without error; when the service API is available
+        // the device read below proves the hub knows the device.
+        if let Some(service_sas) = service_token.as_deref() {
+            let res = http
+                .get(&device_url)
+                .header("Authorization", service_sas)
+                .send()
+                .await
+                .expect("qual get device");
+            assert!(
+                res.status().is_success(),
+                "qual get device failed: {}",
+                res.status()
+            );
+            let device: serde_json::Value = res.json().await.expect("qual device json");
+            assert_eq!(device["deviceId"], serde_json::json!(device_id));
+            eprintln!("qual hub receipt asserted: device exists");
+        }
+
+        // TODO(parity): the TLS transport subscribes to twin-desired
+        // and direct-method filters on connect but inbound downlink
+        // dispatch is not built yet. The reported patch and method
+        // response below still prove the twin/method write path through
+        // the same broker-facing sink routing D2C uses
+        // (`Sink::send` -> `flush`).
+        let rid = format!("qual-{}", now_millis().max(0));
+        let reported = serde_json::json!({"indra_qual": 1, "device": device_id});
+        sink.send(
+            &Topic::new(format!("twin/reported/{rid}")).unwrap(),
+            &Bytes::from(serde_json::to_vec(&reported).expect("qual twin json")),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("qual twin reported send");
+        sink.send(
+            &Topic::new(format!("methods/res/200/{rid}")).unwrap(),
+            &Bytes::from_static(br#"{"ok":true}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("qual method response send");
+        sink.flush().await.expect("qual twin/method flush");
+        assert_eq!(sink.sent_records(), 502);
+        eprintln!("qual rows asserted: twin_reported=1 method_responses=1");
+        // Twin sync is hub-side receipt: read the twin back and assert
+        // the reported patch landed.
+        if let Some(service_sas) = service_token.as_deref() {
+            let res = http
+                .get(&twin_url)
+                .header("Authorization", service_sas)
+                .send()
+                .await
+                .expect("qual get twin");
+            assert!(
+                res.status().is_success(),
+                "qual get twin failed: {}",
+                res.status()
+            );
+            let twin: serde_json::Value = res.json().await.expect("qual twin json");
+            assert_eq!(
+                twin["properties"]["reported"]["indra_qual"],
+                serde_json::json!(1),
+                "qual twin sync failed: {twin:?}"
+            );
+            eprintln!("qual twin sync asserted: reported.indra_qual=1");
+        }
+
+        transport.disconnect().await;
+        if qual_env("AZURE_IOT_DELETE_DEVICE").as_deref() == Some("1") {
+            if let Some(service_sas) = service_token.as_deref() {
+                let _ = http
+                    .delete(&device_url)
+                    .header("Authorization", service_sas)
+                    .send()
+                    .await;
+                eprintln!("qual cleanup: deleted test device + disconnected transport");
+            } else {
+                eprintln!("qual cleanup: disconnected TLS client, no retained cloud state");
+            }
+        } else {
+            eprintln!("qual cleanup: disconnected TLS client, no retained cloud state");
+        }
     }
 }
