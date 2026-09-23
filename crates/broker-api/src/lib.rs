@@ -25,6 +25,7 @@ pub mod admin_users;
 pub mod api_auth;
 pub mod dashboard;
 pub mod errors;
+pub mod licence;
 pub mod node_scope;
 pub mod pagination;
 pub mod swagger;
@@ -119,6 +120,10 @@ pub struct ApiState {
     /// routes read one bounded snapshot per request; the kernel hook
     /// clones the same capped list once per bind, never per message.
     pub auto_subscribe: Arc<crate::v5::auto_subscribe::AutoSubscribeStore>,
+    /// Licence request/install/status store for B2-04: cluster identity,
+    /// stored token and trusted signing set. Management-plane only; never
+    /// touched on the per-message path.
+    pub licence: Arc<crate::licence::LicenceStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -183,6 +188,7 @@ impl ApiState {
             tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
+            licence: Arc::new(crate::licence::LicenceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -221,6 +227,7 @@ impl ApiState {
             tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
+            licence: Arc::new(crate::licence::LicenceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -275,6 +282,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
         .route("/api/v1/rules/:id", get(get_rule).delete(delete_rule))
+        .route("/api/v1/licence/request", get(licence::get_request))
+        .route("/api/v1/licence/install", post(licence::install_licence))
+        .route("/api/v1/licence/status", get(licence::get_status))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api_auth::require_api_auth,

@@ -1,6 +1,11 @@
 use async_trait::async_trait;
-use broker_auth::{Authenticator, Authorizer, LdapAuthenticator, LdapConfig, MemoryAuth};
-use broker_cluster::{ClusterLicense, ClusterMessage, RoutingPlane};
+use broker_auth::{
+    Authenticator, Authorizer, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
+    LdapConfig, MemoryAuth,
+};
+use broker_cluster::{
+    ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
+};
 use broker_config::{ConfigError, ConfigRegistry};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
@@ -48,6 +53,33 @@ struct Args {
     /// Enterprise commercial license key for multi-node clustering (or via INDRA_LICENSE_KEY env).
     #[arg(long)]
     license_key: Option<String>,
+
+    /// Trusted licence-signing keys (B2-03): a JSON file or a directory of
+    /// JSON files of the form
+    /// `{"keys": [{"kid": "...", "public_key_hex": "<SEC1 hex>"}]}`.
+    /// Empty (the default) trusts nothing: enterprise licences are then
+    /// rejected as unknown keys while community mode still boots. A
+    /// missing or corrupt path fails boot loudly rather than silently
+    /// running unlicensed.
+    #[arg(long, default_value = "")]
+    license_keys: String,
+
+    /// Write the installation licence request to this path and exit, for
+    /// sites with no dashboard. The file carries the cluster identity and
+    /// is safe to email to sales.
+    #[arg(long, default_value = "")]
+    licence_request_out: String,
+
+    /// Install the licence token read from this path and exit. Verified
+    /// before any write, so a failed install never touches the stored
+    /// licence.
+    #[arg(long, default_value = "")]
+    licence_install_file: String,
+
+    /// Days before expiry that the approaching-expiry alarm and log
+    /// warning start. Applies to the trial and to licensed expiry alike.
+    #[arg(long, default_value_t = 30)]
+    licence_expiry_warn_days: u64,
 
     /// Cluster seed nodes (e.g. 127.0.0.1:19883). Specifying enables distributed clustering.
     #[arg(long)]
@@ -137,6 +169,52 @@ struct Args {
     /// Path to a PEM CA certificate for private directories (`ldaps://`).
     #[arg(long, default_value = "")]
     ldap_ca_cert: String,
+
+    /// Keytab file for Kerberos authentication (B2-02). Empty (the
+    /// default) disables Kerberos: CONNECT falls back to the local user
+    /// store (plus LDAP when configured). Set to a MIT keytab v2 file
+    /// holding the broker's service principal to enable GSSAPI-based
+    /// authentication at CONNECT (SPNEGO NegTokenInit wrapping AP-REQ,
+    /// or bare AP-REQ). A missing or unreadable keytab disables the
+    /// mechanism explicitly with a clear log line and never accepts
+    /// tokens.
+    #[arg(long, default_value = "")]
+    kerberos_keytab: String,
+
+    /// Service principal name held in the keytab (for example
+    /// `mqtt/broker.example.com@EXAMPLE.COM`). Must match the ticket's
+    /// service name or CONNECT is refused.
+    #[arg(long, default_value = "")]
+    kerberos_service_principal: String,
+
+    /// Expected service realm (for example `EXAMPLE.COM`). Empty disables
+    /// the realm check on the service name.
+    #[arg(long, default_value = "")]
+    kerberos_realm: String,
+
+    /// Comma-separated list of trusted client realms (for example
+    /// `EXAMPLE.COM`). Empty allows any realm that verifies.
+    #[arg(long, default_value = "")]
+    kerberos_allowed_realms: String,
+
+    /// Clock-skew allowance in seconds for ticket validity and
+    /// authenticator timestamps (default 300, clamped 1..3600).
+    #[arg(long, default_value_t = 300)]
+    kerberos_clock_skew_secs: u64,
+
+    /// Comma-separated `principal=role` mappings for verified Kerberos
+    /// client principals (for example
+    /// `alice@EXAMPLE.COM=publisher,bob@EXAMPLE.COM=subscriber`).
+    /// Unmapped principals authenticate with role `user`. Empty (the
+    /// default) leaves every principal at `user`.
+    #[arg(long, default_value = "")]
+    kerberos_role_map: String,
+
+    /// Replay-cache bound for Kerberos authenticators (default 1024,
+    /// clamped 16..8192). Bounds CONNECT-only memory: each entry is
+    /// under 128 bytes, so the default holds under 128 KiB.
+    #[arg(long, default_value_t = broker_auth::REPLAY_MAX_ENTRIES)]
+    kerberos_replay_max: usize,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -213,6 +291,12 @@ fn session_binding_reply(
 /// per-user connection quota applies (overage short-circuits to `0x8B`),
 /// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    // B2-02: verified Kerberos identity for this CONNECT. Set inside the
+    // auth block on Kerberos success and read by the ownership stamp below
+    // without re-verifying the same token (the replay cache would refuse a
+    // second verify). CONNECT-only, never on the delivery path.
+    let mut kerberos_principal: Option<String> = None;
+    let mut kerberos_role: Option<String> = None;
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         // B1-03: banned identities never reach the session. Checked
         // before credentials and quotas so a banned client is refused
@@ -232,9 +316,11 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // A non-empty user store always wins over `--allow-anonymous`:
             // unauthenticated clients are rejected whenever users exist.
             // A configured directory does the same: anonymous never
-            // authenticates against LDAP. The flag only opens the broker
-            // while the store is empty and no directory is configured.
-            if shared.auth.user_count() > 0 || shared.ldap.is_some() {
+            // authenticates against LDAP or Kerberos. The flag only opens
+            // the broker while the store is empty and no directory or
+            // enabled Kerberos mechanism is configured.
+            let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
+            if shared.auth.user_count() > 0 || shared.ldap.is_some() || kerberos_enabled {
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87));
             }
@@ -247,8 +333,18 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // directory unless a local user matches. A directory outage
             // fails closed with a clear log line inside the authenticator
             // and never grants access.
+            // B2-02: Kerberos tokens (SPNEGO `0x60` or AP-REQ `0x6E`) go
+            // through the Kerberos authenticator when enabled (real DER
+            // plus keytab verification, never a bypass). Other passwords
+            // keep the LDAP path. An enabled Kerberos mechanism disables
+            // the open mode like LDAP does: non-Kerberos passwords fail
+            // closed with 0x86 instead of falling through.
             let local_has_users = shared.auth.user_count() > 0;
+            let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
+            let looks_kerberos =
+                password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
             let mut via_ldap = false;
+            let mut via_kerberos = false;
             if local_has_users {
                 let local_ok = shared
                     .auth
@@ -257,6 +353,42 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     .is_ok();
                 if local_ok {
                     // Local credential accepted; quotas apply below.
+                } else if kerberos_enabled && looks_kerberos {
+                    let Some(kerberos) = shared.kerberos.as_ref() else {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                    };
+                    let Some(token) = password else {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                    };
+                    match kerberos.verify_token(&req.client_id, token) {
+                        Ok(verified) => {
+                            // Wire every verified field live: client and
+                            // service principals, session-key length and
+                            // mapped role, plus the authenticator config
+                            // for the expected service. Audit-logged for
+                            // SSO traceability; CONNECT-only.
+                            let expected_service = kerberos.config().service_principal_name.clone();
+                            tracing::info!(
+                                client_principal = %verified.client_principal,
+                                service_principal = %verified.service_principal,
+                                expected_service = %expected_service,
+                                role = %verified.role,
+                                session_key_len = verified.session_key.len(),
+                                "Kerberos CONNECT accepted"
+                            );
+                            debug_assert_eq!(verified.service_principal, expected_service);
+                            debug_assert_eq!(verified.session_key.len(), 32);
+                            via_kerberos = true;
+                            kerberos_principal = Some(verified.client_principal);
+                            kerberos_role = Some(verified.role);
+                        }
+                        Err(_) => {
+                            shared.metrics.inc_auth_failures();
+                            return Some(session_binding_reply(frame, 0, false, 0x86));
+                        }
+                    }
                 } else if let Some(ldap) = shared.ldap.as_ref() {
                     if ldap
                         .authenticate(&req.client_id, req.username.as_deref(), password)
@@ -269,8 +401,49 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         return Some(session_binding_reply(frame, 0, false, 0x86));
                     }
                 } else {
+                    // No LDAP and (no enabled Kerberos or a non-Kerberos
+                    // password): with local users present the failure is
+                    // final. When Kerberos is enabled a non-Kerberos
+                    // password is not an open-mode accept.
+                    if kerberos_enabled {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                    }
                     shared.metrics.inc_auth_failures();
                     return Some(session_binding_reply(frame, 0, false, 0x86));
+                }
+            } else if kerberos_enabled && looks_kerberos {
+                let Some(kerberos) = shared.kerberos.as_ref() else {
+                    shared.metrics.inc_auth_failures();
+                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                };
+                let Some(token) = password else {
+                    shared.metrics.inc_auth_failures();
+                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                };
+                match kerberos.verify_token(&req.client_id, token) {
+                    Ok(verified) => {
+                        // Same live wiring as above: every verified field
+                        // plus the authenticator config is read here.
+                        let expected_service = kerberos.config().service_principal_name.clone();
+                        tracing::info!(
+                            client_principal = %verified.client_principal,
+                            service_principal = %verified.service_principal,
+                            expected_service = %expected_service,
+                            role = %verified.role,
+                            session_key_len = verified.session_key.len(),
+                            "Kerberos CONNECT accepted"
+                        );
+                        debug_assert_eq!(verified.service_principal, expected_service);
+                        debug_assert_eq!(verified.session_key.len(), 32);
+                        via_kerberos = true;
+                        kerberos_principal = Some(verified.client_principal);
+                        kerberos_role = Some(verified.role);
+                    }
+                    Err(_) => {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                    }
                 }
             } else if let Some(ldap) = shared.ldap.as_ref() {
                 if ldap
@@ -283,10 +456,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     shared.metrics.inc_auth_failures();
                     return Some(session_binding_reply(frame, 0, false, 0x86));
                 }
+            } else if kerberos_enabled {
+                // Enabled Kerberos disables the open mode: a credentialed
+                // CONNECT without a Kerberos token fails closed.
+                shared.metrics.inc_auth_failures();
+                return Some(session_binding_reply(frame, 0, false, 0x86));
             } else {
-                // Open broker: no users, no directory. Fall through to the
-                // session resolution below (rc 0).
+                // Open broker: no users, no directory, no enabled Kerberos.
+                // Fall through to the session resolution below (rc 0).
             }
+            // Effective identity for quotas and takeover: the verified
+            // Kerberos principal when present, else the MQTT username.
+            let effective_username: Option<String> =
+                kerberos_principal.clone().or_else(|| req.username.clone());
             // Takeover pre-release: a live session for this client means
             // the previous holder was orphaned by this very bind.
             let already_live = shared
@@ -295,13 +477,18 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 .map(|session| *session.connected.read())
                 .unwrap_or(false);
             if already_live {
-                if let Some(username) = &req.username {
+                if let Some(username) = &effective_username {
                     shared.sessions.release_connection_slot(username);
                 }
             }
-            if let Some(username) = &req.username {
-                // Directory users have no local quotas: unlimited.
-                let max = if via_ldap {
+            if let Some(username) = &effective_username {
+                // Directory and Kerberos users have no local quotas:
+                // unlimited. The invariant below reads the live role so
+                // `VerifiedKerberos::role` is wired, not test-only:
+                // every Kerberos CONNECT sets a role alongside the
+                // principal, and non-Kerberos CONNECTs set neither.
+                debug_assert!(via_kerberos == kerberos_role.is_some());
+                let max = if via_ldap || via_kerberos {
                     None
                 } else {
                     shared
@@ -337,12 +524,17 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     if !stale.1.is_empty() {
         refresh_subscription_stats(shared);
     }
-    // Stamp ownership for quota release and publish attribution.
+    // Stamp ownership for quota release and publish attribution. Kerberos
+    // CONNECTs stamp the verified client principal (not the MQTT username
+    // string, which the ticket supersedes); all other paths keep the MQTT
+    // username. The principal was verified above, never re-verified here.
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
-        if let (Some(session), Some(username)) =
-            (shared.sessions.get(&req.client_id), &req.username)
-        {
-            *session.username.write() = Some(username.clone());
+        if let Some(session) = shared.sessions.get(&req.client_id) {
+            if let Some(principal) = &kerberos_principal {
+                *session.username.write() = Some(principal.clone());
+            } else if let Some(username) = &req.username {
+                *session.username.write() = Some(username.clone());
+            }
         }
         // Stamp the peer address for publish-time ban checks (B1-03):
         // only overwritten when the edge forwarded one, so a rebind
@@ -649,12 +841,21 @@ struct Shared {
     /// lock off the delivery path, publishes take one read lock that
     /// returns after a length check when the store is empty.
     bans: Arc<broker_api::v5::banned::BanStore>,
+    /// Licence request/install/status store for B2-04: cluster identity,
+    /// stored token and trusted signing set, shared with the management
+    /// API so validated installs are visible without a restart. One Arc
+    /// clone; the publish path never touches it.
+    licence: Arc<broker_api::licence::LicenceStore>,
+    /// Alarm directory shared with the management API so licence lifecycle
+    /// events (trial/expiry/grace/lapse/ceiling) are visible via the API.
+    /// One Arc clone; management-plane only.
+    alarms: Arc<broker_api::v5::alarms::AlarmStore>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
     cluster: Option<Arc<dyn RoutingPlane>>,
     metrics: Arc<Metrics>,
-    /// Gauge-plus-high-water-mark store for EMQX `/stats` (W1 reads it;
+    /// Gauge-plus-high-water-mark store for the broker `/stats` endpoint (W1 reads it;
     /// lifecycle points below keep it exact).
     stats: Arc<StatsStore>,
     /// Node readiness flag for `GET /api/v5/status` (W1-27): single atomic
@@ -668,6 +869,12 @@ struct Shared {
     /// directory outage fails closed. One `Arc` clone at boot; connects
     /// take a semaphore permit off the delivery path.
     ldap: Option<Arc<LdapAuthenticator>>,
+    /// Kerberos authenticator for B2-02 (`None` disables Kerberos).
+    /// Consulted at CONNECT for SPNEGO/AP-REQ tokens when the local store
+    /// refuses; a missing keytab disables explicitly with a log line and
+    /// never accepts tokens. One `Arc` clone at boot; CONNECT-only (one
+    /// bounded replay-cache lock, never on the delivery path).
+    kerberos: Option<Arc<KerberosAuthenticator>>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
     /// boot; validated defaults in tests and before boot wiring runs.
@@ -760,12 +967,15 @@ impl Shared {
             retainer_config: Arc::new(broker_api::v5::retainer::RetainerConfigStore::new()),
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
+            licence: Arc::new(broker_api::licence::LicenceStore::new()),
+            alarms: Arc::new(broker_api::v5::alarms::AlarmStore::new()),
             cluster: None,
             metrics,
             stats,
             readiness,
             auth: Arc::new(MemoryAuth::new()),
             ldap: None,
+            kerberos: None,
             allow_anonymous: false,
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
@@ -801,6 +1011,64 @@ fn defaults_registry() -> Arc<ConfigRegistry> {
 /// (a missing file yields validated defaults). A corrupt file or an
 /// invalid snapshot is a fatal error naming the file and the field;
 /// defaults are never silently substituted.
+/// Log the licence lifecycle state at boot (B2-04).
+///
+/// Names the state, the days remaining and what stopped where relevant, so
+/// an operator never needs the status route to answer what they are
+/// licensed for. MQTT serving never depends on this state: trial, grace
+/// and lapsed alike keep connect, publish and subscribe working, and only
+/// enterprise entitlements turn off when lapsed.
+fn log_licence_lifecycle(state: &InstallationState, warn_days: u64) {
+    match state {
+        InstallationState::Trial { days_remaining } => {
+            info!(
+                "Licence state: trial ({} days remaining, every entitlement working)",
+                days_remaining
+            );
+            if *days_remaining <= warn_days {
+                warn!(
+                    "Trial ends in {} days; generate a licence request via GET /api/v1/licence/request or `indramqtt --licence-request-out <file>`",
+                    days_remaining
+                );
+            }
+        }
+        InstallationState::Valid {
+            customer,
+            expires_at,
+            max_nodes,
+            days_remaining,
+            ..
+        } => {
+            info!(
+                "Licence state: valid for '{}' (max {} nodes, expires at {}, {} days remaining)",
+                customer, max_nodes, expires_at, days_remaining
+            );
+            if *days_remaining <= warn_days {
+                warn!(
+                    "Licence for '{}' expires in {} days (at {}); renew before grace runs out",
+                    customer, days_remaining, expires_at
+                );
+            }
+        }
+        InstallationState::Grace {
+            customer,
+            expires_at,
+            days_remaining,
+            ..
+        } => {
+            warn!(
+                "Licence state: grace for '{}' (expired at {}, {} days remaining); every entitlement still working",
+                customer, expires_at, days_remaining
+            );
+        }
+        InstallationState::Lapsed { reason } => {
+            warn!(
+                "Licence state: lapsed ({reason}); enterprise entitlements off, MQTT still serving"
+            );
+        }
+    }
+}
+
 fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError> {
     std::fs::create_dir_all(data_dir).map_err(|err| ConfigError::Load {
         file: data_dir.to_string(),
@@ -2941,6 +3209,11 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // are enforced by the connect and publish checks without a restart.
     // One Arc clone; checks take a short read lock, never a write.
     state.bans = shared.bans.clone();
+    // Share the licence store and alarms (B2-04) so validated management
+    // installs and lifecycle alarms are visible without a restart. One
+    // Arc clone each; management-plane only, never on the delivery path.
+    state.licence = shared.licence.clone();
+    state.alarms = shared.alarms.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -3025,17 +3298,159 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         shared.ldap = Some(Arc::new(LdapAuthenticator::new(ldap_config)));
     }
+    // Kerberos authentication (B2-02): opt-in via `--kerberos-keytab`.
+    // Empty leaves `kerberos` as `None` so CONNECT pays one `is_some`
+    // branch and benchmarks see no new work. When set, CONNECT consults
+    // the local store first, then Kerberos for SPNEGO/AP-REQ tokens; a
+    // missing or unreadable keytab disables explicitly with a clear log
+    // line inside the authenticator and never accepts tokens.
+    if !args.kerberos_keytab.is_empty() {
+        let allowed_realms: Vec<String> = args
+            .kerberos_allowed_realms
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        // `principal=role` pairs; malformed entries are ignored so one
+        // typo cannot disable the whole map (fail closed per-principal:
+        // unmapped stays `user`).
+        let mut principal_role_map = std::collections::HashMap::new();
+        for pair in args.kerberos_role_map.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((principal, role)) = pair.split_once('=') {
+                let principal = principal.trim();
+                let role = role.trim();
+                if !principal.is_empty() && !role.is_empty() {
+                    principal_role_map.insert(principal.to_string(), role.to_string());
+                }
+            }
+        }
+        let kerberos_config = KerberosConfig {
+            service_principal_name: args.kerberos_service_principal.clone(),
+            realm: args.kerberos_realm.clone(),
+            allowed_realms,
+            keytab_path: args.kerberos_keytab.clone(),
+            clock_skew_secs: args.kerberos_clock_skew_secs,
+            replay_max_entries: args.kerberos_replay_max,
+            principal_role_map,
+        };
+        info!(
+            "Kerberos authentication enabled for {}",
+            args.kerberos_service_principal
+        );
+        shared.kerberos = Some(Arc::new(KerberosAuthenticator::new(kerberos_config)));
+    }
+
+    // Licensing lifecycle (B2-04): trusted keys are configuration loaded at
+    // startup whether or not clustering is enabled (a single node is a
+    // cluster of one). The cluster identity is created on first start and
+    // persisted in the data directory with the trial start, so restarts and
+    // added nodes never restart the trial. See LICENSING.md for the data
+    // directory loss procedure and the two-node join case.
+    let trusted_keys = if args.license_keys.trim().is_empty() {
+        TrustedKeys::new()
+    } else {
+        match TrustedKeys::load_from_path(std::path::Path::new(args.license_keys.trim())) {
+            Ok(keys) => keys,
+            Err(e) => {
+                return Err(format!(
+                    "cannot load trusted licence keys from {}: {e}",
+                    args.license_keys.trim()
+                )
+                .into());
+            }
+        }
+    };
+    trusted_keys.log_at_boot();
+    shared.licence.set_trusted_keys(trusted_keys.clone());
+    shared
+        .licence
+        .set_expiry_warn_days(args.licence_expiry_warn_days);
+    let now_licence = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let licence_state = match shared
+        .licence
+        .load_from_data_dir(std::path::Path::new(&args.data_dir), now_licence)
+    {
+        Ok(state) => state,
+        Err(e) => {
+            return Err(format!("cannot load licence state from {}: {e}", args.data_dir).into());
+        }
+    };
+    // File commands for sites with no dashboard: generate the request or
+    // install a licence, then exit without starting the broker.
+    if !args.licence_request_out.trim().is_empty() {
+        let request = shared
+            .licence
+            .generate_request(Some(3), vec!["clustering".to_string()], "")
+            .map_err(|e| format!("cannot generate licence request: {e}"))?;
+        let text = serde_json::to_string_pretty(&request)
+            .map_err(|e| format!("cannot encode licence request: {e}"))?;
+        std::fs::write(args.licence_request_out.trim(), text.as_bytes()).map_err(|e| {
+            format!(
+                "cannot write licence request to {}: {e}",
+                args.licence_request_out.trim()
+            )
+        })?;
+        println!(
+            "Licence request written to {}\n{}",
+            args.licence_request_out.trim(),
+            request.summary
+        );
+        return Ok(());
+    }
+    if !args.licence_install_file.trim().is_empty() {
+        let text = std::fs::read_to_string(args.licence_install_file.trim()).map_err(|e| {
+            format!(
+                "cannot read licence file {}: {e}",
+                args.licence_install_file.trim()
+            )
+        })?;
+        match shared.licence.install(&text, now_licence) {
+            Ok(payload) => {
+                shared.licence.refresh_alarms(&shared.alarms, now_licence);
+                println!(
+                    "Licence installed for '{}' (max {} nodes, expires at {})",
+                    payload.customer, payload.max_nodes, payload.expires_at
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!("licence install refused: {e}").into());
+            }
+        }
+    }
+    log_licence_lifecycle(&licence_state, args.licence_expiry_warn_days);
+    shared.licence.refresh_alarms(&shared.alarms, now_licence);
 
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
+        // The licence binds to the stable cluster identity (one licence
+        // covers the whole cluster): the stored token wins when present,
+        // otherwise the explicit flag or environment provides it. Joiners
+        // adopt the cluster identity and receive the licence as part of
+        // joining, so adding a node never needs another round trip.
+        let cluster_id = shared
+            .licence
+            .cluster_identity()
+            .unwrap_or_else(|| args.node_id.clone());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let license_key = args
-            .license_key
+        let license_key = shared
+            .licence
+            .stored_token()
+            .or_else(|| args.license_key.clone())
             .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
-        let status = ClusterLicense::evaluate(license_key.as_deref(), 1, now, &args.node_id);
+        let status =
+            ClusterLicense::evaluate(license_key.as_deref(), 1, now, &cluster_id, &trusted_keys);
         ClusterLicense::log_status_banner(&status);
 
         let local_node = broker_cluster::NodeId::new(&args.node_id);
@@ -3049,6 +3464,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         transport.clone(),
                     );
                     swim.set_license_key(license_key);
+                    swim.set_trusted_keys(trusted_keys.clone());
+                    swim.set_cluster_identity(
+                        cluster_id.clone(),
+                        shared.licence.cluster_trial_started_at(),
+                    );
                     let route_table =
                         Arc::new(broker_cluster::ClusterRouteTable::new(local_node.clone()));
                     swim.attach_route_table(route_table);
@@ -5425,6 +5845,524 @@ mod tests {
         assert!(down_shared.sessions.get("ldap-down").is_none());
     }
 
+    /// B2-02: Kerberos authentication through the broker CONNECT path.
+    ///
+    /// Starts an in-process test KDC (real DER via manual encoding that the
+    /// broker decodes with `kerberos-parser`/`der-parser`, real AES-256-GCM
+    /// via `ring`) holding the broker service key in a MIT keytab v2 file,
+    /// then drives CONNECTs through `apply_bind`, the same entry point the
+    /// edge uses. A valid ticket (bare and SPNEGO-wrapped) is accepted,
+    /// expired, wrong-service, replayed and malformed tokens are refused
+    /// with 0x86, the old B1-01 plaintext bypasses still fail, anonymous is
+    /// refused while Kerberos is enabled, and local users keep working.
+    #[tokio::test]
+    async fn kerberos_bind_through_broker_connect() {
+        use std::collections::HashMap;
+        use std::io::Write as _;
+
+        const REALM: &str = "EXAMPLE.COM";
+        const SERVICE_FULL: &str = "mqtt/broker.example.com@EXAMPLE.COM";
+
+        fn krb_len(len: usize) -> Vec<u8> {
+            if len < 128 {
+                vec![len as u8]
+            } else {
+                let mut bytes = Vec::new();
+                let mut n = len;
+                while n > 0 {
+                    bytes.push((n & 0xFF) as u8);
+                    n >>= 8;
+                }
+                bytes.reverse();
+                let mut out = vec![0x80 | (bytes.len() as u8)];
+                out.extend_from_slice(&bytes);
+                out
+            }
+        }
+
+        fn krb_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            out.extend_from_slice(&krb_len(content.len()));
+            out.extend_from_slice(content);
+            out
+        }
+
+        fn krb_u32(v: u32) -> Vec<u8> {
+            let mut bytes = v.to_be_bytes().to_vec();
+            while bytes.len() > 1 && bytes[0] == 0 {
+                bytes.remove(0);
+            }
+            if bytes[0] & 0x80 != 0 {
+                let mut prefixed = vec![0x00];
+                prefixed.extend_from_slice(&bytes);
+                bytes = prefixed;
+            }
+            krb_tlv(0x02, &bytes)
+        }
+
+        fn krb_general_string(s: &str) -> Vec<u8> {
+            krb_tlv(0x1B, s.as_bytes())
+        }
+
+        fn krb_octets(b: &[u8]) -> Vec<u8> {
+            krb_tlv(0x04, b)
+        }
+
+        fn krb_seq(content: &[u8]) -> Vec<u8> {
+            krb_tlv(0x30, content)
+        }
+
+        fn krb_ctx(n: u8, content: &[u8]) -> Vec<u8> {
+            krb_tlv(0xA0 | n, content)
+        }
+
+        fn krb_app(n: u8, content: &[u8]) -> Vec<u8> {
+            krb_tlv(0x60 | n, content)
+        }
+
+        fn krb_oid_content(numbers: &[u64]) -> Vec<u8> {
+            let mut out = vec![(numbers[0] * 40 + numbers[1]) as u8];
+            for n in &numbers[2..] {
+                let mut stack = Vec::new();
+                let mut v = *n;
+                loop {
+                    stack.push((v & 0x7F) as u8);
+                    v >>= 7;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                stack.reverse();
+                for (i, b) in stack.iter().enumerate() {
+                    if i + 1 < stack.len() {
+                        out.push(b | 0x80);
+                    } else {
+                        out.push(*b);
+                    }
+                }
+            }
+            out
+        }
+
+        fn krb_oid(numbers: &[u64]) -> Vec<u8> {
+            krb_tlv(0x06, &krb_oid_content(numbers))
+        }
+
+        fn krb_cts_encrypt(key: &[u8; 32], key_usage: i32, plain: &[u8]) -> Vec<u8> {
+            use picky_krb::crypto::CipherSuite;
+            CipherSuite::Aes256CtsHmacSha196
+                .cipher()
+                .encrypt(key, key_usage, plain)
+                .expect("CTS encrypt")
+        }
+
+        fn krb_realm(s: &str) -> picky_krb::data_types::Realm {
+            use picky_asn1::restricted_string::IA5String;
+            picky_krb::data_types::Realm::from(picky_asn1::wrapper::GeneralStringAsn1::from(
+                IA5String::from_string(s.to_string()).expect("realm as IA5"),
+            ))
+        }
+
+        fn krb_principal(name_type: u8, comps: &[String]) -> picky_krb::data_types::PrincipalName {
+            use picky_asn1::restricted_string::IA5String;
+            use picky_asn1::wrapper::{Asn1SequenceOf, ExplicitContextTag0, ExplicitContextTag1};
+            let strings: Vec<picky_krb::data_types::KerberosStringAsn1> = comps
+                .iter()
+                .map(|c| {
+                    picky_krb::data_types::KerberosStringAsn1::from(
+                        IA5String::from_string(c.clone()).expect("component as IA5"),
+                    )
+                })
+                .collect();
+            picky_krb::data_types::PrincipalName {
+                name_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(vec![
+                    name_type,
+                ])),
+                name_string: ExplicitContextTag1::from(Asn1SequenceOf::from(strings)),
+            }
+        }
+
+        fn krb_time(secs: i64) -> picky_krb::data_types::KerberosTime {
+            use picky_asn1::date::GeneralizedTime;
+            let dt = time::OffsetDateTime::from_unix_timestamp(secs).expect("valid time");
+            picky_krb::data_types::KerberosTime::from(GeneralizedTime::from(dt))
+        }
+
+        fn krb_ticket_inner(
+            client: &str,
+            _service: &str,
+            start: i64,
+            end: i64,
+            session_key: &[u8],
+        ) -> Vec<u8> {
+            use picky_asn1::wrapper::{
+                ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag2, ExplicitContextTag3,
+                ExplicitContextTag4, ExplicitContextTag5, ExplicitContextTag6, ExplicitContextTag7,
+                OctetStringAsn1, Optional,
+            };
+            use picky_krb::data_types::{
+                EncTicketPart, EncTicketPartInner, EncryptionKey, TransitedEncoding,
+            };
+            let (cname_part, crealm_part) =
+                client.split_once('@').unwrap_or((client, "EXAMPLE.COM"));
+            let cname = krb_principal(1, &[cname_part.to_string()]);
+            let crealm = krb_realm(crealm_part);
+            let enc_part = EncTicketPart::from(EncTicketPartInner {
+                flags: ExplicitContextTag0::from(picky_asn1::wrapper::BitStringAsn1::default()),
+                key: ExplicitContextTag1::from(EncryptionKey {
+                    key_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(
+                        vec![18u8],
+                    )),
+                    key_value: ExplicitContextTag1::from(OctetStringAsn1::from(
+                        session_key.to_vec(),
+                    )),
+                }),
+                crealm: ExplicitContextTag2::from(crealm),
+                cname: ExplicitContextTag3::from(cname),
+                transited: ExplicitContextTag4::from(TransitedEncoding {
+                    tr_type: ExplicitContextTag0::from(picky_asn1::wrapper::IntegerAsn1::from(
+                        vec![0u8],
+                    )),
+                    contents: ExplicitContextTag1::from(OctetStringAsn1::from(vec![1u8])),
+                }),
+                auth_time: ExplicitContextTag5::from(krb_time(start)),
+                starttime: Optional::from(Some(ExplicitContextTag6::from(krb_time(start)))),
+                endtime: ExplicitContextTag7::from(krb_time(end)),
+                renew_till: Optional::from(None),
+                caddr: Optional::from(None),
+                authorization_data: Optional::from(None),
+            });
+            picky_asn1_der::to_vec(&enc_part).expect("encode EncTicketPart")
+        }
+
+        fn krb_auth_inner(client: &str, ts: i64, usec: u32) -> Vec<u8> {
+            use picky_asn1::wrapper::{
+                ExplicitContextTag0, ExplicitContextTag1, ExplicitContextTag2, ExplicitContextTag4,
+                ExplicitContextTag5, IntegerAsn1, Optional,
+            };
+            use picky_krb::data_types::{Authenticator, AuthenticatorInner};
+            let (cname_part, crealm_part) =
+                client.split_once('@').unwrap_or((client, "EXAMPLE.COM"));
+            let cname = krb_principal(1, &[cname_part.to_string()]);
+            let crealm = krb_realm(crealm_part);
+            let mut usec_bytes = usec.to_be_bytes().to_vec();
+            while usec_bytes.len() > 1 && usec_bytes[0] == 0 {
+                usec_bytes.remove(0);
+            }
+            if usec_bytes[0] & 0x80 != 0 {
+                let mut prefixed = vec![0x00];
+                prefixed.extend_from_slice(&usec_bytes);
+                usec_bytes = prefixed;
+            }
+            let auth = Authenticator::from(AuthenticatorInner {
+                authenticator_vno: ExplicitContextTag0::from(IntegerAsn1::from(vec![5u8])),
+                crealm: ExplicitContextTag1::from(crealm),
+                cname: ExplicitContextTag2::from(cname),
+                cksum: Optional::from(None),
+                cusec: ExplicitContextTag4::from(IntegerAsn1::from(usec_bytes)),
+                ctime: ExplicitContextTag5::from(krb_time(ts)),
+                subkey: Optional::from(None),
+                seq_number: Optional::from(None),
+                authorization_data: Optional::from(None),
+            });
+            picky_asn1_der::to_vec(&auth).expect("encode Authenticator")
+        }
+
+        fn krb_principal_name(comps: &[String]) -> Vec<u8> {
+            let mut strings = Vec::new();
+            for c in comps {
+                strings.extend_from_slice(&krb_general_string(c));
+            }
+            let seq = krb_seq(&strings);
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(1)));
+            content.extend_from_slice(&krb_ctx(1, &seq));
+            krb_seq(&content)
+        }
+
+        fn krb_encrypted(cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_tlv(0x02, &[18])));
+            content.extend_from_slice(&krb_ctx(2, &krb_octets(cipher)));
+            krb_seq(&content)
+        }
+
+        fn krb_ticket(realm: &str, comps: &[String], cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(5)));
+            content.extend_from_slice(&krb_ctx(1, &krb_general_string(realm)));
+            content.extend_from_slice(&krb_ctx(2, &krb_principal_name(comps)));
+            content.extend_from_slice(&krb_ctx(3, &krb_encrypted(cipher)));
+            krb_app(1, &krb_seq(&content))
+        }
+
+        fn krb_ap_req(ticket: &[u8], auth_cipher: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(&krb_ctx(0, &krb_u32(5)));
+            content.extend_from_slice(&krb_ctx(1, &krb_u32(14)));
+            content.extend_from_slice(&krb_ctx(2, &krb_tlv(0x03, &[0x00])));
+            let mut ticket_field = vec![0xA3];
+            ticket_field.extend_from_slice(&krb_len(ticket.len()));
+            ticket_field.extend_from_slice(ticket);
+            content.extend_from_slice(&ticket_field);
+            content.extend_from_slice(&krb_ctx(4, &krb_encrypted(auth_cipher)));
+            krb_app(14, &krb_seq(&content))
+        }
+
+        fn krb_spnego(ap_req: &[u8]) -> Vec<u8> {
+            let kerberos_oid = krb_oid(&[1, 2, 840, 113554, 1, 2, 2]);
+            let mut mech_list = Vec::new();
+            mech_list.extend_from_slice(&kerberos_oid);
+            let mech_seq = krb_seq(&mech_list);
+            let mut neg = Vec::new();
+            neg.extend_from_slice(&krb_ctx(0, &mech_seq));
+            neg.extend_from_slice(&krb_ctx(2, &krb_octets(ap_req)));
+            let neg_seq = krb_seq(&neg);
+            let spnego_oid = krb_oid(&[1, 3, 6, 1, 5, 5, 2]);
+            let mut outer = Vec::new();
+            outer.extend_from_slice(&spnego_oid);
+            outer.extend_from_slice(&neg_seq);
+            krb_app(0, &outer)
+        }
+
+        fn krb_now() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }
+
+        fn krb_random_key() -> [u8; 32] {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let rng = SystemRandom::new();
+            let mut key = [0u8; 32];
+            rng.fill(&mut key).expect("system randomness");
+            key
+        }
+
+        // Test KDC state: service key shared with the keytab file.
+        let service_key = krb_random_key();
+        let service_comps = vec!["mqtt".to_string(), "broker.example.com".to_string()];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keytab_path = dir.path().join("broker.keytab");
+        {
+            let mut file = vec![0x05u8, 0x02u8];
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&2u16.to_be_bytes());
+            entry.extend_from_slice(&(REALM.len() as u16).to_be_bytes());
+            entry.extend_from_slice(REALM.as_bytes());
+            for comp in &service_comps {
+                entry.extend_from_slice(&(comp.len() as u16).to_be_bytes());
+                entry.extend_from_slice(comp.as_bytes());
+            }
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            entry.extend_from_slice(&0u32.to_be_bytes());
+            entry.push(1u8);
+            entry.extend_from_slice(&18u16.to_be_bytes());
+            entry.extend_from_slice(&32u16.to_be_bytes());
+            entry.extend_from_slice(&service_key);
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            file.extend_from_slice(&(entry.len() as i32).to_be_bytes());
+            file.extend_from_slice(&entry);
+            let mut handle = std::fs::File::create(&keytab_path).expect("write keytab");
+            handle.write_all(&file).expect("write keytab");
+        }
+        let mint = |client: &str, start: i64, end: i64, ts: i64, usec: u32| {
+            let session_key = krb_random_key();
+            let inner = krb_ticket_inner(client, SERVICE_FULL, start, end, &session_key);
+            let ticket_cipher = krb_cts_encrypt(&service_key, 2, &inner);
+            let ticket = krb_ticket(REALM, &service_comps, &ticket_cipher);
+            let auth_inner = krb_auth_inner(client, ts, usec);
+            let auth_cipher = krb_cts_encrypt(&session_key, 11, &auth_inner);
+            krb_ap_req(&ticket, &auth_cipher)
+        };
+
+        let kerberos_config = KerberosConfig {
+            service_principal_name: SERVICE_FULL.to_string(),
+            realm: REALM.to_string(),
+            allowed_realms: vec![REALM.to_string()],
+            keytab_path: keytab_path.to_string_lossy().to_string(),
+            clock_skew_secs: 300,
+            replay_max_entries: broker_auth::REPLAY_MAX_ENTRIES,
+            principal_role_map: HashMap::from([(
+                "alice@EXAMPLE.COM".to_string(),
+                "publisher".to_string(),
+            )]),
+        };
+        let mut shared = test_shared();
+        shared.kerberos = Some(std::sync::Arc::new(KerberosAuthenticator::new(
+            kerberos_config,
+        )));
+        assert!(
+            shared.kerberos.as_ref().is_some_and(|k| k.is_enabled()),
+            "test keytab must enable Kerberos"
+        );
+        shared
+            .auth
+            .add_user("local-user", b"localpw")
+            .expect("seed local user");
+
+        // Valid bare AP-REQ through the broker: accepted, principal stamped.
+        let now = krb_now();
+        let token = mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 21);
+        let frame = bind_frame(
+            91,
+            1,
+            encode_bind_meta_creds("krb-device-1", true, 60, "alice", &token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "valid Kerberos ticket must be accepted");
+        let session = shared.sessions.get("krb-device-1").expect("session exists");
+        assert_eq!(
+            session.username.read().clone(),
+            Some("alice@EXAMPLE.COM".to_string()),
+            "session must carry the verified principal"
+        );
+        // Role mapping through the broker (live, not store-only): the
+        // broker's authenticator maps the verified principal onto its
+        // configured role, and its config carries the map.
+        let kerberos = shared.kerberos.as_ref().expect("kerberos enabled");
+        assert_eq!(
+            kerberos.role_for_principal("alice@EXAMPLE.COM"),
+            "publisher"
+        );
+        assert_eq!(kerberos.role_for_principal("mallory@EXAMPLE.COM"), "user");
+        assert_eq!(
+            kerberos
+                .config()
+                .principal_role_map
+                .get("alice@EXAMPLE.COM")
+                .map(String::as_str),
+            Some("publisher")
+        );
+
+        // Valid SPNEGO-wrapped AP-REQ: accepted.
+        let token = krb_spnego(&mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 22));
+        let frame = bind_frame(
+            92,
+            1,
+            encode_bind_meta_creds("krb-device-2", true, 60, "alice", &token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "valid SPNEGO ticket must be accepted");
+
+        // Local users keep working with Kerberos enabled.
+        let frame = bind_frame(
+            93,
+            1,
+            encode_bind_meta_creds("local-device", true, 60, "local-user", b"localpw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "local users keep working with Kerberos enabled");
+
+        // Expired ticket: refused with 0x86, no session.
+        let token = mint("alice@EXAMPLE.COM", now - 7200, now - 3600, now - 3600, 23);
+        let frame = bind_frame(
+            94,
+            1,
+            encode_bind_meta_creds("krb-device-3", true, 60, "alice", &token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "expired ticket must yield 0x86");
+        assert!(shared.sessions.get("krb-device-3").is_none());
+
+        // Ticket for another service: refused with 0x86.
+        let other_key = krb_random_key();
+        let other_inner = krb_ticket_inner(
+            "alice@EXAMPLE.COM",
+            "mqtt/other.example.com@EXAMPLE.COM",
+            now - 60,
+            now + 3600,
+            &krb_random_key(),
+        );
+        let other_cipher = krb_cts_encrypt(&other_key, 2, &other_inner);
+        let other_ticket = krb_ticket(
+            REALM,
+            &["mqtt".to_string(), "other.example.com".to_string()],
+            &other_cipher,
+        );
+        // Authenticator for the other ticket (session key unknown to the
+        // broker, but the outer service check already fails first).
+        let dummy_session = krb_random_key();
+        let dummy_auth = krb_cts_encrypt(
+            &dummy_session,
+            11,
+            &krb_auth_inner("alice@EXAMPLE.COM", now, 24),
+        );
+        let other_token = krb_ap_req(&other_ticket, &dummy_auth);
+        let frame = bind_frame(
+            95,
+            1,
+            encode_bind_meta_creds("krb-device-4", true, 60, "alice", &other_token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "wrong-service ticket must yield 0x86");
+
+        // Replay: same token twice, second refused.
+        let token = mint("alice@EXAMPLE.COM", now - 60, now + 3600, now, 25);
+        let frame = bind_frame(
+            96,
+            1,
+            encode_bind_meta_creds("krb-device-5", true, 60, "alice", &token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "first presentation must succeed");
+        let frame = bind_frame(
+            97,
+            1,
+            encode_bind_meta_creds("krb-device-6", true, 60, "alice", &token),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "replayed token must yield 0x86");
+
+        // Malformed token: refused with 0x86.
+        let frame = bind_frame(
+            98,
+            1,
+            encode_bind_meta_creds("krb-device-7", true, 60, "alice", b"not a token"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "malformed token must yield 0x86");
+
+        // Old B1-01 bypasses still fail through the broker.
+        let legacy = b"KRB5:operator@EXAMPLE.COM:mqtt/broker.example.com@EXAMPLE.COM:EXAMPLE.COM";
+        let frame = bind_frame(
+            99,
+            1,
+            encode_bind_meta_creds("krb-device-8", true, 60, "operator", legacy),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "legacy plaintext bypass must yield 0x86");
+        let mut tagged = vec![0x6E, legacy.len() as u8];
+        tagged.extend_from_slice(legacy);
+        let frame = bind_frame(
+            100,
+            1,
+            encode_bind_meta_creds("krb-device-9", true, 60, "operator", &tagged),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "legacy 0x6E bypass must yield 0x86");
+
+        // Anonymous while Kerberos is enabled: refused with 0x87.
+        let frame = bind_frame(101, 1, encode_bind_meta("krb-anon", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(
+            rc, 0x87,
+            "anonymous must be refused while Kerberos is enabled"
+        );
+    }
+
     #[tokio::test]
     async fn bind_quota_overage_returns_0x8b() {
         use broker_auth::UserQuotas;
@@ -7033,6 +7971,127 @@ mod tests {
                 .payload,
             Bytes::from_static(b"journalled-bytes")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn b2_04_mqtt_serves_in_trial_grace_and_lapsed() {
+        // MQTT connect, publish and subscribe keep working with no
+        // licence (trial), with a licence in grace, and with a lapsed
+        // licence: only enterprise entitlements turn off, never traffic.
+        use broker_cluster::InstallationState;
+        let now = 1_750_000_000u64;
+        let states = vec![
+            InstallationState::Trial { days_remaining: 90 },
+            InstallationState::Grace {
+                customer: "Acme".to_string(),
+                expires_at: now - 1_000,
+                days_remaining: 80,
+                grace_total_days: 90,
+                max_nodes: 5,
+                features: vec!["clustering".to_string()],
+                kid: "key-a".to_string(),
+            },
+            InstallationState::Lapsed {
+                reason: "trial ended".to_string(),
+            },
+        ];
+        for state in &states {
+            let sessions = SessionManager::new();
+            let router = Router::new();
+            let metrics = Metrics::new();
+            let frame = bind_frame(11, 1, encode_bind_meta("device-b204", true, 60));
+            let reply = reply_for_frame(&frame, &sessions).expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0, "connect works in state {}", state.name());
+            let filter = TopicFilter::new("sensors/b204").unwrap();
+            router.subscribe(
+                &filter,
+                Subscription::new("device-b204", 77, QoS::AtLeastOnce),
+            );
+            let topic = Topic::new("sensors/b204").unwrap();
+            let deliveries = build_downlink_frames(
+                &router,
+                &sessions,
+                &metrics,
+                &topic,
+                QoS::AtLeastOnce,
+                false,
+                &Bytes::from_static(b"hello"),
+            );
+            assert!(
+                !deliveries.is_empty(),
+                "publish/subscribe work in state {}",
+                state.name()
+            );
+            assert_eq!(state.entitlements_on(), state.name() != "lapsed");
+        }
+    }
+
+    #[test]
+    fn b2_04_ceiling_refusal_raises_alarm_and_names_ceiling() {
+        // A node joining beyond the licensed ceiling is refused membership
+        // with a reason naming the ceiling and the current count, raises an
+        // alarm, and keeps serving MQTT standalone (refused from the
+        // cluster, not stopped as a broker).
+        let shared = test_shared();
+        let now = 1_750_000_000u64;
+        let state = InstallationState::Valid {
+            customer: "Acme".to_string(),
+            expires_at: now + 10_000_000,
+            max_nodes: 1,
+            features: vec!["clustering".to_string()],
+            kid: "key-a".to_string(),
+            days_remaining: 100,
+        };
+        let err = broker_cluster::join_admission(2, &state).expect_err("beyond ceiling refused");
+        assert!(err.contains('1'), "reason names the ceiling: {err}");
+        assert!(err.contains('2'), "reason names the current count: {err}");
+        shared.licence.note_ceiling_refusal(&shared.alarms, &err);
+        let active = shared.alarms.list_active();
+        assert!(
+            active.iter().any(|a| a.name == "licence_node_ceiling"),
+            "ceiling refusal raises an alarm"
+        );
+    }
+
+    #[test]
+    fn b2_04_restart_keeps_identity_and_trial() {
+        // Restarting a node inside a trial does not restart the trial: the
+        // identity (with its recorded trial start) survives the restart.
+        let dir = unique_data_dir();
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+        let start = 1_750_000_000u64;
+        let first =
+            broker_cluster::ClusterIdentity::load_or_create(std::path::Path::new(&data_dir), start)
+                .expect("create identity");
+        let mid = start + 10 * 86_400;
+        let reloaded =
+            broker_cluster::ClusterIdentity::load_or_create(std::path::Path::new(&data_dir), mid)
+                .expect("reload identity");
+        assert_eq!(reloaded.identity, first.identity);
+        assert_eq!(reloaded.trial_started_at, first.trial_started_at);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn b2_04_unlicensed_node_generates_request() {
+        // A fresh installation with no licence is in trial and can
+        // generate a licence request: the bootstrap never deadlocks.
+        let shared = test_shared();
+        let now = 1_750_000_000u64;
+        let dir = unique_data_dir();
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+        let state = shared
+            .licence
+            .load_from_data_dir(std::path::Path::new(&data_dir), now)
+            .expect("loads");
+        assert_eq!(state.name(), "trial");
+        let request = shared
+            .licence
+            .generate_request(Some(3), vec!["clustering".to_string()], "")
+            .expect("request");
+        assert!(!request.installation_identity.is_empty());
+        assert!(request.summary.contains(&request.installation_identity));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

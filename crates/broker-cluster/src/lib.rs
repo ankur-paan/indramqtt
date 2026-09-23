@@ -1,6 +1,13 @@
 pub mod license;
 pub mod swim;
-pub use license::{ClusterLicense, LicensePayload, LicenseStatus};
+pub use license::{
+    canonical_json_bytes, evaluate_installation, install_licence, is_known_entitlement,
+    join_admission, licence_file_path, load_stored_licence, log_identity_adoption,
+    trial_request_hint, verify_for_install, ClusterIdentity, ClusterLicense, InstallError,
+    InstallationState, LicenceRequest, LicensePayload, LicenseStatus, TrustedKeys,
+    DEFAULT_GRACE_DAYS, IDENTITY_FILE_NAME, KNOWN_ENTITLEMENTS, LICENCE_FILE_NAME, SECS_PER_DAY,
+    TRIAL_DAYS,
+};
 pub use swim::{
     ChannelSwimNetwork, ChannelSwimTransport, GossipItem, MemberState, NodeStatus, SwimConfig,
     SwimMembership, SwimMessage, SwimTransport, UdpSwimTransport,

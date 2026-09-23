@@ -45,3 +45,8 @@ clap = { workspace = true }
 flate2 = { workspace = true }
 yamldap = "0.2"
 tempfile = "3"
+ring = "0.17"
+picky-krb = "0.12"
+picky-asn1 = { version = "0.10", features = ["time_conversion"] }
+picky-asn1-der = "0.5"
+time = "0.3"

@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Apache Pulsar Producer Sink (`INDRA-153`)**: Multi-tenant (`tenant/namespace/topic`) partitioned producer with keyed routing and sequence tracking.
 - **Cloud Streaming Studio (`INDRA-218`)**: REST API and Web Dashboard forms for all 4 cloud bridges.
 
+### Changed
+- **Kafka connector `health_check_topic` default**: the schema default is now `indramqtt_health_check`. Anyone who set the topic explicitly is unaffected; to keep the previous topic, set `health_check_topic` explicitly in the connector configuration.
+
 ---
 
 ## [0.1.0-sprint19] - 2026-09-12 (Commit `a09eb88`)

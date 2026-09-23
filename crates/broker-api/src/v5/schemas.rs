@@ -120,7 +120,7 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "password": pwd_prop()
             }
         }),
-        "health_check_topic": str_prop("emqx_health_check"),
+        "health_check_topic": str_prop("indramqtt_health_check"),
         "allow_auto_topic_creation": bool_prop(true),
         "ssl": ssl_prop()
     }), &["name", "bootstrap_hosts"]));
@@ -875,4 +875,21 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
 
 pub async fn list_schemas() -> Response {
     (StatusCode::OK, Json(json!(["actions", "connectors"]))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONNECTORS_SCHEMA;
+
+    #[test]
+    fn kafka_health_check_topic_defaults_to_indramqtt() {
+        let default = CONNECTORS_SCHEMA["components"]["schemas"]["bridge_kafka.post_connector"]
+            ["properties"]["health_check_topic"]["default"]
+            .as_str()
+            .expect("kafka connector schema carries a health_check_topic default");
+        assert_eq!(
+            default, "indramqtt_health_check",
+            "kafka health-check topic default must stay branded for this repository"
+        );
+    }
 }

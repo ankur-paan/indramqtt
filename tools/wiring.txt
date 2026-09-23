@@ -11,7 +11,7 @@ wired  auto_subscribe
 wired  retainer_config
 
 wired  bans
-facade alarms              T-71
+wired  alarms
 facade monitor             T-72
 facade slow_subs           T-73
 facade slow_subs_settings  T-73
