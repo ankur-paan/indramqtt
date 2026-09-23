@@ -18,13 +18,21 @@ Method:
 - `Proving test` names one test by path. All paths are
   `crates/broker-connectors/src/<module>.rs`.
 
-Dependency note: `crates/broker-connectors/Cargo.toml` pulls in no
-maintained vendor driver (`tokio-postgres`, `mysql_async`, `rdkafka`,
-`redis`, `mongodb`, cloud SDKs). Every TCP sink is hand-written over
-`tokio::net::TcpStream`; the AWS IoT and Azure IoT sinks upgrade that
-socket with `tokio-rustls`/`rustls` (platform roots plus a configured
-CA bundle); every cloud sink is otherwise hand-written over
-`reqwest`. The `dev-dependency` is only `axum` for the loopback fakes.
+Dependency note: `crates/broker-connectors/Cargo.toml` pulls in the
+maintained vendor drivers `tokio-postgres 0.7` +
+`tokio-postgres-rustls` for the cockroachdb sink only
+(`PgDriverCockroachDbTransport` with `rustls` system roots), and
+`rdkafka 0.39` (SASL_SSL + SASL) plus `schema-registry-client 0.4`
+for the confluent sink only (`RdkafkaConfluentTransport` with the
+system OpenSSL roots, `RegistrySchemaClient` for Avro/JSON subjects;
+`apache-avro 0.15` proves Avro framing in dev-tests); no other
+sink uses a maintained vendor driver (`mysql_async`,
+`redis`, `mongodb`, cloud SDKs remain absent). Every other TCP sink is
+hand-written over `tokio::net::TcpStream`; the AWS IoT and Azure IoT
+sinks upgrade that socket with `tokio-rustls`/`rustls` (platform roots
+plus a configured CA bundle); every cloud sink is otherwise
+hand-written over `reqwest`. The `dev-dependencies` are `axum` for
+the loopback fakes and `apache-avro` for the confluent Avro vectors.
 
 Counts: 47 sink modules. 19 speak a native wire protocol over TCP
 (alloydb, aws_iot, azure_iot, cassandra, cockroachdb, confluent, couchbase,
@@ -42,8 +50,8 @@ vendor server in-tree. 47 have only mock or loopback-fake coverage.
 | bigquery | vendor HTTP API (`HttpBigQueryTransport` POST `insertAll` with Bearer token) | mock transport | `crates/broker-connectors/src/bigquery.rs:990 test_insert_flow_and_ids` (`MockBigQueryTransport`; no `TcpListener`) |
 | cassandra | native CQL binary v4 over TCP (`NativeCassandraTransport`, STARTUP/AUTH/USE/UNLOGGED BATCH, password auth) | loopback fake (in-process `TcpListener` scripting startup/auth/batch; plus `MockCassandraTransport`) | `crates/broker-connectors/src/cassandra.rs:1498 test_tcp_loopback_startup_auth_use_batch` |
 | clickhouse | vendor HTTP API (`reqwest` POST `?query=INSERT ... FORMAT JSONEachRow`; no dedicated transport struct) | loopback fake (ephemeral `axum` capture via `serve_captured`) | `crates/broker-connectors/src/clickhouse.rs:376 test_batch_posts_json_each_row` |
-| cockroachdb | native PG-compatible wire over TCP (`TcpCockroachDbTransport`, startup + Simple Query, UPSERT/ON CONFLICT) | mock transport (despite `loopback` in name, uses `MockCockroachDbTransport`; no `TcpListener`) | `crates/broker-connectors/src/cockroachdb.rs:1179 test_cockroach_sink_loopback_success` |
-| confluent | native Kafka wire over TCP (`TcpConfluentTransport`, ApiVersions + SASL PLAIN/SCRAM + Produce v3 RecordBatch-v2) | loopback fake (in-process fake broker `TcpListener`; plus `MemoryConfluentTransport`) | `crates/broker-connectors/src/confluent.rs:1446 test_tcp_plain_produce_against_fake_broker` |
+| cockroachdb | PG-compatible wire via the maintained `tokio-postgres` driver with `rustls` TLS (`PgDriverCockroachDbTransport`; UPSERT/ON CONFLICT, retry on 40001). Legacy hand-written `TcpCockroachDbTransport` retained for offline unit tests only | mock transport for unit tests (despite `loopback` in name, uses `MockCockroachDbTransport`; no `TcpListener`); real-server qualification in `test_qualify_driver_write_path` (ignored, needs `COCKROACHDB_*` env) | `crates/broker-connectors/src/cockroachdb.rs:1179 test_cockroach_sink_loopback_success` + `test_qualify_driver_write_path` |
+| confluent | Kafka wire plus SASL/SCRAM over TLS via the maintained `rdkafka` driver (`RdkafkaConfluentTransport`, SASL_SSL, acks=all; Schema Registry via `schema-registry-client`, `{topic}-value` subjects, magic `0x00` + schema-id framing). Legacy hand-written `TcpConfluentTransport` (ApiVersions + SASL PLAIN/SCRAM + Produce v3 RecordBatch-v2) retained for offline unit tests only | loopback fake + mock transport for unit tests (in-process fake broker `TcpListener`; plus `MemoryConfluentTransport`); real-server qualification in `test_qualify_driver_write_path` (ignored, needs `CONFLUENT_*` env) | `crates/broker-connectors/src/confluent.rs:1446 test_tcp_plain_produce_against_fake_broker` + `test_qualify_driver_write_path` |
 | couchbase | native KV binary over TCP (`NativeCouchbaseTransport`, SET/ADD/REPLACE opcodes + SASL PLAIN, pipelined opaque) | loopback fake (in-process `TcpListener` for SASL + batch; plus `MockCouchbaseTransport`) | `crates/broker-connectors/src/couchbase.rs:1219 test_tcp_loopback_sasl_and_pipelined_batch` |
 | databricks | vendor HTTP API (`HttpDatabricksTransport` POST `/api/2.0/sql/statements` with Bearer) | mock transport | `crates/broker-connectors/src/databricks.rs:1053 test_insert_flow_and_bearer` (`MockDatabricksTransport`; no `TcpListener`) |
 | datalayers | vendor HTTP API (`HttpDatalayersTransport` POST `/api/v1/write?db=` JSON) | mock transport | `crates/broker-connectors/src/datalayers.rs:529 test_datalayers_sink_loopback_success` (`MockDatalayersTransport`; no `TcpListener` despite name) |

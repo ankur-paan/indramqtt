@@ -1012,16 +1012,31 @@ async fn register_live_sink(
                 format: "JSONEachRow".to_string(),
                 batch_size: 1,
                 batch_timeout_ms: 10,
+                username: body
+                    .get("username")
+                    .or_else(|| body.get("user"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                password: body
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 request_timeout_ms,
             };
-            if let Ok(sink) =
-                broker_connectors::clickhouse::ClickHouseSink::new(config, reqwest::Client::new())
-            {
-                let sink = Arc::new(sink);
-                engine.connectors().register(name, sink.clone());
-                engine
-                    .connectors()
-                    .register(format!("clickhouse:{}", name), sink);
+            if let Ok(driver) = broker_connectors::DriverClickHouseTransport::new(&config) {
+                let transport: std::sync::Arc<dyn broker_connectors::ClickHouseTransport> =
+                    std::sync::Arc::new(driver);
+                if let Ok(sink) =
+                    broker_connectors::clickhouse::ClickHouseSink::new(config, transport)
+                {
+                    let sink = Arc::new(sink);
+                    engine.connectors().register(name, sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("clickhouse:{}", name), sink);
+                }
             }
         }
         "mqtt_bridge" | "bridge" => {
@@ -1265,7 +1280,9 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::TcpCockroachDbTransport::new(&config));
+            let transport = Arc::new(broker_connectors::PgDriverCockroachDbTransport::new(
+                &config,
+            ));
             if let Ok(sink) = broker_connectors::CockroachDbSink::new(config, transport) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
@@ -2147,7 +2164,8 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::confluent::TcpConfluentTransport::new(&config)
+            if let Ok(transport) =
+                broker_connectors::confluent::RdkafkaConfluentTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =

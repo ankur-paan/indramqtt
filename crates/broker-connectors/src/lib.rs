@@ -104,22 +104,30 @@ pub use cassandra::{
     CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport,
     ScyllaCassandraTransport,
 };
-pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
+pub use clickhouse::{
+    CapturedClickHouseBatch, ClickHouseConnector, ClickHouseRow, ClickHouseSink,
+    ClickHouseSinkConfig, ClickHouseTransport, DriverClickHouseTransport, HttpClickHouseTransport,
+    MockClickHouseOutcome, MockClickHouseTransport,
+};
 pub use cockroachdb::{
     build_native_upsert_query, build_on_conflict_upsert_query, classify_cockroach_sqlstate,
-    extract_cockroach_row, CapturedCockroachExecution, CockroachDbConfig, CockroachDbConnector,
-    CockroachDbSink, CockroachDbTransport, CockroachErrorClassification, CockroachQueryResult,
-    CockroachRow, CockroachValue, MockCockroachDbTransport, TcpCockroachDbTransport,
+    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed, extract_cockroach_row,
+    map_cockroach_driver_error, CapturedCockroachExecution, CockroachDbConfig,
+    CockroachDbConnector, CockroachDbSink, CockroachDbTransport, CockroachErrorClassification,
+    CockroachQueryResult, CockroachRow, CockroachValue, MockCockroachDbTransport,
+    PgDriverCockroachDbTransport, TcpCockroachDbTransport,
 };
 pub use confluent::{
-    classify_kafka_error, frame_schema_registry, parse_scram_server_first,
+    classify_driver_error, classify_kafka_error, frame_schema_registry, is_terminal_driver_message,
+    parse_scram_server_first, rdkafka_client_config, registry_subject_for_topic,
     resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template,
     resolve_topic as resolve_confluent_topic, sasl_plain_payload, schema_registry_basic_auth,
     scram_client_first_message, scram_client_proof as scram_confluent_client_proof, scram_hi,
     scram_nonce, scram_server_signature, split_schema_registry, ConfluentKafkaConfig,
     ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord,
-    ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport, SaslMechanism,
-    ScramHash, ScramServerFirst, TcpConfluentTransport,
+    ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport,
+    RdkafkaConfluentTransport, RegistrySchemaClient, SaslMechanism, ScramHash, ScramServerFirst,
+    TcpConfluentTransport,
 };
 pub use couchbase::{
     decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,

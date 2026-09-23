@@ -970,7 +970,11 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid clickhouse config: {e}"))?;
-                let sink = broker_connectors::ClickHouseSink::new(config, reqwest::Client::new())
+                let transport = std::sync::Arc::new(
+                    broker_connectors::DriverClickHouseTransport::new(&config)
+                        .map_err(|e| format!("invalid clickhouse transport: {e}"))?,
+                );
+                let sink = broker_connectors::ClickHouseSink::new(config, transport)
                     .map_err(|e| format!("invalid clickhouse sink: {e}"))?;
                 Ok(("clickhouse".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
@@ -1319,7 +1323,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid confluent config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpConfluentTransport::new(&config)
+                    broker_connectors::RdkafkaConfluentTransport::new(&config)
                         .map_err(|e| format!("invalid confluent transport: {e}"))?,
                 );
                 let sink = broker_connectors::ConfluentKafkaSink::new(config, transport)
@@ -1574,7 +1578,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid cockroachdb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpCockroachDbTransport::new(&config),
+                    broker_connectors::PgDriverCockroachDbTransport::new(&config),
                 );
                 let sink = broker_connectors::CockroachDbSink::new(config, transport)
                     .map_err(|e| format!("invalid cockroachdb sink: {e}"))?;
