@@ -633,12 +633,14 @@ pub async fn get_client_inflight(
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
-    // Bounded per-client view over the real QoS 1 tracker: the snapshot
-    // clones at most `MAX_QOS1_INFLIGHT` (100) entries under a short read
-    // lock, then paginates with the W0 helper. Management-plane read only;
+    // Bounded per-client view over the real QoS 1 tracker: the window
+    // snapshot plus the spill snapshot (oldest-first, window then spill),
+    // clones at most window + spill entries under short read locks, then
+    // paginates with the W0 helper. Management-plane read only;
     // the delivery hot path never takes a management lock (it takes the
     // session write lock only to track/ack, never to serve this view).
-    let snapshot = session.inflight_snapshot();
+    let mut snapshot = session.inflight_snapshot();
+    snapshot.extend(session.inflight_spill_snapshot());
     let total = snapshot.len();
     let page_items = paginate(&snapshot, params.page, params.limit);
     let data: Vec<serde_json::Value> = page_items
@@ -888,15 +890,25 @@ fn build_publish_deliveries(
                             session.next_packet_id()
                         };
                         if effective == 1 {
-                            let tracked = session.track_inflight(broker_session::InflightMessage {
+                            // B4-01: window fast path, spill past it (still
+                            // tracked for DUP replay), counted drop only
+                            // past window + spill. Mirrors the kernel
+                            // publish-to-delivery event.
+                            match session.track_inflight_or_spill(broker_session::InflightMessage {
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: payload.clone(),
-                            });
-                            if !tracked {
-                                state.metrics.inc_inflight_dropped();
+                            }) {
+                                broker_session::InflightTrackOutcome::Tracked => {}
+                                broker_session::InflightTrackOutcome::Spilled => {
+                                    state.metrics.inc_inflight_spilled();
+                                }
+                                broker_session::InflightTrackOutcome::Dropped => {
+                                    state.metrics.inc_inflight_dropped();
+                                    state.metrics.inc_inflight_spill_evicted();
+                                }
                             }
                         }
                         if let Some(frame) = encode_publish_out_frame(
@@ -1105,16 +1117,26 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                 session.next_packet_id()
                             };
                             if effective == 1 {
-                                let tracked =
-                                    session.track_inflight(broker_session::InflightMessage {
+                                // B4-01: spill past the window, still
+                                // tracked for DUP replay; counted drop
+                                // only past window + spill.
+                                match session.track_inflight_or_spill(
+                                    broker_session::InflightMessage {
                                         packet_id: downlink_id,
                                         topic: topic.clone(),
                                         qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                         retain,
                                         payload: payload.clone(),
-                                    });
-                                if !tracked {
-                                    self.metrics.inc_inflight_dropped();
+                                    },
+                                ) {
+                                    broker_session::InflightTrackOutcome::Tracked => {}
+                                    broker_session::InflightTrackOutcome::Spilled => {
+                                        self.metrics.inc_inflight_spilled();
+                                    }
+                                    broker_session::InflightTrackOutcome::Dropped => {
+                                        self.metrics.inc_inflight_dropped();
+                                        self.metrics.inc_inflight_spill_evicted();
+                                    }
                                 }
                             }
                             let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);

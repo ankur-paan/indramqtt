@@ -49,6 +49,19 @@ pub struct Metrics {
     // QoS 1 downlinks delivered live once but not tracked for redelivery
     // because the per-session inflight window (T-31) was full.
     inflight_dropped: AtomicU64,
+    // QoS 1 downlinks spilled past the in-memory window into the bounded
+    // per-session overflow buffer (B4-01). Each bump means one live
+    // delivery that IS still tracked for DUP redelivery, unlike
+    // `inflight_dropped`.
+    inflight_spilled: AtomicU64,
+    // Spilled overflow entries redelivered with DUP set on reconnect
+    // replay (B4-01). Bumped once per spilled frame that reaches the new
+    // mailbox; window replays keep counting through `delivered` only.
+    inflight_spill_replayed: AtomicU64,
+    // Spill evictions: live deliveries past both window and spill bounds,
+    // left untracked. Each also bumps `inflight_dropped` so the old
+    // untracked-delivery alert keeps firing.
+    inflight_spill_evicted: AtomicU64,
     // Kernel-to-edge delivery accounting (egress redesign, stage 0).
     // `messages_forwarded` counts admission into the shard transport
     // mailbox at `route()` time; `transport_sent` counts frames actually
@@ -110,6 +123,9 @@ pub struct MetricsSnapshot {
     pub detached_clean_dropped: u64,
     pub offline_queue_evicted: u64,
     pub inflight_dropped: u64,
+    pub inflight_spilled: u64,
+    pub inflight_spill_replayed: u64,
+    pub inflight_spill_evicted: u64,
     pub transport_sent: u64,
     pub transport_send_failed: u64,
     pub egress_qos0_shed: u64,
@@ -388,6 +404,38 @@ impl Metrics {
         self.inflight_dropped.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// One QoS 1 downlink spilled past the window into the bounded
+    /// overflow buffer (B4-01). The live delivery still goes out once and
+    /// stays tracked for DUP redelivery.
+    pub fn inc_inflight_spilled(&self) -> u64 {
+        self.inc_inflight_spilled_by(1)
+    }
+
+    pub fn inc_inflight_spilled_by(&self, n: u64) -> u64 {
+        self.inflight_spilled.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One spilled overflow entry redelivered with DUP set on reconnect
+    /// replay (B4-01).
+    pub fn inc_inflight_spill_replayed(&self) -> u64 {
+        self.inc_inflight_spill_replayed_by(1)
+    }
+
+    pub fn inc_inflight_spill_replayed_by(&self, n: u64) -> u64 {
+        self.inflight_spill_replayed.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One live delivery past both window and spill bounds, left
+    /// untracked. Callers also bump `inflight_dropped` so the legacy
+    /// untracked-delivery counter keeps covering every silent loss.
+    pub fn inc_inflight_spill_evicted(&self) -> u64 {
+        self.inc_inflight_spill_evicted_by(1)
+    }
+
+    pub fn inc_inflight_spill_evicted_by(&self, n: u64) -> u64 {
+        self.inflight_spill_evicted.fetch_add(n, Ordering::Relaxed) + n
+    }
+
     /// Frames actually written toward the edge by a successful transport
     /// batch write (compare with `messages_forwarded`, which counts
     /// admission into the transport mailbox).
@@ -550,6 +598,18 @@ impl Metrics {
         self.inflight_dropped.load(Ordering::Relaxed)
     }
 
+    pub fn inflight_spilled(&self) -> u64 {
+        self.inflight_spilled.load(Ordering::Relaxed)
+    }
+
+    pub fn inflight_spill_replayed(&self) -> u64 {
+        self.inflight_spill_replayed.load(Ordering::Relaxed)
+    }
+
+    pub fn inflight_spill_evicted(&self) -> u64 {
+        self.inflight_spill_evicted.load(Ordering::Relaxed)
+    }
+
     pub fn transport_sent(&self) -> u64 {
         self.transport_sent.load(Ordering::Relaxed)
     }
@@ -611,6 +671,9 @@ impl Metrics {
             detached_clean_dropped: self.detached_clean_dropped(),
             offline_queue_evicted: self.offline_queue_evicted(),
             inflight_dropped: self.inflight_dropped(),
+            inflight_spilled: self.inflight_spilled(),
+            inflight_spill_replayed: self.inflight_spill_replayed(),
+            inflight_spill_evicted: self.inflight_spill_evicted(),
             transport_sent: self.transport_sent(),
             transport_send_failed: self.transport_send_failed(),
             egress_qos0_shed: self.egress_qos0_shed(),
@@ -655,6 +718,15 @@ impl Metrics {
               # HELP indramqtt_inflight_dropped_total QoS 1 downlinks delivered live but untracked for redelivery (per-session inflight window full).\n\
               # TYPE indramqtt_inflight_dropped_total counter\n\
               indramqtt_inflight_dropped_total {}\n\
+              # HELP indramqtt_inflight_spilled_total QoS 1 downlinks spilled past the window into the bounded overflow buffer (still tracked for DUP redelivery).\n\
+              # TYPE indramqtt_inflight_spilled_total counter\n\
+              indramqtt_inflight_spilled_total {}\n\
+              # HELP indramqtt_inflight_spill_replayed_total Spilled QoS 1 entries redelivered with DUP set on reconnect replay.\n\
+              # TYPE indramqtt_inflight_spill_replayed_total counter\n\
+              indramqtt_inflight_spill_replayed_total {}\n\
+              # HELP indramqtt_inflight_spill_evicted_total Live QoS 1 deliveries past both window and spill bounds, left untracked.\n\
+              # TYPE indramqtt_inflight_spill_evicted_total counter\n\
+              indramqtt_inflight_spill_evicted_total {}\n\
               # HELP indramqtt_transport_sent_total Frames actually written toward the edge by successful transport batch writes.\n\
               # TYPE indramqtt_transport_sent_total counter\n\
               indramqtt_transport_sent_total {}\n\
@@ -689,6 +761,9 @@ impl Metrics {
             self.detached_clean_dropped(),
             self.offline_queue_evicted(),
             self.inflight_dropped(),
+            self.inflight_spilled(),
+            self.inflight_spill_replayed(),
+            self.inflight_spill_evicted(),
             self.transport_sent(),
             self.transport_send_failed(),
             self.egress_qos0_shed(),
@@ -1055,6 +1130,31 @@ mod tests {
         assert!(text.contains("indramqtt_credit_clamped_total 1\n"));
         assert!(text.contains("indramqtt_credit_exhausted_total 1\n"));
         assert!(text.contains("indramqtt_credit_received_total 1\n"));
+    }
+
+    #[test]
+    fn test_inflight_spill_counters_increment_and_render() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.inflight_spilled(), 0);
+        assert_eq!(metrics.inflight_spill_replayed(), 0);
+        assert_eq!(metrics.inflight_spill_evicted(), 0);
+
+        assert_eq!(metrics.inc_inflight_spilled_by(2), 2);
+        assert_eq!(metrics.inc_inflight_spill_replayed(), 1);
+        assert_eq!(metrics.inc_inflight_spill_evicted(), 1);
+        assert_eq!(metrics.inc_inflight_dropped(), 1);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.inflight_spilled, 2);
+        assert_eq!(snap.inflight_spill_replayed, 1);
+        assert_eq!(snap.inflight_spill_evicted, 1);
+        assert_eq!(snap.inflight_dropped, 1);
+
+        let text = metrics.render_prometheus_metrics();
+        assert!(text.contains("indramqtt_inflight_spilled_total 2\n"));
+        assert!(text.contains("indramqtt_inflight_spill_replayed_total 1\n"));
+        assert!(text.contains("indramqtt_inflight_spill_evicted_total 1\n"));
+        assert!(text.contains("indramqtt_inflight_dropped_total 1\n"));
     }
 
     #[test]

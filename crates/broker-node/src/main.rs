@@ -13,15 +13,19 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
-    InflightMessage, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionManager,
+    InflightMessage, InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage,
+    SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
+use delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod delayed;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -108,6 +112,25 @@ struct Args {
     /// msg/s without drops.
     #[arg(long, default_value_t = broker_router::DEFAULT_QOS0_BACKLOG)]
     qos0_backlog: usize,
+
+    /// Per-session QoS 1 inflight window bound (B4-01). Each live session
+    /// tracks at most this many unacknowledged QoS 1 downlinks in the
+    /// fast in-memory window; past it overflow spills into the bounded
+    /// per-session spill buffer (still tracked for DUP redelivery).
+    /// Default 100 caps per-session live unacked state near 100 small
+    /// frames while absorbing a short ack stall without spilling.
+    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_INFLIGHT)]
+    qos1_inflight_window: usize,
+
+    /// Per-session QoS 1 spill bound past the window (B4-01). Overflow
+    /// beyond the window is still delivered live once and tracked here
+    /// for oldest-first DUP replay; past window + spill the newest live
+    /// delivery stays untracked (counted). Default 1000 (10x the window)
+    /// absorbs roughly a 1 s burst at 1k msg/s from a stalled
+    /// acknowledger while keeping per-session tracked memory bounded
+    /// near 1,100 messages total.
+    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_SPILL)]
+    qos1_spill: usize,
 
     /// CoAP gateway UDP listen address (B1-04). Empty disables the
     /// gateway (the default): nothing listens, nothing is dispatched,
@@ -215,6 +238,15 @@ struct Args {
     /// under 128 bytes, so the default holds under 128 KiB.
     #[arg(long, default_value_t = broker_auth::REPLAY_MAX_ENTRIES)]
     kerberos_replay_max: usize,
+
+    /// Upper bound for `$delayed` deferrals in seconds (B4-03). Past it
+    /// the request is dropped with a warning instead of pinning a wheel
+    /// slot and a file row indefinitely. Default one day: longer
+    /// deferrals pin memory for no realistic device schedule, and the
+    /// previous per-message sleep used the same one-day ceiling so
+    /// existing publishers see the same limit.
+    #[arg(long, default_value_t = DEFAULT_MAX_DELAYED_SECS)]
+    delayed_max_secs: u64,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -900,6 +932,18 @@ struct Shared {
     /// every publish through a bounded channel drained off the hot path.
     /// One `Arc` clone at boot; the hook never blocks delivery.
     stream_journal: Option<Arc<StreamJournalHandle>>,
+    /// Delayed-publish scheduler (B4-03): one shared hierarchical timer
+    /// wheel plus the file-backed pending log behind it. The publish
+    /// event records here before the publisher is acknowledged; a single
+    /// background driver ticks the wheel and delivers due entries through
+    /// the normal ingress pipeline. One `Arc` clone at boot; the publish
+    /// path pays one atomic load, one bounded file append and one short
+    /// wheel-lock insert, while cascading and file rewrites stay in the
+    /// driver task. Measured before/after rates print in
+    /// `delayed_delivery_workload_timings`. Bounded by the pending cap
+    /// and the per-message
+    /// payload cap documented in `delayed.rs`.
+    delayed: Arc<DelayedScheduler>,
 }
 
 impl Shared {
@@ -982,8 +1026,79 @@ impl Shared {
             coap: Arc::new(CoapGatewayHandler::new()),
             coap_socket: None,
             stream_journal: None,
+            delayed: Arc::new(DelayedScheduler::new()),
         }
     }
+
+    /// Start the single delayed-delivery driver task for this node. The
+    /// first caller wins (the scheduler's claim bit); later callers are
+    /// no-ops so connection tasks can call this freely without spawning
+    /// a driver per connection. The driver ticks every 100 ms off the
+    /// delivery path and routes due entries through the normal ingress
+    /// pipeline.
+    fn spawn_delayed_driver(&self) {
+        if !self.delayed.claim_driver() {
+            return;
+        }
+        let shared = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(DELAYED_TICK_MS)).await;
+                let due = shared.delayed.tick_due();
+                if due.is_empty() {
+                    continue;
+                }
+                let mut fired_ids = Vec::with_capacity(due.len());
+                for entry in due {
+                    fired_ids.push(entry.id);
+                    deliver_delayed_entry(&shared, entry).await;
+                }
+                shared.delayed.remove_ids(&fired_ids);
+            }
+        });
+    }
+}
+
+/// Deliver one due delayed entry through the same ingress pipeline an
+/// immediate publish takes (retained store, rules, fan-out, cluster
+/// forward), then count it. Runs in the delayed driver task, never on
+/// the live publish or deliver path.
+async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
+    let Ok(topic) = Topic::new(entry.topic.clone()) else {
+        shared.delayed.note_malformed();
+        warn!("Dropping delayed entry with bad inner topic");
+        return;
+    };
+    let Ok(qos) = QoS::try_from(entry.qos) else {
+        shared.delayed.note_malformed();
+        warn!("Dropping delayed entry with bad QoS");
+        return;
+    };
+    let payload = Bytes::from(entry.payload.clone());
+    let deliveries = ingress_pipeline_with_publisher(
+        shared,
+        &topic,
+        qos,
+        entry.retain,
+        &payload,
+        entry.publisher.as_deref(),
+    )
+    .await;
+    let mut enqueued = 0u64;
+    let mut enqueued_bytes = 0u64;
+    for (conn_id, routed) in deliveries {
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            enqueued += 1;
+            enqueued_bytes += len;
+        }
+    }
+    shared.metrics.inc_messages_forwarded_by(enqueued);
+    shared.metrics.inc_publish_sent_by(enqueued);
+    shared.metrics.inc_delivered_by(enqueued);
+    shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+    forward_cluster(shared, &topic, qos, &payload).await;
+    shared.delayed.note_delivered();
 }
 
 /// Defaults-only registry for fresh `Shared` state (tests and pre-boot).
@@ -1718,7 +1833,17 @@ async fn apply_subscribe(
 
     let mut codes = Vec::with_capacity(subs.len());
     let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
-    for (filter_str, qos_raw) in subs {
+    for (raw_filter_str, qos_raw) in subs {
+        // B4-04 ordered regex filter rewriting (subscribe scope): the
+        // first matching subscribe/both rule wins and the router, the
+        // session mirror, the cluster announce and retained replay all
+        // observe the rewritten filter. `None` subscribes unchanged.
+        // System-prefixed filters bypass rewriting inside the router so
+        // shared-subscription group splitting keeps its semantics.
+        let filter_str = match shared.router.rewrite_subscribe(&raw_filter_str) {
+            Some(rewritten) => rewritten,
+            None => raw_filter_str,
+        };
         // Delayed topics are publish-only markers, never subscriptions.
         if strip_delayed_prefix(&filter_str).is_some() {
             codes.push(0x80);
@@ -1851,12 +1976,14 @@ async fn apply_subscribe(
 }
 
 /// Replay a resumed durable session's backlog onto its new connection:
-/// unacknowledged QoS 1 downlinks first (T-31, DUP set, original order,
-/// same packet ids), then uncompleted QoS 2 downlinks (D1-01, in queued
-/// order: PUBLISH with DUP set while waiting for PUBREC, PUBREL while
-/// waiting for PUBCOMP), then the offline queue of never-routed messages.
-/// Runs after the `SessionBinding` reply so the edge always observes
-/// binding before backlog. Returns the replayed frame count.
+/// unacknowledged QoS 1 window downlinks first (T-31, DUP set, original
+/// order, same packet ids), then the QoS 1 spill overflow (B4-01, DUP
+/// set, arrival order, same packet ids), then uncompleted QoS 2
+/// downlinks (D1-01, in queued order: PUBLISH with DUP set while waiting
+/// for PUBREC, PUBREL while waiting for PUBCOMP), then the offline queue
+/// of never-routed messages. Runs after the `SessionBinding` reply so
+/// the edge always observes binding before backlog. Returns the replayed
+/// frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     let req = match decode_bind_meta(&frame.metadata) {
         Ok(req) => req,
@@ -1892,6 +2019,52 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             if shared.conns.route(frame.header.conn_id, routed) {
                 replayed_bytes += len;
                 replayed += 1;
+            }
+        }
+    }
+    // B4-01: spilled overflow replays immediately after the window, in
+    // arrival order, with DUP set and the original packet ids. Entries
+    // stay held until their PUBACK like the window. This consults the
+    // spilled state written by `build_downlink_frames` on the
+    // publish-to-delivery event; driven by the reconnect (SessionBinding)
+    // event. Each mailbox arrival also bumps `inflight_spill_replayed`
+    // so spill redelivery is never silent. The spill snapshot (one Vec
+    // alloc sized by the spill length plus one frame alloc per spilled
+    // message, all bounded by max_spill) runs only when spill is
+    // non-empty (one relaxed atomic load via `has_spill`);
+    // steady-state reconnect with empty spill allocates exactly what the
+    // window replay allocated before B4-01. Spill-nonempty snapshot
+    // throughput is printed by
+    // `broker-session::test_qos1_inflight_hot_path_timings` (slow-path
+    // section); broker delivery/replay workload before/after numbers
+    // (steady-state `apply_publish` rate as the pre-change baseline vs
+    // spill-overflow and `replay_offline` rates) are printed by
+    // `qos1_inflight_delivery_workload_timings`; functional spill replay
+    // through this path is asserted by
+    // `qos1_inflight_spill_redelivers_everything_with_dup`.
+    if session.has_spill() {
+        for held in session.inflight_spill_snapshot() {
+            let topic_str = held.topic.as_str();
+            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+            meta.extend_from_slice(topic_str.as_bytes());
+            meta.extend_from_slice(&held.packet_id.to_be_bytes());
+            meta.push(u8::from(held.qos));
+            meta.push(u8::from(held.retain));
+            meta.push(1u8); // dup: redelivery of a spilled unacked downlink
+            if let Ok(routed) = BrokerFrame::new(
+                OpCode::PublishOut,
+                frame.header.conn_id,
+                0, // stamped per-destination by ConnTable::route
+                Bytes::from(meta),
+                held.payload.clone(),
+            ) {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(frame.header.conn_id, routed) {
+                    replayed_bytes += len;
+                    replayed += 1;
+                    shared.metrics.inc_inflight_spill_replayed();
+                }
             }
         }
     }
@@ -1998,13 +2171,36 @@ async fn apply_publish(
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
     shared.metrics.inc_publish_received();
-    let (topic_str, packet_id, qos_raw, retain) = match decode_publish_meta(&frame.metadata) {
+    let (raw_topic_str, packet_id, qos_raw, retain) = match decode_publish_meta(&frame.metadata) {
         Some(parts) => parts,
         None => return (None, Vec::new()),
     };
+    // B4-04 ordered regex topic rewriting (publish scope): the first
+    // matching publish/both rule wins and every stage below (auth,
+    // quota, retained store, rule engine, fan-out, cluster forward)
+    // observes the rewritten name. `None` delivers unchanged. QoS 2
+    // stores the rewritten name, so its second phase routes without a
+    // second rewrite. System-prefixed names (`$delayed/` markers,
+    // shared-subscription requests) bypass rewriting inside the router,
+    // so delayed entries schedule the literal inner topic and delayed
+    // markers keep their semantics.
+    let topic_str = match shared.router.rewrite_publish(&raw_topic_str) {
+        Some(rewritten) => rewritten,
+        None => raw_topic_str,
+    };
     let topic = match Topic::new(topic_str.clone()) {
         Ok(topic) => topic,
-        Err(_) => return (None, Vec::new()),
+        Err(_) => {
+            // A `$delayed/<secs>/<inner>` marker whose inner topic carries
+            // wildcards fails the outer concrete-topic check before the
+            // delayed path is reached. Count it as a malformed delayed
+            // drop (fail closed, never queued) so the counter observes it.
+            if strip_delayed_prefix(&topic_str).is_some() {
+                shared.delayed.note_malformed();
+                warn!("Dropping delayed publish with bad inner topic");
+            }
+            return (None, Vec::new());
+        }
     };
     let qos = match QoS::try_from(qos_raw) {
         Ok(qos) => qos,
@@ -2102,19 +2298,32 @@ async fn apply_publish(
         None
     };
 
-    let deliveries = ingress_pipeline(shared, &topic, qos, retain, &frame.payload).await;
+    // B4-02: resolve the publisher once for the shared `hash_clientid`
+    // strategy. `None` (unknown session) hashes the empty string in the
+    // router; delivery still proceeds to exactly one member.
+    let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
+    let deliveries = ingress_pipeline_with_publisher(
+        shared,
+        &topic,
+        qos,
+        retain,
+        &frame.payload,
+        publisher.as_deref(),
+    )
+    .await;
     forward_cluster(shared, &topic, qos, &frame.payload).await;
 
     (ack, deliveries)
 }
 
-/// Upper bound for `$delayed` deferrals: beyond a day the request is
-/// dropped with a warning instead of pinning a task indefinitely.
-const MAX_DELAYED_SECS: u64 = 86_400;
-
 /// Handle a `$delayed/<secs>/<topic>` publish: immediate ack, deferred
-/// pipeline. An unparseable inner topic or an over-limit delay drops the
-/// message (it could never be delivered correctly).
+/// pipeline through the shared timer wheel. An unparseable inner topic,
+/// an over-limit delay, an oversized payload or a full backlog drops the
+/// message with a warning and a counter (it could never be delivered
+/// correctly). The entry is recorded in the wheel and in
+/// `<data-dir>/delayed.jsonl` (see `delayed.rs`) before the ack is
+/// returned, so the publisher is never stalled past the timer and a
+/// restart keeps the entry on schedule.
 async fn apply_delayed_publish(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -2127,51 +2336,73 @@ async fn apply_delayed_publish(
     let inner_topic = match Topic::new(inner.to_string()) {
         Ok(topic) => topic,
         Err(e) => {
+            shared.delayed.note_malformed();
             warn!("Dropping delayed publish with bad inner topic: {}", e);
             return (None, Vec::new());
         }
     };
-    if delay_secs > MAX_DELAYED_SECS {
-        warn!(
-            "Dropping delayed publish: {}s exceeds the {}s cap",
-            delay_secs, MAX_DELAYED_SECS
-        );
-        return (None, Vec::new());
-    }
-    let ack = if qos == QoS::AtLeastOnce {
-        pub_ack_reply(frame, packet_id, 0)
-    } else {
-        None
-    };
     if delay_secs == 0 {
-        let deliveries = ingress_pipeline(shared, &inner_topic, qos, retain, &frame.payload).await;
+        let ack = if qos == QoS::AtLeastOnce {
+            pub_ack_reply(frame, packet_id, 0)
+        } else {
+            None
+        };
+        // B4-02: delayed delivery keeps the publisher when the session
+        // still exists so `hash_clientid` stays stable across the defer.
+        let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
+        let deliveries = ingress_pipeline_with_publisher(
+            shared,
+            &inner_topic,
+            qos,
+            retain,
+            &frame.payload,
+            publisher.as_deref(),
+        )
+        .await;
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
         return (ack, deliveries);
     }
-    let shared = shared.clone();
-    let payload = frame.payload.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let deliveries = ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
-        // Outcome counting, like the immediate path: only live
-        // mailboxes count as delivered; drops are already counted
-        // inside `ConnTable::route`.
-        let mut enqueued = 0u64;
-        let mut enqueued_bytes = 0u64;
-        for (conn_id, routed) in deliveries {
-            let len = routed.total_frame_len() as u64;
-            if shared.conns.route(conn_id, routed) {
-                enqueued += 1;
-                enqueued_bytes += len;
-            }
+    // TODO(parity): a backlog-full, oversized or over-limit drop returns
+    // no ack, so a QoS 1 publisher retries and may worsen the overload.
+    // The alternative (ack a message that was never queued) lies about
+    // acceptance. The rulebook does not decide this case; current choice
+    // fails closed.
+    let max_secs = shared.delayed.max_secs();
+    if delay_secs > max_secs {
+        warn!(
+            "Dropping delayed publish: {}s exceeds the {}s cap",
+            delay_secs, max_secs
+        );
+    }
+    let now_ms = broker_storage::now_ms();
+    let entry = DelayedEntry {
+        id: shared.delayed.next_id(),
+        deliver_at_ms: now_ms.saturating_add(delay_secs.saturating_mul(1_000)),
+        topic: inner.to_string(),
+        qos: qos as u8,
+        retain,
+        payload: frame.payload.to_vec(),
+        publisher: shared.sessions.client_id_for_conn(frame.header.conn_id),
+    };
+    match shared.delayed.persist_and_schedule(entry, delay_secs) {
+        Ok(()) => {
+            let ack = if qos == QoS::AtLeastOnce {
+                pub_ack_reply(frame, packet_id, 0)
+            } else {
+                None
+            };
+            (ack, Vec::new())
         }
-        shared.metrics.inc_messages_forwarded_by(enqueued);
-        shared.metrics.inc_publish_sent_by(enqueued);
-        shared.metrics.inc_delivered_by(enqueued);
-        shared.metrics.inc_bytes_sent_by(enqueued_bytes);
-        forward_cluster(&shared, &inner_topic, qos, &payload).await;
-    });
-    (ack, Vec::new())
+        Err(e) => {
+            // The scheduler already bumped the matching drop counter
+            // (over-limit, oversized, backlog-full or file error); warn
+            // here so the drop is visible in the log like before.
+            if delay_secs <= max_secs {
+                warn!("Dropping delayed publish: {:?}", e);
+            }
+            (None, Vec::new())
+        }
+    }
 }
 
 /// QoS 2 inbound first phase (D1-01): store the publish against the
@@ -2243,68 +2474,65 @@ async fn apply_qos2_pubrel(
         None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
     };
     // Delayed targets defer everything except the PUBCOMP: the publisher
-    // must not stall past the timer.
+    // must not stall past the timer. The entry is recorded on the shared
+    // wheel and in `<data-dir>/delayed.jsonl` before the PUBCOMP is
+    // returned; the driver delivers it through the normal pipeline.
     if let Some((delay_secs, inner)) = strip_delayed_prefix(stored.topic.as_str()) {
         let comp = qos2_reply(OpCode::PubCompOut, frame, packet_id);
-        if delay_secs > MAX_DELAYED_SECS {
-            warn!(
-                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
-                delay_secs, MAX_DELAYED_SECS
-            );
-            return (comp, Vec::new());
-        }
         let Ok(inner_topic) = Topic::new(inner.to_string()) else {
+            shared.delayed.note_malformed();
             warn!("Dropping delayed QoS 2 publish with bad inner topic");
             return (comp, Vec::new());
         };
         if delay_secs == 0 {
-            let deliveries = ingress_pipeline(
+            // B4-02: the QoS 2 publisher id is the PUBREL sender, so the
+            // deferred fan-out hashes the same key as immediate delivery.
+            let deliveries = ingress_pipeline_with_publisher(
                 shared,
                 &inner_topic,
                 QoS::ExactlyOnce,
                 stored.retain,
                 &stored.payload,
+                Some(client_id.as_str()),
             )
             .await;
             forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
             return (comp, deliveries);
         }
-        let shared_clone = shared.clone();
-        let payload = stored.payload.clone();
-        let retain = stored.retain;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-            let deliveries = ingress_pipeline(
-                &shared_clone,
-                &inner_topic,
-                QoS::ExactlyOnce,
-                retain,
-                &payload,
-            )
-            .await;
-            let mut enqueued = 0u64;
-            let mut enqueued_bytes = 0u64;
-            for (conn_id, routed) in deliveries {
-                let len = routed.total_frame_len() as u64;
-                if shared_clone.conns.route(conn_id, routed) {
-                    enqueued += 1;
-                    enqueued_bytes += len;
-                }
+        let max_secs = shared.delayed.max_secs();
+        if delay_secs > max_secs {
+            warn!(
+                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
+                delay_secs, max_secs
+            );
+        }
+        let entry = DelayedEntry {
+            id: shared.delayed.next_id(),
+            deliver_at_ms: broker_storage::now_ms()
+                .saturating_add(delay_secs.saturating_mul(1_000)),
+            topic: inner.to_string(),
+            qos: QoS::ExactlyOnce as u8,
+            retain: stored.retain,
+            payload: stored.payload.to_vec(),
+            publisher: Some(client_id.clone()),
+        };
+        if let Err(e) = shared.delayed.persist_and_schedule(entry, delay_secs) {
+            // The scheduler already bumped the matching drop counter;
+            // warn here so the drop is visible in the log like before.
+            if delay_secs <= max_secs {
+                warn!("Dropping delayed QoS 2 publish: {:?}", e);
             }
-            shared_clone.metrics.inc_messages_forwarded_by(enqueued);
-            shared_clone.metrics.inc_publish_sent_by(enqueued);
-            shared_clone.metrics.inc_delivered_by(enqueued);
-            shared_clone.metrics.inc_bytes_sent_by(enqueued_bytes);
-            forward_cluster(&shared_clone, &inner_topic, QoS::ExactlyOnce, &payload).await;
-        });
+        }
         return (comp, Vec::new());
     }
-    let deliveries = ingress_pipeline(
+    // B4-02: QoS 2 second phase hashes the original publisher id.
+    let deliveries = ingress_pipeline_with_publisher(
         shared,
         &stored.topic,
         QoS::ExactlyOnce,
         stored.retain,
         &stored.payload,
+        Some(client_id.as_str()),
     )
     .await;
     forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
@@ -2391,6 +2619,22 @@ async fn ingress_pipeline(
     retain: bool,
     payload: &Bytes,
 ) -> Vec<(u64, BrokerFrame)> {
+    ingress_pipeline_with_publisher(shared, topic, qos, retain, payload, None).await
+}
+
+/// [`ingress_pipeline`] with publisher context for shared strategies
+/// (B4-02). The MQTT ingress path passes the publishing client id; all
+/// other ingress paths (delayed timers without a live session, QoS 2
+/// second phase without a stored publisher, CoAP gateway, rule and
+/// management publishes) pass `None`.
+async fn ingress_pipeline_with_publisher(
+    shared: &Shared,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
+) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message. Enforces
     // the same configurable limits as the management publish path
@@ -2467,7 +2711,7 @@ async fn ingress_pipeline(
     // plus one fsync.
     maybe_journal_stream(shared, topic, qos, payload);
 
-    let deliveries = build_downlink_frames(
+    let deliveries = build_downlink_frames_with_publisher(
         &shared.router,
         &shared.sessions,
         &shared.metrics,
@@ -2475,6 +2719,7 @@ async fn ingress_pipeline(
         qos,
         retain,
         payload,
+        publisher,
     );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
@@ -2745,6 +2990,12 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
 /// PERF-10: each silent drop also bumps its kernel counter (detached
 /// clean drop, durable-queue eviction) exactly where the frame is
 /// discarded. Drops that happened before still happen.
+///
+/// B4-02: `publisher` carries the publishing client id for the shared
+/// `hash_clientid` strategy. The MQTT ingress path passes the real id;
+/// rule republishes, retained replays, cluster forwards and management
+/// publishes pass `None` (the router hashes the empty string there; see
+/// its open-question note on that branch).
 fn build_downlink_frames(
     router: &Router,
     sessions: &SessionManager,
@@ -2754,19 +3005,41 @@ fn build_downlink_frames(
     retain: bool,
     payload: &Bytes,
 ) -> Vec<(u64, BrokerFrame)> {
+    build_downlink_frames_with_publisher(
+        router, sessions, metrics, topic, qos, retain, payload, None,
+    )
+}
+
+/// [`build_downlink_frames`] with publisher context for shared
+/// strategies. This is the delivery event that drives
+/// `balance_shared_groups` (via `matches_with_publisher`): every publish
+/// fan-out reduces the matched shared groups through the router call and
+/// consumes the reduced set here.
+#[allow(clippy::too_many_arguments)]
+fn build_downlink_frames_with_publisher(
+    router: &Router,
+    sessions: &SessionManager,
+    metrics: &Metrics,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
+) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
     // D1-03: share one payload buffer across all N subscribers.
     // `Bytes::clone` bumps a refcount without copying the bytes, so an
     // 8 KB publish fanned out to N subscribers costs one 8 KB buffer
     // plus N small handles. Per-subscriber memory stays bounded by the
-    // existing queue caps (`MAX_OFFLINE_QUEUE`, `MAX_QOS1_INFLIGHT`,
+    // existing queue caps (`MAX_OFFLINE_QUEUE`, the QoS 1 window
+    // `DEFAULT_MAX_QOS1_INFLIGHT` plus spill `DEFAULT_MAX_QOS1_SPILL`,
     // `MAX_QOS2_INFLIGHT`, the `ConnTable` QoS 0 bound); it is never
     // N copies of the payload. Clone once here so every per-subscriber
     // `clone` below shares this single root.
     let shared = payload.clone();
     let mut deliveries = Vec::new();
-    for sub in router.matches(topic) {
+    for sub in router.matches_with_publisher(topic, publisher) {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
         match sessions.get(&sub.client_id) {
             Some(session) => {
@@ -2779,22 +3052,38 @@ fn build_downlink_frames(
                         } else {
                             session.next_packet_id()
                         };
-                        // T-31: hold every QoS 1 downlink from the moment
-                        // it is written until its PUBACK arrives. At the
-                        // per-session bound the frame still goes out live
-                        // once but is left untracked (counted), so the
-                        // live delivery rate never pays for the window.
-                        // QoS 0 never touches session state here.
+                        // B4-01: hold every QoS 1 downlink from the moment
+                        // it is written until its PUBACK arrives. Inside
+                        // the window this is one bounded deque push under
+                        // a single lock with no allocation beyond the
+                        // message itself, so the publish fast path pays
+                        // nothing for the bound. Past the window the entry
+                        // spills into the bounded overflow buffer (still
+                        // tracked for DUP replay, counted); past window +
+                        // spill the frame still goes out live once but is
+                        // left untracked (counted), so the live delivery
+                        // rate never pays for the window. QoS 0 never
+                        // touches session state here. Driven by the
+                        // publish-to-delivery event. Before/after
+                        // delivery-workload numbers for this path are
+                        // printed by
+                        // `qos1_inflight_delivery_workload_timings`.
                         if effective == 1 {
-                            let tracked = session.track_inflight(InflightMessage {
+                            match session.track_inflight_or_spill(InflightMessage {
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: shared.clone(),
-                            });
-                            if !tracked {
-                                metrics.inc_inflight_dropped();
+                            }) {
+                                InflightTrackOutcome::Tracked => {}
+                                InflightTrackOutcome::Spilled => {
+                                    metrics.inc_inflight_spilled();
+                                }
+                                InflightTrackOutcome::Dropped => {
+                                    metrics.inc_inflight_dropped();
+                                    metrics.inc_inflight_spill_evicted();
+                                }
                             }
                         }
                         // D1-01: hold every QoS 2 downlink until its
@@ -3243,11 +3532,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the shared delivery table before any edge binds. One atomic store
     // at boot; the hot publish path pays a single relaxed load.
     shared.conns.set_qos0_bound(args.qos0_backlog);
+    // B4-01: apply the configured QoS 1 window and spill bounds to the
+    // session manager before any edge binds. Two atomic stores at boot;
+    // future sessions inherit them at creation, and the publish fast
+    // path pays one relaxed load for the window check only.
+    shared
+        .sessions
+        .set_max_qos1_inflight(args.qos1_inflight_window);
+    shared.sessions.set_max_qos1_spill(args.qos1_spill);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
     // silent boot with defaults.
     shared.config = Arc::new(load_data_dir_registry(&args.data_dir)?);
+    // Delayed publishes (B4-03): apply the configured delay bound, point
+    // the wheel at the kernel data dir, reload pending entries, then
+    // start the single driver task. Torn or expired rows are discarded
+    // with a counter and never served. One atomic store plus one file
+    // read at boot; the publish path pays one atomic load, one bounded
+    // file append and one short wheel-lock insert afterwards.
+    shared.delayed.set_max_secs(args.delayed_max_secs);
+    shared.delayed.set_persist_dir(args.data_dir.clone());
+    let (delayed_loaded, delayed_torn, delayed_expired) = shared.delayed.load();
+    if delayed_loaded > 0 || delayed_torn > 0 || delayed_expired > 0 {
+        info!(
+            "Delayed backlog reloaded: {} pending, {} torn discarded, {} expired discarded",
+            delayed_loaded, delayed_torn, delayed_expired
+        );
+    }
+    shared.spawn_delayed_driver();
     // MQTT users/ACLs: seed the shared `MemoryAuth` in place (the same
     // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
     // enforces persisted credentials from the first accepted connection.
@@ -4118,6 +4431,208 @@ mod tests {
         assert_eq!(pid_b, 0, "QoS 0 downlink carries no packet id");
     }
 
+    /// Subscribe one shared-group member through the broker subscribe
+    /// path (`apply_subscribe` with a `$share/<group>/tasks` filter) and
+    /// bind its session to `conn`, so later publishes deliver live.
+    async fn subscribe_shared_member(shared: &Shared, conn: u64, client: &str, group: &str) {
+        let filter = format!("$share/{group}/tasks");
+        let frame = subscribe_frame(
+            conn,
+            1,
+            encode_subscribe_meta(1, client, &[(filter.as_str(), 0)]),
+        );
+        let (reply, _) = apply_subscribe(&frame, shared).await;
+        reply.expect("shared subscribe replies");
+        let (session, _) = shared.sessions.get_or_create(client, true);
+        *session.conn_id.write() = Some(conn);
+    }
+
+    /// Publish one message through the broker ingress pipeline and
+    /// return the receiving connection ids (one per delivery).
+    async fn publish_shared_once(
+        shared: &Shared,
+        topic: &Topic,
+        publisher: Option<&str>,
+        payload: &[u8],
+    ) -> Vec<u64> {
+        ingress_pipeline_with_publisher(
+            shared,
+            topic,
+            QoS::AtMostOnce,
+            false,
+            &Bytes::from(payload.to_vec()),
+            publisher,
+        )
+        .await
+        .into_iter()
+        .map(|(conn, _)| conn)
+        .collect()
+    }
+
+    /// B4-02: round-robin through the broker rotates across members.
+    #[tokio::test]
+    async fn shared_strategy_round_robin_rotates_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(101u64, "rr-a"), (102, "rr-b"), (103, "rr-c")] {
+            subscribe_shared_member(&shared, conn, client, "rr").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("rr", "round_robin")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let mut owners = Vec::new();
+        for i in 0..6u8 {
+            let got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(got.len(), 1, "exactly one member per publish");
+            owners.push(got[0]);
+        }
+        assert_eq!(owners, vec![101, 102, 103, 101, 102, 103]);
+    }
+
+    /// B4-02: `hash_clientid` through the broker pins one member per
+    /// publisher id.
+    #[tokio::test]
+    async fn shared_strategy_hash_clientid_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(111u64, "hc-a"), (112, "hc-b"), (113, "hc-c")] {
+            subscribe_shared_member(&shared, conn, client, "hc").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("hc", "hash_clientid")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        for publisher in ["pub-1", "pub-2", "pub-3"] {
+            let first = publish_shared_once(&shared, &topic, Some(publisher), b"x").await;
+            assert_eq!(first.len(), 1);
+            for _ in 0..5 {
+                let again = publish_shared_once(&shared, &topic, Some(publisher), b"x").await;
+                assert_eq!(again, first, "one publisher id pins one member");
+            }
+        }
+    }
+
+    /// B4-02: `hash_topic` through the broker pins one member per topic.
+    #[tokio::test]
+    async fn shared_strategy_hash_topic_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(121u64, "ht-a"), (122, "ht-b"), (123, "ht-c")] {
+            subscribe_shared_member(&shared, conn, client, "ht").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("ht", "hash_topic")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let first = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(first.len(), 1);
+        for _ in 0..5 {
+            let again = publish_shared_once(&shared, &topic, Some("other-pub"), b"x").await;
+            assert_eq!(
+                again, first,
+                "one topic pins one member whatever the publisher"
+            );
+        }
+    }
+
+    /// B4-02: sticky through the broker holds one member while the
+    /// membership is stable.
+    #[tokio::test]
+    async fn shared_strategy_sticky_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(131u64, "st-a"), (132, "st-b"), (133, "st-c")] {
+            subscribe_shared_member(&shared, conn, client, "st").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("st", "sticky")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let first = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(first.len(), 1);
+        for i in 0..10u8 {
+            let again = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(again, first, "sticky holds while members stable");
+        }
+    }
+
+    /// B4-02: random through the broker shows liveness across members.
+    #[tokio::test]
+    async fn shared_strategy_random_live_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(141u64, "rn-a"), (142, "rn-b"), (143, "rn-c")] {
+            subscribe_shared_member(&shared, conn, client, "rn").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("rn", "random")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..60u8 {
+            let got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(got.len(), 1);
+            seen.insert(got[0]);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "random must reach every member, saw {seen:?}"
+        );
+    }
+
+    /// B4-02: an unknown strategy name is rejected, never mapped to
+    /// round-robin: the set call fails and the group keeps its default.
+    #[tokio::test]
+    async fn shared_strategy_unknown_rejected_through_broker() {
+        let shared = test_shared();
+        subscribe_shared_member(&shared, 151, "ux-a", "ux").await;
+        subscribe_shared_member(&shared, 152, "ux-b", "ux").await;
+        let err = shared
+            .router
+            .set_shared_strategy("ux", "least-connections")
+            .expect_err("unknown strategy must fail");
+        assert!(err.to_string().contains("round_robin"));
+        assert_eq!(
+            shared.router.shared_strategy("ux"),
+            broker_router::SharedStrategy::RoundRobin
+        );
+        // The group still balances (default), it was not left broken.
+        let topic = Topic::new("tasks").unwrap();
+        let got = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(got.len(), 1);
+    }
+
+    /// B4-02: plain subscribers alongside shared members each receive a
+    /// copy through the broker.
+    #[tokio::test]
+    async fn shared_and_plain_coexist_through_broker() {
+        let shared = test_shared();
+        subscribe_shared_member(&shared, 161, "co-a", "co").await;
+        subscribe_shared_member(&shared, 162, "co-b", "co").await;
+        let frame = subscribe_frame(
+            163,
+            1,
+            encode_subscribe_meta(1, "co-plain", &[("tasks", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&frame, &shared).await;
+        reply.expect("plain subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("co-plain", true);
+        *session.conn_id.write() = Some(163);
+        let topic = Topic::new("tasks").unwrap();
+        for i in 0..4u8 {
+            let mut got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            got.sort_unstable();
+            assert_eq!(got.len(), 2, "plain plus exactly one member");
+            assert!(got.contains(&163), "plain subscriber always present");
+            assert!(
+                got.contains(&161) || got.contains(&162),
+                "exactly one member joins, saw {got:?}"
+            );
+        }
+    }
+
     /// D1-03: an 8 KB payload fanned out to N subscribers must share one
     /// buffer instead of copying N times. Fails if any delivery or queued
     /// copy allocates its own 8 KB (e.g. via `to_vec` + `Bytes::from` per
@@ -4697,8 +5212,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qos1_inflight_bound_drops_newest_from_tracking_and_counts() {
-        use broker_session::MAX_QOS1_INFLIGHT;
+    async fn qos1_inflight_bound_spills_past_window_and_counts() {
+        use broker_session::DEFAULT_MAX_QOS1_INFLIGHT;
         let shared = test_shared();
         let bind = bind_frame(61, 1, encode_bind_meta("q1-bound", false, 60));
         reply_for_frame(&bind, &shared.sessions).expect("bind replies");
@@ -4708,7 +5223,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
-        for i in 0..MAX_QOS1_INFLIGHT {
+        for i in 0..DEFAULT_MAX_QOS1_INFLIGHT {
             let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
             let (_, deliveries) =
                 apply_publish(&publish_frame(62, 3 + i as u64, meta, payload), &shared).await;
@@ -4719,10 +5234,12 @@ mod tests {
             rx61.try_recv().expect("live downlink arrived");
         }
         let session = shared.sessions.get("q1-bound").expect("session known");
-        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
         assert_eq!(shared.metrics.inflight_dropped(), 0);
+        assert_eq!(shared.metrics.inflight_spilled(), 0);
 
-        // One past the bound: still delivered live once, left untracked.
+        // One past the window: still delivered live once AND still
+        // tracked, now in the spill buffer (B4-01, no silent loss).
         let (meta, payload) = encode_publish_meta("t", 0x0FFF, 1, false, b"over");
         let (_, deliveries) = apply_publish(&publish_frame(62, 999, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1, "bound never blocks live delivery");
@@ -4730,17 +5247,269 @@ mod tests {
             let _ = shared.conns.route(conn_id, frame);
         }
         rx61.try_recv()
-            .expect("over-bound downlink still delivered live");
+            .expect("over-window downlink still delivered live");
         assert_eq!(
             session.inflight_len(),
-            MAX_QOS1_INFLIGHT,
-            "store stays bounded at the limit"
+            DEFAULT_MAX_QOS1_INFLIGHT,
+            "window stays bounded at the limit"
         );
         assert_eq!(
-            shared.metrics.inflight_dropped(),
+            session.inflight_spill_len(),
             1,
-            "exactly one untracked delivery counted"
+            "overflow is tracked in spill"
         );
+        assert_eq!(session.inflight_total_len(), DEFAULT_MAX_QOS1_INFLIGHT + 1);
+        assert_eq!(shared.metrics.inflight_spilled(), 1, "spill counted");
+        assert_eq!(
+            shared.metrics.inflight_dropped(),
+            0,
+            "nothing untracked while spill has room"
+        );
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_spill_redelivers_everything_with_dup() {
+        use broker_session::{DEFAULT_MAX_QOS1_INFLIGHT, DEFAULT_MAX_QOS1_SPILL};
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-spill-all", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-spill-all", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Stall the acknowledger: publish window + spill + 3 without ever
+        // acking, through the broker publish-to-delivery event.
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let total = DEFAULT_MAX_QOS1_INFLIGHT + 5;
+        assert!(
+            total < DEFAULT_MAX_QOS1_INFLIGHT + DEFAULT_MAX_QOS1_SPILL,
+            "test stays inside the spill bound"
+        );
+        let mut live_pids = Vec::new();
+        let mut live_payloads = Vec::new();
+        for i in 0..total {
+            let body = format!("spill-{i:04}");
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, body.as_bytes());
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 100 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = rx61.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_ne!(pid, 0);
+            live_pids.push(pid);
+            live_payloads.push(got.payload.clone());
+        }
+        let session = shared.sessions.get("q1-spill-all").expect("session known");
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_spill_len(), 5);
+        assert_eq!(shared.metrics.inflight_spilled(), 5);
+        assert_eq!(shared.metrics.inflight_dropped(), 0);
+
+        // Disconnect without acking anything, then reconnect: every QoS 1
+        // message replays, window oldest-first then spill oldest-first,
+        // every replay with DUP set and its original packet id.
+        let mut unbind_meta = vec![0x00u8, 0x0Bu8];
+        unbind_meta.extend_from_slice(b"q1-spill-all");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-spill-all", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, total);
+        assert_eq!(shared.metrics.inflight_spill_replayed(), 5);
+        for (pid, payload) in live_pids.iter().zip(live_payloads.iter()) {
+            let got = rx63.try_recv().expect("ordered redelivery past the window");
+            assert_eq!(&got.payload, payload, "original order preserved");
+            assert!(
+                decode_publish_dup(&got.metadata),
+                "every replay past the window carries DUP=1"
+            );
+            let (_, replay_pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_eq!(&replay_pid, pid, "same packet id reused in order");
+        }
+        assert!(rx63.try_recv().is_err(), "no new traffic interleaved");
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_bound_configurable_and_overflow_counted() {
+        let shared = test_shared();
+        shared.sessions.set_max_qos1_inflight(3);
+        shared.sessions.set_max_qos1_spill(2);
+        assert_eq!(shared.sessions.max_qos1_inflight(), 3);
+        assert_eq!(shared.sessions.max_qos1_spill(), 2);
+
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-tiny", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let session = shared.sessions.get("q1-tiny").expect("session known");
+        assert_eq!(
+            session.max_inflight(),
+            3,
+            "manager bound reaches the session"
+        );
+        assert_eq!(session.max_spill(), 2);
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-tiny", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        for i in 0..6u16 {
+            let (meta, payload) = encode_publish_meta("t", i, 1, false, b"x");
+            let (_, deliveries) = apply_publish(
+                &publish_frame(62, 200 + u64::from(i), meta, payload),
+                &shared,
+            )
+            .await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv().expect("live downlink arrived");
+        }
+        // Window 3 tracked, next 2 spilled, last one past both: live once,
+        // untracked, both drop counters bump.
+        assert_eq!(session.inflight_len(), 3);
+        assert_eq!(session.inflight_spill_len(), 2);
+        assert_eq!(session.inflight_total_len(), 5);
+        assert_eq!(shared.metrics.inflight_spilled(), 2);
+        assert_eq!(shared.metrics.inflight_dropped(), 1);
+        assert_eq!(shared.metrics.inflight_spill_evicted(), 1);
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_delivery_workload_timings() {
+        use broker_session::DEFAULT_MAX_QOS1_INFLIGHT;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // B4-01 delivery-workload before/after numbers (spec Done-when
+        // bullet 5, RULEBOOK hot-path row): measured through the broker
+        // publish-to-delivery event (`apply_publish`), not just the
+        // session store. BEFORE is the steady-state loop with the spill
+        // empty: `build_downlink_frames` takes only the window lock here,
+        // exactly the pre-B4-01 work plus one relaxed atomic load, so its
+        // rate is the pre-change baseline. AFTER is the overflow loop past
+        // the window, which additionally takes the spill lock and bumps
+        // `inflight_spilled`. Both print msgs/sec and avg ns/msg into the
+        // gate output with no threshold assert; counts are CI sample
+        // sizes, not SLOs. Per-message bound: window (default 100) + spill
+        // (default 1000) entries, each one shared `Bytes` handle plus topic
+        // bytes, never N payload copies.
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-timing", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-timing", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let session = shared.sessions.get("q1-timing").expect("session known");
+
+        // BEFORE: steady-state publish-to-delivery, spill empty. Every
+        // publish is acked at once so the window never fills and the spill
+        // lock is never taken (guarded by `has_spill`).
+        let steady_iters = 200usize;
+        let steady_start = Instant::now();
+        for i in 0..steady_iters {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 1000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = rx61.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            black_box(pid);
+            assert!(session.ack_inflight(pid), "steady-state ack releases");
+        }
+        let steady_elapsed = steady_start.elapsed();
+        assert!(
+            !session.has_spill(),
+            "steady-state loop must never touch the spill"
+        );
+        let steady_rate = steady_iters as f64 / steady_elapsed.as_secs_f64();
+        let steady_avg_ns = steady_elapsed.as_nanos() as f64 / steady_iters as f64;
+        println!(
+            "qos1 broker delivery workload steady-state (spill empty, before): {steady_rate:.0} msgs/sec, avg {steady_avg_ns:.1} ns/msg ({steady_iters} apply_publish+ack rounds in {steady_elapsed:?})"
+        );
+
+        // AFTER: fill the window without acking, then time overflow past it.
+        for i in 0..DEFAULT_MAX_QOS1_INFLIGHT {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"y");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 2000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv().expect("live downlink arrived");
+        }
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        let spill_iters = 20usize;
+        let spill_start = Instant::now();
+        for i in 0..spill_iters {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"z");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 3000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "bound never blocks live delivery");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv()
+                .expect("over-window downlink still delivered live");
+        }
+        let spill_elapsed = spill_start.elapsed();
+        assert_eq!(session.inflight_spill_len(), spill_iters);
+        assert_eq!(shared.metrics.inflight_spilled(), spill_iters as u64);
+        let spill_rate = spill_iters as f64 / spill_elapsed.as_secs_f64();
+        let spill_avg_ns = spill_elapsed.as_nanos() as f64 / spill_iters as f64;
+        println!(
+            "qos1 broker delivery workload spill-overflow (past window, after): {spill_rate:.0} msgs/sec, avg {spill_avg_ns:.1} ns/msg ({spill_iters} apply_publish rounds in {spill_elapsed:?})"
+        );
+
+        // Replay workload through the reconnect event, window then spill.
+        let mut unbind_meta = vec![0x00u8, 0x09u8];
+        unbind_meta.extend_from_slice(b"q1-timing");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-timing", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        let replay_start = Instant::now();
+        let replayed = replay_offline(&rebind, &shared).await;
+        let replay_elapsed = replay_start.elapsed();
+        assert_eq!(replayed, DEFAULT_MAX_QOS1_INFLIGHT + spill_iters);
+        let replay_rate = replayed as f64 / replay_elapsed.as_secs_f64();
+        let replay_avg_ns = replay_elapsed.as_nanos() as f64 / replayed as f64;
+        println!(
+            "qos1 broker replay workload (window plus spill, after): {replay_rate:.0} msgs/sec, avg {replay_avg_ns:.1} ns/msg ({replayed} replayed in {replay_elapsed:?})"
+        );
+        for _ in 0..replayed {
+            let got = rx63.try_recv().expect("ordered redelivery");
+            assert!(decode_publish_dup(&got.metadata), "replay carries DUP=1");
+        }
+        assert!(rx63.try_recv().is_err(), "no new traffic interleaved");
     }
 
     #[tokio::test]
@@ -7005,6 +7774,9 @@ mod tests {
         );
         let (reply, _) = apply_subscribe(&sub, shared).await;
         reply.expect("subscribe replies");
+        // The single shared driver serves the wheel; without it nothing
+        // fires (one task per node, never one task per message).
+        shared.spawn_delayed_driver();
         let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"later");
         let ack = apply_publish(&publish_frame(952, 1, meta, payload), shared).await;
         (rx, ack.0)
@@ -7058,11 +7830,24 @@ mod tests {
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
 
-        // Absurd delays are dropped, not scheduled.
+        // Absurd delays are dropped, not scheduled, and counted.
+        let over_before = shared.delayed.dropped_over_limit();
         let (meta, payload) = encode_publish_meta("$delayed/99999999/t", 0, 0, false, b"x");
         let (ack, deliveries) = apply_publish(&publish_frame(953, 2, meta, payload), &shared).await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
+        assert_eq!(shared.delayed.dropped_over_limit(), over_before + 1);
+        assert!(shared.delayed.is_empty());
+
+        // An inner topic that is not a servable concrete topic is
+        // dropped with a warning and a counter, never queued.
+        let malformed_before = shared.delayed.dropped_malformed();
+        let (meta, payload) = encode_publish_meta("$delayed/1/#/x", 0, 0, false, b"x");
+        let (ack, deliveries) = apply_publish(&publish_frame(953, 3, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+        assert_eq!(shared.delayed.dropped_malformed(), malformed_before + 1);
+        assert!(shared.delayed.is_empty());
 
         // Delayed markers are not subscribable.
         let sub = subscribe_frame(
@@ -7076,8 +7861,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_publish_survives_restart_from_same_dir() {
+        // Persistence lives behind the wheel in `<data-dir>/delayed.jsonl`
+        // (written by `DelayedScheduler::persist_and_schedule` in
+        // `delayed.rs`, consulted by `DelayedScheduler::load`): the
+        // publish event drives the write, the boot path drives the
+        // reload, and the driver delivers on schedule afterwards.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("scratch data dir");
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+
+        // First incarnation: publish through the broker but never start
+        // its driver, so the entry stays pending in the file.
+        let pending = {
+            let shared = test_shared();
+            shared.delayed.set_persist_dir(&data_dir);
+            assert_eq!(shared.delayed.load(), (0, 0, 0));
+            let (meta, payload) =
+                encode_publish_meta("$delayed/2/restart/alerts", 0, 0, false, b"restart-me");
+            let (ack, deliveries) =
+                apply_publish(&publish_frame(957, 1, meta, payload), &shared).await;
+            assert!(ack.is_none());
+            assert!(deliveries.is_empty());
+            assert_eq!(shared.delayed.len(), 1);
+            assert!(
+                dir.join("delayed.jsonl").is_file(),
+                "the publish event must persist before ack"
+            );
+            shared.delayed.scheduled_count()
+        };
+        assert_eq!(pending, 1);
+
+        // Second incarnation from the same directory: reload, subscribe,
+        // then deliver on schedule through the broker.
+        let shared = test_shared();
+        shared.delayed.set_persist_dir(&data_dir);
+        let (loaded, torn, expired) = shared.delayed.load();
+        assert_eq!(loaded, 1);
+        assert_eq!((torn, expired), (0, 0));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(958, tx);
+        shared.conns.set_client_label(958, "restart-sub");
+        let (session, _) = shared.sessions.get_or_create("restart-sub", true);
+        *session.conn_id.write() = Some(958);
+        let sub = subscribe_frame(
+            958,
+            1,
+            encode_subscribe_meta(1, "restart-sub", &[("restart/alerts", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        shared.spawn_delayed_driver();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let routed = loop {
+            if let Some(frame) = shared.conns.pop_qos0(958) {
+                break frame;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("restarted node must still deliver on schedule");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "restart/alerts");
+        assert_eq!(routed.payload, Bytes::from_static(b"restart-me"));
+        assert_eq!(shared.delayed.delivered_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn delayed_publish_end_to_end_over_tcp() {
         let shared = Shared::new();
+        shared.spawn_delayed_driver();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -7123,6 +7978,140 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_delivery_workload_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // B4-03 delayed-delivery workload before/after numbers (spec
+        // Done-when bullet 5, RULEBOOK hot-path row): measured through the
+        // broker publish event (`apply_publish`), not just the wheel.
+        // BEFORE is the steady-state immediate publish-to-delivery loop
+        // (no wheel lock, no file append, no fsync): its rate is the
+        // pre-change baseline. AFTER is the delayed-schedule loop through
+        // `$delayed` (one file_lock hold, one bounded append plus fsync,
+        // two short wheel-lock holds, one payload copy). Both print
+        // msgs/sec and avg ns/msg into the gate output with no threshold
+        // assert; counts are CI sample sizes, not SLOs. On-time behaviour
+        // (requested vs actual delay) and pending memory (wheel depth,
+        // persisted file bytes) print alongside. Publish-path cost prose
+        // lives in `delayed.rs`; this test is the measured numbers behind
+        // it.
+        let shared = test_shared();
+        let (tx_base, _rx_base) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(971, tx_base);
+        shared.conns.set_client_label(971, "wload-base");
+        let (session_base, _) = shared.sessions.get_or_create("wload-base", true);
+        *session_base.conn_id.write() = Some(971);
+        let sub = subscribe_frame(
+            971,
+            1,
+            encode_subscribe_meta(1, "wload-base", &[("wload/base", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+
+        // BEFORE: immediate publish-to-delivery, no delayed work.
+        let steady_iters = 200usize;
+        let steady_start = Instant::now();
+        for i in 0..steady_iters {
+            let (meta, payload) = encode_publish_meta("wload/base", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(970, 1000 + i as u64, meta, payload), &shared).await;
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = shared.conns.pop_qos0(971).expect("live downlink arrived");
+            black_box(got);
+        }
+        let steady_elapsed = steady_start.elapsed();
+        let steady_rate = steady_iters as f64 / steady_elapsed.as_secs_f64();
+        let steady_avg_ns = steady_elapsed.as_nanos() as f64 / steady_iters as f64;
+        println!(
+            "delayed broker workload immediate baseline (before): {steady_rate:.0} msgs/sec, avg {steady_avg_ns:.1} ns/msg ({steady_iters} apply_publish rounds in {steady_elapsed:?})"
+        );
+
+        // AFTER: delayed schedule through the broker with persistence.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("scratch data dir");
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+        shared.delayed.set_persist_dir(&data_dir);
+        assert_eq!(shared.delayed.load(), (0, 0, 0));
+        let payload_bytes = b"x".len();
+        let delayed_iters = 200usize;
+        let delayed_start = Instant::now();
+        for i in 0..delayed_iters {
+            let (meta, payload) =
+                encode_publish_meta("$delayed/60/wload/delayed", 0, 0, false, b"x");
+            let (ack, deliveries) =
+                apply_publish(&publish_frame(970, 5000 + i as u64, meta, payload), &shared).await;
+            black_box(ack);
+            assert!(deliveries.is_empty(), "delayed schedule defers delivery");
+        }
+        let delayed_elapsed = delayed_start.elapsed();
+        assert_eq!(shared.delayed.len(), delayed_iters);
+        let delayed_rate = delayed_iters as f64 / delayed_elapsed.as_secs_f64();
+        let delayed_avg_ns = delayed_elapsed.as_nanos() as f64 / delayed_iters as f64;
+        let file_bytes = std::fs::metadata(dir.join("delayed.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let estimated_payload_bytes = (delayed_iters * payload_bytes) as u64;
+        println!(
+            "delayed broker schedule workload (wheel plus file append, after): {delayed_rate:.0} msgs/sec, avg {delayed_avg_ns:.1} ns/msg ({delayed_iters} apply_publish rounds in {delayed_elapsed:?})"
+        );
+        println!(
+            "delayed pending memory: wheel depth {delayed_iters} entries, persisted file {file_bytes} bytes, estimated payload {estimated_payload_bytes} bytes ({delayed_iters} entries)"
+        );
+
+        // On-time behaviour: short-delay batch through the broker driver.
+        let otime = test_shared();
+        let (tx_ot, _rx_ot) = tokio::sync::mpsc::unbounded_channel();
+        otime.conns.register(972, tx_ot);
+        otime.conns.set_client_label(972, "wload-ontime");
+        let (session_ot, _) = otime.sessions.get_or_create("wload-ontime", true);
+        *session_ot.conn_id.write() = Some(972);
+        let sub = subscribe_frame(
+            972,
+            1,
+            encode_subscribe_meta(1, "wload-ontime", &[("wload/ontime", 0)]),
+        );
+        apply_subscribe(&sub, &otime).await.0.expect("subscribe");
+        otime.spawn_delayed_driver();
+        let ontime_count = 5usize;
+        let ontime_start = Instant::now();
+        for i in 0..ontime_count {
+            let (meta, payload) = encode_publish_meta("$delayed/1/wload/ontime", 0, 0, false, b"y");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(973, 9000 + i as u64, meta, payload), &otime).await;
+            assert!(deliveries.is_empty(), "delayed schedule defers delivery");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut received = 0usize;
+        while received < ontime_count {
+            if otime.conns.pop_qos0(972).is_some() {
+                received += 1;
+                continue;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ontime_elapsed = ontime_start.elapsed();
+        let ontime_ms = ontime_elapsed.as_millis() as u64;
+        // Requested 1000 ms plus one 100 ms tick of firing slack: late
+        // only past that window; early only before the delay.
+        let ontime_ok = received == ontime_count && (900..=8_000).contains(&ontime_ms);
+        println!(
+            "delayed on-time delivery: {received}/{ontime_count} delivered in {ontime_elapsed:?} (requested 1000 ms, on_time={ontime_ok})"
+        );
+        assert_eq!(received, ontime_count, "short-delay batch must fire");
+        assert!(
+            ontime_ms >= 900,
+            "delivery must honor the 1s delay (got {ontime_elapsed:?})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -8093,5 +9082,300 @@ mod tests {
         assert!(!request.installation_identity.is_empty());
         assert!(request.summary.contains(&request.installation_identity));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Decode the topic out of a `PublishOut` downlink frame (test mirror
+    /// of `encode_publish_out`: `TopicLen:16be | Topic | PacketId:16be |
+    /// QoS:8 | Retain:8 | Dup:8`).
+    fn downlink_topic(frame: &BrokerFrame) -> String {
+        let meta = &frame.metadata;
+        let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+        std::str::from_utf8(&meta[2..2 + topic_len])
+            .expect("downlink topic is UTF-8")
+            .to_string()
+    }
+
+    /// B4-04: a publish through the broker with a capture-group rule
+    /// delivers the rewritten topic. Subscriber sits on the rewritten
+    /// name; the publisher sends the original; the downlink carries the
+    /// rewritten name. Fails before the change (no rewrite existed, so
+    /// nothing matched and no delivery arrived).
+    #[tokio::test]
+    async fn rewrite_publish_capture_group_delivers_rewritten_topic() {
+        let shared = test_shared();
+        shared
+            .router
+            .set_rewrite_rules(vec![broker_router::RewriteRuleConfig::new(
+                "^sensors/(.*)$",
+                "devices/$1",
+                broker_router::RewriteScope::Publish,
+            )])
+            .expect("valid rule installs");
+
+        // Subscriber on the rewritten name (publish-scoped rule leaves
+        // subscribe filters untouched, so this subscribes literally).
+        let (session, _) = shared.sessions.get_or_create("rw-sub", true);
+        *session.conn_id.write() = Some(61);
+        let sub = subscribe_frame(
+            61,
+            1,
+            encode_subscribe_meta(3, "rw-sub", &[("devices/temp", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Publish the original name through the real ingress event.
+        let (meta, payload) = encode_publish_meta("sensors/temp", 0, 0, false, b"21.5");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 2, meta, payload), &shared).await;
+
+        assert_eq!(deliveries.len(), 1, "rewritten publish must fan out");
+        assert_eq!(deliveries[0].0, 61);
+        assert_eq!(downlink_topic(&deliveries[0].1), "devices/temp");
+        assert_eq!(shared.router.rewrite_stats().rewritten, 1);
+    }
+
+    /// B4-04: publish-side, subscribe-side and both-scoped rules act
+    /// independently through the broker. A publish-scoped rule never
+    /// rewrites a subscription; a subscribe-scoped rule never rewrites
+    /// a publish; a both-scoped rule rewrites either.
+    #[tokio::test]
+    async fn rewrite_scopes_apply_independently_through_broker() {
+        // Publish-only: publish rewrites, subscribe does not.
+        let shared = test_shared();
+        shared
+            .router
+            .set_rewrite_rules(vec![broker_router::RewriteRuleConfig::new(
+                "^p/(.*)$",
+                "pub/$1",
+                broker_router::RewriteScope::Publish,
+            )])
+            .expect("publish rule installs");
+        let (session, _) = shared.sessions.get_or_create("rw-p", true);
+        *session.conn_id.write() = Some(63);
+        // Subscribing to the pre-rewrite name stays literal (no match).
+        let sub = subscribe_frame(63, 1, encode_subscribe_meta(4, "rw-p", &[("p/a", 0)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        // Publishing the same name rewrites away from the subscription.
+        let (meta, payload) = encode_publish_meta("p/a", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(64, 1, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "publish-only rewrite must not match the literal subscription"
+        );
+        // A subscriber on the rewritten name receives it.
+        let sub = subscribe_frame(63, 2, encode_subscribe_meta(5, "rw-p", &[("pub/a", 0)]));
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        let (meta, payload) = encode_publish_meta("p/a", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(64, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(downlink_topic(&deliveries[0].1), "pub/a");
+
+        // Subscribe-only: subscribe rewrites, publish does not.
+        let shared = test_shared();
+        shared
+            .router
+            .set_rewrite_rules(vec![broker_router::RewriteRuleConfig::new(
+                "^s/(.*)$",
+                "sub/$1",
+                broker_router::RewriteScope::Subscribe,
+            )])
+            .expect("subscribe rule installs");
+        let (session, _) = shared.sessions.get_or_create("rw-s", true);
+        *session.conn_id.write() = Some(65);
+        // Subscribing to the pre-rewrite name lands on the rewritten filter.
+        let sub = subscribe_frame(65, 1, encode_subscribe_meta(6, "rw-s", &[("s/a", 0)]));
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        // Publishing the rewritten name (untouched by the rule) delivers.
+        let (meta, payload) = encode_publish_meta("sub/a", 0, 0, false, b"y");
+        let (_, deliveries) = apply_publish(&publish_frame(66, 1, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(downlink_topic(&deliveries[0].1), "sub/a");
+        // Publishing the pre-rewrite name does not rewrite, so nothing matches.
+        let (meta, payload) = encode_publish_meta("s/a", 0, 0, false, b"y");
+        let (_, deliveries) = apply_publish(&publish_frame(66, 2, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "subscribe-only rule must not rewrite publishes"
+        );
+
+        // Both-scoped: either direction rewrites.
+        let shared = test_shared();
+        shared
+            .router
+            .set_rewrite_rules(vec![broker_router::RewriteRuleConfig::new(
+                "^b/(.*)$",
+                "both/$1",
+                broker_router::RewriteScope::Both,
+            )])
+            .expect("both rule installs");
+        let (session, _) = shared.sessions.get_or_create("rw-b", true);
+        *session.conn_id.write() = Some(67);
+        let sub = subscribe_frame(67, 1, encode_subscribe_meta(7, "rw-b", &[("b/a", 0)]));
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        let (meta, payload) = encode_publish_meta("b/a", 0, 0, false, b"z");
+        let (_, deliveries) = apply_publish(&publish_frame(68, 1, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(downlink_topic(&deliveries[0].1), "both/a");
+    }
+
+    /// B4-04: rule order decides (first match wins) and an unmatched
+    /// topic passes through unchanged, through the real broker events.
+    #[tokio::test]
+    async fn rewrite_order_first_match_wins_and_miss_passes_through() {
+        let shared = test_shared();
+        shared
+            .router
+            .set_rewrite_rules(vec![
+                broker_router::RewriteRuleConfig::new(
+                    "^o/(.*)$",
+                    "first/$1",
+                    broker_router::RewriteScope::Both,
+                ),
+                broker_router::RewriteRuleConfig::new(
+                    "^o/(.*)$",
+                    "second/$1",
+                    broker_router::RewriteScope::Both,
+                ),
+            ])
+            .expect("rules install");
+        let (session, _) = shared.sessions.get_or_create("rw-o", true);
+        *session.conn_id.write() = Some(69);
+        for filter in ["first/x", "second/x", "plain/x"] {
+            let sub = subscribe_frame(69, 1, encode_subscribe_meta(8, "rw-o", &[(filter, 0)]));
+            apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        }
+        // First matching rule wins.
+        let (meta, payload) = encode_publish_meta("o/x", 0, 0, false, b"o");
+        let (_, deliveries) = apply_publish(&publish_frame(70, 1, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(downlink_topic(&deliveries[0].1), "first/x");
+        // An unmatched topic passes through unchanged to its subscriber.
+        let (meta, payload) = encode_publish_meta("plain/x", 0, 0, false, b"p");
+        let (_, deliveries) = apply_publish(&publish_frame(70, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(downlink_topic(&deliveries[0].1), "plain/x");
+    }
+
+    /// B4-04: the rule-count bound and the evaluation budget are enforced
+    /// with counters. Over-cap installs fail closed (table unchanged);
+    /// over-long inputs fail closed to no-rewrite with the budget counter.
+    #[tokio::test]
+    async fn rewrite_bounds_enforced_with_counters() {
+        let shared = test_shared();
+        let too_many: Vec<broker_router::RewriteRuleConfig> = (0
+            ..(broker_router::MAX_REWRITE_RULES + 1))
+            .map(|i| {
+                broker_router::RewriteRuleConfig::new(
+                    format!("^bound{i}/(.*)$"),
+                    "x/$1",
+                    broker_router::RewriteScope::Both,
+                )
+            })
+            .collect();
+        let err = shared
+            .router
+            .set_rewrite_rules(too_many)
+            .expect_err("over-cap install must fail");
+        assert!(
+            matches!(err, broker_router::RewriteRuleError::TooManyRules(_)),
+            "unexpected error: {err}"
+        );
+        assert_eq!(shared.router.rewrite_rule_count(), 0);
+
+        // Budget: an input past the length bound never rewrites and bumps
+        // exactly the budget counter (delivery would proceed unchanged).
+        let huge = "t".repeat(broker_router::MAX_REWRITE_LEN + 1);
+        assert_eq!(shared.router.rewrite_publish(&huge), None);
+        let stats = shared.router.rewrite_stats();
+        assert_eq!(stats.budget_exceeded, 1);
+        assert_eq!(stats.rewritten, 0);
+    }
+
+    /// B4-04 publish-path workload numbers with rewriting off and on,
+    /// measured through the real broker publish event (`apply_publish`),
+    /// not just the router. OFF is the no-rules baseline; ON installs one
+    /// capture-group rule plus a full 64-rule table miss path on a second
+    /// router state. Both print msgs/sec and avg ns/msg into the gate
+    /// output with no threshold assert; counts are CI sample sizes, not
+    /// SLOs. Per-message cost prose lives on `Router::rewrite_for`; this
+    /// test is the measured numbers behind it.
+    #[tokio::test]
+    async fn rewrite_publish_timing_reports_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // OFF: no rules installed.
+        let shared = test_shared();
+        let (session, _) = shared.sessions.get_or_create("rw-load", true);
+        *session.conn_id.write() = Some(71);
+        let sub = subscribe_frame(
+            71,
+            1,
+            encode_subscribe_meta(9, "rw-load", &[("devices/load", 0), ("load/plain", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        let off_iters = 200usize;
+        let off_start = Instant::now();
+        for i in 0..off_iters {
+            let (meta, payload) = encode_publish_meta("load/plain", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(72, 100 + i as u64, meta, payload), &shared).await;
+            black_box(&deliveries);
+            assert_eq!(deliveries.len(), 1, "baseline must deliver");
+        }
+        let off_elapsed = off_start.elapsed();
+        let off_rate = off_iters as f64 / off_elapsed.as_secs_f64();
+        let off_avg_ns = off_elapsed.as_nanos() as f64 / off_iters as f64;
+        println!(
+            "rewrite broker workload baseline (off, no rules): {off_rate:.0} msgs/sec, avg {off_avg_ns:.1} ns/msg ({off_iters} apply_publish rounds in {off_elapsed:?})"
+        );
+
+        // ON: one matching capture-group rule plus 63 preceding misses so
+        // the measured path pays the worst-case ordered scan.
+        let mut rules = Vec::with_capacity(broker_router::MAX_REWRITE_RULES);
+        for i in 0..(broker_router::MAX_REWRITE_RULES - 1) {
+            rules.push(broker_router::RewriteRuleConfig::new(
+                format!("^nomatch{i}/(.*)$"),
+                "miss/$1",
+                broker_router::RewriteScope::Both,
+            ));
+        }
+        rules.push(broker_router::RewriteRuleConfig::new(
+            "^load/(.*)$",
+            "devices/$1",
+            broker_router::RewriteScope::Both,
+        ));
+        shared
+            .router
+            .set_rewrite_rules(rules)
+            .expect("full table installs");
+        // Resubscribe through the rewritten filter so the ON loop delivers.
+        let sub = subscribe_frame(
+            71,
+            2,
+            encode_subscribe_meta(10, "rw-load", &[("load/plain", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        let on_iters = 200usize;
+        let on_start = Instant::now();
+        for i in 0..on_iters {
+            let (meta, payload) = encode_publish_meta("load/plain", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(72, 500 + i as u64, meta, payload), &shared).await;
+            black_box(&deliveries);
+            assert_eq!(deliveries.len(), 1, "rewritten publish must deliver");
+            assert_eq!(downlink_topic(&deliveries[0].1), "devices/plain");
+        }
+        let on_elapsed = on_start.elapsed();
+        let on_rate = on_iters as f64 / on_elapsed.as_secs_f64();
+        let on_avg_ns = on_elapsed.as_nanos() as f64 / on_iters as f64;
+        println!(
+            "rewrite broker workload (on, 64-rule table, last-rule hit): {on_rate:.0} msgs/sec, avg {on_avg_ns:.1} ns/msg ({on_iters} apply_publish rounds in {on_elapsed:?})"
+        );
+        println!(
+            "rewrite counters after workload: {:?}",
+            shared.router.rewrite_stats()
+        );
     }
 }
