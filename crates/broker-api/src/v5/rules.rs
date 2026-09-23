@@ -424,6 +424,182 @@ fn connector_node_status(status: &str) -> serde_json::Value {
     serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": status }])
 }
 
+/// Required-field gate for connector registration (S1-01): no connector
+/// may fall back to a built-in credential or an invented identity. Returns
+/// the first missing required field's canonical name, or `None` when the
+/// body supplies everything the live-sink builder needs. Callers answer
+/// 400 naming that field; `register_live_sink` itself also fails closed
+/// (returns without registering) so boot replay cannot invent values.
+///
+/// Only the six connector families that previously carried built-in
+/// credentials or invented identities are gated here. Every other family
+/// keeps its existing behaviour; see the marker on the fallback arm below.
+fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<&'static str> {
+    fn present(body: &serde_json::Value, keys: &[&str]) -> bool {
+        keys.iter().any(|k| {
+            body.get(*k)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+    }
+
+    match conn_type {
+        "gcp_iot" | "gcp_iot_core" => {
+            // Credential first so a bare body names the credential, not an identity.
+            if !present(body, &["private_key_pem", "private_key"]) {
+                return Some("private_key_pem");
+            }
+            if !present(body, &["project_id", "project"]) {
+                return Some("project_id");
+            }
+            if !present(body, &["cloud_region", "region"]) {
+                return Some("cloud_region");
+            }
+            if !present(body, &["registry_id", "registry"]) {
+                return Some("registry_id");
+            }
+            if !present(body, &["device_id", "device"]) {
+                return Some("device_id");
+            }
+            None
+        }
+        "databricks" | "delta_lake" => {
+            if !present(body, &["token", "api_key"]) {
+                return Some("token");
+            }
+            if !present(body, &["host", "server", "endpoint"]) {
+                return Some("host");
+            }
+            if !present(body, &["catalog"]) {
+                return Some("catalog");
+            }
+            if !present(body, &["schema"]) {
+                return Some("schema");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
+        "snowflake" => {
+            if !present(body, &["private_key_pem", "private_key"]) {
+                return Some("private_key_pem");
+            }
+            if !present(body, &["account"]) {
+                return Some("account");
+            }
+            if !present(body, &["user", "username"]) {
+                return Some("user");
+            }
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            if !present(body, &["schema"]) {
+                return Some("schema");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
+        "tablestore" | "ots" => {
+            if !present(body, &["access_key_id", "ak"]) {
+                return Some("access_key_id");
+            }
+            if !present(body, &["access_key_secret", "sk"]) {
+                return Some("access_key_secret");
+            }
+            if !present(body, &["instance_name", "instance"]) {
+                return Some("instance_name");
+            }
+            if !present(body, &["table_name", "table"]) {
+                return Some("table_name");
+            }
+            if !present(body, &["endpoint", "url"]) {
+                return Some("endpoint");
+            }
+            None
+        }
+        "oci_streaming" | "oci" => {
+            if !present(body, &["private_key_pem", "private_key"]) {
+                return Some("private_key_pem");
+            }
+            if !present(body, &["stream_pool_id"]) {
+                return Some("stream_pool_id");
+            }
+            if !present(body, &["stream_id"]) {
+                return Some("stream_id");
+            }
+            if !present(body, &["tenancy_ocid"]) {
+                return Some("tenancy_ocid");
+            }
+            if !present(body, &["user_ocid"]) {
+                return Some("user_ocid");
+            }
+            if !present(body, &["fingerprint"]) {
+                return Some("fingerprint");
+            }
+            if !present(body, &["endpoint", "url"]) {
+                return Some("endpoint");
+            }
+            None
+        }
+        "confluent" => {
+            if !present(body, &["api_key", "username"]) {
+                return Some("api_key");
+            }
+            if !present(body, &["api_secret", "password"]) {
+                return Some("api_secret");
+            }
+            None
+        }
+        "azure_eventhubs" | "azure_event_hubs" => {
+            if !present(body, &["shared_access_key", "key"]) {
+                return Some("shared_access_key");
+            }
+            None
+        }
+        "azure_iot" | "azure_iot_hub" => {
+            if !present(body, &["shared_access_key", "key"]) {
+                return Some("shared_access_key");
+            }
+            None
+        }
+        "aws_iot" | "aws_iot_core" => {
+            // mTLS-only build (R1-01): client certificate + key come from
+            // the operator. SigV4/WebSocket has no transport and is rejected
+            // at construction; never invent test credentials here.
+            // Accept flat fields and the nested `auth` object used by v1.
+            let nested = body.get("auth").and_then(|v| v.as_object());
+            let has = |keys: &[&str]| {
+                if present(body, keys) {
+                    return true;
+                }
+                if let Some(auth) = nested {
+                    return keys.iter().any(|k| {
+                        auth.get(*k)
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.trim().is_empty())
+                    });
+                }
+                false
+            };
+            if !has(&["client_cert_pem", "client_cert", "certificate", "cert_pem"]) {
+                return Some("client_cert_pem");
+            }
+            if !has(&["client_key_pem", "client_key", "private_key", "key_pem"]) {
+                return Some("client_key_pem");
+            }
+            None
+        }
+        // TODO(parity): remaining `register_live_sink` families still invent
+        // operational defaults (endpoints, tables, batch knobs); each needs
+        // the same fail-closed gate once its service documentation is
+        // checked for real defaults.
+        _ => None,
+    }
+}
+
 /// Boot replay for the connector store: merge the persisted snapshot
 /// into the process-global store and re-register every live sink through
 /// [`register_live_sink`], the same path `create_connector` uses, so a
@@ -538,8 +714,6 @@ pub async fn get_connector(Path(id): Path<String>) -> Response {
         .into_response()
 }
 
-const DEFAULT_RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
-
 async fn register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
@@ -631,8 +805,11 @@ async fn register_live_sink(
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
+                tls: None,
+                ca_bundle_pem: None,
+                tls_ca_file: None,
             };
-            let transport = Arc::new(broker_connectors::alloydb::TcpAlloydbTransport::new(
+            let transport = Arc::new(broker_connectors::alloydb::PgDriverAlloydbTransport::new(
                 &config,
             ));
             if let Ok(sink) = broker_connectors::alloydb::AlloydbSink::new(config, transport) {
@@ -1049,7 +1226,7 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::NativeCassandraTransport::new(&config) {
+            if let Ok(transport) = broker_connectors::ScyllaCassandraTransport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::CassandraSink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -1933,18 +2110,24 @@ async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .unwrap_or("telemetry-events")
                 .to_string();
-            let api_key = body
+            // Fail closed (S1-01): API key and secret are operator-supplied;
+            // the previous built-in placeholders are removed.
+            let Some(api_key) = body
                 .get("api_key")
                 .or_else(|| body.get("username"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("confluent-key")
-                .to_string();
-            let api_secret = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(api_secret) = body
                 .get("api_secret")
                 .or_else(|| body.get("password"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("confluent-secret")
-                .to_string();
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -1953,8 +2136,8 @@ async fn register_live_sink(
 
             let config = broker_connectors::confluent::ConfluentKafkaConfig {
                 bootstrap_servers: vec![bootstrap],
-                api_key,
-                api_secret,
+                api_key: api_key.to_string(),
+                api_secret: api_secret.to_string(),
                 auth_mechanism: broker_connectors::confluent::SaslMechanism::Plain,
                 topic_template: topic,
                 partition_key_template: Some("${client_id}".to_string()),
@@ -2528,34 +2711,61 @@ async fn register_live_sink(
             }
         }
         "aws_iot" | "aws_iot_core" => {
-            let endpoint = body
-                .get("endpoint")
-                .or_else(|| body.get("url"))
-                .or_else(|| body.get("server"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:8883");
-            let region = body
-                .get("region")
-                .and_then(|v| v.as_str())
-                .unwrap_or("us-east-1");
-            let client_id = body
-                .get("client_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("indra-bridge");
+            // Fail closed (S1-01 + R1-01): mTLS material is operator-supplied
+            // from the request body (flat or nested `auth`), never invented.
+            // A missing certificate or key registers nothing; SigV4 has no
+            // transport in this build and is rejected at construction.
+            let auth_obj = body.get("auth").and_then(|v| v.as_object());
+            let field = |keys: &[&str]| -> Option<String> {
+                for key in keys {
+                    if let Some(value) = body.get(*key).and_then(|v| v.as_str()) {
+                        if !value.trim().is_empty() {
+                            return Some(value.to_string());
+                        }
+                    }
+                    if let Some(auth) = auth_obj {
+                        if let Some(value) = auth.get(*key).and_then(|v| v.as_str()) {
+                            if !value.trim().is_empty() {
+                                return Some(value.to_string());
+                            }
+                        }
+                    }
+                }
+                None
+            };
+            let endpoint = field(&["endpoint", "url", "server"])
+                .unwrap_or_else(|| "127.0.0.1:8883".to_string());
+            let region = field(&["region"]).unwrap_or_else(|| "us-east-1".to_string());
+            let client_id = field(&["client_id"]).unwrap_or_else(|| "indra-bridge".to_string());
+            let Some(client_cert_pem) =
+                field(&["client_cert_pem", "client_cert", "certificate", "cert_pem"])
+            else {
+                return;
+            };
+            let Some(client_key_pem) =
+                field(&["client_key_pem", "client_key", "private_key", "key_pem"])
+            else {
+                return;
+            };
+            let ca_cert_pem = field(&["ca_cert_pem", "ca_cert", "ca_pem", "certificate_authority"])
+                .unwrap_or_default();
+            let ca_bundle_pem = field(&["ca_bundle_pem", "ca_bundle"]);
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+            let connect_timeout_ms = body.get("connect_timeout_ms").and_then(|v| v.as_u64());
+            let handshake_timeout_ms = body.get("handshake_timeout_ms").and_then(|v| v.as_u64());
 
             let config = broker_connectors::aws_iot::AwsIotConfig {
                 endpoint: endpoint.to_string(),
                 region: region.to_string(),
                 client_id: client_id.to_string(),
-                auth: broker_connectors::aws_iot::AwsIotAuth::SigV4 {
-                    access_key_id: "test".to_string(),
-                    secret_access_key: "test".to_string(),
-                    session_token: None,
+                auth: broker_connectors::aws_iot::AwsIotAuth::Mtls {
+                    ca_cert_pem,
+                    client_cert_pem,
+                    client_key_pem,
                 },
                 topic_mappings: vec![broker_connectors::aws_iot::BridgeTopicMapping {
                     local_topic: "#".to_string(),
@@ -2568,9 +2778,9 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 max_retries: Some(3),
                 timeout_ms,
-                connect_timeout_ms: None,
-                handshake_timeout_ms: None,
-                ca_bundle_pem: None,
+                connect_timeout_ms,
+                handshake_timeout_ms,
+                ca_bundle_pem,
                 alpn_protocols: None,
             };
             if let Ok(transport) = broker_connectors::aws_iot::TlsAwsIotTransport::new(&config) {
@@ -2611,14 +2821,87 @@ async fn register_live_sink(
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            let auth = body
+                .get("auth")
+                .and_then(|v| {
+                    serde_json::from_value::<broker_connectors::azure_blob::AzureBlobAuth>(
+                        v.clone(),
+                    )
+                    .ok()
+                })
+                .or_else(|| {
+                    body.get("account_key")
+                        .or_else(|| body.get("accountKey"))
+                        .and_then(|v| v.as_str())
+                        .map(
+                            |s| broker_connectors::azure_blob::AzureBlobAuth::SharedKey {
+                                account_key: s.to_string(),
+                            },
+                        )
+                })
+                .or_else(|| {
+                    body.get("auth").and_then(|v| v.as_object()).and_then(|o| {
+                        o.get("account_key")
+                            .or_else(|| o.get("accountKey"))
+                            .and_then(|v| v.as_str())
+                            .map(
+                                |s| broker_connectors::azure_blob::AzureBlobAuth::SharedKey {
+                                    account_key: s.to_string(),
+                                },
+                            )
+                    })
+                })
+                .or_else(|| {
+                    body.get("sas_token")
+                        .or_else(|| body.get("sas"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| broker_connectors::azure_blob::AzureBlobAuth::SasToken {
+                            sas_token: s.to_string(),
+                        })
+                        .or_else(|| {
+                            body.get("auth").and_then(|v| v.as_object()).and_then(|o| {
+                                o.get("sas_token")
+                                    .or_else(|| o.get("sas"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        broker_connectors::azure_blob::AzureBlobAuth::SasToken {
+                                            sas_token: s.to_string(),
+                                        }
+                                    })
+                            })
+                        })
+                })
+                .or_else(|| {
+                    body.get("token")
+                        .or_else(|| body.get("bearer_token"))
+                        .and_then(|v| v.as_str())
+                        .map(
+                            |s| broker_connectors::azure_blob::AzureBlobAuth::BearerToken {
+                                token: s.to_string(),
+                            },
+                        )
+                        .or_else(|| {
+                            body.get("auth").and_then(|v| v.as_object()).and_then(|o| {
+                                o.get("token")
+                                    .or_else(|| o.get("bearer_token"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        broker_connectors::azure_blob::AzureBlobAuth::BearerToken {
+                                            token: s.to_string(),
+                                        }
+                                    })
+                            })
+                        })
+                });
+            let Some(auth) = auth else {
+                return;
+            };
 
             let config = broker_connectors::azure_blob::AzureBlobSinkConfig {
                 account_name: account_name.to_string(),
                 container_name: container_name.to_string(),
                 endpoint,
-                auth: broker_connectors::azure_blob::AzureBlobAuth::BearerToken {
-                    token: "mock-azure-token".to_string(),
-                },
+                auth,
                 blob_path_template: blob_path.to_string(),
                 compression: broker_connectors::azure_blob::AzureBlobCompression::None,
                 max_records_per_blob: Some(1),
@@ -2666,11 +2949,16 @@ async fn register_live_sink(
                 .or_else(|| body.get("key_name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("SendPolicy");
-            let shared_access_key = body
+            // Fail closed (S1-01): SAS key is operator-supplied; the previous
+            // built-in test key is removed.
+            let Some(shared_access_key) = body
                 .get("shared_access_key")
                 .or_else(|| body.get("key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("dGVzdC1rZXk=");
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -2726,36 +3014,94 @@ async fn register_live_sink(
                 .get("device_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("device-01");
-            let shared_access_key = body
+            // Fail closed (S1-01): SAS key is operator-supplied; the previous
+            // built-in test key is removed.
+            let Some(shared_access_key) = body
                 .get("shared_access_key")
                 .or_else(|| body.get("key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("dGVzdC1rZXk=");
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
+                .and_then(|v| v.as_u64());
+            let module_id = body
+                .get("module_id")
+                .or_else(|| body.get("module"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let key_name = body
+                .get("key_name")
+                .or_else(|| body.get("shared_access_key_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("device")
+                .to_string();
+            let api_version = body
+                .get("api_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2021-04-12")
+                .to_string();
+            let direct_methods_enabled = body
+                .get("direct_methods_enabled")
+                .or_else(|| body.get("direct_methods"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let twin_sync_enabled = body
+                .get("twin_sync_enabled")
+                .or_else(|| body.get("twin_sync"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let batch_size = body
+                .get("batch_size")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .or(Some(1));
+            let buffer_capacity = body
+                .get("buffer_capacity")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let linger_ms = body.get("linger_ms").and_then(|v| v.as_u64()).or(Some(10));
+            let max_retries = body
+                .get("max_retries")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .or(Some(3));
+            let connect_timeout_ms = body.get("connect_timeout_ms").and_then(|v| v.as_u64());
+            let handshake_timeout_ms = body.get("handshake_timeout_ms").and_then(|v| v.as_u64());
+            let ca_bundle_pem = body
+                .get("ca_bundle_pem")
+                .or_else(|| body.get("ca_bundle"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let sas_ttl_secs = body
+                .get("sas_ttl_secs")
+                .or_else(|| body.get("sas_ttl"))
+                .or_else(|| body.get("token_ttl_secs"))
                 .and_then(|v| v.as_u64());
 
             let config = broker_connectors::azure_iot::AzureIotConfig {
                 iot_hub_name: hub_name.to_string(),
                 device_id: device_id.to_string(),
-                module_id: None,
+                module_id,
                 auth: broker_connectors::azure_iot::AzureIotAuth::SharedAccessKey {
                     key: shared_access_key.to_string(),
-                    key_name: Some("device".to_string()),
+                    key_name: Some(key_name),
                 },
-                api_version: "2021-04-12".to_string(),
-                direct_methods_enabled: false,
-                twin_sync_enabled: false,
-                batch_size: Some(1),
-                buffer_capacity: None,
-                linger_ms: Some(10),
-                max_retries: Some(3),
+                api_version,
+                direct_methods_enabled,
+                twin_sync_enabled,
+                batch_size,
+                buffer_capacity,
+                linger_ms,
+                max_retries,
                 timeout_ms,
-                connect_timeout_ms: None,
-                handshake_timeout_ms: None,
-                ca_bundle_pem: None,
-                sas_ttl_secs: None,
+                connect_timeout_ms,
+                handshake_timeout_ms,
+                ca_bundle_pem,
+                sas_ttl_secs,
             };
             if let Ok(transport) = broker_connectors::azure_iot::TlsAzureIotTransport::new(&config)
             {
@@ -2853,6 +3199,45 @@ async fn register_live_sink(
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // Batching / retry knobs are read from the request so management
+            // configuration drives the sink; defaults preserve the previous
+            // live-path behaviour (auto-flush every row).
+            let ignore_unknown_values = body
+                .get("ignore_unknown_values")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let skip_invalid_rows = body
+                .get("skip_invalid_rows")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let template_suffix = body
+                .get("template_suffix")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let batch_size = body
+                .get("batch_size")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .or(Some(1));
+            let batch_bytes = body
+                .get("batch_bytes")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .or(Some(1_048_576));
+            let linger_ms = body.get("linger_ms").and_then(|v| v.as_u64()).or(Some(10));
+            let max_retries = body
+                .get("max_retries")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .or(Some(3));
+            let initial_backoff_ms = body
+                .get("initial_backoff_ms")
+                .and_then(|v| v.as_u64())
+                .or(Some(100));
+            let max_backoff_ms = body
+                .get("max_backoff_ms")
+                .and_then(|v| v.as_u64())
+                .or(Some(2_000));
 
             let config = broker_connectors::bigquery::BigQuerySinkConfig {
                 project_id: project_id.to_string(),
@@ -2860,18 +3245,18 @@ async fn register_live_sink(
                 table_template: table.to_string(),
                 endpoint,
                 auth: broker_connectors::gcp_pubsub::GcpAuth::None,
-                ignore_unknown_values: true,
-                skip_invalid_rows: false,
-                template_suffix: None,
-                batch_size: Some(1),
-                batch_bytes: Some(1_048_576),
-                linger_ms: Some(10),
-                max_retries: Some(3),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(2_000),
+                ignore_unknown_values,
+                skip_invalid_rows,
+                template_suffix,
+                batch_size,
+                batch_bytes,
+                linger_ms,
+                max_retries,
+                initial_backoff_ms,
+                max_backoff_ms,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::bigquery::HttpBigQueryTransport::new(
+            if let Ok(transport) = broker_connectors::bigquery::SdkBigQueryTransport::new(
                 &config,
                 reqwest::Client::new(),
             ) {
@@ -2887,37 +3272,58 @@ async fn register_live_sink(
             }
         }
         "gcp_iot" | "gcp_iot_core" => {
+            // Kept: service-documented default endpoint
+            // (`mqtt.googleapis.com:8883`, the Google Cloud IoT MQTT bridge;
+            // same default as `GcpIotConfig::default_endpoint`).
+            // The connector still fails closed without its required fields below.
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("server"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:8883");
-            let project_id = body
+                .unwrap_or("mqtt.googleapis.com:8883");
+            // Fail closed (S1-01): an operator-supplied project, region,
+            // registry, device and key are required; nothing is invented.
+            let Some(project_id) = body
                 .get("project_id")
                 .or_else(|| body.get("project"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("my-iot-project");
-            let cloud_region = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(cloud_region) = body
                 .get("cloud_region")
                 .or_else(|| body.get("region"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("us-central1");
-            let registry_id = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(registry_id) = body
                 .get("registry_id")
                 .or_else(|| body.get("registry"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry-registry");
-            let device_id = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(device_id) = body
                 .get("device_id")
                 .or_else(|| body.get("device"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("edge-7");
-            let private_key_pem = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(private_key_pem) = body
                 .get("private_key_pem")
                 .or_else(|| body.get("private_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_RSA_PEM);
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -2958,30 +3364,48 @@ async fn register_live_sink(
             }
         }
         "databricks" | "delta_lake" => {
-            let host = body
+            // Fail closed (S1-01): host, token, catalog, schema and table are
+            // all operator-supplied; the previous mock token and invented
+            // names are removed.
+            let Some(host) = body
                 .get("host")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1:18096");
-            let token = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(token) = body
                 .get("token")
                 .or_else(|| body.get("api_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("dapi-mock-token");
-            let catalog = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(catalog) = body
                 .get("catalog")
                 .and_then(|v| v.as_str())
-                .unwrap_or("main");
-            let schema = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(schema) = body
                 .get("schema")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default");
-            let table = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(table) = body
                 .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("events");
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3024,38 +3448,59 @@ async fn register_live_sink(
             }
         }
         "snowflake" => {
-            let account = body
+            // Fail closed (S1-01): account, user, database, schema, table and
+            // key are all operator-supplied; the previous test names and
+            // built-in key are removed.
+            let Some(account) = body
                 .get("account")
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-account");
-            let user = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(user) = body
                 .get("user")
                 .or_else(|| body.get("username"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-user");
-            let database = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-db");
-            let schema = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(schema) = body
                 .get("schema")
                 .and_then(|v| v.as_str())
-                .unwrap_or("PUBLIC");
-            let table = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(table) = body
                 .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("TELEMETRY");
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let private_key_pem = body
+            let Some(private_key_pem) = body
                 .get("private_key_pem")
                 .or_else(|| body.get("private_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_RSA_PEM);
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3097,31 +3542,52 @@ async fn register_live_sink(
             }
         }
         "tablestore" | "ots" => {
-            let endpoint = body
+            // Fail closed (S1-01): endpoint, instance, table and both access
+            // keys are all operator-supplied; no loopback default is invented
+            // (Tablestore endpoints are instance-specific, so there is no
+            // service-documented default to keep).
+            let Some(endpoint) = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:18098");
-            let instance_name = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            // Fail closed (S1-01): instance, table and both access keys are
+            // operator-supplied; the previous test names and keys are removed.
+            let Some(instance_name) = body
                 .get("instance_name")
                 .or_else(|| body.get("instance"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-instance");
-            let table_name = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(table_name) = body
                 .get("table_name")
                 .or_else(|| body.get("table"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("sensor_data");
-            let access_key_id = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(access_key_id) = body
                 .get("access_key_id")
                 .or_else(|| body.get("ak"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-ak");
-            let access_key_secret = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(access_key_secret) = body
                 .get("access_key_secret")
                 .or_else(|| body.get("sk"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-sk");
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3166,36 +3632,64 @@ async fn register_live_sink(
             }
         }
         "oci_streaming" | "oci" => {
-            let endpoint = body
+            // Fail closed (S1-01): endpoint, OCIDs, fingerprint and key are
+            // all operator-supplied; no loopback default is invented (OCI
+            // Streaming endpoints are cell-specific, so there is no
+            // service-documented default to keep).
+            let Some(endpoint) = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:18099");
-            let stream_pool_id = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            // Fail closed (S1-01): OCIDs, fingerprint and key are
+            // operator-supplied; the previous test OCIDs, test fingerprint
+            // and built-in key are removed.
+            let Some(stream_pool_id) = body
                 .get("stream_pool_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("ocid1.streampool.oc1..teststreampool");
-            let stream_id = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(stream_id) = body
                 .get("stream_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("ocid1.stream.oc1..teststream");
-            let tenancy_ocid = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(tenancy_ocid) = body
                 .get("tenancy_ocid")
                 .and_then(|v| v.as_str())
-                .unwrap_or("ocid1.tenancy.oc1..testtenancy");
-            let user_ocid = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(user_ocid) = body
                 .get("user_ocid")
                 .and_then(|v| v.as_str())
-                .unwrap_or("ocid1.user.oc1..testuser");
-            let fingerprint = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(fingerprint) = body
                 .get("fingerprint")
                 .and_then(|v| v.as_str())
-                .unwrap_or("20:3b:97:13:55:1c:5b:0d:d3:37:d8:50:4e:c9:42:01");
-            let private_key_pem = body
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
+            let Some(private_key_pem) = body
                 .get("private_key_pem")
                 .or_else(|| body.get("private_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_RSA_PEM);
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return;
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3323,6 +3817,23 @@ pub async fn create_connector(
             .into_response();
     }
 
+    // Fail closed (S1-01): a connector without its required credential or
+    // identity is rejected here with the missing field named. It is never
+    // stored in a degraded state, and `register_live_sink` below also
+    // refuses to invent values.
+    if let Some(missing) = missing_connector_field(&conn_type, &body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!(
+                    "missing required field: {missing} for connector type {conn_type}"
+                ),
+            })),
+        )
+            .into_response();
+    }
+
     let is_reachable = probe_connector_reachable(&body).await;
     let status_str = connector_status(is_reachable);
 
@@ -3412,6 +3923,20 @@ pub async fn update_connector(
         .and_then(|v| v.as_str())
         .unwrap_or("http")
         .to_string();
+    // Fail closed (S1-01): same required-field gate as create; an update
+    // that drops a credential or identity is rejected with the field named.
+    if let Some(missing) = missing_connector_field(&conn_type, &body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!(
+                    "missing required field: {missing} for connector type {conn_type}"
+                ),
+            })),
+        )
+            .into_response();
+    }
     register_live_sink(&state.engine, &conn_type, &clean_id, &body).await;
 
     {

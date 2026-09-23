@@ -62,20 +62,22 @@ pub mod timescaledb;
 pub mod timestream;
 
 pub use alloydb::{
-    build_alloydb_insert_query, classify_alloydb_error, extract_alloydb_row, AlloydbAuth,
-    AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
+    alloydb_connect_config, alloydb_value_to_boxed, build_alloydb_insert_query,
+    classify_alloydb_error, extract_alloydb_row, map_driver_error, resolve_alloydb_password,
+    AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
     AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
-    CapturedAlloydbExecution, MockAlloydbTransport, TcpAlloydbTransport,
+    CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport, TcpAlloydbTransport,
 };
 pub use aws_iot::{
-    shadow_update_document, sign_websocket_url, AwsIotAuth, AwsIotConfig, AwsIotConnector,
-    AwsIotFrame, AwsIotSink, AwsIotTransport, BridgeDirection, BridgeTopicMapping,
-    MockAwsIotOutcome, MockAwsIotTransport, ShadowSyncConfig, ShadowTopics, TlsAwsIotTransport,
+    shadow_update_document, sign_websocket_url, sigv4_signature_via_sdk, sigv4_signing_key_manual,
+    sigv4_signing_key_via_sdk, AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIotSink,
+    AwsIotTransport, BridgeDirection, BridgeTopicMapping, MockAwsIotOutcome, MockAwsIotTransport,
+    ShadowSyncConfig, ShadowTopics, TlsAwsIotTransport,
 };
 pub use azure_blob::{
-    azure_error_code, canonicalized_resource, classify_blob_status, shared_key_authorization,
-    string_to_sign as azure_blob_string_to_sign, AzureBlobAuth, AzureBlobCompression,
-    AzureBlobConnector, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
+    azure_error_code, canonicalized_resource, classify_blob_status, container_string_to_sign,
+    shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AzureBlobAuth,
+    AzureBlobCompression, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
     AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
 };
 pub use azure_eventhubs::{
@@ -85,20 +87,22 @@ pub use azure_eventhubs::{
 };
 pub use azure_iot::{
     d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token, AzureIotAuth,
-    AzureIotConfig, AzureIotConnectTransport, AzureIotConnector, AzureIotPublish, AzureIotSink,
-    AzureIotTransport, CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport,
-    TlsAzureIotTransport, TwinTopics,
+    AzureIotConfig, AzureIotConnectTransport, AzureIotPublish, AzureIotSink, AzureIotTransport,
+    CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TlsAzureIotTransport,
+    TwinTopics,
 };
 pub use bigquery::{
-    classify_insert_errors, render_insert_body as render_bigquery_body, BigQueryConnector,
-    BigQueryInsertResponse, BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport,
-    CapturedBigQueryInsert, HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport,
+    classify_driver_response, classify_insert_errors, driver_insert_request,
+    render_insert_body as render_bigquery_body, BigQueryConnector, BigQueryInsertResponse,
+    BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert,
+    HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
 };
 pub use cassandra::{
     decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token,
     parse_contact_point, CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink,
     CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError,
     CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport,
+    ScyllaCassandraTransport,
 };
 pub use clickhouse::{ClickHouseConnector, ClickHouseSink, ClickHouseSinkConfig};
 pub use cockroachdb::{
@@ -779,31 +783,14 @@ pub(crate) fn rfc3339_millis(millis: i64) -> String {
 // AWS Signature Version 4 core (shared by the S3 and Kinesis signers).
 // ---------------------------------------------------------------------------
 
-/// HMAC-SHA256 (sha2 only, no extra dependency).
+/// HMAC-SHA256 on the maintained `hmac` + `sha2` crates (shared by
+/// the S3 and Kinesis signers and the Azure SharedKey/SAS signers).
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = sha2::Sha256::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = sha2::Sha256::new();
-    use sha2::Digest;
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-    let mut outer = sha2::Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
+    use hmac::Mac;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// Lowercase hex SHA-256 of `data`.
@@ -815,33 +802,14 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-/// HMAC-SHA1 (sha1 only, no extra dependency). Shared by the
-/// Alibaba Tablestore and RocketMQ signers (clean-room, same shape
-/// as the HMAC-SHA256 core above).
+/// HMAC-SHA1 on the maintained `hmac` + `sha1` crates. Shared by
+/// the Alibaba Tablestore and RocketMQ signers.
 pub(crate) fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = sha1::Sha1::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    use sha1::Digest;
-    let mut inner = sha1::Sha1::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-    let mut outer = sha1::Sha1::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
+    use hmac::Mac;
+    let mut mac =
+        hmac::Hmac::<sha1::Sha1>::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// SigV4 `x-amz-date` timestamp (`YYYYMMDDTHHMMSSZ`, UTC).

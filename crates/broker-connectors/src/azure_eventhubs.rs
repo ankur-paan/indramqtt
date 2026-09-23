@@ -11,19 +11,28 @@
 //!
 //! HTTP 201 is success; 429/503 throttle with jittered backoff; other
 //! non-2xx statuses are terminal dispatch failures.
+//!
+//! Production traffic runs on [`HttpAzureEventHubsTransport`]
+//! below over `reqwest`: `POST {resource_uri}/messages` carries the
+//! JSON batch array with a per-batch Shared Access Signature minted
+//! from the stored key (HMAC-SHA256 on the maintained `hmac` +
+//! `sha2` crates). No vendor SDK is involved: the dependency tree
+//! stays at `reqwest` + `hmac` + `sha2`.
 
 use async_trait::async_trait;
 use base64::Engine;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
+use super::{
+    hmac_sha256, now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result,
+    Sink,
+};
 
 fn default_token_ttl_secs() -> u64 {
     3_600
@@ -273,33 +282,15 @@ fn sas_key_bytes(secret: &str) -> Vec<u8> {
 }
 
 /// Build the `Authorization: SharedAccessSignature ...` value for
-/// `resource_uri` expiring at `expiry_secs` (Unix seconds).
+/// `resource_uri` expiring at `expiry_secs` (Unix seconds). Signing is
+/// HMAC-SHA256 on the maintained `hmac` + `sha2` crates via the shared
+/// signer.
 pub fn sas_token(resource_uri: &str, key_name: &str, secret: &str, expiry_secs: u64) -> String {
     let string_to_sign = format!("{resource_uri}\n{expiry_secs}");
-    // HMAC-SHA256 inline (same shape as the shared signer).
-    const BLOCK: usize = 64;
-    let key = sas_key_bytes(secret);
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = Sha256::digest(&key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(&key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(string_to_sign.as_bytes());
-    let inner_digest = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    let signature = base64::engine::general_purpose::STANDARD.encode(outer.finalize());
+    let signature = base64::engine::general_purpose::STANDARD.encode(hmac_sha256(
+        &sas_key_bytes(secret),
+        string_to_sign.as_bytes(),
+    ));
     format!(
         "SharedAccessSignature sr={}&sig={}&se={expiry_secs}&skn={key_name}",
         url_encode(resource_uri),
@@ -446,6 +437,7 @@ impl AzureEventHubsTransport for MockAzureEventHubsTransport {
 pub struct HttpAzureEventHubsTransport {
     url: String,
     client: reqwest::Client,
+    timeout: Duration,
 }
 
 impl HttpAzureEventHubsTransport {
@@ -453,6 +445,7 @@ impl HttpAzureEventHubsTransport {
         config.validate()?;
         Ok(Self {
             url: config.send_url(),
+            timeout: config.timeout(),
             client,
         })
     }
@@ -466,15 +459,19 @@ impl AzureEventHubsTransport for HttpAzureEventHubsTransport {
         events: Vec<AzureEventItem>,
         sas_token: &str,
     ) -> Result<()> {
-        let response = self
-            .client
-            .post(&self.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, sas_token)
-            .body(render_batch_body(&events))
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("azure send failed: {e}")))?;
+        let timeout = self.timeout;
+        let response = tokio::time::timeout(
+            timeout,
+            self.client
+                .post(&self.url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::AUTHORIZATION, sas_token)
+                .body(render_batch_body(&events))
+                .send(),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection("azure send timeout".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("azure send failed: {e}")))?;
         let status = response.status().as_u16();
         if status == 201 || (200..=299).contains(&status) {
             return Ok(());
@@ -994,5 +991,305 @@ mod tests {
         let calls = transport.calls();
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), calls);
+    }
+
+    #[test]
+    fn test_http_builds_offline_and_send_url_shape() {
+        // REST construction validates offline and never dials: every
+        // config shape below builds without I/O. The send URL is the
+        // documented HTTPS endpoint `{resource_uri}/messages`, and the
+        // per-batch SAS always carries the key name (so the service can
+        // attribute and the sink can renew it from the stored key).
+        let config = test_config();
+        let _transport =
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new()).expect("rest builds");
+        assert_eq!(
+            config.send_url(),
+            "https://my-eventhub-ns.servicebus.windows.net/telemetry-hub/messages"
+        );
+        assert_eq!(
+            config.resource_uri(),
+            "https://my-eventhub-ns.servicebus.windows.net/telemetry-hub"
+        );
+
+        // Custom endpoint override is preserved for proxies/emulators.
+        let mut custom = test_config();
+        custom.endpoint = Some("http://127.0.0.1:9".to_string());
+        let loopback = HttpAzureEventHubsTransport::new(&custom, reqwest::Client::new())
+            .expect("custom builds");
+        assert_eq!(
+            custom.send_url(),
+            "http://127.0.0.1:9/telemetry-hub/messages"
+        );
+        let _ = loopback;
+
+        // Bad material still fails offline with no I/O.
+        let mut bad = test_config();
+        bad.namespace = "UPPER".to_string();
+        assert!(HttpAzureEventHubsTransport::new(&bad, reqwest::Client::new()).is_err());
+        let mut bad_key = test_config();
+        bad_key.shared_access_key.clear();
+        assert!(HttpAzureEventHubsTransport::new(&bad_key, reqwest::Client::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_send_against_loopback() {
+        // Production HTTPS send without a real server: a local HTTP
+        // fake captures the POST so the SAS header, content type and
+        // batch body are asserted on the wire.
+        #[derive(Debug, Default)]
+        struct Captured {
+            inner: parking_lot::Mutex<Vec<CapturedPost>>,
+        }
+        #[derive(Debug)]
+        struct CapturedPost {
+            path: String,
+            content_type: Option<String>,
+            auth: Option<String>,
+            body: Vec<u8>,
+        }
+
+        let captured = Arc::new(Captured::default());
+        let app = axum::Router::new().fallback(axum::routing::post({
+            let captured = captured.clone();
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    let get = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    captured.inner.lock().push(CapturedPost {
+                        path: uri.path().to_string(),
+                        content_type: get("content-type"),
+                        auth: get("authorization"),
+                        body: body.to_vec(),
+                    });
+                    axum::http::StatusCode::CREATED
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let mut config = test_config();
+        config.endpoint = Some(format!("http://127.0.0.1:{port}"));
+        config.batch_size = Some(10);
+        let transport = Arc::new(
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new()).expect("rest builds"),
+        );
+        let sink = Arc::new(AzureEventHubsSink::new(config, transport).expect("sink builds"));
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from_static(br#"{"client_id":"edge-7","v":1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer");
+        sink.flush().await.expect("rest flush via loopback");
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.sent_batches(), 1);
+
+        let posts = captured.inner.lock();
+        assert_eq!(posts.len(), 1, "got {posts:?}");
+        assert_eq!(posts[0].path, "/telemetry-hub/messages");
+        assert_eq!(posts[0].content_type.as_deref(), Some("application/json"));
+        let auth = posts[0].auth.as_deref().expect("SAS header");
+        assert!(auth.starts_with("SharedAccessSignature sr="));
+        assert!(auth.contains("&skn=SendPolicy"));
+        let doc: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&posts[0].body).unwrap()).unwrap();
+        assert_eq!(doc[0]["BrokerProperties"]["PartitionKey"], "edge-7");
+        assert_eq!(doc[0]["UserProperties"]["mqtt_topic"], "sensors/t1");
+        server.abort();
+    }
+
+    #[test]
+    fn test_sink_kind_unchanged() {
+        // Stored configuration keeps working: the sink reports the same
+        // kind string over every transport.
+        let config = test_config();
+        let transport = Arc::new(MockAzureEventHubsTransport::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let sink = AzureEventHubsSink::new(config, transport.clone()).expect("sink builds");
+            assert_eq!(sink.kind(), "azure_eventhubs");
+            sink.send(
+                &Topic::new("sensors/t1").unwrap(),
+                &Bytes::from(r#"{"v":1}"#),
+                QoS::AtMostOnce,
+            )
+            .await
+            .expect("buffer");
+            sink.flush().await.expect("flush");
+            assert_eq!(sink.kind(), "azure_eventhubs");
+            assert_eq!(sink.sent_records(), 1);
+        });
+        // The REST transport itself validates the same config shape.
+        let rest = HttpAzureEventHubsTransport::new(&test_config(), reqwest::Client::new())
+            .expect("rest builds offline");
+        let _ = rest;
+    }
+
+    #[tokio::test]
+    async fn test_http_flush_reports_retryable_when_endpoint_unreachable() {
+        // The REST write path runs offline: with no listener on the
+        // custom endpoint the HTTPS send fails with a retryable
+        // Connection error, rows are restored and backoff engages, so
+        // nothing is dropped.
+        let mut config = test_config();
+        config.endpoint = Some("http://127.0.0.1:9".to_string());
+        config.timeout_ms = Some(2_000);
+        config.batch_size = Some(10);
+        config.initial_backoff_ms = Some(1);
+        config.max_backoff_ms = Some(2);
+        let transport = Arc::new(
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new()).expect("rest builds"),
+        );
+        let sink = AzureEventHubsSink::new(config, transport).expect("sink builds");
+        assert_eq!(sink.kind(), "azure_eventhubs");
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from(r#"{"v":1}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("buffer");
+        let err = sink.flush().await.expect_err("unreachable must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)), "got {err:?}");
+        assert_eq!(sink.buffered_rows(), 1);
+        assert_eq!(sink.sent_records(), 0);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Azure Event Hubs server over the
+    /// production HTTPS send endpoint.
+    ///
+    /// Run with e.g.:
+    /// `AZURE_EVENTHUBS_NAMESPACE=<ns>
+    ///  AZURE_EVENTHUBS_HUB=<hub>
+    ///  AZURE_EVENTHUBS_KEY_NAME=<policy>
+    ///  AZURE_EVENTHUBS_KEY=<key> \
+    ///  cargo test -p broker-connectors --lib \
+    ///  azure_eventhubs::tests::test_qualify_rest_write_path \
+    ///  -- --ignored --nocapture`
+    ///
+    /// Creates no hub (the hub must exist); sends 1000 events with
+    /// partition keys through [`AzureEventHubsSink`] on
+    /// [`HttpAzureEventHubsTransport`] (`POST {resource}/messages`
+    /// with a per-batch SAS minted from the stored key), asserts the
+    /// sink counters read 1000 sent / 0 buffered and every attempt
+    /// answered 2xx, then proves SAS renewal without loss by sending
+    /// one more event on a fresh transport.
+    /// TODO(parity): the HTTPS send answers 201 without proving the
+    /// events are consumable from the partitions; per-partition
+    /// landing still needs a consumer (AMQP/Kafka) check. Where is
+    /// that check owned once no vendor SDK remains in the tree?
+    /// Cleanup: none required (hub retained; events expire by
+    /// retention); the report states the server and row counts.
+    #[tokio::test]
+    #[ignore = "needs a real Azure Event Hubs server (see AZURE_EVENTHUBS_* env)"]
+    async fn test_qualify_rest_write_path() {
+        let namespace = qual_env("AZURE_EVENTHUBS_NAMESPACE").unwrap_or_default();
+        if namespace.is_empty() {
+            eprintln!("AZURE_EVENTHUBS_NAMESPACE is empty; skipping qualification");
+            return;
+        }
+        let hub = qual_env("AZURE_EVENTHUBS_HUB").unwrap_or_default();
+        let key_name = qual_env("AZURE_EVENTHUBS_KEY_NAME").unwrap_or_default();
+        let key = qual_env("AZURE_EVENTHUBS_KEY").unwrap_or_default();
+        if hub.is_empty() || key_name.is_empty() || key.is_empty() {
+            eprintln!("AZURE_EVENTHUBS_HUB/KEY_NAME/KEY missing; skipping qualification");
+            return;
+        }
+        eprintln!("qual server: namespace={namespace} hub={hub} key_name={key_name}");
+
+        let config = AzureEventHubsSinkConfig {
+            namespace,
+            event_hub: hub.clone(),
+            endpoint: None,
+            shared_access_key_name: key_name,
+            shared_access_key: key,
+            partition_key_template: Some("${client_id}".to_string()),
+            user_properties: HashMap::from([("run".to_string(), "qual-b3-04".to_string())]),
+            token_ttl_secs: 3_600,
+            batch_size: Some(100),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(20),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_500),
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        // Renewable SAS: every attempt mints a fresh token from the
+        // stored key, so expiry mid-backoff never loses rows.
+        let transport = Arc::new(
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new())
+                .expect("qual transport"),
+        );
+
+        // Write path end to end: 1000 events across 4 partition keys.
+        let sink = Arc::new(
+            AzureEventHubsSink::new(config.clone(), transport.clone()).expect("qual sink"),
+        );
+        assert_eq!(sink.kind(), "azure_eventhubs");
+        for seq in 0..1000 {
+            let key = format!("qual-key-{}", seq % 4);
+            let payload = Bytes::from(format!(
+                "{{\"run\":\"qual-b3-04\",\"seq\":{seq},\"client_id\":\"{key}\"}}"
+            ));
+            sink.send(
+                &Topic::new("sensors/qual-1").unwrap(),
+                &payload,
+                QoS::AtMostOnce,
+            )
+            .await
+            .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1000, "qual row count");
+        assert_eq!(sink.buffered_rows(), 0, "qual no rows left");
+        eprintln!(
+            "qual rows asserted: records=1000 batches={}",
+            sink.sent_batches()
+        );
+
+        // Every send answered 2xx: the service accepted the batches.
+        // (Per-partition landing needs a consumer check; see TODO above.)
+        eprintln!("qual accepted asserted: records=1000 batches accepted");
+
+        // SAS renewal without loss: a fresh transport re-mints the
+        // token from the stored key and sends one more event.
+        let fresh = Arc::new(
+            HttpAzureEventHubsTransport::new(&config, reqwest::Client::new())
+                .expect("qual fresh transport"),
+        );
+        let renew_sink =
+            Arc::new(AzureEventHubsSink::new(config.clone(), fresh).expect("qual renew sink"));
+        renew_sink
+            .send(
+                &Topic::new("sensors/qual-1").unwrap(),
+                &Bytes::from(r#"{"run":"qual-b3-04","seq":1000,"client_id":"qual-key-0"}"#),
+                QoS::AtMostOnce,
+            )
+            .await
+            .expect("qual renew send");
+        renew_sink.flush().await.expect("qual renew flush");
+        assert_eq!(renew_sink.sent_records(), 1);
+        eprintln!("qual SAS renewal asserted: reconnect + 1 event, no loss");
     }
 }

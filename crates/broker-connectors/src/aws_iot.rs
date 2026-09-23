@@ -2,13 +2,23 @@
 //!
 //! Bidirectional edge↔cloud bridge: local topics remap to AWS IoT
 //! Core topics (with `${client_id}` substitution), telemetry wraps
-//! into Device Shadow documents on demand, and SigV4 signs WebSocket
-//! URLs (`GET /mqtt`, service `iotdevicegateway`, ALPN `mqtt`) via
-//! the shared signer. MQTT travels over TLS with mutual X.509
+//! into Device Shadow documents on demand, and SigV4 URL signing
+//! (`GET /mqtt`, service `iotdevicegateway`) stays as a pure helper
+//! for offline validation. MQTT travels over TLS with mutual X.509
 //! authentication: the client certificate/key come from
 //! configuration, the server chain verifies against the configured
-//! CA bundle plus the platform roots, and ALPN negotiates `mqtt`
+//! CA bundle plus the OS system trust store, and ALPN negotiates `mqtt`
 //! where the endpoint requires it.
+//!
+//! Production traffic runs on the hand-written `TlsAwsIotTransport`
+//! below over `tokio-rustls` with `rustls` TLS: mutual TLS on port
+//! 8883 with CONNECT, PUBLISH at QoS 0 and 1, PUBACK tracking,
+//! keepalive PING and reconnect with backoff. There is no WebSocket
+//! transport in this build (no compliant WebSocket client was
+//! available without a disallowed licence); SigV4 configurations are
+//! rejected at registration. SigV4 URL signatures remain
+//! cross-checked against the maintained `aws-sigv4` signing key
+//! derivation by unit tests.
 //!
 //! Throttling (429 / `TooManyRequestsException`) and disconnects
 //! retry with backoff; authorization rejections (`Unauthorized` /
@@ -18,10 +28,10 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::cloud_tls;
 use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
@@ -209,7 +219,7 @@ pub struct AwsIotConfig {
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: Option<u64>,
     /// Extra CA bundle PEM for server verification, in addition to
-    /// the platform roots and (for mTLS) `auth.ca_cert_pem`.
+    /// the OS system trust store and (for mTLS) `auth.ca_cert_pem`.
     #[serde(default)]
     pub ca_bundle_pem: Option<String>,
     /// ALPN protocols offered during the handshake (`Some(["mqtt"])`
@@ -457,6 +467,9 @@ pub struct AwsIotFrame {
     pub user_properties: Vec<(String, String)>,
     pub content_type: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
+    /// Egress QoS: 0 or 1 only (AWS IoT Core has no QoS 2).
+    /// QoS 1 waits for PUBACK; QoS 0 is fire-and-forget.
+    pub qos: u8,
 }
 
 #[async_trait]
@@ -530,41 +543,62 @@ impl AwsIotTransport for MockAwsIotTransport {
     }
 }
 
+/// MQTT keepalive for the AWS IoT bridge (seconds). The CONNECT
+/// frame advertises this; the transport sends PINGREQ when idle for
+/// half of it and expects PINGRESP, so a half-open connection is
+/// noticed before the next publish blocks on it.
+const AWS_KEEPALIVE_SECS: u16 = 60;
+
 /// TLS transport: MQTT over mutual-TLS to AWS IoT Core (port 8883
 /// by default). The TCP socket is only ever used as the underlay for
-/// the TLS handshake; there is no cleartext MQTT path. SigV4
-/// (WebSocket auth on port 443) cannot do MQTT on 8883: construction
-/// succeeds so management validation stays offline, but `connect`
-/// fails loudly without opening any socket.
+/// the TLS handshake; there is no cleartext MQTT path. Only mTLS is
+/// built in this tree: SigV4 WebSocket auth has no transport and is
+/// rejected at construction (registration), never deferred to first
+/// publish. Missing client material is likewise refused by `new`,
+/// not by `connect` or `publish`.
 pub struct TlsAwsIotTransport {
     host: String,
     port: u16,
     client_id: String,
-    tls: Option<Arc<rustls::ClientConfig>>,
+    tls: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
     handshake_timeout: Duration,
     io_timeout: Duration,
+    keepalive: Duration,
     stream: tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>,
+    packet_id: AtomicU32,
+    last_activity: parking_lot::Mutex<Instant>,
+}
+
+impl std::fmt::Debug for TlsAwsIotTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsAwsIotTransport")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("io_timeout", &self.io_timeout)
+            .field("keepalive", &self.keepalive)
+            .field("packet_id", &self.packet_id.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl TlsAwsIotTransport {
     pub fn new(config: &AwsIotConfig) -> Result<Self> {
         config.validate()?;
         let (host, port) = config.host_port()?;
-        let common = (
-            host,
-            port,
-            config.client_id.clone(),
-            config.connect_timeout(),
-            config.handshake_timeout(),
-            config.timeout(),
-        );
         match &config.auth {
             AwsIotAuth::Mtls {
                 ca_cert_pem,
                 client_cert_pem,
                 client_key_pem,
             } => {
+                // Fail fast on bad PEM material so management
+                // validation stays offline: a missing certificate or
+                // key is a registration error, not a first-publish
+                // surprise.
                 let chain = cloud_tls::certs_from_pem(client_cert_pem).map_err(|e| {
                     ConnectorError::Dispatch(format!("aws-iot client certificate rejected: {e}"))
                 })?;
@@ -573,34 +607,123 @@ impl TlsAwsIotTransport {
                 })?;
                 let roots =
                     cloud_tls::root_store_with(ca_pem_combine(config, ca_cert_pem).as_deref())?;
+                // Server trust defaults to the OS system store plus the
+                // configured bundle (`ca_cert_pem`/`ca_bundle_pem`).
                 let tls =
                     cloud_tls::client_config(roots, Some((chain, key)), &config.effective_alpn())?;
                 Ok(Self {
-                    host: common.0,
-                    port: common.1,
-                    client_id: common.2,
-                    tls: Some(tls),
-                    connect_timeout: common.3,
-                    handshake_timeout: common.4,
-                    io_timeout: common.5,
+                    host,
+                    port,
+                    client_id: config.client_id.clone(),
+                    tls,
+                    connect_timeout: config.connect_timeout(),
+                    handshake_timeout: config.handshake_timeout(),
+                    io_timeout: config.timeout(),
+                    keepalive: Duration::from_secs(u64::from(AWS_KEEPALIVE_SECS)),
                     stream: tokio::sync::Mutex::new(None),
+                    packet_id: AtomicU32::new(0),
+                    last_activity: parking_lot::Mutex::new(Instant::now()),
                 })
             }
-            AwsIotAuth::SigV4 { .. } => Ok(Self {
-                host: common.0,
-                port: common.1,
-                client_id: common.2,
-                tls: None,
-                connect_timeout: common.3,
-                handshake_timeout: common.4,
-                io_timeout: common.5,
-                stream: tokio::sync::Mutex::new(None),
-            }),
+            AwsIotAuth::SigV4 { .. } => Err(ConnectorError::Dispatch(
+                "aws-iot SigV4 WebSocket path is not built in this build; use mTLS client credentials"
+                    .to_string(),
+            )),
         }
     }
 
     fn connect_frame(&self) -> Result<Vec<u8>> {
-        cloud_tls::encode_mqtt_connect(&self.client_id, true, 60, None, None)
+        cloud_tls::encode_mqtt_connect(&self.client_id, true, AWS_KEEPALIVE_SECS, None, None)
+    }
+
+    /// Next packet identifier, cycling 1..=65535 and never yielding 0.
+    fn next_packet_id(&self) -> u16 {
+        (self.packet_id.fetch_add(1, Ordering::SeqCst) % 65_535 + 1) as u16
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.stream.lock().await.is_some()
+    }
+
+    /// Drop the TLS stream. The next `connect` dials again (used to
+    /// prove reconnect after a rotation or a half-open drop).
+    pub async fn disconnect(&self) {
+        *self.stream.lock().await = None;
+    }
+
+    fn should_ping(&self) -> bool {
+        let half = self.keepalive.checked_div(2).unwrap_or(self.keepalive);
+        self.last_activity.lock().elapsed() > half
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock() = Instant::now();
+    }
+
+    async fn ping_stream(
+        stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        io_timeout: Duration,
+    ) -> Result<()> {
+        tokio::time::timeout(io_timeout, stream.write_all(&[0xC0, 0x00]))
+            .await
+            .map_err(|_| ConnectorError::Connection("aws-iot ping timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot ping failed: {e}")))?;
+        let mut resp = [0u8; 2];
+        tokio::time::timeout(io_timeout, stream.read_exact(&mut resp))
+            .await
+            .map_err(|_| ConnectorError::Connection("aws-iot pingresp timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot pingresp failed: {e}")))?;
+        if resp != [0xD0, 0x00] {
+            return Err(ConnectorError::Connection(
+                "aws-iot malformed PINGRESP".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_publish_qos0(
+        stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        topic: &str,
+        payload: &[u8],
+        io_timeout: Duration,
+    ) -> Result<()> {
+        let bytes = super::mqtt_bridge::encode_publish(topic, 0, false, 0, payload, false)?;
+        tokio::time::timeout(io_timeout, stream.write_all(&bytes))
+            .await
+            .map_err(|_| ConnectorError::Connection("aws-iot publish timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn write_publish_qos1(
+        stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        topic: &str,
+        payload: &[u8],
+        packet_id: u16,
+        io_timeout: Duration,
+    ) -> Result<()> {
+        let bytes = super::mqtt_bridge::encode_publish(topic, 1, false, packet_id, payload, false)?;
+        tokio::time::timeout(io_timeout, stream.write_all(&bytes))
+            .await
+            .map_err(|_| ConnectorError::Connection("aws-iot publish timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
+        let mut ack = [0u8; 4];
+        tokio::time::timeout(io_timeout, stream.read_exact(&mut ack))
+            .await
+            .map_err(|_| ConnectorError::Connection("aws-iot PUBACK timeout".to_string()))?
+            .map_err(|e| ConnectorError::Connection(format!("aws-iot PUBACK failed: {e}")))?;
+        if ack[0] != 0x40 || ack[1] != 0x02 {
+            return Err(ConnectorError::Connection(
+                "aws-iot malformed PUBACK".to_string(),
+            ));
+        }
+        let got = u16::from_be_bytes([ack[2], ack[3]]);
+        if got != packet_id {
+            return Err(ConnectorError::Connection(format!(
+                "aws-iot PUBACK id mismatch: got {got}, want {packet_id}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -633,17 +756,10 @@ impl AwsIotTransport for TlsAwsIotTransport {
         if self.stream.lock().await.is_some() {
             return Ok(());
         }
-        let tls = self.tls.clone().ok_or_else(|| {
-            ConnectorError::Dispatch(
-                "aws-iot SigV4 is WebSocket auth on port 443; MQTT over TLS needs \
-                 mTLS client credentials and has no plain-text fallback"
-                    .to_string(),
-            )
-        })?;
         let mut stream = cloud_tls::tls_dial(
             &self.host,
             self.port,
-            tls,
+            self.tls.clone(),
             self.connect_timeout,
             self.handshake_timeout,
             "aws-iot",
@@ -652,28 +768,126 @@ impl AwsIotTransport for TlsAwsIotTransport {
         let connect = self.connect_frame()?;
         cloud_tls::mqtt_connect_over_tls(&mut stream, &connect, "aws-iot", self.io_timeout).await?;
         *self.stream.lock().await = Some(stream);
+        self.touch();
         Ok(())
     }
 
     async fn publish(&self, frame: &AwsIotFrame) -> Result<()> {
-        let bytes = super::mqtt_bridge::encode_publish(
-            &frame.remote_topic,
-            1,
-            false,
-            1,
-            &frame.payload,
-            false,
-        )?;
+        if frame.qos > 1 {
+            return Err(ConnectorError::Dispatch(format!(
+                "aws-iot qos {} not supported; use 0 or 1",
+                frame.qos
+            )));
+        }
+        // Reconnect is driven by the sink's backoff loop: any
+        // `Connection` failure below invalidates the stream so the
+        // next `connect` dials again. `Dispatch` failures (bad topic,
+        // bad QoS) leave the stream alone.
         let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("aws-iot not connected".to_string()))?;
-        tokio::time::timeout(self.io_timeout, stream.write_all(&bytes))
-            .await
-            .map_err(|_| ConnectorError::Connection("aws-iot publish timeout".to_string()))?
-            .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
-        Ok(())
+        if guard.is_none() {
+            return Err(ConnectorError::Connection(
+                "aws-iot not connected".to_string(),
+            ));
+        }
+        if self.should_ping() {
+            let ping_ok = {
+                let stream = guard.as_mut().expect("checked above");
+                Self::ping_stream(stream, self.io_timeout).await.is_ok()
+            };
+            if !ping_ok {
+                *guard = None;
+                return Err(ConnectorError::Connection(
+                    "aws-iot keepalive ping failed".to_string(),
+                ));
+            }
+            self.touch();
+        }
+        if frame.qos == 0 {
+            let outcome = {
+                let stream = guard.as_mut().expect("checked above");
+                Self::write_publish_qos0(
+                    stream,
+                    &frame.remote_topic,
+                    &frame.payload,
+                    self.io_timeout,
+                )
+                .await
+            };
+            match outcome {
+                Ok(()) => {
+                    self.touch();
+                    Ok(())
+                }
+                Err(e) => {
+                    if matches!(e, ConnectorError::Connection(_)) {
+                        *guard = None;
+                    }
+                    Err(e)
+                }
+            }
+        } else {
+            let packet_id = self.next_packet_id();
+            let outcome = {
+                let stream = guard.as_mut().expect("checked above");
+                Self::write_publish_qos1(
+                    stream,
+                    &frame.remote_topic,
+                    &frame.payload,
+                    packet_id,
+                    self.io_timeout,
+                )
+                .await
+            };
+            match outcome {
+                Ok(()) => {
+                    self.touch();
+                    Ok(())
+                }
+                Err(e) => {
+                    // PUBACK timeouts, mismatches and writes are all
+                    // `Connection` here, so the stream is no longer
+                    // trustworthy for at-least-once; `Dispatch` (bad
+                    // topic) leaves it alone.
+                    if matches!(e, ConnectorError::Connection(_)) {
+                        *guard = None;
+                    }
+                    Err(e)
+                }
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SigV4 signing helpers (manual HMAC chain cross-checked against
+// the maintained `aws-sigv4` crate by unit tests).
+// ---------------------------------------------------------------------------
+
+/// Derive the SigV4 signing key with the manual HMAC chain (the same
+/// chain `sign_websocket_url` uses). Public so qualification tooling
+/// and downstream gates can cross-check the maintained `aws-sigv4`
+/// derivation below.
+pub fn sigv4_signing_key_manual(secret: &str, short_date: &str, region: &str) -> Vec<u8> {
+    let mut key = super::hmac_sha256(format!("AWS4{secret}").as_bytes(), short_date.as_bytes());
+    for part in [region, "iotdevicegateway", "aws4_request"] {
+        key = super::hmac_sha256(&key, part.as_bytes());
+    }
+    key
+}
+
+/// Derive the same signing key through the maintained `aws-sigv4`
+/// crate. The two must agree; the unit test below pins that.
+pub fn sigv4_signing_key_via_sdk(secret: &str, millis: i64, region: &str) -> Vec<u8> {
+    use std::time::{Duration, UNIX_EPOCH};
+    let time = UNIX_EPOCH + Duration::from_millis(millis.max(0) as u64);
+    aws_sigv4::sign::v4::generate_signing_key(secret, time, region, "iotdevicegateway")
+        .as_ref()
+        .to_vec()
+}
+
+/// Sign `string_to_sign` through the maintained `aws-sigv4` crate.
+pub fn sigv4_signature_via_sdk(signing_key: &[u8], string_to_sign: &str) -> String {
+    aws_sigv4::sign::v4::calculate_signature(signing_key, string_to_sign.as_bytes())
 }
 
 /// One buffered row: remote topic + payload + properties.
@@ -682,6 +896,9 @@ struct AwsIotRow {
     remote_topic: String,
     payload: Vec<u8>,
     user_properties: Vec<(String, String)>,
+    /// Egress QoS 0 or 1 (ingress ExactlyOnce downgrades to 1: AWS
+    /// IoT Core speaks 0/1 only).
+    qos: u8,
 }
 
 /// AWS IoT bridge sink: routes egress events through mappings with
@@ -748,6 +965,7 @@ impl AwsIotSink {
                             user_properties: row.user_properties.clone(),
                             content_type: Some("application/json".to_string()),
                             correlation_data: None,
+                            qos: row.qos,
                         })
                         .await?;
                 }
@@ -790,7 +1008,7 @@ impl AwsIotSink {
     /// Route one event through the first egress mapping whose local
     /// pattern matches the topic (`+`/`#` wildcards). Unmatched
     /// topics fail loudly (no silent blackhole).
-    fn buffer_row(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<bool> {
+    fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<bool> {
         if topic.as_str().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "aws-iot row requires a non-empty topic".to_string(),
@@ -818,10 +1036,20 @@ impl AwsIotSink {
         // Local patterns may carry `${client_id}`; resolve with an
         // empty client here (patterns match structurally first).
         let remote_topic = mapping.resolve_remote(&self.config.client_id)?;
+        // AWS IoT Core speaks QoS 0 and 1 only. Preserve 0/1 from
+        // ingress; downgrade ExactlyOnce to AtLeastOnce so QoS 2
+        // ingress still delivers instead of failing the bridge.
+        // TODO(parity): should QoS 2 ingress be rejected instead of
+        // downgraded to QoS 1?
+        let qos: u8 = match qos {
+            QoS::AtMostOnce => 0,
+            QoS::AtLeastOnce | QoS::ExactlyOnce => 1,
+        };
         Ok(self.buffer.lock().push(AwsIotRow {
             remote_topic,
             payload: payload.to_vec(),
             user_properties: Vec::new(),
+            qos,
         }))
     }
 }
@@ -1172,21 +1400,54 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_tls_transport_needs_mtls() {
-        // SigV4 credentials cannot do MQTT over TLS on 8883: fail
-        // loudly at connect time instead of falling back to
+    #[test]
+    fn test_tls_sigv4_rejected_at_registration() {
+        // No WebSocket transport exists in this build: SigV4
+        // configurations are refused at registration (construction),
+        // never deferred to first publish, and never fall back to
         // cleartext. Construction stays offline so management
         // validation never dials.
         let mut config = test_config();
         config.endpoint = "127.0.0.1:8883".to_string();
-        let transport = TlsAwsIotTransport::new(&config).unwrap();
-        match transport.connect().await {
+        match TlsAwsIotTransport::new(&config) {
             Err(ConnectorError::Dispatch(message)) => {
-                assert!(message.contains("no plain-text fallback"));
+                assert!(
+                    message.contains("WebSocket"),
+                    "unexpected message: {message}"
+                );
             }
-            _ => panic!("SigV4 must not connect over MQTT"),
+            other => panic!("SigV4 must be rejected at registration, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_tls_missing_cert_refused_at_registration() {
+        // A missing certificate or key is a registration error, not a
+        // first-publish surprise: management validation stays offline
+        // and fails fast.
+        let mut config = mtls_test_config("127.0.0.1:8883");
+        config.auth = AwsIotAuth::Mtls {
+            ca_cert_pem: TEST_CA_PEM.to_string(),
+            client_cert_pem: String::new(),
+            client_key_pem: String::new(),
+        };
+        assert!(matches!(
+            TlsAwsIotTransport::new(&config),
+            Err(ConnectorError::Dispatch(_))
+        ));
+        let mut bad_key = mtls_test_config("127.0.0.1:8883");
+        bad_key.auth = AwsIotAuth::Mtls {
+            ca_cert_pem: TEST_CA_PEM.to_string(),
+            client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
+            client_key_pem: "not-a-pem".to_string(),
+        };
+        assert!(matches!(
+            TlsAwsIotTransport::new(&bad_key),
+            Err(ConnectorError::Dispatch(_))
+        ));
+        // Valid material builds offline without dialling.
+        let ok = mtls_test_config("127.0.0.1:8883");
+        assert!(TlsAwsIotTransport::new(&ok).is_ok());
     }
 
     #[test]
@@ -1247,7 +1508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_handshake_and_publish() {
+    async fn test_tls_handshake_and_publish_qos1_with_puback() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1299,11 +1560,20 @@ mod tests {
             assert_eq!(decoded.topic, "$aws/things/edge-gateway-1/telemetry");
             assert_eq!(decoded.packet_id, 1);
             assert_eq!(decoded.payload, b"{\"temp\":21.5}");
+            // PUBACK for the same packet id, through the real codec.
+            let ack = [
+                0x40,
+                0x02,
+                (decoded.packet_id >> 8) as u8,
+                (decoded.packet_id & 0xFF) as u8,
+            ];
+            tls.write_all(&ack).await.expect("PUBACK");
         });
 
         let config = mtls_test_config(&format!("127.0.0.1:{port}"));
         let transport = Arc::new(TlsAwsIotTransport::new(&config).unwrap());
         transport.connect().await.unwrap();
+        assert!(transport.is_connected().await);
         transport
             .publish(&AwsIotFrame {
                 remote_topic: "$aws/things/edge-gateway-1/telemetry".to_string(),
@@ -1311,6 +1581,7 @@ mod tests {
                 user_properties: Vec::new(),
                 content_type: None,
                 correlation_data: None,
+                qos: 1,
             })
             .await
             .unwrap();
@@ -1318,6 +1589,141 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+        transport.disconnect().await;
+        assert!(!transport.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_and_publish_qos0_no_puback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let server_config = crate::cloud_tls::test_certs::server_config(
+            TEST_SERVER_CERT_PEM,
+            TEST_SERVER_KEY_PEM,
+            Some(TEST_CA_PEM),
+        )
+        .expect("test server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            let _ = crate::cloud_tls::read_client_connect(&mut tls)
+                .await
+                .expect("read CONNECT");
+            tls.write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("CONNACK");
+            // One QoS 0 PUBLISH frame (0x30); no PUBACK follows.
+            let mut head = [0u8; 1];
+            tls.read_exact(&mut head).await.expect("head");
+            assert_eq!(head[0], 0x30);
+            let mut len_buf = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                tls.read_exact(&mut byte).await.expect("len");
+                len_buf.push(byte[0]);
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            let (remaining, _) =
+                crate::mqtt_bridge::decode_remaining_length(&len_buf).expect("remaining");
+            let mut rest = vec![0u8; remaining];
+            tls.read_exact(&mut rest).await.expect("body");
+            let mut frame = vec![head[0]];
+            frame.extend_from_slice(&len_buf);
+            frame.extend_from_slice(&rest);
+            let decoded = crate::mqtt_bridge::decode_publish(&frame, false).expect("decode");
+            assert_eq!(decoded.topic, "a/b");
+            assert_eq!(decoded.qos, 0);
+            assert_eq!(decoded.payload, b"hi");
+        });
+
+        let config = mtls_test_config(&format!("127.0.0.1:{port}"));
+        let transport = Arc::new(TlsAwsIotTransport::new(&config).unwrap());
+        transport.connect().await.unwrap();
+        transport
+            .publish(&AwsIotFrame {
+                remote_topic: "a/b".to_string(),
+                payload: b"hi".to_vec(),
+                user_properties: Vec::new(),
+                content_type: None,
+                correlation_data: None,
+                qos: 0,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server done")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn test_sink_reconnect_invalidates_on_failure() {
+        // Reconnect: a publish without a connection and a dial against
+        // a closed port both fail as retryable Connection errors and
+        // leave the transport disconnected, so the sink backoff loop
+        // dials again instead of reusing a dead stream.
+        let mut closed = mtls_test_config("127.0.0.1:1");
+        closed.connect_timeout_ms = Some(200);
+        closed.handshake_timeout_ms = Some(200);
+        closed.timeout_ms = Some(200);
+        let tls = Arc::new(TlsAwsIotTransport::new(&closed).unwrap());
+        let err = tls
+            .publish(&AwsIotFrame {
+                remote_topic: "a/b".to_string(),
+                payload: b"{}".to_vec(),
+                user_properties: Vec::new(),
+                content_type: None,
+                correlation_data: None,
+                qos: 1,
+            })
+            .await
+            .expect_err("not connected must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        let err = tls.connect().await.expect_err("closed port must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        assert!(!tls.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn test_sink_preserves_qos0_qos1_and_downgrades_qos2() {
+        // AWS IoT Core speaks QoS 0 and 1 only: ingress AtMostOnce
+        // stays 0, AtLeastOnce stays 1, ExactlyOnce downgrades to 1.
+        let mut config = test_config();
+        config.batch_size = Some(10);
+        let (sink, transport) = test_sink(config);
+        sink.send(
+            &Topic::new("devices/a/telemetry").unwrap(),
+            &Bytes::from_static(b"q0"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("devices/a/telemetry").unwrap(),
+            &Bytes::from_static(b"q1"),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("devices/a/telemetry").unwrap(),
+            &Bytes::from_static(b"q2"),
+            QoS::ExactlyOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0].qos, 0);
+        assert_eq!(captured[1].qos, 1);
+        assert_eq!(captured[2].qos, 1);
     }
 
     #[tokio::test]
@@ -1344,5 +1750,267 @@ mod tests {
             .expect_err("plain listener must fail");
         assert!(matches!(err, ConnectorError::Connection(_)));
         server.abort();
+    }
+
+    #[test]
+    fn test_sigv4_sdk_key_matches_manual() {
+        // The maintained `aws-sigv4` key derivation must agree with
+        // the manual HMAC chain used by `sign_websocket_url`.
+        let millis = 1_789_211_889_000;
+        let manual = sigv4_signing_key_manual(
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "20260912",
+            "us-east-1",
+        );
+        let via_sdk = sigv4_signing_key_via_sdk(
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            millis,
+            "us-east-1",
+        );
+        assert_eq!(manual, via_sdk);
+    }
+
+    #[test]
+    fn test_sigv4_sdk_signature_matches_manual() {
+        // Same string-to-sign through both paths must give the same
+        // hex signature.
+        let string_to_sign = "AWS4-HMAC-SHA256\n20260912T111809Z\n20260912/us-east-1/iotdevicegateway/aws4_request\nabc123";
+        let manual_key = sigv4_signing_key_manual(
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "20260912",
+            "us-east-1",
+        );
+        let manual_sig = crate::hmac_sha256(&manual_key, string_to_sign.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let sdk_sig = sigv4_signature_via_sdk(&manual_key, string_to_sign);
+        assert_eq!(manual_sig, sdk_sig);
+        assert_eq!(sdk_sig.len(), 64);
+    }
+
+    #[test]
+    fn test_mtls_constructs_offline() {
+        // mTLS construction validates offline and never dials, so
+        // management validation stays offline.
+        let mtls = mtls_test_config("127.0.0.1:8883");
+        assert!(TlsAwsIotTransport::new(&mtls).is_ok());
+
+        // SigV4 has no transport in this build: rejected at
+        // registration, never deferred.
+        let sigv4 = test_config();
+        assert!(matches!(
+            TlsAwsIotTransport::new(&sigv4),
+            Err(ConnectorError::Dispatch(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_tls_publish_without_connect_fails() {
+        let config = mtls_test_config("127.0.0.1:8883");
+        let transport = TlsAwsIotTransport::new(&config).expect("tls transport builds");
+        assert!(!transport.is_connected().await);
+        let err = transport
+            .publish(&AwsIotFrame {
+                remote_topic: "indra/qual/telemetry".to_string(),
+                payload: b"{}".to_vec(),
+                user_properties: Vec::new(),
+                content_type: None,
+                correlation_data: None,
+                qos: 1,
+            })
+            .await
+            .expect_err("publish before connect must fail");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        transport.disconnect().await;
+    }
+
+    #[test]
+    fn test_tls_sink_kind_unchanged() {
+        // Stored configuration keeps working: the TLS sink reports the
+        // same kind string as before.
+        let config = mtls_test_config("127.0.0.1:8883");
+        let transport = Arc::new(TlsAwsIotTransport::new(&config).expect("tls builds"));
+        let sink = AwsIotSink::new(config, transport).expect("sink builds");
+        assert_eq!(sink.kind(), "aws_iot");
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_pem(var_pem: &str, var_file: &str) -> Option<String> {
+        if let Some(inline) = qual_env(var_pem) {
+            return Some(inline.replace("\\n", "\n"));
+        }
+        if let Some(path) = qual_env(var_file) {
+            return std::fs::read_to_string(path).ok();
+        }
+        None
+    }
+
+    /// Qualification against a real AWS IoT Core endpoint (mTLS only).
+    ///
+    /// Run with e.g.:
+    /// `AWS_IOT_ENDPOINT=abc123-ats.iot.us-east-1.amazonaws.com
+    ///  AWS_IOT_REGION=us-east-1 AWS_IOT_CLIENT_ID=edge-gateway-qual
+    ///  AWS_IOT_CA_FILE=/run/secrets/aws-ca.pem
+    ///  AWS_IOT_CLIENT_CERT_FILE=/run/secrets/aws-cert.pem
+    ///  AWS_IOT_CLIENT_KEY_FILE=/run/secrets/aws-key.pem
+    ///  AWS_IOT_THING=qual-thing-1 \
+    ///  cargo test -p broker-connectors --lib aws_iot::tests::test_qualify_tls_write_path -- --ignored --nocapture`
+    ///
+    /// Registers a thing out of band (console/CLI), attaches a policy
+    /// allowing `iot:Connect`/`iot:Publish`/`iot:Subscribe` on the
+    /// qual topics below, forwards 500 publishes through
+    /// [`AwsIotSink`] on [`TlsAwsIotTransport`], asserts one
+    /// shadow update plus 500 telemetry publishes, rotates the
+    /// certificate (new transport from `AWS_IOT_CLIENT_CERT_FILE_2` /
+    /// `AWS_IOT_CLIENT_KEY_FILE_2` when set, else the same material)
+    /// and asserts reconnect plus one further publish. Cleans up by
+    /// disconnecting; cloud-side test topics are ephemeral
+    /// (`indra/qual/...`) with no retained state.
+    #[tokio::test]
+    #[ignore = "needs a real AWS IoT Core server (see AWS_IOT_* env)"]
+    async fn test_qualify_tls_write_path() {
+        let endpoint = qual_env("AWS_IOT_ENDPOINT").unwrap_or_default();
+        if endpoint.is_empty() {
+            eprintln!("AWS_IOT_ENDPOINT is empty; skipping qualification");
+            return;
+        }
+        let region = qual_env("AWS_IOT_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        let client_id =
+            qual_env("AWS_IOT_CLIENT_ID").unwrap_or_else(|| "edge-gateway-qual".to_string());
+        let thing = qual_env("AWS_IOT_THING").unwrap_or_else(|| client_id.clone());
+
+        let ca_pem = qual_pem("AWS_IOT_CA_PEM", "AWS_IOT_CA_FILE").unwrap_or_default();
+        let client_cert = qual_pem("AWS_IOT_CLIENT_CERT_PEM", "AWS_IOT_CLIENT_CERT_FILE");
+        let client_key = qual_pem("AWS_IOT_CLIENT_KEY_PEM", "AWS_IOT_CLIENT_KEY_FILE");
+        let (Some(cert), Some(key)) = (client_cert, client_key) else {
+            eprintln!(
+                "no mTLS material; SigV4 WebSocket path is not built; skipping qualification"
+            );
+            return;
+        };
+        let auth = AwsIotAuth::Mtls {
+            ca_cert_pem: ca_pem.clone(),
+            client_cert_pem: cert,
+            client_key_pem: key,
+        };
+
+        let topic_prefix =
+            qual_env("AWS_IOT_TOPIC_PREFIX").unwrap_or_else(|| format!("indra/qual/{client_id}"));
+        let config = AwsIotConfig {
+            endpoint: endpoint.clone(),
+            region: region.clone(),
+            client_id: client_id.clone(),
+            auth,
+            topic_mappings: vec![BridgeTopicMapping {
+                local_topic: "devices/+/telemetry".to_string(),
+                remote_topic: format!("{topic_prefix}/telemetry"),
+                direction: BridgeDirection::LocalToRemote,
+            }],
+            shadow_sync: Some(ShadowSyncConfig {
+                thing_name_template: thing.clone(),
+            }),
+            batch_size: Some(250),
+            buffer_capacity: None,
+            linger_ms: Some(50),
+            max_retries: Some(5),
+            timeout_ms: Some(10_000),
+            connect_timeout_ms: Some(10_000),
+            handshake_timeout_ms: Some(10_000),
+            ca_bundle_pem: if ca_pem.trim().is_empty() {
+                None
+            } else {
+                Some(ca_pem)
+            },
+            alpn_protocols: None,
+        };
+        config.validate().expect("qual config validates");
+        eprintln!("qual server: endpoint={endpoint} region={region} client_id={client_id}");
+
+        let transport = Arc::new(TlsAwsIotTransport::new(&config).expect("qual transport"));
+        transport.connect().await.expect("qual connect");
+        assert!(transport.is_connected().await);
+        let sink = Arc::new(AwsIotSink::new(config.clone(), transport.clone()).expect("qual sink"));
+
+        // One shadow update first (reported state + client token).
+        let shadow_topic = ShadowTopics::update(&thing);
+        let reported = serde_json::json!({"qual": 1, "client": client_id});
+        let doc = shadow_update_document(&reported, "qual-1");
+        let doc_bytes = Bytes::from(serde_json::to_vec(&doc).expect("shadow json"));
+        transport
+            .publish(&AwsIotFrame {
+                remote_topic: shadow_topic,
+                payload: doc_bytes.to_vec(),
+                user_properties: Vec::new(),
+                content_type: Some("application/json".to_string()),
+                correlation_data: None,
+                qos: 1,
+            })
+            .await
+            .expect("qual shadow publish");
+
+        // 500 telemetry publishes through the rule-shaped sink path.
+        let topic = Topic::new("devices/qual-1/telemetry").unwrap();
+        for seq in 0..500 {
+            let payload = Bytes::from(format!(
+                "{{\"seq\":{seq},\"client\":\"{client_id}\",\"temp\":{temp}}}",
+                temp = 20.0 + (seq as f64) * 0.01
+            ));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 500);
+        eprintln!("qual rows asserted: shadow=1 telemetry=500");
+
+        // Rotate the certificate and prove reconnect: a fresh
+        // transport (rotated files when provided, else the same
+        // material) must connect and publish once more.
+        transport.disconnect().await;
+        assert!(!transport.is_connected().await);
+        let rotated_cert = qual_pem("AWS_IOT_CLIENT_CERT_PEM_2", "AWS_IOT_CLIENT_CERT_FILE_2");
+        let rotated_key = qual_pem("AWS_IOT_CLIENT_KEY_PEM_2", "AWS_IOT_CLIENT_KEY_FILE_2");
+        let rotated_config = match (&config.auth, rotated_cert, rotated_key) {
+            (
+                AwsIotAuth::Mtls {
+                    ca_cert_pem,
+                    client_cert_pem,
+                    client_key_pem,
+                },
+                Some(new_cert),
+                Some(new_key),
+            ) => {
+                let _ = (client_cert_pem, client_key_pem);
+                AwsIotConfig {
+                    auth: AwsIotAuth::Mtls {
+                        ca_cert_pem: ca_cert_pem.clone(),
+                        client_cert_pem: new_cert,
+                        client_key_pem: new_key,
+                    },
+                    ..config.clone()
+                }
+            }
+            _ => config.clone(),
+        };
+        let rotated = Arc::new(TlsAwsIotTransport::new(&rotated_config).expect("rotated builds"));
+        rotated.connect().await.expect("rotated connect");
+        rotated
+            .publish(&AwsIotFrame {
+                remote_topic: format!("{topic_prefix}/telemetry"),
+                payload: b"{\"seq\":501}".to_vec(),
+                user_properties: Vec::new(),
+                content_type: Some("application/json".to_string()),
+                correlation_data: None,
+                qos: 1,
+            })
+            .await
+            .expect("rotated publish");
+        rotated.disconnect().await;
+        transport.disconnect().await;
+        eprintln!("qual cleanup: disconnected TLS clients, no retained cloud state");
     }
 }

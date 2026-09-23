@@ -317,8 +317,7 @@ impl OciStreamingSinkConfig {
 // Cavage HTTP signing (RSA-SHA256).
 // ---------------------------------------------------------------------------
 
-/// Parse a PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8 (`BEGIN
-/// PRIVATE KEY`) RSA private key PEM.
+/// Parse a PKCS#1 or PKCS#8 RSA private key PEM.
 pub fn parse_rsa_key(pem: &str) -> Result<rsa::RsaPrivateKey> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
