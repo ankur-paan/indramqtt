@@ -2150,13 +2150,13 @@ async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
         .await
         .is_err());
 
-    // 4B: Kerberos removed (B1-01, T-77): every token is refused.
-    // The previous fake accepted self-described plaintext tokens; the stub
-    // below fails closed with "not supported" on every attempt.
+    // 4B: Kerberos without a keytab (B2-02 disabled path): every token is
+    // refused. A missing keytab disables explicitly and never accepts.
     let krb_config = KerberosConfig {
         service_principal_name: "mqtt/broker.enterprise.corp@ENTERPRISE.CORP".to_string(),
         realm: "ENTERPRISE.CORP".to_string(),
         allowed_realms: vec!["ENTERPRISE.CORP".to_string()],
+        ..KerberosConfig::default()
     };
     let krb_auth = KerberosAuthenticator::new(krb_config);
 

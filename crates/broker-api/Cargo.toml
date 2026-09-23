@@ -36,3 +36,4 @@ broker-connectors = { workspace = true }
 async-trait = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
+p256 = "0.13"

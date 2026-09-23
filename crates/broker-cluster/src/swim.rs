@@ -1,5 +1,5 @@
 use crate::{
-    license::{ClusterLicense, LicenseStatus},
+    license::{ClusterLicense, LicenseStatus, TrustedKeys},
     ClusterError, ClusterMembership, ClusterRouteTable, NodeId,
 };
 use async_trait::async_trait;
@@ -58,6 +58,16 @@ pub enum GossipItem {
         node_id: NodeId,
         filter: String,
         is_add: bool,
+    },
+    /// Licence token disseminated from a licensed node so a joiner becomes
+    /// licensed without a separate install. Management-plane gossip only.
+    LicenceUpdate { token: String },
+    /// Cluster identity handover: the stable per-cluster identity plus the
+    /// trial start it was created with. A joiner adopts these and discards
+    /// any identity it generated while standing alone.
+    ClusterIdentity {
+        identity: String,
+        trial_started_at: u64,
     },
 }
 
@@ -285,6 +295,15 @@ pub struct SwimMembership {
     route_table: RwLock<Option<Arc<ClusterRouteTable>>>,
     pending_acks: Mutex<HashMap<u64, Arc<Notify>>>,
     license_key: RwLock<Option<String>>,
+    trusted_keys: RwLock<Arc<TrustedKeys>>,
+    /// Stable per-cluster identity the licence binds to. Defaults to the
+    /// local node id until the kernel loads the persisted identity; the
+    /// join path verifies against this, and joiners adopt the cluster
+    /// value through gossip.
+    cluster_identity: RwLock<String>,
+    /// Trial start carried with the cluster identity so a joiner inside a
+    /// trial adopts the cluster remaining days rather than its own.
+    cluster_trial_started_at: RwLock<Option<u64>>,
 }
 
 impl SwimMembership {
@@ -316,6 +335,7 @@ impl SwimMembership {
             },
         );
 
+        let cluster_default = local.0.clone();
         Arc::new(Self {
             local,
             address,
@@ -328,11 +348,61 @@ impl SwimMembership {
             route_table: RwLock::new(None),
             pending_acks: Mutex::new(HashMap::new()),
             license_key: RwLock::new(None),
+            trusted_keys: RwLock::new(Arc::new(TrustedKeys::new())),
+            cluster_identity: RwLock::new(cluster_default),
+            cluster_trial_started_at: RwLock::new(None),
         })
     }
 
     pub fn set_license_key(&self, key: Option<String>) {
         *self.license_key.write() = key;
+    }
+
+    /// Current licence token, if any (propagated to joiners via gossip).
+    pub fn licence_token(&self) -> Option<String> {
+        self.license_key.read().clone()
+    }
+
+    /// Set the stable cluster identity the licence binds to. Called once
+    /// at boot after the persisted identity is loaded; defaults to the
+    /// local node id so unconfigured nodes keep prior behaviour.
+    pub fn set_cluster_identity(&self, identity: String, trial_started_at: Option<u64>) {
+        *self.cluster_identity.write() = identity;
+        *self.cluster_trial_started_at.write() = trial_started_at;
+    }
+
+    /// Stable cluster identity in use on this node.
+    pub fn cluster_identity(&self) -> String {
+        self.cluster_identity.read().clone()
+    }
+
+    /// Adopt cluster state received while joining: the cluster identity
+    /// (logging both identities when they differ, since any licence bound
+    /// to the old identity is no longer valid) plus the trial start and
+    /// the licence, so a new member is licensed the moment it is a member
+    /// with no separate install.
+    pub fn adopt_cluster_state(
+        &self,
+        identity: String,
+        trial_started_at: Option<u64>,
+        licence: Option<String>,
+    ) {
+        let old = self.cluster_identity.read().clone();
+        if old != identity {
+            crate::license::log_identity_adoption(&old, &identity);
+        }
+        *self.cluster_identity.write() = identity;
+        *self.cluster_trial_started_at.write() = trial_started_at;
+        if licence.is_some() {
+            *self.license_key.write() = licence;
+        }
+    }
+
+    /// Install the configured set of trusted signing keys. Called once at
+    /// boot after the keys file is loaded; the join path consults this set
+    /// on every admission so rotation is a configuration change.
+    pub fn set_trusted_keys(&self, keys: TrustedKeys) {
+        *self.trusted_keys.write() = Arc::new(keys);
     }
 
     pub fn attach_route_table(&self, route_table: Arc<ClusterRouteTable>) {
@@ -498,6 +568,19 @@ impl SwimMembership {
                                 rt.remove_route(&tf, &node_id);
                             }
                         }
+                    }
+                }
+                GossipItem::LicenceUpdate { token } => {
+                    if !token.trim().is_empty() {
+                        *self.license_key.write() = Some(token);
+                    }
+                }
+                GossipItem::ClusterIdentity {
+                    identity,
+                    trial_started_at,
+                } => {
+                    if !identity.trim().is_empty() {
+                        self.adopt_cluster_state(identity, Some(trial_started_at), None);
                     }
                 }
             }
@@ -782,18 +865,27 @@ impl SwimMembership {
             } => {
                 self.apply_gossip_batch(gossip).await;
 
-                // Enterprise License validation before admitting node
+                // Licence admission (B2-04): the licence binds to the stable
+                // cluster identity, not to any one node id. An unlicensed
+                // cluster still forms (trial or lapsed runs with enterprise
+                // entitlements off) so a customer can always reach the state
+                // where a request is generated; only the node ceiling refuses
+                // membership, and the refused node keeps serving MQTT
+                // standalone. Grace counts as licensed for admission.
                 let current_count = self.get_active_members().len();
                 let now_epoch = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 let lic_key = self.license_key.read().clone();
+                let trusted = self.trusted_keys.read().clone();
+                let cluster_id = self.cluster_identity.read().clone();
                 let status = ClusterLicense::evaluate(
                     lic_key.as_deref(),
                     current_count + 1,
                     now_epoch,
-                    self.local.0.as_str(),
+                    cluster_id.as_str(),
+                    &trusted,
                 );
 
                 match status {
@@ -803,24 +895,27 @@ impl SwimMembership {
                         customer,
                     } => {
                         warn!(
-                            "Rejecting node {} join: license quota exceeded ({}/{} nodes) for {}",
-                            from, current_nodes, max_nodes, customer
+                            "Rejecting node {} join: node beyond licensed ceiling: ceiling {} nodes, cluster would have {} nodes (customer '{}'); refused from the cluster, still serving MQTT standalone",
+                            from, max_nodes, current_nodes, customer
                         );
-                        return Err(ClusterError::Transport("License quota exceeded".into()));
+                        return Err(ClusterError::Transport(format!(
+                            "node beyond licensed ceiling: ceiling {max_nodes} nodes, cluster would have {current_nodes} nodes"
+                        )));
                     }
                     LicenseStatus::Expired {
                         customer,
                         expired_at,
                     } => {
                         warn!(
-                            "Rejecting node {} join: license expired for {} at {}",
+                            "Node {} joins with lapsed licence for {} expired at {}: admitted with enterprise entitlements off",
                             from, customer, expired_at
                         );
-                        return Err(ClusterError::Transport("License expired".into()));
                     }
                     LicenseStatus::InvalidSignature(reason) => {
                         warn!("Rejecting node {} join: license invalid: {}", from, reason);
-                        return Err(ClusterError::Transport("License invalid".into()));
+                        return Err(ClusterError::Transport(format!(
+                            "licence invalid: {reason}"
+                        )));
                     }
                     _ => {}
                 }
@@ -833,7 +928,19 @@ impl SwimMembership {
                     members.values().map(|r| r.state.clone()).collect()
                 };
 
-                let reply_gossip = self.harvest_gossip().await;
+                let mut reply_gossip = self.harvest_gossip().await;
+                reply_gossip.push(GossipItem::ClusterIdentity {
+                    identity: self.cluster_identity.read().clone(),
+                    trial_started_at: self.cluster_trial_started_at.read().unwrap_or_else(|| {
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    }),
+                });
+                if let Some(token) = self.license_key.read().clone() {
+                    reply_gossip.push(GossipItem::LicenceUpdate { token });
+                }
                 let join_ack = SwimMessage::JoinAck {
                     from: self.local.clone(),
                     members: member_states,
@@ -1183,17 +1290,55 @@ mod tests {
 
     #[tokio::test]
     async fn test_license_quota_enforcement() {
+        use crate::license::{canonical_json_bytes, LicensePayload, TOKEN_PREFIX};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        fn signing_key(seed: u8) -> SigningKey {
+            let bytes = [seed; 32];
+            let field_bytes =
+                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+            SigningKey::from_bytes(&field_bytes).expect("test seed")
+        }
+        fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
+            let payload = LicensePayload {
+                customer: "Acme Industrial IoT".to_string(),
+                max_nodes,
+                issued_at: 1700000000,
+                expires_at: 2000000000,
+                features: vec!["clustering".to_string()],
+                node_id: node_id.to_string(),
+                kid: kid.to_string(),
+                grace_period_days: crate::license::DEFAULT_GRACE_DAYS,
+            };
+            let bytes = canonical_json_bytes(&payload).expect("json");
+            let sig: Signature = signing.sign(&bytes);
+            format!(
+                "{}.{}.{}",
+                TOKEN_PREFIX,
+                URL_SAFE_NO_PAD.encode(&bytes),
+                URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            )
+        }
+
         let net = ChannelSwimNetwork::new();
         let t1 = net.register(node("node-1"));
         let _t2 = net.register(node("node-2"));
         let _t3 = net.register(node("node-3"));
         let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
 
-        // Enterprise license minted offline with the shipped public key's
-        // private counterpart (max 2 nodes, bound to node-1). The private
-        // key was discarded; only this token remains in the tree.
-        let key = "INDRA-ENT-V1.eyJjdXN0b21lciI6IkFjbWUgSW5kdXN0cmlhbCBJb1QiLCJtYXhfbm9kZXMiOjIsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwiZXhwaXJlc19hdCI6MjAwMDAwMDAwMCwiZmVhdHVyZXMiOlsiY2x1c3RlcmluZyJdLCJub2RlX2lkIjoibm9kZS0xIn0.AWjBqrbps61WwM9EWby7YPlmRtOYbXasZ53B6vE0fwlEJhBZHpaQszfBdUR873dMkMyAbUpB1AHSsdRDQf4kBQ";
-        swim1.set_license_key(Some(key.to_string()));
+        // Two enrolled P-256 devices with different key material. A licence
+        // from either is admitted through the real join path.
+        let key_a = signing_key(0xA1);
+        let key_b = signing_key(0xB2);
+        let mut trusted = TrustedKeys::new();
+        trusted.insert("key-a".to_string(), p256::ecdsa::VerifyingKey::from(&key_a));
+        trusted.insert("key-b".to_string(), p256::ecdsa::VerifyingKey::from(&key_b));
+        swim1.set_trusted_keys(trusted);
+
+        // Licence from the first device (max 2 nodes, bound to node-1).
+        let key = mint(&key_a, "key-a", 2, "node-1");
+        swim1.set_license_key(Some(key));
 
         // Node-2 joins -> admitted (2/2 nodes)
         let join2 = SwimMessage::Join {
@@ -1213,6 +1358,188 @@ mod tests {
         let res3 = swim1.handle_message(node("node-3"), join3).await;
         assert!(res3.is_err());
         assert!(matches!(res3, Err(ClusterError::Transport(_))));
+
+        // A licence from the second device is admitted the same way: swap
+        // the presented licence and re-run the join on a fresh member.
+        let net2 = ChannelSwimNetwork::new();
+        let t1b = net2.register(node("node-1"));
+        let _t2b = net2.register(node("node-2"));
+        let swim1b = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1b);
+        let mut trusted_b = TrustedKeys::new();
+        trusted_b.insert("key-a".to_string(), p256::ecdsa::VerifyingKey::from(&key_a));
+        trusted_b.insert("key-b".to_string(), p256::ecdsa::VerifyingKey::from(&key_b));
+        swim1b.set_trusted_keys(trusted_b);
+        swim1b.set_license_key(Some(mint(&key_b, "key-b", 5, "node-1")));
+        let join_b = SwimMessage::Join {
+            from: node("node-2"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        assert!(swim1b.handle_message(node("node-2"), join_b).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn b2_04_join_beyond_ceiling_names_ceiling_and_stays_standalone() {
+        use crate::license::{canonical_json_bytes, LicensePayload, TOKEN_PREFIX};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        fn signing_key(seed: u8) -> SigningKey {
+            let bytes = [seed; 32];
+            let field_bytes =
+                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+            SigningKey::from_bytes(&field_bytes).expect("test seed")
+        }
+        fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
+            let payload = LicensePayload {
+                customer: "Acme".to_string(),
+                max_nodes,
+                issued_at: 1700000000,
+                expires_at: 2000000000,
+                features: vec!["clustering".to_string()],
+                node_id: node_id.to_string(),
+                kid: kid.to_string(),
+                grace_period_days: crate::license::DEFAULT_GRACE_DAYS,
+            };
+            let bytes = canonical_json_bytes(&payload).expect("json");
+            let sig: Signature = signing.sign(&bytes);
+            format!(
+                "{}.{}.{}",
+                TOKEN_PREFIX,
+                URL_SAFE_NO_PAD.encode(&bytes),
+                URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            )
+        }
+
+        let net = ChannelSwimNetwork::new();
+        let t1 = net.register(node("node-1"));
+        let _t2 = net.register(node("node-2"));
+        let _t3 = net.register(node("node-3"));
+        let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
+        let key_a = signing_key(0xA1);
+        let mut trusted = TrustedKeys::new();
+        trusted.insert("key-a".to_string(), p256::ecdsa::VerifyingKey::from(&key_a));
+        swim1.set_trusted_keys(trusted);
+        swim1.set_cluster_identity("cluster-x".to_string(), None);
+        swim1.set_license_key(Some(mint(&key_a, "key-a", 1, "cluster-x")));
+        // First join fills the ceiling of 1 (cluster would have 2 with the seed counted).
+        // Admit node-2 by raising the ceiling first, then check refusal past it.
+        swim1.set_license_key(Some(mint(&key_a, "key-a", 2, "cluster-x")));
+        let join2 = SwimMessage::Join {
+            from: node("node-2"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        assert!(swim1.handle_message(node("node-2"), join2).await.is_ok());
+        // Tighten to a ceiling of 2 and try node-3: refused with numbers.
+        swim1.set_license_key(Some(mint(&key_a, "key-a", 2, "cluster-x")));
+        // Active members are node-1 and node-2, so node-3 would make 3.
+        let join3 = SwimMessage::Join {
+            from: node("node-3"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        let err = swim1
+            .handle_message(node("node-3"), join3)
+            .await
+            .expect_err("past ceiling refused");
+        let text = err.to_string();
+        assert!(text.contains('2'), "reason names the ceiling: {text}");
+        assert!(text.contains('3'), "reason names the current count: {text}");
+        // Refused from the cluster, not stopped as a broker: node-3 was
+        // never admitted, while the cluster keeps its members.
+        let active = swim1.get_active_members();
+        assert!(active.contains(&node("node-1")));
+        assert!(active.contains(&node("node-2")));
+        assert!(!active.contains(&node("node-3")));
+    }
+
+    #[tokio::test]
+    async fn b2_04_joiner_becomes_licensed_without_separate_install() {
+        use crate::license::{canonical_json_bytes, LicensePayload, TOKEN_PREFIX};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        fn signing_key(seed: u8) -> SigningKey {
+            let bytes = [seed; 32];
+            let field_bytes =
+                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+            SigningKey::from_bytes(&field_bytes).expect("test seed")
+        }
+        fn mint(signing: &SigningKey, kid: &str, max_nodes: usize, node_id: &str) -> String {
+            let payload = LicensePayload {
+                customer: "Acme".to_string(),
+                max_nodes,
+                issued_at: 1700000000,
+                expires_at: 2000000000,
+                features: vec!["clustering".to_string()],
+                node_id: node_id.to_string(),
+                kid: kid.to_string(),
+                grace_period_days: crate::license::DEFAULT_GRACE_DAYS,
+            };
+            let bytes = canonical_json_bytes(&payload).expect("json");
+            let sig: Signature = signing.sign(&bytes);
+            format!(
+                "{}.{}.{}",
+                TOKEN_PREFIX,
+                URL_SAFE_NO_PAD.encode(&bytes),
+                URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            )
+        }
+
+        let net = ChannelSwimNetwork::new();
+        let ta = net.register(node("node-a"));
+        let tb = net.register(node("node-b"));
+        let swim_a = SwimMembership::new(node("node-a"), None, SwimConfig::default(), ta);
+        let swim_b = SwimMembership::new(node("node-b"), None, SwimConfig::default(), tb);
+        let key_a = signing_key(0xB1);
+        let mut trusted = TrustedKeys::new();
+        trusted.insert("key-a".to_string(), p256::ecdsa::VerifyingKey::from(&key_a));
+        swim_a.set_trusted_keys(trusted.clone());
+        swim_b.set_trusted_keys(trusted);
+        swim_a.set_cluster_identity("cluster-main".to_string(), Some(1_700_000_000));
+        let token = mint(&key_a, "key-a", 10, "cluster-main");
+        swim_a.set_license_key(Some(token.clone()));
+        assert!(swim_b.licence_token().is_none());
+        // Node B joins A: A admits and replies with identity plus licence.
+        let join = SwimMessage::Join {
+            from: node("node-b"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        assert!(swim_a.handle_message(node("node-b"), join).await.is_ok());
+        let (_from, ack) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            swim_b.transport.recv(),
+        )
+        .await
+        .expect("joinack arrives")
+        .expect("message");
+        swim_b
+            .handle_message(node("node-a"), ack)
+            .await
+            .expect("joinack applies");
+        assert_eq!(swim_b.cluster_identity(), "cluster-main");
+        assert_eq!(swim_b.licence_token().as_deref(), Some(token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn b2_04_unlicensed_cluster_still_forms() {
+        let net = ChannelSwimNetwork::new();
+        let t1 = net.register(node("node-1"));
+        let _t2 = net.register(node("node-2"));
+        let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
+        swim1.set_trusted_keys(TrustedKeys::new());
+        swim1.set_cluster_identity("cluster-new".to_string(), Some(1_750_000_000));
+        // No licence installed: the join still succeeds (trial runs with
+        // enterprise entitlements off) so the bootstrap never deadlocks.
+        let join = SwimMessage::Join {
+            from: node("node-2"),
+            address: None,
+            gossip: Vec::new(),
+        };
+        assert!(swim1.handle_message(node("node-2"), join).await.is_ok());
+        assert!(swim1.get_active_members().contains(&node("node-2")));
     }
 
     #[tokio::test]
@@ -1220,8 +1547,9 @@ mod tests {
         let net = ChannelSwimNetwork::new();
         let t1 = net.register(node("node-1"));
         let swim1 = SwimMembership::new(node("node-1"), None, SwimConfig::default(), t1);
+        swim1.set_trusted_keys(TrustedKeys::new());
 
-        swim1.set_license_key(Some("INDRA-ENT-V1.forged.forged".to_string()));
+        swim1.set_license_key(Some("INDRA-ENT-V2.forged.forged".to_string()));
         let join = SwimMessage::Join {
             from: node("node-2"),
             address: None,

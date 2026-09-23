@@ -10,7 +10,7 @@ broker-protocol = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-ed25519-dalek = "2"
+p256 = "0.13"
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

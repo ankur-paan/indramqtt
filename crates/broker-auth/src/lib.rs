@@ -1,7 +1,7 @@
 pub mod kerberos;
 pub mod ldap;
 
-pub use kerberos::{KerberosAuthenticator, KerberosConfig};
+pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 
 use async_trait::async_trait;

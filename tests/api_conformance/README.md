@@ -1,4 +1,4 @@
-Conformance checker: validates a running kernel against the EMQX 6.3 spec.
+Conformance checker: validates a running kernel against the published management API specification.
 Spec is not in the repo; pass it by path (`--spec`) or `IM_OPENAPI_SPEC`.
 Read-only by default; mutations need a case file plus `--allow-mutations`.
 Usage:

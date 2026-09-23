@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// The v4 benchmark JSON reports `avg_latency_ms`/`p99_latency_ms` as 0.0 on
 /// every row because no harness ever sampled latency: the fields are
 /// hardcoded placeholders (the producing script is not in any repo; only
-/// the result JSONs exist under `emqx/benchmark_suite/`). This histogram
+/// the result JSONs exist under `benchmark_suite/`). This histogram
 /// is the sampler for the in-process harness.
 ///
 /// Memory is constant no matter how many samples are recorded: 64 buckets
