@@ -4236,6 +4236,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     linger_ms: Some(10),
                     max_retries: Some(5),
                     timeout_ms: None,
+                    ca_bundle_pem: None,
                 },
                 gcp_transport.clone(),
             )

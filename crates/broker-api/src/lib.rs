@@ -872,13 +872,12 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid kafka config: {e}"))?;
+                // Production write path on the maintained `rdkafka`
+                // driver; the hand-written TCP framing stays for offline
+                // unit tests only.
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpKafkaTransport::new(
-                        config.bootstrap_servers.clone(),
-                        config.client_id.clone(),
-                        &config.acks,
-                    )
-                    .map_err(|e| format!("invalid kafka transport: {e}"))?,
+                    broker_connectors::RdkafkaKafkaTransport::new(&config)
+                        .map_err(|e| format!("invalid kafka transport: {e}"))?,
                 );
                 let sink = broker_connectors::KafkaSink::new(config, transport)
                     .map_err(|e| format!("invalid kafka sink: {e}"))?;
@@ -892,8 +891,11 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid rabbitmq config: {e}"))?;
+                // Production write path on the maintained `lapin`
+                // driver; the hand-written TCP framing stays for offline
+                // unit tests only.
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpRabbitTransport::new(&config.endpoint)
+                    broker_connectors::LapinRabbitTransport::new(&config.endpoint)
                         .map_err(|e| format!("invalid rabbitmq transport: {e}"))?,
                 );
                 let sink = broker_connectors::RabbitMqSink::new(config, transport)
@@ -917,7 +919,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid postgres config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpPgTransport::new(
+                    broker_connectors::DriverPgTransport::new(
                         &config.connection_url,
                         config.pool_size,
                     )
@@ -936,7 +938,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid redis config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpRedisTransport::new(&config.endpoint)
+                    broker_connectors::DriverRedisTransport::new(&config.endpoint)
                         .map_err(|e| format!("invalid redis transport: {e}"))?,
                 );
                 let sink = broker_connectors::RedisSink::new(config, transport)
@@ -952,7 +954,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid mysql config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpMySqlTransport::new(
+                    broker_connectors::DriverMySqlTransport::new(
                         &config.connection_url,
                         config.pool_size,
                     )
@@ -999,7 +1001,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid s3 config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpS3Transport::new(&config, reqwest::Client::new())
+                    broker_connectors::SdkS3Transport::new(&config)
                         .map_err(|e| format!("invalid s3 transport: {e}"))?,
                 );
                 let sink = broker_connectors::S3Sink::new(config, transport)
@@ -1015,11 +1017,8 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid elasticsearch config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpElasticsearchTransport::new(
-                        &config,
-                        reqwest::Client::new(),
-                    )
-                    .map_err(|e| format!("invalid elasticsearch transport: {e}"))?,
+                    broker_connectors::DriverElasticsearchTransport::new(&config)
+                        .map_err(|e| format!("invalid elasticsearch transport: {e}"))?,
                 );
                 let sink = broker_connectors::ElasticsearchSink::new(config, transport)
                     .map_err(|e| format!("invalid elasticsearch sink: {e}"))?;
@@ -1034,7 +1033,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid timescaledb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpTimescaleTransport::new(
+                    broker_connectors::DriverTimescaleDbTransport::new(
                         &config.connection_url,
                         config.pool_size,
                     )
@@ -1069,7 +1068,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid mqtt_bridge config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpMqttBridgeTransport::new(&config)
+                    broker_connectors::RumqttcMqttBridgeTransport::new(&config)
                         .map_err(|e| format!("invalid mqtt_bridge transport: {e}"))?,
                 );
                 let sink = broker_connectors::MqttBridgeSink::new(config, transport)
@@ -1089,7 +1088,8 @@ async fn build_connector(
                         .await
                         .map_err(|e| format!("invalid disk_log writer: {e}"))?,
                 );
-                let sink = broker_connectors::DiskLogSink::new(config, writer)
+                let sink = broker_connectors::DiskLogSink::open(config, writer)
+                    .await
                     .map_err(|e| format!("invalid disk_log sink: {e}"))?;
                 Ok(("disk_log".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
@@ -1135,7 +1135,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid gcp_pubsub config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpGcpPubSubTransport::new(&config, reqwest::Client::new())
+                    broker_connectors::SdkGcpPubSubTransport::new(&config)
                         .map_err(|e| format!("invalid gcp_pubsub transport: {e}"))?,
                 );
                 let sink = broker_connectors::GcpPubSubSink::new(config, transport)
@@ -1237,7 +1237,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid gcp_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpGcpIotTransport::new(&config.endpoint)
+                    broker_connectors::TlsGcpIotTransport::new(&config)
                         .map_err(|e| format!("invalid gcp_iot transport: {e}"))?,
                 );
                 let sink = broker_connectors::GcpIotSink::new(config, transport)
@@ -1403,7 +1403,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid couchbase config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::NativeCouchbaseTransport::new(&config)
+                    broker_connectors::DriverCouchbaseTransport::new(&config)
                         .map_err(|e| format!("invalid couchbase transport: {e}"))?,
                 );
                 let sink = broker_connectors::CouchbaseSink::new(config, transport)
@@ -1467,7 +1467,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid dynamodb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpDynamoDbTransport::new(&config, reqwest::Client::new())
+                    broker_connectors::SdkDynamoDbTransport::new(&config)
                         .map_err(|e| format!("invalid dynamodb transport: {e}"))?,
                 );
                 let sink = broker_connectors::DynamoDbSink::new(config, transport)
@@ -1514,9 +1514,15 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid doris config: {e}"))?;
+                // No-redirect client: the transport replays auth + label
+                // itself on the FE 307 -> BE hop (a stock client strips
+                // Authorization when the BE is a different origin).
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpDorisTransport::new(&config, reqwest::Client::new())
-                        .map_err(|e| format!("invalid doris transport: {e}"))?,
+                    broker_connectors::HttpDorisTransport::new(
+                        &config,
+                        broker_connectors::doris_http_client(config.timeout()),
+                    )
+                    .map_err(|e| format!("invalid doris transport: {e}"))?,
                 );
                 let sink = broker_connectors::DorisSink::new(config, transport)
                     .map_err(|e| format!("invalid doris sink: {e}"))?;

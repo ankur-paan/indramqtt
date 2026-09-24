@@ -4,11 +4,21 @@
 //! `topic_template` (`${topic}`), the partition key extracts from a JSON
 //! payload field (Kafka murmur2 partitioning), and MQTT topic, QoS, and
 //! timestamp travel as record headers. Records batch in memory and flush
-//! on size limits or explicitly. The [`KafkaTransport`] boundary keeps
-//! unit tests broker-free ([`MemoryKafkaTransport`]); [`TcpKafkaTransport`]
-//! speaks the real Produce/ApiVersions framing over TCP.
+//! on size limits or explicitly.
+//!
+//! The production write path runs on the maintained `rdkafka` driver
+//! ([`RdkafkaKafkaTransport`] below): Kafka Produce protocol (RecordBatch
+//! v2 framing, murmur2 partitioning, acks, idempotence where configured)
+//! through `FutureProducer` futures. The hand-written
+//! [`TcpKafkaTransport`] (Produce/ApiVersions framing over TCP) is
+//! retained for offline unit tests only; production wiring uses the
+//! driver transport.
+//!
+//! The [`KafkaTransport`] boundary keeps unit tests broker-free
+//! ([`MemoryKafkaTransport`]); [`TcpKafkaTransport`] speaks the legacy
+//! framing over TCP.
 
-use super::{ConnectorError, Result, Sink};
+use super::{BackoffState, ConnectorError, Result, Sink};
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
@@ -20,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as AsyncRwLock;
 
 fn default_partitions() -> u32 {
     1
@@ -638,6 +649,184 @@ impl KafkaTransport for TcpKafkaTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained driver transport (`rdkafka`).
+// ---------------------------------------------------------------------------
+
+/// Build the maintained `rdkafka` client configuration for plain Apache
+/// Kafka endpoints: the configured bootstrap servers and client id, the
+/// configured acks as `request.required.acks`, and a 30 s
+/// `message.timeout.ms` (covers a single-broker KRaft restart window
+/// while keeping each delivery future bounded; the Kafka default of
+/// 5 min would hold rule-path futures far past the sink's retry
+/// window). Idempotence turns on exactly when acks requests a quorum
+/// (`all`/`-1`, the Kafka requirement for `enable.idempotence=true`);
+/// otherwise it stays off so `acks=1`/`acks=0` keep their documented
+/// throughput semantics.
+///
+/// Building the config opens no socket and spawns no thread; the
+/// driver connects lazily on first publish (see
+/// [`RdkafkaKafkaTransport`]). Management-plane validation therefore
+/// stays offline-safe: creating the sink never touches the network.
+pub fn rdkafka_client_config(config: &KafkaSinkConfig) -> rdkafka::config::ClientConfig {
+    let mut client = rdkafka::config::ClientConfig::new();
+    client
+        .set("bootstrap.servers", config.bootstrap_servers.clone())
+        .set("client.id", config.client_id.clone())
+        .set(
+            "request.required.acks",
+            match config.acks.as_str() {
+                "all" | "-1" => "all",
+                "1" => "1",
+                _ => "0",
+            },
+        )
+        // 30 s: single-broker restart window (see QUAL fault test);
+        // the Kafka default (300 s) would pin rule-path futures.
+        .set("message.timeout.ms", "30000")
+        .set("socket.timeout.ms", "30000")
+        .set(
+            "enable.idempotence",
+            match config.acks.as_str() {
+                "all" | "-1" => "true",
+                _ => "false",
+            },
+        );
+    client
+}
+
+/// Whether a driver failure message is terminal (`true`) or retryable
+/// (`false`). Authentication/authorisation failures and oversize
+/// records can never succeed on retry, so they are terminal; timeouts,
+/// transport loss, unknown topics and queue pressure retry with
+/// backoff through the sink.
+///
+/// TODO(parity): librdkafka reports a wider taxonomy than these
+/// substrings; which further codes must be terminal versus retryable
+/// for exactly-once accounting on plain Kafka?
+pub fn is_terminal_driver_message(message: &str) -> bool {
+    let text = message.to_lowercase();
+    text.contains("sasl")
+        || text.contains("auth")
+        || text.contains("ssl")
+        || text.contains("message too large")
+        || text.contains("msg_size_too_large")
+}
+
+/// Classify a driver delivery failure into the sink's error contract:
+/// terminal failures become `Dispatch` (drop, never retry), everything
+/// else becomes `Connection` (restore the batch, back off, retry).
+pub fn classify_driver_error(error: &rdkafka::error::KafkaError) -> ConnectorError {
+    if is_terminal_driver_message(&format!("{error:?}")) {
+        ConnectorError::Dispatch(format!("kafka driver delivery failed terminally: {error}"))
+    } else {
+        ConnectorError::Connection(format!("kafka driver delivery failed retryably: {error}"))
+    }
+}
+
+/// Production transport on the maintained `rdkafka` driver.
+///
+/// The `FutureProducer` is created lazily on first publish and cached;
+/// creation validates the librdkafka keys without opening any socket,
+/// and the driver dials on first delivery. Records publish
+/// sequentially, one delivery future at a time, so the driver queue
+/// holds at most one flush in flight: no new unbounded buffer on the
+/// publish path, no lock held across I/O (the producer handle is
+/// cloned under a short read lock, then used lock-free). The sink's
+/// in-memory batch (bounded by `batch_max_records`/`batch_max_bytes`,
+/// defaults 500 records / 256 KiB because a rule worker must stay
+/// small) is the only queue ahead of it.
+pub struct RdkafkaKafkaTransport {
+    config: KafkaSinkConfig,
+    producer: AsyncRwLock<Option<rdkafka::producer::FutureProducer>>,
+}
+
+impl RdkafkaKafkaTransport {
+    pub fn new(config: &KafkaSinkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            producer: AsyncRwLock::new(None),
+        })
+    }
+
+    pub fn config(&self) -> &KafkaSinkConfig {
+        &self.config
+    }
+
+    async fn producer(&self) -> Result<rdkafka::producer::FutureProducer> {
+        if let Some(producer) = self.producer.read().await.clone() {
+            return Ok(producer);
+        }
+        let mut guard = self.producer.write().await;
+        if let Some(producer) = guard.clone() {
+            return Ok(producer);
+        }
+        // PERF(parity): one driver producer per transport, created once
+        // and shared by every flush. A pooled producer set would be the
+        // fast version under very high partition fan-out; kept singular
+        // so a kernel restart never inherits half-open broker sessions.
+        // Hot-path numbers (per publish of R records): before (legacy
+        // TCP): R framed copies into one Produce body + 1 socket write;
+        // after (driver): R queue copies + R delivery futures, no new
+        // locks (the handle clones under a short read lock, then runs
+        // lock-free) and at most one flush in flight.
+        let producer: rdkafka::producer::FutureProducer = rdkafka_client_config(&self.config)
+            .create()
+            .map_err(|error: rdkafka::error::KafkaError| {
+                ConnectorError::Dispatch(format!("kafka driver config rejected: {error}"))
+            })?;
+        *guard = Some(producer.clone());
+        Ok(producer)
+    }
+
+    /// Drop the cached driver producer so the next publish redials with
+    /// the current configuration. Used by qualification to prove the
+    /// driver recovers after a server restart.
+    pub async fn reconnect(&self) -> Result<()> {
+        *self.producer.write().await = None;
+        self.producer().await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl KafkaTransport for RdkafkaKafkaTransport {
+    async fn publish(&self, records: Vec<KafkaRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let producer = self.producer().await?;
+        // 30 s per record: matches `message.timeout.ms` above so a
+        // delivery future never outlives the driver's own deadline.
+        let timeout = Duration::from_secs(30);
+        for record in &records {
+            let payload: &[u8] = record.value.as_ref();
+            let mut headers = rdkafka::message::OwnedHeaders::new();
+            for (name, value) in &record.headers {
+                let content: &[u8] = value.as_ref();
+                headers = headers.insert(rdkafka::message::Header {
+                    key: name.as_str(),
+                    value: Some(content),
+                });
+            }
+            let mut wire: rdkafka::producer::FutureRecord<'_, [u8], [u8]> =
+                rdkafka::producer::FutureRecord::to(record.topic.as_str())
+                    .partition(record.partition)
+                    .payload(payload)
+                    .headers(headers);
+            if let Some(key) = record.key.as_ref() {
+                let key_bytes: &[u8] = key.as_ref();
+                wire = wire.key(key_bytes);
+            }
+            producer
+                .send(wire, rdkafka::util::Timeout::After(timeout))
+                .await
+                .map_err(|(error, _)| classify_driver_error(&error))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -647,7 +836,9 @@ pub struct KafkaSink {
     config: KafkaSinkConfig,
     transport: Arc<dyn KafkaTransport>,
     buffer: parking_lot::Mutex<BatchBuffer>,
+    backoff: parking_lot::Mutex<BackoffState>,
     sent_batches: AtomicU64,
+    sent_records: AtomicU64,
 }
 
 #[derive(Default)]
@@ -663,7 +854,9 @@ impl KafkaSink {
             config,
             transport,
             buffer: parking_lot::Mutex::new(BatchBuffer::default()),
+            backoff: parking_lot::Mutex::new(BackoffState::default()),
             sent_batches: AtomicU64::new(0),
+            sent_records: AtomicU64::new(0),
         })
     }
 
@@ -673,6 +866,10 @@ impl KafkaSink {
 
     pub fn sent_batches(&self) -> u64 {
         self.sent_batches.load(Ordering::Relaxed)
+    }
+
+    pub fn sent_records(&self) -> u64 {
+        self.sent_records.load(Ordering::Relaxed)
     }
 
     pub fn buffered_records(&self) -> usize {
@@ -711,8 +908,15 @@ impl KafkaSink {
         }
     }
 
-    /// Flush buffered records as one batch per call (no-op when empty).
+    /// Flush buffered records (no-op when empty). Retryable driver
+    /// failures retry in place with backoff so a mid-batch single-broker
+    /// restart still lands every key (at-least-once: duplicates possible,
+    /// loss is a defect); terminal failures restore the batch and
+    /// propagate. At most 200 attempts with 100 ms to 1 s backoff (about
+    /// 100 s window: covers a KRaft single-broker restart while keeping
+    /// the rule worker bounded).
     pub async fn flush(&self) -> Result<()> {
+        self.backoff.lock().check()?;
         let batch = {
             let mut buffer = self.buffer.lock();
             buffer.bytes = 0;
@@ -721,9 +925,55 @@ impl KafkaSink {
         if batch.is_empty() {
             return Ok(());
         }
-        self.transport.publish(batch).await?;
-        self.sent_batches.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        let count = batch.len() as u64;
+        // 200 attempts: single-broker restart window for the
+        // qualification fault test; each sleep is 100 ms doubling to
+        // 1 s, so the window is about 100 s without wedging the rule
+        // worker past the driver's own 30 s deadline per record.
+        let mut attempt = 0usize;
+        loop {
+            match self.transport.publish(batch.clone()).await {
+                Ok(()) => {
+                    self.backoff.lock().success();
+                    self.sent_batches.fetch_add(1, Ordering::Relaxed);
+                    self.sent_records.fetch_add(count, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(ConnectorError::Connection(message)) => {
+                    attempt += 1;
+                    if attempt >= 200 {
+                        let mut buffer = self.buffer.lock();
+                        let mut restored = batch;
+                        restored.append(&mut buffer.records);
+                        buffer.records = restored;
+                        buffer.bytes = buffer
+                            .records
+                            .iter()
+                            .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+                            .sum();
+                        self.backoff.lock().failure();
+                        return Err(ConnectorError::Connection(message));
+                    }
+                    let delay_ms = 100u64
+                        .saturating_mul(2u64.saturating_pow((attempt.min(4)) as u32))
+                        .min(1_000);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => {
+                    let mut buffer = self.buffer.lock();
+                    let mut restored = batch;
+                    restored.append(&mut buffer.records);
+                    buffer.records = restored;
+                    buffer.bytes = buffer
+                        .records
+                        .iter()
+                        .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+                        .sum();
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
@@ -1077,5 +1327,374 @@ mod tests {
         let mut prefixed = (body.len() as i32).to_be_bytes().to_vec();
         prefixed.extend_from_slice(body);
         stream.write_all(&prefixed).await.expect("write frame");
+    }
+
+    #[test]
+    fn test_driver_config_mapping() {
+        // The driver config must accept every acks mode we advertise:
+        // `create` validates the librdkafka keys without opening any
+        // socket, so this stays offline.
+        for acks in ["all", "-1", "1", "0"] {
+            let mut config = test_config();
+            config.acks = acks.to_string();
+            let client = rdkafka_client_config(&config);
+            let producer: std::result::Result<
+                rdkafka::producer::FutureProducer,
+                rdkafka::error::KafkaError,
+            > = client.create();
+            assert!(
+                producer.is_ok(),
+                "driver must accept acks {acks:?} without I/O"
+            );
+        }
+        // Idempotence follows the Kafka requirement: on exactly when a
+        // quorum ack is requested.
+        let mut all = test_config();
+        all.acks = "all".to_string();
+        let _ = rdkafka_client_config(&all);
+        let mut one = test_config();
+        one.acks = "1".to_string();
+        let _ = rdkafka_client_config(&one);
+    }
+
+    #[test]
+    fn test_driver_error_classification() {
+        // Terminal: authentication/authorisation and oversize records.
+        for message in [
+            "SASL authentication failed: bad credentials",
+            "SaslAuthFailedError: invalid username",
+            "ssl handshake failed: certificate verify",
+            "Message production error: MessageTooLarge (MSG_SIZE_TOO_LARGE)",
+            "msg_size_too_large: record exceeds the limit",
+        ] {
+            assert!(
+                is_terminal_driver_message(message),
+                "{message:?} must be terminal"
+            );
+        }
+        // Retryable: timeouts, transport loss, unknown topics, pressure.
+        for message in [
+            "Message timed out (MSG_TIMED_OUT)",
+            "Broker transport failure: connection reset",
+            "Unknown topic or partition",
+            "Queue full: would block",
+            "success",
+        ] {
+            assert!(
+                !is_terminal_driver_message(message),
+                "{message:?} must be retryable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_driver_transport_validates_without_io() {
+        // `new` validates our config only; `reconnect` builds (and
+        // caches) the driver producer, which dials lazily, so neither
+        // touches the network.
+        let transport = RdkafkaKafkaTransport::new(&test_config()).expect("valid driver transport");
+        transport
+            .reconnect()
+            .await
+            .expect("reconnect builds the producer offline");
+        let mut bad = test_config();
+        bad.bootstrap_servers.clear();
+        assert!(RdkafkaKafkaTransport::new(&bad).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Apache Kafka server via the
+    /// maintained `rdkafka` driver.
+    ///
+    /// Run with e.g.:
+    /// `KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092 KAFKA_TOPIC=qual-b324 \
+    ///  cargo test -p broker-connectors --lib kafka::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates the topic (`<topic>`, 6 partitions) when missing, streams
+    /// 5000 keyed records through [`KafkaSink`] on
+    /// [`RdkafkaKafkaTransport`] via the shared [`crate::ConnectorManager`]
+    /// path the broker uses, restarts the server mid-batch through
+    /// `$QUAL_FAULT_FILE` when set, then reads all 5000 back with a
+    /// driver consumer asserting exact distinct counts, murmur2
+    /// placement and per-partition ordering. Deletes the topic
+    /// afterwards.
+    ///
+    /// TODO(parity): multi-broker leader failover qualification needs a
+    /// second broker; single-broker restart is the only fault covered
+    /// here.
+    #[tokio::test]
+    #[ignore = "needs a real Apache Kafka server (see KAFKA_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use rdkafka::consumer::Consumer as _;
+        use rdkafka::message::Message as _;
+        use std::collections::{HashMap, HashSet};
+
+        const RECORDS: u32 = 5000;
+        const PARTITIONS: u32 = 6;
+
+        let bootstrap = qual_env("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|| {
+            panic!(
+                "KAFKA_BOOTSTRAP_SERVERS must point at a real Apache Kafka server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092)"
+            )
+        });
+        let topic = qual_env("KAFKA_TOPIC")
+            .unwrap_or_else(|| panic!("KAFKA_TOPIC must be set for qualification; failing closed"));
+        // Server version for the report comes from the qualification
+        // image the gates start (apache/kafka:3.8.0); the driver exposes
+        // no broker-version RPC here, so the bootstrap/topic line below
+        // is the measured endpoint, never a substitute version string.
+        eprintln!("qual server: image apache/kafka:3.8.0 bootstrap={bootstrap} topic={topic}");
+        let fault_file = qual_env("QUAL_FAULT_FILE");
+
+        // Ensure the topic exists (idempotent: already-exists is fine).
+        let admin_config = KafkaSinkConfig {
+            bootstrap_servers: bootstrap.clone(),
+            topic_template: topic.clone(),
+            partition_key_field: Some("device_id".to_string()),
+            partitions: PARTITIONS,
+            client_id: "indra-qual-b324-admin".to_string(),
+            acks: "all".to_string(),
+            batch_max_records: 500,
+            batch_max_bytes: 256 * 1024,
+        };
+        let admin: rdkafka::admin::AdminClient<rdkafka::client::DefaultClientContext> =
+            rdkafka_client_config(&admin_config)
+                .create()
+                .expect("qual admin client");
+        let new_topic = rdkafka::admin::NewTopic::new(
+            topic.as_str(),
+            PARTITIONS as i32,
+            rdkafka::admin::TopicReplication::Fixed(1),
+        );
+        let created = admin
+            .create_topics(
+                [&new_topic],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+            .expect("qual create topic rpc");
+        for result in created {
+            if let Err(error) = result {
+                let text = format!("{error:?}");
+                if !text.contains("AlreadyExists")
+                    && !text.contains("already exists")
+                    && !text.contains("ALREADY_EXISTS")
+                {
+                    panic!("qual create topic failed: {error:?}");
+                }
+            }
+        }
+
+        let config = KafkaSinkConfig {
+            bootstrap_servers: bootstrap.clone(),
+            topic_template: topic.clone(),
+            partition_key_field: Some("device_id".to_string()),
+            partitions: PARTITIONS,
+            client_id: "indra-qual-b324".to_string(),
+            acks: "all".to_string(),
+            batch_max_records: 500,
+            batch_max_bytes: 256 * 1024,
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(RdkafkaKafkaTransport::new(&config).expect("qual transport"));
+        let sink = Arc::new(KafkaSink::new(config, transport.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "kafka");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it and
+        // never `sink.send` directly.
+        let manager = ConnectorManager::new();
+        manager.register("qual-kafka", sink.clone());
+        manager.register("kafka:qual-kafka", sink.clone());
+
+        let mqtt_topic = Topic::new("sensors/qual").expect("qual topic");
+        for seq in 0..RECORDS {
+            let device = format!("qual-{seq:06}");
+            let payload = Bytes::from(format!(
+                r#"{{"device_id":"{device}","seq":{seq},"temperature":{:.2}}}"#,
+                20.0 + f64::from(seq) * 0.01
+            ));
+            // Retry transient connection failures per record so a
+            // mid-batch server restart never loses a sequence number;
+            // terminal failures panic immediately (fail closed).
+            let mut attempts = 0usize;
+            loop {
+                match manager
+                    .send("qual-kafka", &mqtt_topic, &payload, QoS::AtLeastOnce)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(ConnectorError::Connection(message)) => {
+                        attempts += 1;
+                        if attempts >= 240 {
+                            panic!("qual send seq={seq} never recovered: {message}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => panic!("qual send seq={seq} terminal: {error:?}"),
+                }
+            }
+            if seq == 2500 {
+                if let Some(path) = fault_file.clone() {
+                    eprintln!("qual fault: requesting server restart via {path}");
+                    std::fs::write(&path, b"restart").expect("qual fault file write");
+                    tokio::time::timeout(Duration::from_secs(600), async {
+                        while std::path::Path::new(&path).exists() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .await
+                    .expect("qual server never came back after restart");
+                    eprintln!("qual fault: server back, continuing writes");
+                }
+            }
+        }
+        // Flush with an outer retry so a restart that outlasts one
+        // inner window still lands every record.
+        let mut flushed = false;
+        for _ in 0..10 {
+            match sink.flush().await {
+                Ok(()) => {
+                    flushed = true;
+                    break;
+                }
+                Err(ConnectorError::Connection(message)) => {
+                    eprintln!("qual flush retryable: {message}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => panic!("qual flush terminal: {error:?}"),
+            }
+        }
+        assert!(flushed, "qual flush never recovered after restart");
+        assert_eq!(sink.sent_records(), u64::from(RECORDS));
+        eprintln!(
+            "qual rows sent: records={} batches={}",
+            sink.sent_records(),
+            sink.sent_batches()
+        );
+
+        // Read everything back: exact distinct counts (at-least-once
+        // permits duplicates, never loss), murmur2 placement and
+        // per-partition ordering.
+        let mut consumer_config = rdkafka::config::ClientConfig::new();
+        consumer_config
+            .set("bootstrap.servers", bootstrap.clone())
+            .set(
+                "group.id",
+                format!("indra-qual-b324-{}", super::super::now_millis()),
+            )
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest");
+        let consumer: rdkafka::consumer::StreamConsumer =
+            consumer_config.create().expect("qual consumer");
+        consumer
+            .subscribe(&[topic.as_str()])
+            .expect("qual subscribe");
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut seq_by_key: HashMap<String, u32> = HashMap::new();
+        let mut last_seq_by_partition: HashMap<i32, u32> = HashMap::new();
+        let mut total = 0usize;
+        let mut duplicates = 0usize;
+        while seen.len() < RECORDS as usize {
+            let message = tokio::time::timeout(Duration::from_secs(180), consumer.recv())
+                .await
+                .expect("qual recv timeout")
+                .expect("qual recv");
+            let key_bytes = message.key().expect("qual records are keyed");
+            let payload_bytes = message.payload().expect("qual payload");
+            let partition = message.partition();
+            let value: serde_json::Value =
+                serde_json::from_slice(payload_bytes).expect("qual payload is JSON");
+            let device = value
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .expect("qual payload carries device_id");
+            let seq = value
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .expect("qual payload carries seq") as u32;
+            assert_eq!(
+                key_bytes,
+                device.as_bytes(),
+                "key bytes must be the device id"
+            );
+            assert_eq!(
+                partition,
+                partition_for_key(Some(key_bytes), PARTITIONS),
+                "murmur2 placement must match for key {device}"
+            );
+            total += 1;
+            if !seen.insert(device.to_string()) {
+                duplicates += 1;
+                assert_eq!(
+                    seq_by_key.get(device),
+                    Some(&seq),
+                    "duplicate delivery must carry the same seq for {device}"
+                );
+                continue;
+            }
+            seq_by_key.insert(device.to_string(), seq);
+            if let Some(last) = last_seq_by_partition.get(&partition) {
+                assert!(
+                    seq > *last,
+                    "ordering per partition violated on partition {partition}: seq={seq} after {last}"
+                );
+            }
+            last_seq_by_partition.insert(partition, seq);
+            if total.is_multiple_of(1000) || seen.len() == RECORDS as usize {
+                eprintln!(
+                    "qual progress: distinct={} total={} duplicates={}",
+                    seen.len(),
+                    total,
+                    duplicates
+                );
+            }
+        }
+        assert_eq!(seen.len(), RECORDS as usize);
+        for seq in 0..RECORDS {
+            let device = format!("qual-{seq:06}");
+            assert!(seen.contains(&device), "qual missing key {device}");
+            assert_eq!(seq_by_key.get(&device), Some(&seq));
+        }
+        eprintln!(
+            "qual rows asserted: distinct={} total={} duplicates={} partitions={}",
+            seen.len(),
+            total,
+            duplicates,
+            last_seq_by_partition.len()
+        );
+        assert_eq!(
+            last_seq_by_partition.len(),
+            PARTITIONS as usize,
+            "keys must spread across all {PARTITIONS} partitions"
+        );
+
+        // Cleanup: delete the topic; a failure is logged, never silent.
+        match admin
+            .delete_topics(
+                &[topic.as_str()],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+        {
+            Ok(results) => {
+                for result in results {
+                    if let Err(error) = result {
+                        eprintln!("qual delete topic note: {error:?}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("qual delete topic rpc failed: {error}"),
+        }
+        eprintln!("qual cleanup: deleted topic {topic}");
     }
 }

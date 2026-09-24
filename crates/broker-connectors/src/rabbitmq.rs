@@ -487,6 +487,151 @@ impl RabbitMqTransport for TcpRabbitTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Production transport on the maintained `lapin` driver.
+// ---------------------------------------------------------------------------
+
+/// Connect timeout for the driver handshake: 5 s matches the legacy
+/// [`TcpRabbitTransport`] dial timeout (the protocol requirement is a
+/// bounded handshake, not a specific value).
+const LAPIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Publisher-confirm wait: 10 s matches the legacy `read_frame` timeout
+/// on the same path.
+const LAPIN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Convert sink headers into a driver field table: `Str` rides as
+/// `LongString`, `Bool` as `Boolean`, `I32` as `LongInt`, `Timestamp`
+/// as `Timestamp`, mirroring the hand-rolled `encode_field_table`
+/// types (`S`/`t`/`I`/`T`).
+fn lapin_field_table(headers: &[(String, FieldValue)]) -> lapin::types::FieldTable {
+    let mut table = lapin::types::FieldTable::default();
+    for (name, value) in headers {
+        let amqp_value = match value {
+            FieldValue::Str(text) => lapin::types::AMQPValue::LongString(text.clone().into()),
+            FieldValue::Bool(flag) => lapin::types::AMQPValue::Boolean(*flag),
+            FieldValue::I32(number) => lapin::types::AMQPValue::LongInt(*number),
+            FieldValue::Timestamp(ts) => lapin::types::AMQPValue::Timestamp(*ts),
+        };
+        table.insert(name.clone().into(), amqp_value);
+    }
+    table
+}
+
+/// Build the driver `BasicProperties` for one publish: content type,
+/// headers table, delivery mode and timestamp ride the content header,
+/// exactly as [`encode_basic_publish`] sets flag `0xB040` on the
+/// hand-rolled path.
+fn lapin_properties(publish: &AmqpPublish) -> lapin::BasicProperties {
+    lapin::BasicProperties::default()
+        .with_content_type("application/json".into())
+        .with_headers(lapin_field_table(&publish.headers))
+        .with_delivery_mode(publish.delivery_mode)
+        .with_timestamp(publish.timestamp_secs)
+}
+
+struct LapinChannelState {
+    connection: lapin::Connection,
+    channel: lapin::Channel,
+}
+
+/// Production RabbitMQ transport on the maintained `lapin` driver
+/// (MIT): AMQP 0-9-1 PLAIN handshake plus `Basic.Publish` with content
+/// header/body frames through the driver. The legacy
+/// [`TcpRabbitTransport`] stays for offline unit tests only;
+/// production wiring uses this transport.
+///
+/// Bound: one shared connection and one multiplexed channel, created
+/// lazily and reused; each `publish` is one driver `basic_publish`
+/// plus one confirm await with no background queue. The sink's send
+/// path runs behind the rule engine's bounded queue, so no benchmark
+/// numbers are needed.
+pub struct LapinRabbitTransport {
+    amqp_url: String,
+    state: AsyncMutex<Option<LapinChannelState>>,
+}
+
+impl LapinRabbitTransport {
+    pub fn new(endpoint: &str) -> Result<Self> {
+        // Validate the URL shape now so misconfiguration fails at
+        // connector creation, never at first publish.
+        parse_endpoint(endpoint)?;
+        Ok(Self {
+            amqp_url: endpoint.to_string(),
+            state: AsyncMutex::new(None),
+        })
+    }
+
+    async fn channel(&self) -> Result<lapin::Channel> {
+        let mut guard = self.state.lock().await;
+        if let Some(state) = guard.as_ref() {
+            // The stored connection owns the TCP session for the shared
+            // channel; touching it keeps the ownership load-bearing.
+            let _ = &state.connection;
+            return Ok(state.channel.clone());
+        }
+        let connection = tokio::time::timeout(
+            LAPIN_CONNECT_TIMEOUT,
+            lapin::Connection::connect(&self.amqp_url, lapin::ConnectionProperties::default()),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "rabbitmq driver connect timeout: {}",
+                self.amqp_url
+            ))
+        })?
+        .map_err(|e| ConnectorError::Connection(format!("rabbitmq driver connect failed: {e}")))?;
+        let channel = connection.create_channel().await.map_err(|e| {
+            ConnectorError::Connection(format!("rabbitmq driver channel failed: {e}"))
+        })?;
+        let cloned = channel.clone();
+        *guard = Some(LapinChannelState {
+            connection,
+            channel,
+        });
+        Ok(cloned)
+    }
+
+    async fn publish_once(&self, publish: &AmqpPublish) -> Result<()> {
+        let channel = self.channel().await?;
+        let confirm = channel
+            .basic_publish(
+                publish.exchange.clone().into(),
+                publish.routing_key.clone().into(),
+                lapin::options::BasicPublishOptions::default(),
+                publish.body.as_ref(),
+                lapin_properties(publish),
+            )
+            .await
+            .map_err(|e| {
+                ConnectorError::Connection(format!("rabbitmq driver publish failed: {e}"))
+            })?;
+        tokio::time::timeout(LAPIN_CONFIRM_TIMEOUT, confirm)
+            .await
+            .map_err(|_| ConnectorError::Connection("rabbitmq driver confirm timeout".to_string()))?
+            .map_err(|e| {
+                ConnectorError::Connection(format!("rabbitmq driver publish not confirmed: {e}"))
+            })?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RabbitMqTransport for LapinRabbitTransport {
+    async fn publish(&self, publish: AmqpPublish) -> Result<()> {
+        match self.publish_once(&publish).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Drop the poisoned connection/channel and retry once
+                // fresh, mirroring the legacy transport's contract.
+                *self.state.lock().await = None;
+                self.publish_once(&publish).await
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -818,5 +963,280 @@ mod tests {
         let mut raw = header.to_vec();
         raw.extend_from_slice(&rest);
         raw
+    }
+
+    #[test]
+    fn test_driver_transport_rejects_bad_endpoint() {
+        assert!(LapinRabbitTransport::new("http://x").is_err());
+        assert!(LapinRabbitTransport::new("").is_err());
+        assert!(LapinRabbitTransport::new("amqp://guest:guest@127.0.0.1:5672/%2f").is_ok());
+    }
+
+    #[test]
+    fn test_driver_properties_carry_headers_mode_and_timestamp() {
+        let publish = AmqpPublish {
+            exchange: "telemetry".to_string(),
+            routing_key: "sensor.a.b".to_string(),
+            delivery_mode: 2,
+            timestamp_secs: 1_700_000_000,
+            headers: vec![
+                ("mqtt.topic".to_string(), FieldValue::Str("a/b".to_string())),
+                ("mqtt.qos".to_string(), FieldValue::I32(1)),
+                ("flag".to_string(), FieldValue::Bool(true)),
+                ("at".to_string(), FieldValue::Timestamp(1_700_000_000)),
+            ],
+            body: Bytes::from_static(b"{}"),
+        };
+        let table = lapin_field_table(&publish.headers);
+        assert_eq!(table.inner().len(), 4);
+        let props = lapin_properties(&publish);
+        assert_eq!(*props.delivery_mode(), Some(2));
+        assert_eq!(*props.timestamp(), Some(1_700_000_000));
+        assert!(props.headers().is_some());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real RabbitMQ server through the
+    /// maintained `lapin` driver write path.
+    ///
+    /// Run with e.g.:
+    /// `RABBITMQ_HOST=127.0.0.1 RABBITMQ_PORT=5672 RABBITMQ_USERNAME=qual \
+    ///  RABBITMQ_PASSWORD=qualpass1 RABBITMQ_EXCHANGE=qual-b336 RABBITMQ_QUEUE=qual-b336 \
+    ///  cargo test -p broker-connectors --lib rabbitmq::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Declares the exchange (topic) and queue, binds with `#`, then
+    /// streams 2000 routed messages through [`RabbitMqSink`] on
+    /// [`LapinRabbitTransport`] via the shared
+    /// [`crate::ConnectorManager`] path the broker uses (never
+    /// `sink.send` directly), and asserts the bound queue delivers
+    /// every payload exactly (duplicates tolerated, loss is not).
+    /// A closed channel is then shown to surface an error. Panics
+    /// when its environment is missing (fail closed, never skips).
+    #[tokio::test]
+    #[ignore = "needs a real RabbitMQ server (see RABBITMQ_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use futures::StreamExt as _;
+        use std::collections::HashSet;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const PUBLISHES: usize = 2000;
+
+        let host = qual_env("RABBITMQ_HOST").unwrap_or_else(|| {
+            panic!(
+                "RABBITMQ_HOST must point at a real RabbitMQ server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. RABBITMQ_HOST=127.0.0.1)"
+            )
+        });
+        let port = qual_env("RABBITMQ_PORT").unwrap_or_else(|| {
+            panic!("RABBITMQ_PORT must be set for qualification; failing closed")
+        });
+        let username = qual_env("RABBITMQ_USERNAME").unwrap_or_else(|| {
+            panic!("RABBITMQ_USERNAME must be set for qualification; failing closed")
+        });
+        let password = qual_env("RABBITMQ_PASSWORD").unwrap_or_else(|| {
+            panic!("RABBITMQ_PASSWORD must be set for qualification; failing closed")
+        });
+        let exchange = qual_env("RABBITMQ_EXCHANGE").unwrap_or_else(|| {
+            panic!("RABBITMQ_EXCHANGE must be set for qualification; failing closed")
+        });
+        let queue = qual_env("RABBITMQ_QUEUE").unwrap_or_else(|| {
+            panic!("RABBITMQ_QUEUE must be set for qualification; failing closed")
+        });
+        // Server version for the report comes from the qualification
+        // image the gates start (rabbitmq:3.13.2-management); the
+        // driver exposes no broker-version RPC here, so the endpoint
+        // line below is the measured endpoint, never a substitute
+        // version string.
+        eprintln!(
+            "qual server: image rabbitmq:3.13.2-management host={host} port={port} exchange={exchange} queue={queue}"
+        );
+
+        let amqp_url = format!("amqp://{username}:{password}@{host}:{port}/%2f");
+        // 30s connect wait: the protocol requirement is a bounded
+        // handshake, not a specific value; 30s tolerates a slow
+        // container start while failing fast on a dead broker.
+        let connection = tokio::time::timeout(
+            Duration::from_secs(30),
+            lapin::Connection::connect(&amqp_url, lapin::ConnectionProperties::default()),
+        )
+        .await
+        .expect("qual connect timeout")
+        .unwrap_or_else(|e| panic!("qual connect failed: {e:?}"));
+        let admin = connection
+            .create_channel()
+            .await
+            .unwrap_or_else(|e| panic!("qual admin channel failed: {e:?}"));
+
+        admin
+            .exchange_declare(
+                exchange.as_str().into(),
+                lapin::ExchangeKind::Topic,
+                lapin::options::ExchangeDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual exchange declare failed: {e:?}"));
+        admin
+            .queue_declare(
+                queue.as_str().into(),
+                lapin::options::QueueDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual queue declare failed: {e:?}"));
+        admin
+            .queue_bind(
+                queue.as_str().into(),
+                exchange.as_str().into(),
+                "#".into(),
+                lapin::options::QueueBindOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual queue bind failed: {e:?}"));
+        admin
+            .queue_purge(
+                queue.as_str().into(),
+                lapin::options::QueuePurgeOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual queue purge failed: {e:?}"));
+        eprintln!("qual declared: exchange={exchange} (topic) queue={queue} binding=#");
+
+        let config = RabbitMqSinkConfig {
+            endpoint: amqp_url.clone(),
+            exchange: exchange.clone(),
+            routing_key_template: "${topic}".to_string(),
+            delivery_mode: 2,
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(LapinRabbitTransport::new(&amqp_url).expect("qual transport"));
+        let sink = Arc::new(RabbitMqSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "rabbitmq");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager (this is what `register_live_sink` fills
+        // and what the rule engine's `ForwardConnector` action sends
+        // through), so the qualification sends through it and never
+        // `sink.send` directly.
+        let manager = ConnectorManager::new();
+        manager.register("qual-rabbit", sink.clone());
+        manager.register("rabbitmq:qual-rabbit", sink.clone());
+
+        for seq in 0..PUBLISHES {
+            // Ingress slashes become routing-key dots
+            // (`qual/3` -> `qual.3`), matched by the `#` binding.
+            let ingress =
+                Topic::new(format!("qual/{seq}")).unwrap_or_else(|e| panic!("qual topic: {e:?}"));
+            let payload = Bytes::from(format!("qual-{seq:06}"));
+            manager
+                .send("qual-rabbit", &ingress, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        assert_eq!(sink.sent_count(), PUBLISHES as u64);
+        eprintln!("qual rows sent: count={PUBLISHES} exchange={exchange}");
+
+        // Bound-queue delivery assertion: at-least-once permits
+        // duplicates, never loss, so every key must be present.
+        let run_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let consumer_tag = format!("qual-b336-{run_nanos}");
+        let mut consumer = admin
+            .basic_consume(
+                queue.as_str().into(),
+                consumer_tag.as_str().into(),
+                lapin::options::BasicConsumeOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual consume failed: {e:?}"));
+        let mut seen: HashSet<String> = HashSet::new();
+        // 180s receive window for 2000 publishes: generous against
+        // the 1800s gate timeout so a slow broker still converges,
+        // while a stuck bridge fails instead of hanging the gate.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        while seen.len() < PUBLISHES {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "qual receive timeout: got {} of {PUBLISHES} distinct payloads",
+                    seen.len()
+                );
+            }
+            let delivery = tokio::time::timeout(remaining, consumer.next())
+                .await
+                .expect("qual recv timeout")
+                .unwrap_or_else(|| panic!("qual consumer stream ended early"))
+                .unwrap_or_else(|e| panic!("qual delivery failed: {e:?}"));
+            let payload = String::from_utf8_lossy(&delivery.data).into_owned();
+            seen.insert(payload);
+            delivery
+                .ack(lapin::options::BasicAckOptions::default())
+                .await
+                .unwrap_or_else(|e| panic!("qual ack failed: {e:?}"));
+        }
+        assert_eq!(seen.len(), PUBLISHES, "qual must receive all publishes");
+        for seq in 0..PUBLISHES {
+            let key = format!("qual-{seq:06}");
+            assert!(seen.contains(&key), "qual missing payload {key}");
+        }
+        eprintln!("qual rows asserted: distinct={} binding=#", seen.len());
+
+        // Channel close surfaces an error: publishing on a closed
+        // channel must fail instead of silently dropping, whether the
+        // driver reports it at publish time or at confirm time.
+        let probe = connection
+            .create_channel()
+            .await
+            .unwrap_or_else(|e| panic!("qual probe channel failed: {e:?}"));
+        probe
+            .close(200, "qual probe close".into())
+            .await
+            .unwrap_or_else(|e| panic!("qual probe close failed: {e:?}"));
+        match probe
+            .basic_publish(
+                exchange.as_str().into(),
+                "qual.probe".into(),
+                lapin::options::BasicPublishOptions::default(),
+                b"probe",
+                lapin::BasicProperties::default(),
+            )
+            .await
+        {
+            Err(_) => {}
+            Ok(confirm) => {
+                let settled = tokio::time::timeout(Duration::from_secs(10), confirm).await;
+                assert!(
+                    settled.is_err() || settled.expect("confirm polled").is_err(),
+                    "qual publishing on a closed channel must surface an error"
+                );
+            }
+        }
+        eprintln!("qual channel-close: publish on closed channel errored as required");
+
+        // Cleanup: delete the queue and exchange created above, then
+        // close the connection. The sink's shared connection closes
+        // with the test process.
+        let _ = admin
+            .queue_delete(
+                queue.as_str().into(),
+                lapin::options::QueueDeleteOptions::default(),
+            )
+            .await;
+        let _ = admin
+            .exchange_delete(
+                exchange.as_str().into(),
+                lapin::options::ExchangeDeleteOptions::default(),
+            )
+            .await;
+        let _ = connection.close(200, "qual done".into()).await;
+        eprintln!("qual cleanup: deleted queue={queue} exchange={exchange}; connection closed");
     }
 }

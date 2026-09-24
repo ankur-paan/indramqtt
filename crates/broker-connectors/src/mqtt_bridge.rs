@@ -466,7 +466,11 @@ fn encode_connect(
 // Transport.
 // ---------------------------------------------------------------------------
 
-/// One serialized outbound frame plus routing metadata.
+/// One serialized outbound frame plus routing metadata. `bytes` is
+/// the tree-framed PUBLISH (used by the offline `Tcp` transport and
+/// the loopback tests); `payload` is the raw message body the
+/// maintained driver transport publishes (it frames and assigns
+/// packet ids itself).
 #[derive(Debug, Clone)]
 pub struct SerializedMqttPacket {
     pub bytes: Vec<u8>,
@@ -474,6 +478,7 @@ pub struct SerializedMqttPacket {
     pub qos: u8,
     pub packet_id: u16,
     pub retain: bool,
+    pub payload: Vec<u8>,
 }
 
 #[async_trait]
@@ -622,6 +627,246 @@ impl MqttBridgeTransport for TcpMqttBridgeTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Driver transport on the maintained `rumqttc` client.
+// ---------------------------------------------------------------------------
+
+/// rumqttc packet-id window for the CONNECT options: the protocol
+/// packet id is a nonzero u16, so a larger sink-side cap cannot widen
+/// the wire window; it only grows the local buffer.
+fn driver_inflight_cap(config: &MqttBridgeSinkConfig) -> u16 {
+    config.effective_inflight().clamp(1, u16::MAX as usize) as u16
+}
+
+/// rumqttc `AsyncClient::new` request-channel bound. The sink buffer
+/// in front of it already bounds rows (`max_inflight`, default
+/// 10,000); this second queue must also be finite when the sink is
+/// configured unbounded, so it clamps to the same 10,000-row default
+/// instead of growing without limit.
+fn driver_channel_cap(config: &MqttBridgeSinkConfig) -> usize {
+    config.effective_inflight().clamp(1, 10_000)
+}
+
+fn driver_qos_v311(qos: u8) -> Result<rumqttc::QoS> {
+    match qos {
+        0 => Ok(rumqttc::QoS::AtMostOnce),
+        1 => Ok(rumqttc::QoS::AtLeastOnce),
+        2 => Ok(rumqttc::QoS::ExactlyOnce),
+        other => Err(ConnectorError::Dispatch(format!(
+            "mqtt bridge bad qos {other}"
+        ))),
+    }
+}
+
+fn driver_qos_v50(qos: u8) -> Result<rumqttc::v5::mqttbytes::QoS> {
+    match qos {
+        0 => Ok(rumqttc::v5::mqttbytes::QoS::AtMostOnce),
+        1 => Ok(rumqttc::v5::mqttbytes::QoS::AtLeastOnce),
+        2 => Ok(rumqttc::v5::mqttbytes::QoS::ExactlyOnce),
+        other => Err(ConnectorError::Dispatch(format!(
+            "mqtt bridge bad qos {other}"
+        ))),
+    }
+}
+
+enum RumqttcInner {
+    V311 {
+        client: rumqttc::AsyncClient,
+        _pump: tokio::task::JoinHandle<()>,
+    },
+    V50 {
+        client: rumqttc::v5::AsyncClient,
+        _pump: tokio::task::JoinHandle<()>,
+    },
+}
+
+/// Production transport on the maintained `rumqttc` driver
+/// (Apache-2.0): CONNECT auth, driver-owned packet-id tracking and
+/// inflight cap, MQTT 3.1.1 or 5.0 framing by configuration. Plain
+/// TCP only in this build (`rumqttc` without its TLS feature):
+/// `mqtts://` endpoints fail closed with a clear error until a TLS
+/// backend lands (terminate TLS in a sidecar proxy meanwhile).
+/// The legacy [`TcpMqttBridgeTransport`] stays for offline unit
+/// tests only; production wiring uses this transport.
+///
+/// Bound: one driver request channel of [`driver_channel_cap`]
+/// entries plus the sink buffer in front of it; no background queue.
+pub struct RumqttcMqttBridgeTransport {
+    endpoint: BridgeEndpoint,
+    client_id: String,
+    clean_start: bool,
+    username: Option<String>,
+    password: Option<String>,
+    keep_alive_secs: u16,
+    v50: bool,
+    inflight: u16,
+    channel_cap: usize,
+    state: tokio::sync::Mutex<Option<RumqttcInner>>,
+}
+
+impl RumqttcMqttBridgeTransport {
+    pub fn new(config: &MqttBridgeSinkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            endpoint: config.endpoint()?,
+            client_id: config.resolve_client_id(0, now_millis())?,
+            clean_start: config.clean_start,
+            username: config.username.clone(),
+            password: config.password.clone(),
+            keep_alive_secs: config.keep_alive_secs,
+            v50: config.protocol == MqttBridgeProtocol::V50,
+            inflight: driver_inflight_cap(config),
+            channel_cap: driver_channel_cap(config),
+            state: tokio::sync::Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl MqttBridgeTransport for RumqttcMqttBridgeTransport {
+    async fn connect(&self) -> Result<()> {
+        if self.state.lock().await.is_some() {
+            return Ok(());
+        }
+        if self.endpoint.tls {
+            return Err(ConnectorError::Dispatch(
+                "mqtts TLS transport not enabled in this build; use mqtt:// \
+                 or terminate TLS in a sidecar proxy"
+                    .to_string(),
+            ));
+        }
+        if self.v50 {
+            let mut options = rumqttc::v5::MqttOptions::new(
+                self.client_id.clone(),
+                self.endpoint.host.clone(),
+                self.endpoint.port,
+            );
+            options.set_keep_alive(Duration::from_secs(u64::from(self.keep_alive_secs)));
+            options.set_clean_start(self.clean_start);
+            if let Some(username) = &self.username {
+                options
+                    .set_credentials(username.clone(), self.password.clone().unwrap_or_default());
+            }
+            options.set_outgoing_inflight_upper_limit(self.inflight);
+            let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(options, self.channel_cap);
+            // Drive CONNECT/CONNACK once inline so auth refusals and
+            // unreachable brokers fail here instead of hiding behind
+            // the background pump. 5s matches the legacy TCP dial
+            // timeout: the protocol requirement is a bounded
+            // handshake, not a specific value.
+            tokio::time::timeout(Duration::from_secs(5), eventloop.poll())
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "mqtt bridge connect timeout: {}:{}",
+                        self.endpoint.host, self.endpoint.port
+                    ))
+                })?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("mqtt bridge connect failed: {e}"))
+                })?;
+            let pump = tokio::spawn(async move {
+                loop {
+                    if eventloop.poll().await.is_err() {
+                        // 100ms reconnect pause: keeps a downed broker
+                        // from hot-spinning the pump task at 100% CPU
+                        // while staying well under any test timeout.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            });
+            *self.state.lock().await = Some(RumqttcInner::V50 {
+                client,
+                _pump: pump,
+            });
+        } else {
+            let mut options = rumqttc::MqttOptions::new(
+                self.client_id.clone(),
+                self.endpoint.host.clone(),
+                self.endpoint.port,
+            );
+            options.set_keep_alive(Duration::from_secs(u64::from(self.keep_alive_secs)));
+            options.set_clean_session(self.clean_start);
+            if let Some(username) = &self.username {
+                options
+                    .set_credentials(username.clone(), self.password.clone().unwrap_or_default());
+            }
+            options.set_inflight(self.inflight);
+            let (client, mut eventloop) = rumqttc::AsyncClient::new(options, self.channel_cap);
+            // Drive CONNECT/CONNACK once inline so auth refusals and
+            // unreachable brokers fail here instead of hiding behind
+            // the background pump. 5s matches the legacy TCP dial
+            // timeout: the protocol requirement is a bounded
+            // handshake, not a specific value.
+            tokio::time::timeout(Duration::from_secs(5), eventloop.poll())
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "mqtt bridge connect timeout: {}:{}",
+                        self.endpoint.host, self.endpoint.port
+                    ))
+                })?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("mqtt bridge connect failed: {e}"))
+                })?;
+            let pump = tokio::spawn(async move {
+                loop {
+                    if eventloop.poll().await.is_err() {
+                        // 100ms reconnect pause: keeps a downed broker
+                        // from hot-spinning the pump task at 100% CPU
+                        // while staying well under any test timeout.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            });
+            *self.state.lock().await = Some(RumqttcInner::V311 {
+                client,
+                _pump: pump,
+            });
+        }
+        Ok(())
+    }
+
+    async fn publish(&self, packet: &SerializedMqttPacket) -> Result<()> {
+        let guard = self.state.lock().await;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Connection("mqtt bridge not connected".to_string()))?;
+        match inner {
+            RumqttcInner::V311 { client, .. } => {
+                let qos = driver_qos_v311(packet.qos)?;
+                client
+                    .publish(
+                        packet.topic.clone(),
+                        qos,
+                        packet.retain,
+                        packet.payload.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::Connection(format!("mqtt bridge publish failed: {e}"))
+                    })?;
+                Ok(())
+            }
+            RumqttcInner::V50 { client, .. } => {
+                let qos = driver_qos_v50(packet.qos)?;
+                client
+                    .publish(
+                        packet.topic.clone(),
+                        qos,
+                        packet.retain,
+                        packet.payload.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::Connection(format!("mqtt bridge publish failed: {e}"))
+                    })?;
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -711,6 +956,7 @@ impl MqttBridgeSink {
                 qos: row.qos,
                 packet_id: row.packet_id,
                 retain: row.retain,
+                payload: row.payload.clone(),
             });
         }
         let record_count = rows.len() as u64;
@@ -1114,5 +1360,220 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real remote MQTT broker through the
+    /// maintained `rumqttc` driver write path.
+    ///
+    /// Run with e.g.:
+    /// `MQTT_BRIDGE_URL=mqtt://127.0.0.1:1883 MQTT_BRIDGE_TOPIC=qual/b327 \
+    ///  MQTT_BRIDGE_CLIENT_ID=qual-bridge \
+    ///  cargo test -p broker-connectors --lib mqtt_bridge::tests::test_qualify_bridge_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Subscribes to a unique run topic first, then bridges 1000
+    /// publishes through [`MqttBridgeSink`] on
+    /// [`RumqttcMqttBridgeTransport`] via the shared
+    /// [`crate::ConnectorManager`] path the broker uses (never
+    /// `sink.send` directly), and asserts the subscriber receives
+    /// every payload exactly (duplicates tolerated, loss is not)
+    /// with QoS 1 preserved. A second bounded sink proves the
+    /// inflight cap backpressures. Panics when its environment is
+    /// missing (fail closed, never skips).
+    #[tokio::test]
+    #[ignore = "needs a real Remote MQTT bridge server (see MQTT_BRIDGE_* env)"]
+    async fn test_qualify_bridge_write_path() {
+        use crate::ConnectorManager;
+        use std::collections::HashSet;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const PUBLISHES: usize = 1000;
+
+        let url = qual_env("MQTT_BRIDGE_URL").unwrap_or_else(|| {
+            panic!(
+                "MQTT_BRIDGE_URL must point at a real Remote MQTT bridge server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. MQTT_BRIDGE_URL=mqtt://127.0.0.1:1883)"
+            )
+        });
+        let base_topic = qual_env("MQTT_BRIDGE_TOPIC").unwrap_or_else(|| {
+            panic!("MQTT_BRIDGE_TOPIC must be set for qualification; failing closed")
+        });
+        let base_client = qual_env("MQTT_BRIDGE_CLIENT_ID").unwrap_or_else(|| {
+            panic!("MQTT_BRIDGE_CLIENT_ID must be set for qualification; failing closed")
+        });
+        // Server version for the report comes from the qualification
+        // image the gates start (eclipse-mosquitto:2.0.18); the driver
+        // exposes no broker-version RPC here, so the endpoint line
+        // below is the measured endpoint, never a substitute version
+        // string.
+        eprintln!(
+            "qual server: image eclipse-mosquitto:2.0.18 url={url} topic={base_topic} client={base_client}"
+        );
+        let endpoint = parse_bridge_address(&url).expect("qual url parses");
+        assert!(
+            !endpoint.tls,
+            "qual uses plaintext mqtt:// (mqtts fails closed in this build)"
+        );
+
+        let run_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let run_topic = format!("{base_topic}/run-{run_nanos}");
+        let bridge_id = format!("{base_client}-{run_nanos}");
+        let sub_id = format!("{base_client}-sub-{run_nanos}");
+
+        // Subscriber first: with clean sessions a publish before the
+        // SUBACK is lost, so the subscription must be active before
+        // the bridge sends anything.
+        let mut sub_options =
+            rumqttc::MqttOptions::new(sub_id.clone(), endpoint.host.clone(), endpoint.port);
+        sub_options.set_keep_alive(Duration::from_secs(10));
+        sub_options.set_clean_session(true);
+        let (sub_client, mut sub_eventloop) =
+            rumqttc::AsyncClient::new(sub_options, PUBLISHES.clamp(10, 10_000));
+        sub_client
+            .subscribe(run_topic.clone(), rumqttc::QoS::AtLeastOnce)
+            .await
+            .expect("qual subscribe request");
+        // 30s SUBACK wait: the protocol requirement is a bounded
+        // handshake, not a specific value; 30s tolerates a slow
+        // container start while failing fast on a dead broker.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match sub_eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("qual subscribe failed: {e:?}"),
+                }
+            }
+        })
+        .await
+        .expect("qual suback timeout");
+        eprintln!("qual subscribed: topic={run_topic}");
+
+        let seen: Arc<parking_lot::Mutex<HashSet<String>>> =
+            Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let qos_ok: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let collector_seen = seen.clone();
+        let collector_qos = qos_ok.clone();
+        let collector_topic = run_topic.clone();
+        let collector = tokio::spawn(async move {
+            loop {
+                match sub_eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                        if publish.topic != collector_topic {
+                            continue;
+                        }
+                        if publish.qos != rumqttc::QoS::AtLeastOnce {
+                            collector_qos.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        let payload = String::from_utf8_lossy(&publish.payload).into_owned();
+                        collector_seen.lock().insert(payload);
+                        if collector_seen.lock().len() >= PUBLISHES {
+                            break;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        eprintln!("qual subscriber eventloop note: {e:?}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let config = MqttBridgeSinkConfig {
+            broker_address: url.clone(),
+            client_id: bridge_id.clone(),
+            clean_start: true,
+            username: None,
+            password: None,
+            // 30s keep-alive: the protocol requirement is a bounded
+            // liveness probe, not a specific value; 30s keeps the
+            // 1000-publish run well inside one interval.
+            keep_alive_secs: 30,
+            topic_prefix: None,
+            topic_template: Some(run_topic.clone()),
+            qos_override: Some(1),
+            retain_override: Some(false),
+            max_inflight: Some(10_000),
+            max_batch_size: Some(100),
+            linger_ms: Some(10),
+            protocol: MqttBridgeProtocol::V311,
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(RumqttcMqttBridgeTransport::new(&config).expect("qual transport"));
+        let sink = Arc::new(MqttBridgeSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "mqtt_bridge");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it
+        // and never `sink.send` directly.
+        let manager = ConnectorManager::new();
+        manager.register("qual-bridge", sink.clone());
+        manager.register("mqtt_bridge:qual-bridge", sink.clone());
+
+        let ingress = Topic::new("sensors/qual").expect("qual topic");
+        for seq in 0..PUBLISHES {
+            let payload = Bytes::from(format!("qual-{seq:04}"));
+            manager
+                .send("qual-bridge", &ingress, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), PUBLISHES as u64);
+        eprintln!(
+            "qual rows sent: records={} batches={}",
+            sink.sent_records(),
+            sink.sent_batches()
+        );
+
+        // 180s receive window for 1000 QoS 1 publishes: generous
+        // against the 1800s gate timeout so a slow broker still
+        // converges, while a stuck bridge fails instead of hanging
+        // the gate.
+        tokio::time::timeout(Duration::from_secs(180), collector)
+            .await
+            .expect("qual receive timeout")
+            .expect("qual collector task");
+        assert!(
+            qos_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "qual QoS must be preserved as AtLeastOnce"
+        );
+        {
+            let seen = seen.lock();
+            assert_eq!(seen.len(), PUBLISHES, "qual must receive all publishes");
+            for seq in 0..PUBLISHES {
+                let key = format!("qual-{seq:04}");
+                assert!(seen.contains(&key), "qual missing payload {key}");
+            }
+            eprintln!("qual rows asserted: distinct={} qos=1", seen.len());
+        }
+        let _ = sub_client.disconnect().await;
+
+        // Inflight cap backpressures through the same sink code path.
+        let mut cap_config = test_config(&url);
+        cap_config.max_inflight = Some(1);
+        cap_config.max_batch_size = Some(100);
+        let (cap_sink, _) = test_sink(cap_config);
+        let cap_topic = Topic::new("t").expect("qual cap topic");
+        cap_sink
+            .send(&cap_topic, &Bytes::from("a"), QoS::AtMostOnce)
+            .await
+            .expect("qual cap first send buffers");
+        let err = cap_sink
+            .send(&cap_topic, &Bytes::from("b"), QoS::AtMostOnce)
+            .await
+            .expect_err("inflight cap must backpressure");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        eprintln!("qual backpressure: inflight cap refused second row");
+
+        eprintln!("qual cleanup: disconnected subscriber {sub_id}, bridge {bridge_id}; no retained state (retain=false)");
     }
 }

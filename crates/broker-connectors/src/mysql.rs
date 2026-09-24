@@ -2,16 +2,20 @@
 //!
 //! MQTT events become parameterized rows: `?` markers bind `(topic,
 //! QoS, payload)` positionally, so values travel out-of-band and SQL
-//! injection is structurally impossible. Execution prepares once per
-//! connection and runs one `COM_STMT_EXECUTE` per buffered row,
-//! pipelined in a single write. The [`MySqlTransport`] boundary keeps
-//! unit tests broker-free ([`MemoryMySqlTransport`]); [`TcpMySqlTransport`]
-//! speaks handshake (mysql_native_password), prepare, and execute.
+//! injection is structurally impossible. Production execution prepares
+//! once per batch and runs one `COM_STMT_EXECUTE` per buffered row
+//! through the maintained `mysql_async` driver
+//! ([`DriverMySqlTransport`]). The [`MySqlTransport`] boundary keeps
+//! unit tests broker-free ([`MemoryMySqlTransport`]);
+//! [`TcpMySqlTransport`] is the legacy hand-written handshake
+//! (mysql_native_password), prepare, and execute path, retained for
+//! offline unit tests only.
 
 use super::{ConnectorError, Result, Sink};
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
+use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -540,8 +544,10 @@ async fn handshake(endpoint: &MySqlEndpoint, stream: &mut TcpStream) -> Result<(
     Ok(())
 }
 
-/// TCP transport with a tiny round-robin pool. Connections establish
-/// lazily on first use (creation never blocks on external brokers).
+/// Legacy TCP transport with a tiny round-robin pool, retained for
+/// offline unit tests only; production wiring uses
+/// [`DriverMySqlTransport`]. Connections establish lazily on first use
+/// (creation never blocks on external brokers).
 pub struct TcpMySqlTransport {
     endpoint: MySqlEndpoint,
     pool: Vec<AsyncMutex<Option<MysqlConn>>>,
@@ -800,6 +806,156 @@ async fn execute_batch_on_conn(
         }
     }
     outcome
+}
+
+// ---------------------------------------------------------------------------
+// Production transport on the maintained `mysql_async` driver.
+// ---------------------------------------------------------------------------
+
+/// Checkout timeout for one driver-pool connection: 5 s matches the
+/// legacy [`TcpMySqlTransport`] dial timeout (the protocol requirement
+/// is a bounded handshake, not a specific value).
+const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-statement timeout for the batch prepare and each row execute:
+/// 10 s matches the legacy `read_packet` timeout on the same path.
+const DRIVER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Production MySQL / MariaDB transport on the maintained `mysql_async`
+/// driver (MIT/Apache-2.0): native client protocol with driver-owned
+/// pooling, both password plugins (`mysql_native_password` and
+/// `caching_sha2_password`), an explicit `COM_STMT_PREPARE` per batch
+/// and one `COM_STMT_EXECUTE` per buffered row. Parameters travel bound
+/// (topic, QoS, payload as binary blobs), so values stay out-of-band
+/// exactly as on the legacy path. The legacy [`TcpMySqlTransport`]
+/// stays for offline unit tests only; production wiring uses this
+/// transport.
+///
+/// Bound: the driver pool holds at most `pool_size` connections plus
+/// the sink buffer in front of it; no background queue. `pool_size`
+/// carries the configured default 10 (`default_pool_size`): the default
+/// is finite because an unbounded pool under fan-in would repeat the
+/// multi-GB RSS collapse the v4 benchmark measured on this path.
+pub struct DriverMySqlTransport {
+    pool: mysql_async::Pool,
+}
+
+impl DriverMySqlTransport {
+    pub fn new(url: &str, pool_size: usize) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "mysql pool_size must be >= 1".to_string(),
+            ));
+        }
+        let opts = mysql_async::Opts::from_url(url)
+            .map_err(|e| ConnectorError::Dispatch(format!("mysql invalid connection url: {e}")))?;
+        let constraints = mysql_async::PoolConstraints::new(0, pool_size).ok_or_else(|| {
+            ConnectorError::Dispatch(format!("mysql invalid pool size {pool_size}"))
+        })?;
+        let pool_opts = mysql_async::PoolOpts::default().with_constraints(constraints);
+        let builder = mysql_async::OptsBuilder::from_opts(opts).pool_opts(pool_opts);
+        Ok(Self {
+            pool: mysql_async::Pool::new(mysql_async::Opts::from(builder)),
+        })
+    }
+}
+
+#[async_trait]
+impl MySqlTransport for DriverMySqlTransport {
+    async fn execute_batch(&self, batch: &MySqlBatch) -> MySqlBatchOutcome {
+        let mut outcome = MySqlBatchOutcome::default();
+        if batch.rows.is_empty() {
+            return outcome;
+        }
+        let mut conn =
+            match tokio::time::timeout(DRIVER_CONNECT_TIMEOUT, self.pool.get_conn()).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    outcome.error = Some(ConnectorError::Connection(format!(
+                        "mysql driver connect failed: {e}"
+                    )));
+                    return outcome;
+                }
+                Err(_) => {
+                    outcome.error = Some(ConnectorError::Connection(
+                        "mysql driver connect timeout".to_string(),
+                    ));
+                    return outcome;
+                }
+            };
+        // Explicit prepare mirrors the legacy COM_STMT_PREPARE: a
+        // statement-level failure (unknown table, syntax) stops the
+        // batch here instead of being miscounted as row rejections
+        // below.
+        let stmt =
+            match tokio::time::timeout(DRIVER_STATEMENT_TIMEOUT, conn.prep(batch.sql.as_str()))
+                .await
+            {
+                Ok(Ok(stmt)) => stmt,
+                Ok(Err(mysql_async::Error::Server(server))) => {
+                    outcome.error = Some(ConnectorError::Dispatch(format!(
+                        "mysql prepare failed: mysql errno {}: {}",
+                        server.code, server.message
+                    )));
+                    return outcome;
+                }
+                Ok(Err(e)) => {
+                    outcome.error = Some(ConnectorError::Connection(format!(
+                        "mysql prepare failed: {e}"
+                    )));
+                    return outcome;
+                }
+                Err(_) => {
+                    outcome.error = Some(ConnectorError::Connection(
+                        "mysql prepare timeout".to_string(),
+                    ));
+                    return outcome;
+                }
+            };
+        for (index, row) in batch.rows.iter().enumerate() {
+            // The sink always buffers exactly three values (topic, QoS,
+            // payload) and `validate` enforces exactly three `?` markers,
+            // so a short row here is unreachable through the sink; the
+            // empty default keeps a hand-built batch total instead of
+            // panicking.
+            let params = (
+                row.first().cloned().unwrap_or_default(),
+                row.get(1).cloned().unwrap_or_default(),
+                row.get(2).cloned().unwrap_or_default(),
+            );
+            match tokio::time::timeout(DRIVER_STATEMENT_TIMEOUT, conn.exec_drop(&stmt, params))
+                .await
+            {
+                Ok(Ok(())) => {
+                    outcome.processed += 1;
+                }
+                Ok(Err(mysql_async::Error::Server(server))) => {
+                    // Row-level rejection (e.g. a CHECK constraint:
+                    // errno 3819 on MySQL, 4025 on MariaDB): log and
+                    // count the row, then continue with the next row on
+                    // the same connection, exactly as the legacy path
+                    // treats an ERR reply to COM_STMT_EXECUTE.
+                    let message = format!("mysql errno {}: {}", server.code, server.message);
+                    tracing::warn!("mysql row {index} rejected by server: {message}");
+                    outcome.rejected.push((index, message));
+                    outcome.processed += 1;
+                }
+                Ok(Err(e)) => {
+                    outcome.error = Some(ConnectorError::Connection(format!(
+                        "mysql execute failed: {e}"
+                    )));
+                    return outcome;
+                }
+                Err(_) => {
+                    outcome.error = Some(ConnectorError::Connection(
+                        "mysql execute timeout".to_string(),
+                    ));
+                    return outcome;
+                }
+            }
+        }
+        outcome
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,5 +2218,290 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(freed, "dropped sink core was not freed within 200 ms");
+    }
+
+    #[test]
+    fn test_driver_transport_rejects_bad_config() {
+        assert!(DriverMySqlTransport::new("mysql://127.0.0.1:1/db", 0).is_err());
+        assert!(DriverMySqlTransport::new("postgres://127.0.0.1:3306/db", 1).is_err());
+        assert!(DriverMySqlTransport::new("not a url", 1).is_err());
+        assert!(DriverMySqlTransport::new("mysql://u:p@127.0.0.1:1/db", 1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_driver_write_path_through_connector_manager() {
+        // Broker path (connect, publish, deliver): ConnectorManager::send ->
+        // Sink::send -> flush -> DriverMySqlTransport::execute_batch.
+        // Points at an unroutable port so the offline gate stays green
+        // while still driving the production driver transport; the
+        // connection must fail closed, never grant access.
+        use super::super::ConnectorManager;
+        let url = "mysql://u:p@127.0.0.1:1/db";
+        let transport = Arc::new(DriverMySqlTransport::new(url, 1).expect("driver transport"));
+        let config = MySqlSinkConfig {
+            connection_url: url.to_string(),
+            sql_template: "INSERT INTO t (topic, qos, payload) VALUES (?, ?, ?)".to_string(),
+            pool_size: 1,
+            batch_size: 1,
+            batch_timeout_ms: 60_000, // keep the linger task out of the way
+        };
+        let sink = Arc::new(MySqlSink::new(config, transport).expect("valid sink"));
+        assert_eq!(sink.kind(), "mysql");
+        let manager = ConnectorManager::new();
+        manager.register("mysql-driver", sink);
+        let res = manager
+            .send(
+                "mysql-driver",
+                &Topic::new("sensors/broker").unwrap(),
+                &Bytes::from_static(b"{}"),
+                QoS::AtLeastOnce,
+            )
+            .await;
+        let err = res.expect_err("unreachable driver must fail closed");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "driver error must be a connection failure, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("mysql"),
+            "driver error must be observable, got: {err}"
+        );
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must point at a real MySQL/MariaDB server for qualification; \
+                 failing closed instead of passing vacuously"
+            )
+        })
+    }
+
+    fn qual_identifier(name: &str, value: &str) -> String {
+        assert!(
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "qual {name} must match [A-Za-z0-9_]+, got {value:?} (failing closed)"
+        );
+        value.to_string()
+    }
+
+    /// Qualification against a real MySQL / MariaDB server over the
+    /// maintained `mysql_async` driver ([`DriverMySqlTransport`]).
+    ///
+    /// Run with e.g.:
+    /// `MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306 MYSQL_DATABASE=qual \
+    ///  MYSQL_USER=qual MYSQL_PASSWORD=qualpass1 \
+    ///  MYSQL_NATIVE_USER=qual_native MYSQL_TABLE=mysql_qual_b329 \
+    ///  cargo test -p broker-connectors --lib mysql::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates a table with a CHECK constraint, proves a violating row
+    /// surfaces errno 3819 (MySQL) / 4025 (MariaDB) on both password
+    /// plugins, streams 2000 rows (1000 per plugin) through the broker
+    /// ([`crate::ConnectorManager`] -> [`MySqlSink`] on
+    /// [`DriverMySqlTransport`]), asserts `SELECT COUNT(*)` returns
+    /// 2000, proves a wrong password fails closed, then drops the table
+    /// it created.
+    #[tokio::test]
+    #[ignore = "needs a real MySQL/MariaDB server (see MYSQL_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use mysql_async::prelude::Queryable;
+
+        let host = qual_require("MYSQL_HOST");
+        let port: u16 = qual_require("MYSQL_PORT")
+            .parse()
+            .expect("qual MYSQL_PORT must be a port number");
+        let database = qual_identifier("database", &qual_require("MYSQL_DATABASE"));
+        let user = qual_require("MYSQL_USER");
+        let password = qual_require("MYSQL_PASSWORD");
+        let native_user = qual_require("MYSQL_NATIVE_USER");
+        let table = qual_identifier("table", &qual_require("MYSQL_TABLE"));
+        const ROWS_PER_PLUGIN: u64 = 1000;
+
+        let native_url = format!("mysql://{native_user}:{password}@{host}:{port}/{database}");
+        let sha2_url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
+
+        // Direct driver pool for DDL and assertions.
+        let ddl_pool = mysql_async::Pool::from_url(native_url.as_str()).expect("qual pool");
+        let mut ddl = ddl_pool
+            .get_conn()
+            .await
+            .expect("qual mysql connect (native user)");
+
+        // Server version for the report (connectivity is already proved
+        // by the connection above; the version string is context).
+        let version: Option<String> = ddl
+            .query_first("SELECT VERSION()")
+            .await
+            .expect("qual server version");
+        eprintln!("qual server: version={version:?} host={host}:{port} database={database}");
+
+        ddl.query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
+            .await
+            .expect("qual drop stale table");
+        ddl.query_drop(format!(
+            "CREATE TABLE `{table}` (\
+             `topic` VARCHAR(256) NOT NULL, \
+             `qos` TINYINT NOT NULL, \
+             `payload` VARCHAR(256) NOT NULL, \
+             CONSTRAINT `{table}_chk` CHECK (CHAR_LENGTH(`payload`) <= 64))"
+        ))
+        .await
+        .expect("qual create table with CHECK");
+
+        let template =
+            format!("INSERT INTO `{table}` (`topic`, `qos`, `payload`) VALUES (?, ?, ?)");
+        let native_transport =
+            Arc::new(DriverMySqlTransport::new(&native_url, 2).expect("qual native transport"));
+        let sha2_transport =
+            Arc::new(DriverMySqlTransport::new(&sha2_url, 2).expect("qual sha2 transport"));
+
+        // CHECK proof on both password plugins: one violating row per
+        // transport must surface errno 3819 (MySQL) or 4025 (MariaDB).
+        for (label, transport) in [
+            ("native", native_transport.clone()),
+            ("sha2", sha2_transport.clone()),
+        ] {
+            let batch = MySqlBatch {
+                sql: template.clone(),
+                rows: vec![vec![
+                    b"sensors/qual".to_vec(),
+                    b"1".to_vec(),
+                    vec![b'x'; 200],
+                ]],
+            };
+            let outcome: MySqlBatchOutcome = transport.execute_batch(&batch).await;
+            assert!(
+                outcome.error.is_none(),
+                "qual {label} CHECK probe must not stop the batch: {outcome:?}"
+            );
+            assert_eq!(outcome.rejected.len(), 1, "qual {label} CHECK probe");
+            let (_, message) = &outcome.rejected[0];
+            assert!(
+                message.contains("3819") || message.contains("4025"),
+                "qual {label} CHECK errno 3819/4025 must surface, got {message:?}"
+            );
+            eprintln!("qual CHECK asserted: plugin={label} message={message:?}");
+        }
+
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it and
+        // never `sink.send` directly.
+        let mk_config = |url: &str| MySqlSinkConfig {
+            connection_url: url.to_string(),
+            sql_template: template.clone(),
+            pool_size: 2,
+            batch_size: 200,
+            batch_timeout_ms: 60_000, // explicit flushes only; keeps the linger task out
+        };
+        let native_sink = Arc::new(
+            MySqlSink::new(mk_config(&native_url), native_transport.clone())
+                .expect("qual native sink"),
+        );
+        let sha2_sink = Arc::new(
+            MySqlSink::new(mk_config(&sha2_url), sha2_transport.clone()).expect("qual sha2 sink"),
+        );
+        assert_eq!(native_sink.kind(), "mysql");
+        assert_eq!(sha2_sink.kind(), "mysql");
+        let manager = ConnectorManager::new();
+        manager.register("qual-mysql-native", native_sink.clone());
+        manager.register("qual-mysql-sha2", sha2_sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..ROWS_PER_PLUGIN {
+            let payload = Bytes::from(format!(r#"{{"seq":{seq}}}"#));
+            manager
+                .send("qual-mysql-native", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual native send");
+            manager
+                .send("qual-mysql-sha2", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual sha2 send");
+        }
+        native_sink.flush().await.expect("qual native flush");
+        sha2_sink.flush().await.expect("qual sha2 flush");
+        assert_eq!(
+            native_sink.inserted_rows(),
+            ROWS_PER_PLUGIN,
+            "qual native row count"
+        );
+        assert_eq!(
+            sha2_sink.inserted_rows(),
+            ROWS_PER_PLUGIN,
+            "qual sha2 row count"
+        );
+        assert_eq!(native_sink.sent_batches(), 5, "qual native batches");
+        assert_eq!(sha2_sink.sent_batches(), 5, "qual sha2 batches");
+        eprintln!("qual rows sent: native={ROWS_PER_PLUGIN} sha2={ROWS_PER_PLUGIN}");
+
+        // Row count asserted back from the server, not the counters.
+        let count_sql = format!("SELECT COUNT(*) FROM `{table}`");
+        let count: Option<u64> = ddl
+            .query_first(count_sql.as_str())
+            .await
+            .expect("qual count");
+        assert_eq!(
+            count.unwrap_or(0),
+            2 * ROWS_PER_PLUGIN,
+            "qual count mismatch"
+        );
+        eprintln!(
+            "qual rows asserted: count={} table={table}",
+            2 * ROWS_PER_PLUGIN
+        );
+
+        // Wrong password fails closed: no rows processed, connection error.
+        let bad_url = format!("mysql://{native_user}:wrongpass@{host}:{port}/{database}");
+        let bad_transport = DriverMySqlTransport::new(&bad_url, 1).expect("qual bad transport");
+        let bad_batch = MySqlBatch {
+            sql: template.clone(),
+            rows: vec![vec![
+                b"sensors/qual".to_vec(),
+                b"1".to_vec(),
+                br#"{"seq":0}"#.to_vec(),
+            ]],
+        };
+        let bad_outcome = bad_transport.execute_batch(&bad_batch).await;
+        assert_eq!(
+            bad_outcome.processed, 0,
+            "qual bad password processes nothing"
+        );
+        assert!(
+            matches!(bad_outcome.error, Some(ConnectorError::Connection(_))),
+            "qual bad password must fail closed, got {bad_outcome:?}"
+        );
+        eprintln!("qual auth asserted: wrong password fails closed");
+
+        let count: Option<u64> = ddl
+            .query_first(count_sql.as_str())
+            .await
+            .expect("qual recount");
+        assert_eq!(
+            count.unwrap_or(0),
+            2 * ROWS_PER_PLUGIN,
+            "qual count unchanged"
+        );
+
+        // Cleanup: drop the table created for this run (best effort).
+        match ddl
+            .query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
+            .await
+        {
+            Ok(()) => eprintln!("qual cleanup: dropped table {table}"),
+            Err(e) => {
+                eprintln!("qual cleanup FAILED to drop {table} (tolerated): {e}");
+            }
+        }
+        drop(ddl);
+        ddl_pool.disconnect().await.expect("qual disconnect");
+        eprintln!(
+            "qual done: rows={} table={table} cleaned table",
+            2 * ROWS_PER_PLUGIN
+        );
     }
 }

@@ -339,6 +339,30 @@ pub struct BigQueryRowEntry {
     pub json: serde_json::Value,
 }
 
+/// Render a JSON value with object keys in sorted order, so the exact
+/// wire assertion holds regardless of Cargo feature unification
+/// (`serde_json/preserve_order` switches objects from sorted `BTreeMap`
+/// to insertion-order `IndexMap`).
+fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&str, serde_json::Value> = map
+                .iter()
+                .map(|(key, val)| (key.as_str(), sorted_json(val)))
+                .collect();
+            let mut ordered = serde_json::Map::with_capacity(sorted.len());
+            for (key, val) in sorted {
+                ordered.insert(key.to_string(), val);
+            }
+            serde_json::Value::Object(ordered)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sorted_json).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 /// Render the `insertAll` JSON body.
 pub fn render_insert_body(
     ignore_unknown: bool,
@@ -358,7 +382,7 @@ pub fn render_insert_body(
         body.push_str("{\"insertId\":");
         body.push_str(&serde_json::to_string(&row.insert_id).unwrap_or_default());
         body.push_str(",\"json\":");
-        body.push_str(&row.json.to_string());
+        body.push_str(&sorted_json(&row.json).to_string());
         body.push('}');
     }
     body.push_str("]}");
@@ -1254,11 +1278,13 @@ mod tests {
         let rows = vec![
             BigQueryRowEntry {
                 insert_id: "uuid-or-seq-1".to_string(),
+                // Keys in sorted order so the exact wire assertion below
+                // holds with and without `serde_json/preserve_order`.
                 json: serde_json::json!({
                     "device_id": "sensor-101",
-                    "topic": "factory/temp",
                     "temperature": 75.2,
                     "timestamp": "2026-09-12T19:00:00Z",
+                    "topic": "factory/temp",
                 }),
             },
             BigQueryRowEntry {

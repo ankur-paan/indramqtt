@@ -39,9 +39,66 @@ gcp-bigquery-client = { version = "0.28", default-features = false, features = [
 scylla = { version = "1.9" }
 clickhouse = { version = "0.15", features = ["native-tls"] }
 aws-sigv4 = { version = "1" }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# S3 / MinIO sink on the maintained official driver (Apache-2.0):
+# `PutObject` with driver-owned SigV4 (static access-key credentials,
+# endpoint override for local servers, path-style for IP endpoints).
+# Multipart above the 5 MiB vendor part minimum rides
+# `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`.
+# The hand-written `HttpS3Transport` stays for offline unit tests
+# only; production wiring uses `SdkS3Transport` below.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 futures = { workspace = true }
 rdkafka = { version = "0.39", features = ["ssl"] }
 schema-registry-client = { version = "0.4" }
+# Elasticsearch/OpenSearch bulk sink on the maintained official driver
+# (Apache-2.0). `http` (MIT/Apache-2.0) builds the per-request headers.
+# Pinned to the latest 8.x prerelease: the `elasticsearch` crate has no
+# stable 8.x on crates.io (only `-alpha.1` prereleases), so a plain
+# `version = "8"` never resolves and the gates fail version selection.
+elasticsearch = { version = "8.19.0-alpha.1" }
+http = { version = "1" }
+# Couchbase sink on the maintained official driver (Apache-2.0). The
+# hand-written `NativeCouchbaseTransport` stays for offline unit tests
+# only; production wiring uses `DriverCouchbaseTransport` below.
+couchbase = { version = "1" }
+# MySQL / MariaDB sink on the maintained `mysql_async` driver
+# (MIT/Apache-2.0): native protocol (handshake, mysql_native_password +
+# caching_sha2_password, COM_STMT_PREPARE/EXECUTE) with driver-owned
+# pooling. The hand-written `TcpMySqlTransport` stays for offline unit
+# tests only; production wiring uses `DriverMySqlTransport`.
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+# Google Cloud Pub/Sub sink on the maintained official driver
+# (Apache-2.0). The sink publishes through `google-cloud-pubsub` gRPC
+# `Publisher` (base64 data, ordering keys, attributes); the hand-written
+# REST `HttpGcpPubSubTransport` is retained for offline unit tests only.
+google-cloud-pubsub = { version = "1" }
+# Error-code mapping for the Pub/Sub driver tests (Apache-2.0).
+google-cloud-gax = { version = "1" }
+# Remote MQTT bridge sink on the maintained `rumqttc` driver
+# (Apache-2.0). Plain TCP only (`default-features = false`, no TLS
+# backend): `mqtts://` endpoints fail closed with a clear error until
+# a TLS backend lands. This also keeps the advisory-pinned
+# `rustls-webpki 0.102` (pulled by rumqttc's `use-rustls` feature)
+# out of the tree.
+rumqttc = { version = "0.25", default-features = false }
+# RabbitMQ sink on the maintained `lapin` driver (MIT): AMQP 0-9-1
+# (PLAIN handshake, Basic.Publish with content header/body frames via
+# the driver). The hand-written `TcpRabbitTransport` stays for offline
+# unit tests only; production wiring uses `LapinRabbitTransport`.
+# `rustls` rides the workspace's single crypto provider (`aws-lc-rs`):
+# requesting `rustls--ring` as well would enable both `ring` and
+# `aws-lc-rs` for `rustls`, and `CryptoProvider::from_crate_features`
+# then returns `None` so every `ClientConfig::builder` panics.
+lapin = { version = "4", default-features = false, features = ["tokio", "rustls"] }
+# Redis sink on the maintained `redis` driver (BSD-3-Clause): RESP with
+# AUTH/SELECT from the URL, multiplexed tokio connection, pipelining via
+# `redis::pipe`. The hand-written `TcpRedisTransport` stays for offline
+# unit tests only; production wiring uses `DriverRedisTransport`.
+# Pinned to the 0.25 line: redis 1.x pulls `xxhash-rust` (BSL-1.0)
+# unconditionally, which the licence gate rejects, while 0.25 exposes
+# the same RESP/AUTH/SELECT/multiplexed API without it.
+redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
 axum = { workspace = true }

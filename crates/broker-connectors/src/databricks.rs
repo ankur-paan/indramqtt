@@ -8,9 +8,14 @@
 //! `BOOLEAN`); non-scalar values ride JSON text as `STRING`.
 //!
 //! Statement states drive the retry loop: `SUCCEEDED` completes,
-//! `PENDING`/`RUNNING` re-execute with backoff (at-least-once, like
+//! `PENDING`/`RUNNING` poll `GET .../statements/{id}` to `SUCCEEDED`
+//! (bounded; past the bound the batch re-executes at-least-once, like
 //! the sibling batch sinks), `FAILED`/`CANCELED`/`CLOSED` are
 //! terminal, and 429/503 plus transport failures retry in-loop.
+//! Authentication failures (401/403) are terminal: the sink fails
+//! closed and never retries with the same Bearer. The Bearer itself
+//! is rotatable at runtime (`DatabricksSink::set_token`) so a renewed
+//! token takes effect on the next statement without rebuilding.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -377,6 +382,60 @@ pub fn parse_statement_state(body: &[u8]) -> Result<StatementState> {
     }
 }
 
+/// Parse the `statement_id` of a statement response body (`None`
+/// for synchronous replies that carry no id; some workspaces omit it
+/// on immediate `SUCCEEDED`).
+/// TODO(parity): the documented API does not say whether a
+/// synchronous reply always carries `statement_id`; absent ids are
+/// decided from `status.state` alone.
+pub fn parse_statement_id(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("statement_id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+}
+
+/// Parse `(statement_id, state)` of a statement response body.
+pub fn parse_statement_response(body: &[u8]) -> Result<(Option<String>, StatementState)> {
+    let state = parse_statement_state(body)?;
+    Ok((parse_statement_id(body), state))
+}
+
+/// Status poll URL for one statement: `{statements-url}/{statement-id}`.
+pub fn statement_status_url(statements_url: &str, statement_id: &str) -> String {
+    format!("{}/{}", statements_url.trim_end_matches('/'), statement_id)
+}
+
+/// Extract `result.data_array` rows (each cell rendered as text) from
+/// a `SUCCEEDED` statement response. Used to assert row counts
+/// (`SELECT COUNT(*)`) without a second client.
+pub fn parse_result_rows(body: &[u8]) -> Result<Vec<Vec<String>>> {
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Connection(format!("databricks bad response JSON: {e}")))?;
+    let mut rows = Vec::new();
+    let data = doc
+        .get("result")
+        .and_then(|result| result.get("data_array"))
+        .and_then(|array| array.as_array());
+    if let Some(data) = data {
+        for row in data {
+            let mut cells = Vec::new();
+            if let Some(columns) = row.as_array() {
+                for cell in columns {
+                    cells.push(
+                        cell.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| cell.to_string()),
+                    );
+                }
+            }
+            rows.push(cells);
+        }
+    }
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // Transport.
 // ---------------------------------------------------------------------------
@@ -476,14 +535,29 @@ impl DatabricksTransport for MockDatabricksTransport {
     }
 }
 
+/// Polls per statement execution (default 30): 30 x 500 ms is a
+/// 15 s upper bound per statement so one slow warehouse cannot stall
+/// a flush forever; past the bound the sink retry loop re-executes
+/// the statement (at-least-once, like the sibling batch sinks).
+const DEFAULT_MAX_POLLS: usize = 30;
+/// Delay between status polls (default 500 ms): warehouses start in
+/// seconds, so faster polling only burns Statements API quota.
+const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
+
 /// Production transport: `POST {statements-url}` with the statement
-/// body; PENDING/RUNNING states surface as retryable connections.
+/// body, then `GET {statements-url}/{statement_id}` polling to
+/// `SUCCEEDED`. 429/503 and transport failures surface as retryable
+/// connections; 401/403 are terminal (fail closed, never retried with
+/// the same Bearer); other non-2xx and failed states are terminal.
 pub struct HttpDatabricksTransport {
     url: String,
     catalog: String,
     schema: String,
     warehouse_id: Option<String>,
     client: reqwest::Client,
+    timeout: Duration,
+    poll_interval: Duration,
+    max_polls: usize,
 }
 
 impl HttpDatabricksTransport {
@@ -494,8 +568,158 @@ impl HttpDatabricksTransport {
             catalog: config.catalog.clone(),
             schema: config.schema.clone(),
             warehouse_id: config.warehouse_id(),
+            timeout: config.timeout(),
+            poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            max_polls: DEFAULT_MAX_POLLS,
             client,
         })
+    }
+
+    /// Constructor with explicit polling bounds (qualification and
+    /// tests; cold warehouses take minutes, loopback fakes none).
+    pub fn with_polling(
+        config: &DatabricksSinkConfig,
+        client: reqwest::Client,
+        poll_interval: Duration,
+        max_polls: usize,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            url: config.statements_url(),
+            catalog: config.catalog.clone(),
+            schema: config.schema.clone(),
+            warehouse_id: config.warehouse_id(),
+            timeout: config.timeout(),
+            poll_interval,
+            max_polls: max_polls.max(1),
+            client,
+        })
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    /// Terminal-vs-retryable mapping for Statements API statuses.
+    fn classify_status(status: u16) -> Result<()> {
+        if status == 429 || status == 503 {
+            return Err(ConnectorError::Connection(format!(
+                "databricks throttled with {status}"
+            )));
+        }
+        if status == 401 || status == 403 {
+            return Err(ConnectorError::Dispatch(format!(
+                "databricks unauthorized with {status}: failing closed, rotate the Bearer"
+            )));
+        }
+        if !(200..=299).contains(&status) {
+            return Err(ConnectorError::Dispatch(format!(
+                "databricks request failed with {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn post_statement(
+        &self,
+        statement: &str,
+        params: &[DatabricksParam],
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .post(&self.url)
+            .header(reqwest::header::AUTHORIZATION, Self::bearer(token))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(self.timeout)
+            .body(render_statement_body(
+                self.warehouse_id.as_deref(),
+                &self.catalog,
+                &self.schema,
+                statement,
+                params,
+            ))
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("databricks request failed: {e}")))?;
+        let status = response.status().as_u16();
+        Self::classify_status(status)?;
+        response
+            .bytes()
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("databricks read failed: {e}")))
+            .map(|bytes| bytes.to_vec())
+    }
+
+    async fn get_statement(&self, statement_id: &str, token: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get(statement_status_url(&self.url, statement_id))
+            .header(reqwest::header::AUTHORIZATION, Self::bearer(token))
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("databricks poll failed: {e}")))?;
+        let status = response.status().as_u16();
+        Self::classify_status(status)?;
+        response
+            .bytes()
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("databricks poll read failed: {e}")))
+            .map(|bytes| bytes.to_vec())
+    }
+
+    /// Poll one statement to a terminal state. `SUCCEEDED` returns the
+    /// final response body (carries `result.data_array` for reads);
+    /// exhaustion returns a retryable error so the sink re-executes.
+    async fn poll_to_terminal(&self, statement_id: &str, token: &str) -> Result<Vec<u8>> {
+        for _ in 0..self.max_polls {
+            tokio::time::sleep(self.poll_interval).await;
+            let body = self.get_statement(statement_id, token).await?;
+            let (_, state) = parse_statement_response(&body)?;
+            match state {
+                StatementState::Succeeded => return Ok(body),
+                StatementState::Failed | StatementState::Canceled | StatementState::Closed => {
+                    return Err(ConnectorError::Dispatch(
+                        "databricks statement failed".to_string(),
+                    ));
+                }
+                StatementState::Pending | StatementState::Running => {}
+            }
+        }
+        Err(ConnectorError::Connection(format!(
+            "databricks statement {statement_id} still pending after {} polls",
+            self.max_polls
+        )))
+    }
+
+    /// Execute one statement through POST + polling, returning the
+    /// final `data_array` rows (empty for writes).
+    pub async fn execute_fetch(
+        &self,
+        statement: &str,
+        params: Vec<DatabricksParam>,
+        token: &str,
+    ) -> Result<Vec<Vec<String>>> {
+        let body = self.post_statement(statement, &params, token).await?;
+        let (statement_id, state) = parse_statement_response(&body)?;
+        let final_body = match state {
+            StatementState::Succeeded => body,
+            StatementState::Failed | StatementState::Canceled | StatementState::Closed => {
+                return Err(ConnectorError::Dispatch(
+                    "databricks statement failed".to_string(),
+                ));
+            }
+            StatementState::Pending | StatementState::Running => match statement_id {
+                Some(id) => self.poll_to_terminal(&id, token).await?,
+                None => {
+                    return Err(ConnectorError::Connection(
+                        "databricks statement pending without an id".to_string(),
+                    ));
+                }
+            },
+        };
+        parse_result_rows(&final_body)
     }
 }
 
@@ -507,45 +731,9 @@ impl DatabricksTransport for HttpDatabricksTransport {
         params: Vec<DatabricksParam>,
         token: &str,
     ) -> Result<()> {
-        let response = self
-            .client
-            .post(&self.url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(render_statement_body(
-                self.warehouse_id.as_deref(),
-                &self.catalog,
-                &self.schema,
-                statement,
-                &params,
-            ))
-            .send()
+        self.execute_fetch(statement, params, token)
             .await
-            .map_err(|e| ConnectorError::Connection(format!("databricks request failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || status == 503 {
-            return Err(ConnectorError::Connection(format!(
-                "databricks throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "databricks request failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("databricks read failed: {e}")))?;
-        match parse_statement_state(&bytes)? {
-            StatementState::Succeeded => Ok(()),
-            StatementState::Pending | StatementState::Running => Err(ConnectorError::Connection(
-                "databricks statement pending".to_string(),
-            )),
-            StatementState::Failed | StatementState::Canceled | StatementState::Closed => Err(
-                ConnectorError::Dispatch("databricks statement failed".to_string()),
-            ),
-        }
+            .map(|_| ())
     }
 }
 
@@ -570,6 +758,11 @@ struct DatabricksBuffer {
 pub struct DatabricksSink {
     config: DatabricksSinkConfig,
     transport: Arc<dyn DatabricksTransport>,
+    /// Effective Bearer token: the configured value until
+    /// [`DatabricksSink::set_token`] rotates it, so a renewed token
+    /// takes effect on the next statement without rebuilding the sink.
+    /// One lock acquisition per `flush` (batch-level, never per message).
+    token: parking_lot::RwLock<String>,
     buffer: parking_lot::Mutex<DatabricksBuffer>,
     backoff: parking_lot::Mutex<BackoffState>,
     sent_batches: AtomicU64,
@@ -584,6 +777,7 @@ impl DatabricksSink {
         config.validate()?;
         let linger = config.effective_linger();
         Ok(Self {
+            token: parking_lot::RwLock::new(config.token.clone()),
             buffer: parking_lot::Mutex::new(DatabricksBuffer {
                 queue: BatchQueue::new(config.effective_batch_size(), linger),
                 bytes: 0,
@@ -598,6 +792,16 @@ impl DatabricksSink {
 
     pub fn config(&self) -> &DatabricksSinkConfig {
         &self.config
+    }
+
+    /// Current Bearer token (the configured value until rotated).
+    pub fn current_token(&self) -> String {
+        self.token.read().clone()
+    }
+
+    /// Rotate the Bearer token; subsequent statements carry it.
+    pub fn set_token(&self, token: impl Into<String>) {
+        *self.token.write() = token.into();
     }
 
     pub fn sent_batches(&self) -> u64 {
@@ -791,6 +995,7 @@ impl DatabricksSink {
         }
         let record_count = rows.len() as u64;
         let max_retries = self.config.max_retries.unwrap_or(usize::MAX);
+        let token = self.current_token();
         let mut attempt = 0usize;
         loop {
             let mut outcome: Result<()> = Ok(());
@@ -798,7 +1003,7 @@ impl DatabricksSink {
                 let (statement, params) = Self::merge_group(table, columns, grouped, &self.config);
                 if let Err(e) = self
                     .transport
-                    .execute_statement(&statement, params, &self.config.token)
+                    .execute_statement(&statement, params, &token)
                     .await
                 {
                     outcome = Err(e);
@@ -905,6 +1110,13 @@ impl super::Connector for DatabricksConnector {
 mod tests {
     use super::*;
     use crate::Sink;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+        Router,
+    };
+    use std::sync::Mutex as StdMutex;
 
     fn test_config() -> DatabricksSinkConfig {
         DatabricksSinkConfig {
@@ -1204,5 +1416,549 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_statement_response_and_result_parsing() {
+        let (id, state) = parse_statement_response(
+            br#"{"statement_id":"stmt-9","status":{"state":"SUCCEEDED"}}"#,
+        )
+        .unwrap();
+        assert_eq!(id.as_deref(), Some("stmt-9"));
+        assert_eq!(state, StatementState::Succeeded);
+
+        // Synchronous replies without an id decide from the state alone.
+        let (id, state) = parse_statement_response(br#"{"status":{"state":"PENDING"}}"#).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(state, StatementState::Pending);
+
+        assert!(parse_statement_response(br#"{"status":{}}"#).is_err());
+        assert!(parse_statement_response(b"nope").is_err());
+
+        assert_eq!(
+            statement_status_url("https://host/api/2.0/sql/statements", "stmt-9"),
+            "https://host/api/2.0/sql/statements/stmt-9"
+        );
+        assert_eq!(
+            statement_status_url("https://host/api/2.0/sql/statements/", "stmt-9"),
+            "https://host/api/2.0/sql/statements/stmt-9"
+        );
+
+        let rows = parse_result_rows(
+            br#"{"status":{"state":"SUCCEEDED"},"result":{"data_array":[[500],["x"]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec!["500".to_string()], vec!["x".to_string()]]);
+        assert!(parse_result_rows(br#"{"status":{"state":"SUCCEEDED"}}"#)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Scripted Statements API fake: records Bearers + statements,
+    /// answers the first POST with PENDING (forcing GET polls) when
+    /// told to, rejects any other Bearer with 401.
+    struct FakeStatements {
+        good_bearer: String,
+        async_first_post: StdMutex<bool>,
+        bearers: StdMutex<Vec<String>>,
+        statements: StdMutex<Vec<String>>,
+        gets: AtomicU64,
+    }
+
+    fn bearer_of(headers: &HeaderMap) -> String {
+        headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    async fn fake_post(
+        State(state): State<Arc<FakeStatements>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, String) {
+        let bearer = bearer_of(&headers);
+        state.bearers.lock().unwrap().push(bearer.clone());
+        if bearer != state.good_bearer {
+            return (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error_code":"UNAUTHENTICATED","message":"bad token"}"#.to_string(),
+            );
+        }
+        state
+            .statements
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&body).to_string());
+        if *state.async_first_post.lock().unwrap() {
+            *state.async_first_post.lock().unwrap() = false;
+            (
+                StatusCode::OK,
+                r#"{"statement_id":"stmt-1","status":{"state":"PENDING"}}"#.to_string(),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                r#"{"statement_id":"stmt-2","status":{"state":"SUCCEEDED"}}"#.to_string(),
+            )
+        }
+    }
+
+    async fn fake_get(
+        State(state): State<Arc<FakeStatements>>,
+        Path(id): Path<String>,
+        headers: HeaderMap,
+    ) -> (StatusCode, String) {
+        let bearer = bearer_of(&headers);
+        state.bearers.lock().unwrap().push(bearer.clone());
+        if bearer != state.good_bearer {
+            return (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error_code":"UNAUTHENTICATED","message":"bad token"}"#.to_string(),
+            );
+        }
+        assert_eq!(id, "stmt-1");
+        if state.gets.fetch_add(1, Ordering::SeqCst) == 0 {
+            (
+                StatusCode::OK,
+                r#"{"statement_id":"stmt-1","status":{"state":"RUNNING"}}"#.to_string(),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                r#"{"statement_id":"stmt-1","status":{"state":"SUCCEEDED"},"result":{"data_array":[]}}"#
+                    .to_string(),
+            )
+        }
+    }
+
+    async fn serve_fake(state: Arc<FakeStatements>) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/api/2.0/sql/statements", post(fake_post))
+            .route("/api/2.0/sql/statements/:id", get(fake_get))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    fn fake_config(host: &str, token: &str) -> DatabricksSinkConfig {
+        DatabricksSinkConfig {
+            host: host.to_string(),
+            token: token.to_string(),
+            catalog: "main".to_string(),
+            schema: "default".to_string(),
+            table_template: "events".to_string(),
+            http_path: Some("/sql/1.0/warehouses/abc123".to_string()),
+            partition_key_template: None,
+            column_mappings: HashMap::new(),
+            batch_size: Some(10),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(5_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_polling_reaches_succeeded_through_manager() {
+        // Broker path (publish, deliver): ConnectorManager::send ->
+        // Sink::send -> flush -> HttpDatabricksTransport POST + GET
+        // polls to SUCCEEDED against the loopback Statements API.
+        use crate::ConnectorManager;
+        let fake = Arc::new(FakeStatements {
+            good_bearer: "Bearer tok-1".to_string(),
+            async_first_post: StdMutex::new(true),
+            bearers: StdMutex::new(Vec::new()),
+            statements: StdMutex::new(Vec::new()),
+            gets: AtomicU64::new(0),
+        });
+        let (host, server) = serve_fake(fake.clone()).await;
+        let config = fake_config(&host, "tok-1");
+        let transport = Arc::new(
+            HttpDatabricksTransport::with_polling(
+                &config,
+                reqwest::Client::new(),
+                Duration::from_millis(5),
+                10,
+            )
+            .expect("fake transport"),
+        );
+        let sink = Arc::new(DatabricksSink::new(config, transport).expect("fake sink"));
+        assert_eq!(sink.kind(), "databricks");
+        let manager = ConnectorManager::new();
+        manager.register("db-poll", sink.clone());
+        manager
+            .send(
+                "db-poll",
+                &Topic::new("sensors/q1").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d7","temperature":2.5}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("broker send");
+        sink.flush().await.expect("polling flush");
+
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.sent_batches(), 1);
+        let statements = fake.statements.lock().unwrap();
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].contains("INSERT INTO main.default.events"),
+            "unexpected statement: {}",
+            statements[0]
+        );
+        assert!(
+            fake.gets.load(Ordering::SeqCst) >= 1,
+            "PENDING must poll to SUCCEEDED"
+        );
+        let bearers = fake.bearers.lock().unwrap();
+        assert!(!bearers.is_empty());
+        assert!(bearers.iter().all(|b| b == "Bearer tok-1"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_bearer_renewal_and_401_fail_closed() {
+        use crate::ConnectorManager;
+        let fake = Arc::new(FakeStatements {
+            good_bearer: "Bearer tok-2".to_string(),
+            async_first_post: StdMutex::new(false),
+            bearers: StdMutex::new(Vec::new()),
+            statements: StdMutex::new(Vec::new()),
+            gets: AtomicU64::new(0),
+        });
+        let (host, server) = serve_fake(fake.clone()).await;
+        let config = fake_config(&host, "tok-1");
+        let transport = Arc::new(
+            HttpDatabricksTransport::with_polling(
+                &config,
+                reqwest::Client::new(),
+                Duration::from_millis(5),
+                10,
+            )
+            .expect("fake transport"),
+        );
+        let sink = Arc::new(DatabricksSink::new(config, transport).expect("fake sink"));
+        let manager = ConnectorManager::new();
+        manager.register("db-renew", sink.clone());
+        manager
+            .send(
+                "db-renew",
+                &Topic::new("sensors/q2").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d8"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("broker send");
+
+        // Stale Bearer fails closed and terminal: no retry storm, rows kept.
+        let err = sink.flush().await.expect_err("401 must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "401 must be terminal, got {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), 1);
+        assert_eq!(sink.sent_records(), 0);
+
+        // Renewed Bearer takes effect without rebuilding the sink.
+        // The terminal failure above engaged the 2 s backoff, so wait
+        // it out: the renewed flush must exercise the transport, not
+        // the backoff gate.
+        sink.set_token("tok-2");
+        assert_eq!(sink.current_token(), "tok-2");
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        sink.flush().await.expect("renewed flush");
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(
+            fake.bearers.lock().unwrap().as_slice(),
+            &["Bearer tok-1".to_string(), "Bearer tok-2".to_string()]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_unreachable_fails_closed_through_manager() {
+        // Unreachable Statements API through the broker path: the
+        // production transport must fail closed, never grant access.
+        use crate::ConnectorManager;
+        let mut config = fake_config("http://127.0.0.1:1", "tok-1");
+        config.batch_size = Some(1);
+        config.max_retries = Some(0);
+        config.timeout_ms = Some(500);
+        let transport =
+            Arc::new(HttpDatabricksTransport::new(&config, reqwest::Client::new()).expect("sink"));
+        let sink = Arc::new(DatabricksSink::new(config, transport).expect("sink"));
+        let manager = ConnectorManager::new();
+        manager.register("db-dead", sink);
+        let err = manager
+            .send(
+                "db-dead",
+                &Topic::new("sensors/q3").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d9"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("unreachable must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "unreachable must be a connection failure, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("databricks"),
+            "driver error must be observable, got: {err}"
+        );
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real workspace via the maintained
+    /// `reqwest` Statements API transport.
+    ///
+    /// Run with e.g.:
+    /// `DATABRICKS_HOST=dbc-xxx.cloud.databricks.com DATABRICKS_TOKEN=dapi... \
+    ///  DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/abc123 \
+    ///  cargo test -p broker-connectors --lib databricks::tests::test_qualify_statements_write_path -- --ignored --nocapture`
+    ///
+    /// Creates a table, streams 500 inserts through the broker
+    /// ([`crate::ConnectorManager`] -> [`DatabricksSink`] on
+    /// [`HttpDatabricksTransport`], Bearer auth, `GET` polling to
+    /// `SUCCEEDED`), asserts `COUNT(*)` is 500, proves a bad Bearer
+    /// fails closed then recovers after [`DatabricksSink::set_token`]
+    /// (renewed row lands in the same table), streams one more row
+    /// and asserts 502, then drops the table.
+    #[tokio::test]
+    #[ignore = "needs a real workspace (see DATABRICKS_* env)"]
+    async fn test_qualify_statements_write_path() {
+        let host = qual_env("DATABRICKS_HOST").unwrap_or_else(|| {
+            panic!(
+                "DATABRICKS_HOST must point at a real workspace for qualification; \
+                 failing closed instead of passing vacuously"
+            )
+        });
+        let token = qual_env("DATABRICKS_TOKEN").unwrap_or_else(|| {
+            panic!("DATABRICKS_TOKEN must be set for qualification; failing closed")
+        });
+        let http_path = qual_env("DATABRICKS_HTTP_PATH")
+            .or_else(|| qual_env("DATABRICKS_WAREHOUSE_PATH"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "DATABRICKS_HTTP_PATH must name the warehouse (contains /warehouses/) \
+                     for qualification; failing closed"
+                )
+            });
+        let catalog = qual_env("DATABRICKS_CATALOG").unwrap_or_else(|| "main".to_string());
+        let schema = qual_env("DATABRICKS_SCHEMA").unwrap_or_else(|| "default".to_string());
+        let table =
+            qual_env("DATABRICKS_TABLE").unwrap_or_else(|| format!("qual_b312_{}", now_millis()));
+        // Cold warehouses take minutes: the per-statement poll bound is
+        // wide here (default 120 x 1 s); the loopback default stays 15 s.
+        let poll_interval = qual_env("DATABRICKS_POLL_INTERVAL_MS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(1));
+        let max_polls = qual_env("DATABRICKS_MAX_POLLS")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(120);
+
+        let config = DatabricksSinkConfig {
+            host: host.clone(),
+            token: token.clone(),
+            catalog: catalog.clone(),
+            schema: schema.clone(),
+            table_template: table.clone(),
+            http_path: Some(http_path.clone()),
+            partition_key_template: None,
+            column_mappings: HashMap::from([
+                ("device_id".to_string(), "${client_id}".to_string()),
+                (
+                    "temperature".to_string(),
+                    "${payload.temperature}".to_string(),
+                ),
+                ("seq".to_string(), "${payload.seq}".to_string()),
+            ]),
+            batch_size: Some(50),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(20),
+            max_retries: Some(5),
+            initial_backoff_ms: Some(200),
+            max_backoff_ms: Some(2_000),
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        let qualified = config.qualified_table(&table);
+        let warehouse_id = config.warehouse_id().expect("qual warehouse id");
+
+        // Warehouse identity for the report (best effort; the
+        // Statements API itself reports no server version).
+        let client = reqwest::Client::new();
+        let info_url = format!("https://{host}/api/2.0/sql/warehouses/{warehouse_id}");
+        match client
+            .get(&info_url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) => match response.bytes().await {
+                Ok(body) => {
+                    let info: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    eprintln!(
+                        "qual server: warehouse={} name={} state={} size={} table={qualified}",
+                        warehouse_id,
+                        info.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                        info.get("state").and_then(|v| v.as_str()).unwrap_or("?"),
+                        info.get("cluster_size")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?"),
+                    );
+                }
+                Err(e) => eprintln!("qual warehouse info unreadable (tolerated): {e}"),
+            },
+            Err(e) => eprintln!("qual warehouse info unreachable (tolerated): {e}"),
+        }
+
+        let transport = Arc::new(
+            HttpDatabricksTransport::with_polling(
+                &config,
+                client.clone(),
+                poll_interval,
+                max_polls,
+            )
+            .expect("qual transport"),
+        );
+        transport
+            .execute_statement(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {qualified} \
+                     (device_id STRING, seq BIGINT, temperature DOUBLE)"
+                ),
+                Vec::new(),
+                &token,
+            )
+            .await
+            .expect("qual create table");
+
+        let sink =
+            Arc::new(DatabricksSink::new(config.clone(), transport.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "databricks");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = Arc::new(crate::ConnectorManager::new());
+        manager.register("qual-db", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..500 {
+            let device = format!("qual-{seq:06}");
+            // Two decimals always: integer-looking values would type
+            // as BIGINT against the DOUBLE column.
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","temperature":{:.2},"seq":{seq}}}"#,
+                20.0 + (seq as f64) * 0.01
+            ));
+            manager
+                .send("qual-db", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 500, "qual row count");
+        eprintln!("qual rows sent: records=500 table={qualified}");
+
+        // Row count asserted back from the server, not the counters.
+        let rows = transport
+            .execute_fetch(
+                &format!("SELECT COUNT(*) AS n FROM {qualified}"),
+                Vec::new(),
+                &token,
+            )
+            .await
+            .expect("qual count");
+        assert_eq!(rows, vec![vec!["500".to_string()]], "qual count: {rows:?}");
+        eprintln!("qual rows asserted: count=500 table={qualified}");
+
+        // Bearer renewal end to end: a bad Bearer fails closed and
+        // terminal (rows kept), the rotated Bearer recovers in place.
+        let mut bad_config = config.clone();
+        bad_config.token = "dapi-qual-bad".to_string();
+        let bad_sink =
+            Arc::new(DatabricksSink::new(bad_config, transport.clone()).expect("qual bad sink"));
+        bad_sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"client_id":"qual-renew","temperature":1.0,"seq":-1}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad buffer");
+        let err = bad_sink.flush().await.expect_err("bad Bearer must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "bad Bearer must be terminal, got {err:?}"
+        );
+        assert_eq!(bad_sink.buffered_rows(), 1);
+        bad_sink.set_token(token.clone());
+        // The terminal failure engaged the 2 s backoff; wait it out so
+        // the renewed flush exercises the transport, not the gate.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        bad_sink.flush().await.expect("qual renewed flush");
+        assert_eq!(bad_sink.sent_records(), 1);
+        eprintln!("qual Bearer renewal asserted: 401 terminal then recovered");
+
+        // One more row through the main sink. The renewed row above
+        // landed in this same table, so the server count is 502 while
+        // the main sink delivered 501 of them.
+        sink.set_token(token.clone());
+        manager
+            .send(
+                "qual-db",
+                &topic,
+                &Bytes::from_static(br#"{"client_id":"qual-000500","temperature":25.0,"seq":500}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual send 501");
+        sink.flush().await.expect("qual flush 501");
+        assert_eq!(sink.sent_records(), 501);
+        let rows = transport
+            .execute_fetch(
+                &format!("SELECT COUNT(*) AS n FROM {qualified}"),
+                Vec::new(),
+                &token,
+            )
+            .await
+            .expect("qual recount");
+        assert_eq!(
+            rows,
+            vec![vec!["502".to_string()]],
+            "qual recount: {rows:?}"
+        );
+        eprintln!("qual rows asserted: count=502 table={qualified}");
+
+        // Cleanup: drop the table created for this run (best effort;
+        // a failure is logged, not hidden).
+        match transport
+            .execute_statement(
+                &format!("DROP TABLE IF EXISTS {qualified}"),
+                Vec::new(),
+                &token,
+            )
+            .await
+        {
+            Ok(()) => eprintln!("qual cleanup: dropped table {qualified}"),
+            Err(e) => eprintln!("qual cleanup FAILED to drop {qualified} (tolerated): {e}"),
+        }
+        eprintln!("qual done: rows=502 table={qualified} cleaned table");
     }
 }

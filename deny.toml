@@ -28,6 +28,9 @@ exceptions = [
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-core" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-sql" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-conf" },
+    # Mozilla root-certificate data. The licence covers the data, puts no
+    # condition on our code, and is scoped to this crate alone.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
 ]
 
 [licenses.private]

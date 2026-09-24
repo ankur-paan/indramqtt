@@ -463,13 +463,35 @@ impl DorisTransport for MockDorisTransport {
     }
 }
 
+/// Build the HTTP client the Stream Load transport expects. Redirects
+/// stay disabled here on purpose: [`HttpDorisTransport::stream_load`]
+/// follows the FE `307` to the BE itself so `Authorization` and `label`
+/// survive the hop. A stock client follows 307 automatically but strips
+/// `Authorization` when the BE is a different origin (a different port
+/// already counts), which the BE then rejects with 401.
+pub fn doris_http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
+
+/// Redirect hops followed per load. The server answers a single 307;
+/// anything beyond this is a loop or a misbehaving proxy, so the load
+/// fails closed instead of chasing it.
+const MAX_REDIRECT_HOPS: usize = 5;
+
 /// Production transport: `PUT {base}/api/{db}/{table}/_stream_load`
-/// with Stream Load headers. reqwest follows 307 redirects to BE
-/// nodes automatically (same origin keeps every header; cross-origin
-/// drops `Authorization`, which the retry loop then surfaces loudly).
+/// with Stream Load headers. The FE answers `307` with a `Location`
+/// pointing at a BE node; the transport replays the identical headers
+/// (auth, format, label) and body there. Replaying the same label is
+/// what keeps the load idempotent across the hop.
 pub struct HttpDorisTransport {
     base: String,
     client: reqwest::Client,
+    timeout: Duration,
+    redirects: AtomicU64,
 }
 
 impl HttpDorisTransport {
@@ -478,7 +500,16 @@ impl HttpDorisTransport {
         Ok(Self {
             base: format!("http://{}:{}", config.fe_host, config.http_port),
             client,
+            timeout: config.timeout(),
+            redirects: AtomicU64::new(0),
         })
+    }
+
+    /// Redirect hops followed so far. Qualification asserts this is
+    /// non-zero against a real server, proving the FE 307 -> BE path
+    /// was taken with the auth intact.
+    pub fn redirects_followed(&self) -> u64 {
+        self.redirects.load(Ordering::Relaxed)
     }
 }
 
@@ -492,51 +523,91 @@ impl DorisTransport for HttpDorisTransport {
         headers: &DorisHeaders,
         auth: &DorisAuth,
     ) -> Result<DorisLoadResult> {
-        let url = format!("{}/api/{}/{}/_stream_load", self.base, db, table);
-        let mut request = self
-            .client
-            .put(&url)
-            .header(reqwest::header::AUTHORIZATION, auth.header_value()?)
-            .header("format", headers.format.as_str())
-            .header(
-                "strip_outer_array",
-                if headers.strip_outer_array {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .header("label", headers.label.as_str())
-            .header("Expect", "100-continue")
-            .body(data.to_vec());
-        if let Some(jsonpaths) = &headers.jsonpaths {
-            request = request.header("jsonpaths", jsonpaths.as_str());
+        let auth_value = auth.header_value()?;
+        let strip_outer_array = if headers.strip_outer_array {
+            "true"
+        } else {
+            "false"
+        };
+        let mut url = format!("{}/api/{}/{}/_stream_load", self.base, db, table);
+        for _ in 0..=MAX_REDIRECT_HOPS {
+            let mut request = self
+                .client
+                .put(&url)
+                .header(reqwest::header::AUTHORIZATION, auth_value.clone())
+                .header("format", headers.format.as_str())
+                .header("strip_outer_array", strip_outer_array)
+                .header("label", headers.label.as_str())
+                .header("Expect", "100-continue")
+                .body(data.to_vec())
+                .timeout(self.timeout);
+            if let Some(jsonpaths) = &headers.jsonpaths {
+                request = request.header("jsonpaths", jsonpaths.as_str());
+            }
+            if let Some(ratio) = &headers.max_filter_ratio {
+                request = request.header("max_filter_ratio", ratio.as_str());
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("doris load failed: {e}")))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::TEMPORARY_REDIRECT
+                || status == reqwest::StatusCode::PERMANENT_REDIRECT
+            {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        ConnectorError::Dispatch("doris redirect lacks location".to_string())
+                    })?
+                    .to_string();
+                url = join_redirect_url(&url, &location)?;
+                self.redirects.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // TODO(parity): should 301/302/303 from a load balancer or
+            // proxy be followed like 307/308, or is failing closed
+            // correct? Only 307 to the BE is documented for Stream Load,
+            // so anything else stays terminal for now.
+            let code = status.as_u16();
+            if code == 429 || code == 503 {
+                return Err(ConnectorError::Connection(format!(
+                    "doris throttled with {code}"
+                )));
+            }
+            if !(200..=299).contains(&code) {
+                return Err(ConnectorError::Dispatch(format!(
+                    "doris load failed with {code}"
+                )));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("doris read failed: {e}")))?;
+            let result = parse_load_result(&bytes)?;
+            return classify_status(&result.status).map(|_| result);
         }
-        if let Some(ratio) = &headers.max_filter_ratio {
-            request = request.header("max_filter_ratio", ratio.as_str());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("doris load failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || status == 503 {
-            return Err(ConnectorError::Connection(format!(
-                "doris throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "doris load failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("doris read failed: {e}")))?;
-        let result = parse_load_result(&bytes)?;
-        classify_status(&result.status).map(|_| result)
+        Err(ConnectorError::Dispatch(
+            "doris too many redirects".to_string(),
+        ))
     }
+}
+
+/// Resolve a redirect `Location` against the request URL: absolute URLs
+/// are used as-is, relative paths (what the FE usually returns) are
+/// joined onto the current URL.
+fn join_redirect_url(current: &str, location: &str) -> Result<String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_string());
+    }
+    let base: reqwest::Url = current.parse().map_err(|e| {
+        ConnectorError::Connection(format!("doris bad request URL {current:?}: {e}"))
+    })?;
+    base.join(location)
+        .map(|joined| joined.to_string())
+        .map_err(|e| ConnectorError::Dispatch(format!("doris bad redirect {location:?}: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,7 +1145,9 @@ mod tests {
         let mut config = test_config();
         config.fe_host = "127.0.0.1".to_string();
         config.http_port = port;
-        let transport = Arc::new(HttpDorisTransport::new(&config, reqwest::Client::new()).unwrap());
+        let transport = Arc::new(
+            HttpDorisTransport::new(&config, doris_http_client(config.timeout())).unwrap(),
+        );
         let result = transport
             .stream_load(
                 "telemetry",
@@ -1093,5 +1166,247 @@ mod tests {
             .expect("redirect flow succeeds");
         assert_eq!(result.status, "Success");
         assert_eq!(result.rows_loaded, 1);
+        // The manual hop ran (no-redirect client) and the BE saw the
+        // replayed auth: same-label idempotency survives the redirect.
+        assert_eq!(transport.redirects_followed(), 1);
+    }
+
+    #[test]
+    fn test_join_redirect_url() {
+        assert_eq!(
+            join_redirect_url(
+                "http://127.0.0.1:8030/api/db/t/_stream_load",
+                "http://10.0.0.2:8040/api/db/t/_stream_load"
+            )
+            .unwrap(),
+            "http://10.0.0.2:8040/api/db/t/_stream_load"
+        );
+        assert_eq!(
+            join_redirect_url(
+                "http://127.0.0.1:8030/api/db/t/_stream_load",
+                "/api/db/t/_be_load"
+            )
+            .unwrap(),
+            "http://127.0.0.1:8030/api/db/t/_be_load"
+        );
+        assert!(join_redirect_url("not a url", "/api/db/t/_be_load").is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_identifier(name: &str, value: &str) -> String {
+        assert!(
+            is_identifier(value),
+            "qual {name} must match [A-Za-z0-9_]+, got {value:?} (failing closed)"
+        );
+        value.to_string()
+    }
+
+    /// Qualification against a real server over the maintained
+    /// `reqwest` Stream Load transport (DDL and query-back go through
+    /// the maintained `mysql_async` client on the FE MySQL port).
+    ///
+    /// Run with e.g.:
+    /// `DORIS_FE_HOST=127.0.0.1 DORIS_HTTP_PORT=8030 DORIS_MYSQL_PORT=9030 \
+    ///  DORIS_USER=root DORIS_PASSWORD=secret DORIS_DATABASE=qual_b315 \
+    ///  DORIS_TABLE=qual_rows \
+    ///  cargo test -p broker-connectors --lib doris::tests::test_qualify_stream_load_write_path -- --ignored --nocapture`
+    ///
+    /// Creates the database/table, streams 2000 rows through the broker
+    /// ([`crate::ConnectorManager`] -> [`DorisSink`] on
+    /// [`HttpDorisTransport`], Basic auth), asserts `SELECT COUNT(*)`
+    /// query-back equality, asserts at least one FE 307 -> BE redirect
+    /// was followed with the auth intact, proves a same-label retry
+    /// deduplicates (`Label Already Exists`, row count unchanged), then
+    /// drops the table it created.
+    #[tokio::test]
+    #[ignore = "needs a real server (see DORIS_* env)"]
+    async fn test_qualify_stream_load_write_path() {
+        use crate::ConnectorManager;
+        use mysql_async::prelude::Queryable;
+
+        let fe_host = qual_env("DORIS_FE_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+        let http_port: u16 = qual_env("DORIS_HTTP_PORT")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8030);
+        let mysql_port: u16 = qual_env("DORIS_MYSQL_PORT")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9030);
+        let username = qual_env("DORIS_USER").unwrap_or_else(|| "root".to_string());
+        let password = qual_env("DORIS_PASSWORD").unwrap_or_default();
+        let database = qual_identifier(
+            "database",
+            &qual_env("DORIS_DATABASE").unwrap_or_else(|| "qual_b315".to_string()),
+        );
+        let table = qual_identifier(
+            "table",
+            &qual_env("DORIS_TABLE").unwrap_or_else(|| "qual_rows".to_string()),
+        );
+        const ROWS: u64 = 2000;
+
+        let builder = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(fe_host.clone())
+            .tcp_port(mysql_port)
+            .user(Some(username.clone()))
+            .pass(Some(password.clone()));
+        let pool = mysql_async::Pool::new(mysql_async::Opts::from(builder));
+        let mut conn = pool.get_conn().await.expect("qual mysql connect");
+
+        // Server identity for the report (best effort; the write path
+        // itself is the proof, the version string is context).
+        let version: mysql_async::Result<Option<String>> =
+            conn.query_first("SELECT VERSION()").await;
+        match version {
+            Ok(version) => eprintln!("qual server: version={version:?} fe={fe_host}:{http_port}"),
+            Err(e) => eprintln!("qual server version unreachable (tolerated): {e}"),
+        }
+
+        conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {database}"))
+            .await
+            .expect("qual create database");
+        conn.query_drop(format!("DROP TABLE IF EXISTS {database}.{table}"))
+            .await
+            .expect("qual drop stale table");
+        conn.query_drop(format!(
+            "CREATE TABLE {database}.{table} (\
+             `seq` BIGINT, `device` VARCHAR(64), `topic` VARCHAR(256), \
+             `qos` TINYINT, `timestamp` BIGINT\
+             ) DUPLICATE KEY(`seq`) \
+             DISTRIBUTED BY HASH(`seq`) BUCKETS 4 \
+             PROPERTIES (\"replication_num\" = \"1\")"
+        ))
+        .await
+        .expect("qual create table");
+
+        let config = DorisSinkConfig {
+            fe_host: fe_host.clone(),
+            http_port,
+            database: database.clone(),
+            table_template: table.clone(),
+            auth: DorisAuth {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            format: DorisFormat::Json,
+            jsonpaths: None,
+            strip_outer_array: true,
+            max_filter_ratio: None,
+            batch_size: Some(200),
+            batch_bytes: Some(4_194_304),
+            linger_ms: Some(10),
+            max_retries: Some(4),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_000),
+            timeout_ms: Some(60_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport: Arc<HttpDorisTransport> = Arc::new(
+            HttpDorisTransport::new(&config, doris_http_client(config.timeout())).unwrap(),
+        );
+        let dyn_transport: Arc<dyn DorisTransport> = transport.clone();
+        let sink = Arc::new(DorisSink::new(config.clone(), dyn_transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "doris");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = Arc::new(ConnectorManager::new());
+        manager.register("qual-doris", sink.clone());
+
+        let topic = Topic::new("qual/doris/b315").unwrap();
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(
+                r#"{{"seq": {seq}, "device": "dev-{:02}}}"#,
+                seq % 16
+            ));
+            manager
+                .send("qual-doris", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), ROWS, "qual row count");
+        eprintln!("qual rows sent: records={ROWS} table={database}.{table}");
+
+        // Row count asserted back from the server, not the counters
+        // (Stream Load is synchronous, but poll briefly for visibility).
+        let count_sql = format!("SELECT COUNT(*) FROM {database}.{table}");
+        let mut count = 0u64;
+        for _ in 0..30 {
+            let current: mysql_async::Result<Option<u64>> =
+                conn.query_first(count_sql.as_str()).await;
+            count = current.expect("qual count").unwrap_or(0);
+            if count == ROWS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(count, ROWS, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={database}.{table}");
+
+        // Every load goes FE -> 307 -> BE: success alone proves the
+        // redirect was followed with the auth intact.
+        let hops = transport.redirects_followed();
+        assert!(
+            hops >= 1,
+            "expected FE 307 -> BE hops against a real server, got {hops}"
+        );
+        eprintln!("qual redirects asserted: hops={hops} (307 followed with auth)");
+
+        // Label idempotency: the same label + body twice must not load
+        // twice. The first send succeeds, the retry reports the known
+        // label and the row count does not move.
+        let probe_seq = 9_000_001u64;
+        let probe = serde_json::json!({
+            "seq": probe_seq,
+            "device": "dedup-probe",
+            "topic": "qual/doris/b315",
+            "qos": 1,
+            "timestamp": now_millis(),
+        });
+        let probe_body = render_body(DorisFormat::Json, &[probe]);
+        let probe_headers = DorisHeaders {
+            format: "json".to_string(),
+            strip_outer_array: true,
+            label: format!("indra-qual-{}-dedup", now_millis()),
+            jsonpaths: None,
+            max_filter_ratio: None,
+        };
+        let first = transport
+            .stream_load(&database, &table, &probe_body, &probe_headers, &config.auth)
+            .await
+            .expect("qual dedup first send");
+        assert_eq!(first.status, "Success");
+        let duplicate = transport
+            .stream_load(&database, &table, &probe_body, &probe_headers, &config.auth)
+            .await
+            .expect_err("same label must not load twice");
+        match &duplicate {
+            ConnectorError::Connection(message) => assert!(
+                message.contains("Label Already Exists"),
+                "expected label dedup, got {message:?}"
+            ),
+            other => panic!("label retry must be retryable, got {other:?}"),
+        }
+        let after: mysql_async::Result<Option<u64>> = conn.query_first(count_sql.as_str()).await;
+        assert_eq!(
+            after.expect("qual post-dedup count").unwrap_or(0),
+            ROWS + 1,
+            "dedup retry must not add rows"
+        );
+        eprintln!(
+            "qual label dedup asserted: retry reported Label Already Exists, count unchanged"
+        );
+
+        // Cleanup: drop the table created for this run (best effort;
+        // the database is left in place).
+        match conn
+            .query_drop(format!("DROP TABLE IF EXISTS {database}.{table}"))
+            .await
+        {
+            Ok(()) => eprintln!("qual cleanup: dropped table {database}.{table}"),
+            Err(e) => eprintln!("qual cleanup FAILED to drop {database}.{table} (tolerated): {e}"),
+        }
+        eprintln!("qual done: rows={ROWS} table={database}.{table} cleaned table");
     }
 }
