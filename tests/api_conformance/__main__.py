@@ -219,6 +219,70 @@ def _mqtt_len(n):
             return bytes(out)
 
 
+def _mqtt_recv_packet(sock):
+    """Read one MQTT control packet from an edge socket."""
+    header = sock.recv(1)
+    if len(header) < 1:
+        raise ConnectionError("MQTT recv failed: empty header")
+    length = 0
+    shift = 0
+    while True:
+        digit = sock.recv(1)
+        if len(digit) < 1:
+            raise ConnectionError("MQTT recv failed: truncated length")
+        byte = digit[0]
+        length |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            break
+        if shift >= 28:
+            raise ConnectionError("MQTT recv failed: bad length")
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            raise ConnectionError("MQTT recv failed: truncated body")
+        body += chunk
+    return header + body
+
+
+def mqtt_subscribe_over(sock, packet_id, topic, qos=0):
+    """Send a normal authorized SUBSCRIBE over an open edge socket.
+
+    Blocks for the SUBACK so the kernel has recorded the subscribe
+    authorization decision before the management read runs. Any granted
+    or denied code is accepted; only a missing SUBACK fails.
+    """
+    encoded = topic.encode("utf-8")
+    body = (struct.pack("!H", packet_id) + struct.pack("!H", len(encoded))
+            + encoded + bytes([qos & 0xFF]))
+    sock.sendall(b"\x82" + _mqtt_len(len(body)) + body)
+    pkt = _mqtt_recv_packet(sock)
+    if (pkt[0] >> 4) != 9:
+        raise ConnectionError("SUBACK failed: %r" % pkt)
+
+
+def mqtt_publish_over(sock, topic, qos=0, payload=b"", packet_id=1):
+    """Send a normal authorized PUBLISH over an open edge socket.
+
+    QoS 0 returns after the send; QoS 1 blocks for the PUBACK so the
+    kernel has recorded the publish authorization decision first.
+    """
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    encoded = topic.encode("utf-8")
+    body = struct.pack("!H", len(encoded)) + encoded
+    if qos > 0:
+        body += struct.pack("!H", packet_id)
+    body += bytes(payload)
+    sock.sendall(bytes([0x30 | ((qos & 0x03) << 1)])
+                 + _mqtt_len(len(body)) + body)
+    if qos == 1:
+        pkt = _mqtt_recv_packet(sock)
+        if (pkt[0] >> 4) != 4:
+            raise ConnectionError("PUBACK failed: %r" % pkt)
+
+
 class CaseRunner:
     def __init__(self, base, headers, mqtt_host, mqtt_port):
         self.base = base
@@ -259,6 +323,21 @@ class CaseRunner:
             sock = self.sockets.pop(args.get("clientid", ""), None)
             if sock is not None:
                 sock.close()
+        elif kind == "mqtt_subscribe":
+            sock = self.sockets.get(args.get("clientid", "conf-c1"))
+            if sock is None:
+                raise ValueError("mqtt_subscribe without mqtt_connect: %r" % (args,))
+            mqtt_subscribe_over(sock, int(args.get("packet_id", 7)),
+                                str(args.get("topic", "")),
+                                int(args.get("qos", 0)))
+        elif kind == "mqtt_publish":
+            sock = self.sockets.get(args.get("clientid", "conf-c1"))
+            if sock is None:
+                raise ValueError("mqtt_publish without mqtt_connect: %r" % (args,))
+            mqtt_publish_over(sock, str(args.get("topic", "")),
+                              int(args.get("qos", 0)),
+                              args.get("payload", b""),
+                              int(args.get("packet_id", 1)))
         else:
             raise ValueError("unknown step type: %s" % kind)
 

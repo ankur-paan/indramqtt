@@ -344,18 +344,25 @@ fn apply_single_subscribe(
         }
     };
     let (filter, qos, nl, rap, rh) = parse_subscribe_entry(entry)?;
-    state
-        .sessions
-        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
-
     // Live connection owns the router copy; offline subscribes keep a
     // placeholder until a live re-subscribe replaces it (the trie holds
     // at most one `conn_id` per `(filter node, client_id)`).
     let conn_id = (*session.conn_id.read()).unwrap_or(1);
 
-    state
+    // B4-08 bound: a new entry past the subscription-table cap is denied
+    // fail closed with the documented quota error, registering nothing
+    // and changing no session state (no session mirror on failure).
+    let stored = state
         .router
         .subscribe(&filter, Subscription::new(client_id, conn_id, qos));
+    if !stored {
+        return Err(ApiError::TooManyRequests(
+            "subscription table full".to_string(),
+        ));
+    }
+    state
+        .sessions
+        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
 
     Ok(serde_json::json!({
         "clientid": client_id,
@@ -729,6 +736,73 @@ pub async fn get_client_mqueue(
         .into_response()
 }
 
+/// Per-client authorization decision cache read (W2-01, C01-10).
+///
+/// Renders the decisions recorded on the session by the publish and
+/// subscribe authorization events as a bare list (no paging): each entry
+/// carries `access` (`action_type`, `qos`, `retain`), `topic`, `result`
+/// (`allow` or `deny`) and `updated_time` (millis since the Unix epoch).
+/// An empty cache returns `[]`, not an error; unknown client ids return
+/// the documented not-found shape. Unknown query keys are ignored: the
+/// handler takes no paging params so extra keys never become a 400.
+/// Management-plane read only: one short lock on the per-session cache,
+/// which the delivery fan-out path never touches.
+// TODO(parity): is the empty-cache shape a bare list or an envelope, and
+// does a disconnected-but-known session read as empty or as 404? The
+// rulebook does not decide the disconnected policy; current choice follows
+// the neighbouring per-client reads (known session returns, unknown 404).
+pub async fn get_client_authz_cache(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    Query(_ignored): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    // Bounded snapshot over real state: at most
+    // `MAX_AUTHZ_DECISIONS_PER_CLIENT` (1024) small entries, oldest first.
+    let data: Vec<serde_json::Value> = session
+        .authz_cache_snapshot()
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "access": {
+                    "action_type": entry.action,
+                    "qos": entry.qos,
+                    "retain": entry.retain,
+                },
+                "topic": entry.topic,
+                "result": if entry.allow { "allow" } else { "deny" },
+                "updated_time": entry.updated_ms,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(data)).into_response()
+}
+
+/// Per-client authorization decision cache clear (W2-01, C01-09).
+///
+/// Evicts every cached decision for the client so a subsequent read shows
+/// empty; clearing an already-empty cache still succeeds (204). Unknown
+/// client ids return the documented not-found shape. A background map
+/// removal only: no work on the publish or deliver path.
+pub async fn clear_client_authz_cache(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+) -> Response {
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    session.clear_authz_cache();
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Global subscription list as a bare array (W1-14).
 ///
 /// Reads the session-mirror index via
@@ -900,6 +974,7 @@ fn build_publish_deliveries(
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: payload.clone(),
+                                enqueued_at: std::time::Instant::now(),
                             }) {
                                 broker_session::InflightTrackOutcome::Tracked => {}
                                 broker_session::InflightTrackOutcome::Spilled => {
@@ -925,18 +1000,23 @@ fn build_publish_deliveries(
                     _ => {
                         if !session.clean_start {
                             let before = session.offline_len();
-                            session.push_offline(broker_session::QueuedMessage {
+                            let queued = session.push_offline(broker_session::QueuedMessage {
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
                                 payload: payload.clone(),
                                 publish_at_ms: None,
                             });
-                            let evicted = (before + 1).saturating_sub(session.offline_len());
-                            if evicted > 0 {
-                                state.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                            // Fail closed: a false return means the durable
+                            // append failed and nothing was queued, so neither
+                            // the queued count nor eviction math advances.
+                            if queued {
+                                let evicted = (before + 1).saturating_sub(session.offline_len());
+                                if evicted > 0 {
+                                    state.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                }
+                                offline_queued += 1;
                             }
-                            offline_queued += 1;
                         } else {
                             state.metrics.inc_detached_clean_dropped();
                         }
@@ -1103,6 +1183,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         let qos_raw = u8::from(qos);
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
+        let mut offline_failed = false;
         for sub in self.router.matches(&topic) {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
             match self.sessions.get(sub.client_id.as_ref()) {
@@ -1127,6 +1208,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                         qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                         retain,
                                         payload: payload.clone(),
+                                        enqueued_at: std::time::Instant::now(),
                                     },
                                 ) {
                                     broker_session::InflightTrackOutcome::Tracked => {}
@@ -1159,16 +1241,25 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                         _ => {
                             if !session.clean_start {
                                 let before = session.offline_len();
-                                session.push_offline(broker_session::QueuedMessage {
+                                let queued = session.push_offline(broker_session::QueuedMessage {
                                     topic: topic.clone(),
                                     qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                     retain,
                                     payload: payload.clone(),
                                     publish_at_ms: None,
                                 });
-                                let evicted = (before + 1).saturating_sub(session.offline_len());
-                                if evicted > 0 {
-                                    self.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                // Fail closed: a false return means the
+                                // durable append failed and nothing was
+                                // queued, so no eviction is counted and the
+                                // republish reports failure below.
+                                if queued {
+                                    let evicted =
+                                        (before + 1).saturating_sub(session.offline_len());
+                                    if evicted > 0 {
+                                        self.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                    }
+                                } else {
+                                    offline_failed = true;
                                 }
                             } else {
                                 self.metrics.inc_detached_clean_dropped();
@@ -1210,6 +1301,15 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         self.metrics.inc_publish_sent_by(enqueued);
         self.metrics.inc_delivered_by(enqueued);
         self.metrics.inc_bytes_sent_by(enqueued_bytes);
+        // Fail closed like the kernel publish path: a detached durable
+        // buffer that lost its stable copy reports failure so the rule
+        // counters mark the republish failed (and an MQTT ingress caller
+        // withholds its ack via the persist-failed snapshot and retries).
+        if offline_failed {
+            return Err(broker_rules::RuleEngineError::Execution(
+                "offline queue persist failed; nothing queued".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1515,5 +1615,68 @@ mod tests {
             rendered.get("connected_at").is_none(),
             "sessions predating timestamp recording must omit connected_at: {rendered}"
         );
+    }
+
+    /// B4-08 bound: a full subscription table denies the management
+    /// subscribe fail closed with the documented quota error (never a
+    /// 200 with a success body) and changes no session state. Fills the
+    /// router to MAX_SUBSCRIPTIONS with three-level filters so each
+    /// path copy stays small.
+    #[tokio::test]
+    async fn quota_full_subscribe_returns_error_and_changes_no_session_state() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("quota-client", true);
+        *session.conn_id.write() = Some(4242);
+        for i in 0..broker_router::MAX_SUBSCRIPTIONS {
+            let a = i / 10_000;
+            let b = (i / 100) % 100;
+            let c = i % 100;
+            let filter = TopicFilter::new(format!("quota/fill/{a}/{b:02}/{c:02}"))
+                .expect("valid fill filter");
+            assert!(
+                state.router.subscribe(
+                    &filter,
+                    Subscription::new(format!("fill-{i}"), i as u64, QoS::AtMostOnce)
+                ),
+                "fill subscribe {i} must succeed"
+            );
+        }
+
+        let entry = serde_json::json!({"topic": "quota/probe", "qos": 0});
+        let error = apply_single_subscribe(&state, "quota-client", &entry)
+            .expect_err("full table must fail, never succeed");
+        assert_eq!(error.code(), "TOO_MANY_REQUESTS");
+        assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The failed subscribe registers nothing: no session mirror, no
+        // router entry.
+        assert!(
+            state
+                .sessions
+                .get("quota-client")
+                .expect("session row")
+                .subscriptions
+                .read()
+                .keys()
+                .all(|f| f.as_str() != "quota/probe"),
+            "quota-denied subscribe must leave the session unchanged"
+        );
+        assert!(
+            state
+                .router
+                .matches(&Topic::new("quota/probe").expect("valid probe topic"))
+                .is_empty(),
+            "quota-denied subscribe must leave the router unchanged"
+        );
+
+        // The HTTP route reports the documented error, never a 200 with
+        // a success body.
+        let body = Bytes::from(serde_json::to_vec(&entry).expect("entry is JSON"));
+        let (status, rendered) = response_parts(
+            client_subscribe(State(state), Path("quota-client".to_string()), body).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rendered["code"], serde_json::json!("TOO_MANY_REQUESTS"));
     }
 }

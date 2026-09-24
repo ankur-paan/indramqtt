@@ -1,4 +1,6 @@
+pub mod offline;
 pub mod stream;
+pub use offline::{OfflineConfig, OfflineQueueStore, OfflineRecord};
 pub use stream::{DurableStreamStore, FsyncPolicy, StreamConfig, StreamRecord};
 
 use async_trait::async_trait;

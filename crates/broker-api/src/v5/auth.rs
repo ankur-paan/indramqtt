@@ -9,7 +9,8 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use broker_auth::{AclAction, AclRule};
+use broker_auth::{AclAction, AclRule, ImportUsersError};
+use bytes::Bytes;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::admin_users::{AdminRole, AdminUserError};
+use crate::errors::ApiError;
 use crate::ApiState;
 
 /// Token lifetime: 60 minutes.
@@ -806,6 +808,140 @@ pub async fn delete_authn_user(
         return mqtt_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /authentication/:id/import_users`: bulk import into the built-in
+/// user map with validate-all-before-apply.
+///
+/// The body is a JSON array of `{user_id, password}` records (an object
+/// carrying the array under `users` is accepted as well); every entry is
+/// validated before anything is applied, so a malformed entry, a
+/// duplicate `user_id` within the batch or against the existing map, or
+/// a batch that would exceed [`broker_auth::MAX_AUTHN_USERS`] rejects
+/// the whole batch and applies nothing. Unknown authenticator ids fail
+/// with `NOT_FOUND` in the documented `{code, message}` shape.
+/// Non-built-in backends are rejected with `BAD_REQUEST`: import targets
+/// the built-in user map only, and no endpoint may claim a backend it
+/// cannot execute.
+// TODO(parity): which import body shapes (bare array versus `users`
+// envelope versus file upload), which `type=plain|hash` query handling,
+// and which duplicate semantics (reject versus overwrite/merge with
+// per-entry counts) does the spec require? The rulebook does not decide
+// the exact set; the current choice accepts both JSON shapes as plain
+// passwords, rejects duplicates for the whole batch, and reports atomic
+// counts until the checker pins it. Extra record fields (for example a
+// superuser flag our store does not model) are ignored.
+// TODO(parity): is the documented success shape the five-count result or
+// a per-entry list? The rulebook does not decide the exact envelope; the
+// current choice reports the atomic counts until the checker pins it.
+///
+/// Management-plane only: locks only the user map (plus the registry
+/// save lock on persist), never the message path; the CONNECT path keeps
+/// reading under short read locks and publish/deliver never touch this
+/// store. The import persists across a restart through the config
+/// registry. The route is not paged.
+pub async fn import_authn_users(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot be imported into the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user batch: {e}")).into_response();
+        }
+    };
+    let items = match parse_import_batch(&value) {
+        Ok(items) => items,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    let batch: Vec<(String, Vec<u8>)> = items
+        .into_iter()
+        .map(|(user_id, password)| (user_id, password.into_bytes()))
+        .collect();
+    match state.auth.import_users(batch) {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "total": summary.total,
+                "success": summary.success,
+                "override": 0,
+                "skipped": 0,
+                "failed": 0,
+            })),
+        )
+            .into_response(),
+        Err(ImportUsersError::Malformed(msg) | ImportUsersError::TooMany(msg)) => {
+            ApiError::BadRequest(msg).into_response()
+        }
+        Err(ImportUsersError::Duplicate(msg)) => ApiError::AlreadyExists(msg).into_response(),
+        Err(ImportUsersError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist user batch: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate an import body into `(user_id, password)` pairs.
+///
+/// Accepts a bare JSON array or an object carrying the array under
+/// `users`. Every element must be an object with non-empty string
+/// `user_id` and `password` fields; anything else is malformed. Extra
+/// fields are ignored so future record fields degrade to the same
+/// import instead of a 400.
+fn parse_import_batch(value: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let items = if let Some(array) = value.as_array() {
+        array
+    } else if let Some(obj) = value.as_object() {
+        match obj.get("users") {
+            Some(array) if array.is_array() => array.as_array().expect("checked is array"),
+            _ => {
+                return Err(
+                    "user batch must be a JSON array or an object with a `users` array".to_string(),
+                );
+            }
+        }
+    } else {
+        return Err(
+            "user batch must be a JSON array or an object with a `users` array".to_string(),
+        );
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("user batch[{index}] must be an object"))?;
+        let user_id = obj
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("user batch[{index}].user_id is required"))?;
+        if user_id.trim().is_empty() {
+            return Err(format!("user batch[{index}].user_id must not be empty"));
+        }
+        let password = obj
+            .get("password")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("user batch[{index}].password is required"))?;
+        if password.is_empty() {
+            return Err(format!("user batch[{index}].password must not be empty"));
+        }
+        out.push((user_id.to_string(), password.to_string()));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

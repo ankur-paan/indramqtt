@@ -388,6 +388,226 @@ unbind_meta_roundtrip_test() ->
                  indra_brokerlink:decode_unbind_meta(<<0, 4, "ab">>)).
 
 %%====================================================================
+%% Topic-alias metadata contracts (B4-05)
+%%====================================================================
+
+bind_meta_alias_roundtrip_test() ->
+    %% The /6 form appends the client's receive limit; the kernel
+    %% outbound table is bounded by it.
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {undefined, undefined},
+                                            undefined, 10),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(10, maps:get(client_alias_max, Dec)),
+    ?assertEqual(undefined, maps:get(peerhost, Dec)),
+    %% With credentials and a peer address the alias still trails last.
+    Full = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7),
+    {ok, FDec} = indra_brokerlink:decode_bind_meta(Full),
+    ?assertEqual(<<"alice">>, maps:get(username, FDec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, FDec)),
+    ?assertEqual(7, maps:get(client_alias_max, FDec)),
+    %% Legacy binds without the section decode with maximum 0.
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"dev-l">>, true, 60)),
+    ?assertEqual(0, maps:get(client_alias_max, LDec)).
+
+bind_meta_alias_peer_variants_test() ->
+    %% Every bind variant with and without the peer section, including
+    %% with the B4-05 alias section present (FX-01: the edge always sends
+    %% /6, so the kernel must see the peer on alias-carrying binds).
+    %% /3 anonymous, no peer, no alias.
+    {ok, D3} = indra_brokerlink:decode_bind_meta(
+                 indra_brokerlink:encode_bind_meta(<<"v3">>, true, 60)),
+    ?assertEqual(undefined, maps:get(peerhost, D3)),
+    ?assertEqual(0, maps:get(client_alias_max, D3)),
+    %% /4 credentials, no peer, no alias.
+    {ok, D4} = indra_brokerlink:decode_bind_meta(
+                 indra_brokerlink:encode_bind_meta(<<"v4">>, true, 60,
+                                                  {<<"u">>, <<"p">>})),
+    ?assertEqual(<<"u">>, maps:get(username, D4)),
+    ?assertEqual(undefined, maps:get(peerhost, D4)),
+    ?assertEqual(0, maps:get(client_alias_max, D4)),
+    %% /5 anonymous plus peer, no alias.
+    {ok, D5a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v5a">>, true, 60,
+                                                   {undefined, undefined},
+                                                   <<"127.0.0.1">>)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D5a)),
+    ?assertEqual(0, maps:get(client_alias_max, D5a)),
+    %% /5 credentials plus peer, no alias.
+    {ok, D5c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v5c">>, true, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   <<"192.0.2.10">>)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D5c)),
+    %% /6 anonymous, no peer, with alias.
+    {ok, D6a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v6a">>, true, 60,
+                                                   {undefined, undefined},
+                                                   undefined, 10)),
+    ?assertEqual(undefined, maps:get(peerhost, D6a)),
+    ?assertEqual(10, maps:get(client_alias_max, D6a)),
+    %% /6 credentials, no peer, with alias.
+    {ok, D6c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v6c">>, true, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   undefined, 10)),
+    ?assertEqual(undefined, maps:get(peerhost, D6c)),
+    ?assertEqual(10, maps:get(client_alias_max, D6c)),
+    %% FX-01 regression: anonymous plus peer plus alias 0 (what a 3.1.1
+    %% edge always sends) must keep the peer, never decode it as a
+    %% username with an empty password.
+    {ok, D6ap0} = indra_brokerlink:decode_bind_meta(
+                    indra_brokerlink:encode_bind_meta(<<"v6ap0">>, true, 60,
+                                                     {undefined, undefined},
+                                                     <<"127.0.0.1">>, 0)),
+    ?assertEqual(undefined, maps:get(username, D6ap0)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D6ap0)),
+    ?assertEqual(0, maps:get(client_alias_max, D6ap0)),
+    %% Anonymous plus peer plus nonzero alias.
+    {ok, D6ap} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"v6ap">>, false, 30,
+                                                    {undefined, undefined},
+                                                    <<"2001:db8::1">>, 9)),
+    ?assertEqual(<<"2001:db8::1">>, maps:get(peerhost, D6ap)),
+    ?assertEqual(9, maps:get(client_alias_max, D6ap)),
+    %% Credentials plus peer plus alias 0 and nonzero.
+    {ok, D6cp0} = indra_brokerlink:decode_bind_meta(
+                    indra_brokerlink:encode_bind_meta(<<"v6cp0">>, true, 60,
+                                                     {<<"u">>, <<"p">>},
+                                                     <<"192.0.2.10">>, 0)),
+    ?assertEqual(<<"u">>, maps:get(username, D6cp0)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D6cp0)),
+    ?assertEqual(0, maps:get(client_alias_max, D6cp0)),
+    {ok, D6cp} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"v6cp">>, true, 60,
+                                                    {<<"u">>, <<"p">>},
+                                                    <<"192.0.2.10">>, 7)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D6cp)),
+    ?assertEqual(7, maps:get(client_alias_max, D6cp)),
+    %% /7 will variants keep the peer with the alias present.
+    Will = #{topic => <<"will/test">>, payload => <<"bye">>,
+             qos => 0, retain => false},
+    {ok, D7a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v7a">>, true, 5,
+                                                   {undefined, undefined},
+                                                   <<"127.0.0.1">>, 0, Will)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D7a)),
+    ?assertEqual(0, maps:get(client_alias_max, D7a)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, D7a)),
+    {ok, D7c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v7c">>, false, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   <<"192.0.2.10">>, 7, Will)),
+    ?assertEqual(<<"u">>, maps:get(username, D7c)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D7c)),
+    ?assertEqual(7, maps:get(client_alias_max, D7c)),
+    %% A bind without the peer section still decodes with the peer unset.
+    {ok, DNoPeer} = indra_brokerlink:decode_bind_meta(
+                      indra_brokerlink:encode_bind_meta(<<"vnp">>, true, 60,
+                                                       {<<"u">>, <<"p">>},
+                                                       undefined, 0)),
+    ?assertEqual(undefined, maps:get(peerhost, DNoPeer)).
+
+%%====================================================================
+%% Last-will bind section (F1-01)
+%%====================================================================
+
+bind_meta_will_roundtrip_test() ->
+    Will = #{topic => <<"will/test">>, payload => <<"client-gone">>,
+             qos => 0, retain => false},
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                            {undefined, undefined},
+                                            undefined, 0, Will),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-w">>, maps:get(client_id, Dec)),
+    ?assertEqual(true, maps:get(clean_start, Dec)),
+    ?assertEqual(5, maps:get(keepalive, Dec)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, Dec)),
+    ?assertEqual(<<"client-gone">>, maps:get(will_payload, Dec)),
+    ?assertEqual(0, maps:get(will_qos, Dec)),
+    ?assertEqual(false, maps:get(will_retain, Dec)),
+    %% With credentials, peer and alias the will still rides first.
+    Full = indra_brokerlink:encode_bind_meta(<<"dev-w">>, false, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7, Will),
+    {ok, FDec} = indra_brokerlink:decode_bind_meta(Full),
+    ?assertEqual(<<"alice">>, maps:get(username, FDec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, FDec)),
+    ?assertEqual(7, maps:get(client_alias_max, FDec)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, FDec)),
+    %% No-will binds decode with undefined will strings, and the /7
+    %% encoding without a will is exactly the /6 encoding.
+    Legacy = indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                              {undefined, undefined},
+                                              undefined),
+    ?assertEqual(indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0),
+                 indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0, undefined)),
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(Legacy),
+    ?assertEqual(undefined, maps:get(will_topic, LDec)),
+    ?assertEqual(undefined, maps:get(will_payload, LDec)),
+    %% Empty will topic rejected at encode time (fail closed).
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0,
+                                                  #{topic => <<>>,
+                                                    payload => <<"x">>,
+                                                    qos => 0,
+                                                    retain => false})).
+
+disconnect_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_disconnect_meta(<<"dev-9">>),
+    ?assertEqual({ok, #{client_id => <<"dev-9">>}},
+                 indra_brokerlink:decode_disconnect_meta(Meta)),
+    ?assertEqual({error, malformed_unbind_meta},
+                 indra_brokerlink:decode_disconnect_meta(<<0, 4, "ab">>)).
+
+session_binding_alias_roundtrip_test() ->
+    %% The /4 form carries the kernel inbound bound for CONNACK
+    %% negotiation; the /3 form decodes with maximum 0.
+    Meta = indra_brokerlink:encode_session_binding_meta(99, true, 0, 10),
+    ?assertEqual(12, byte_size(Meta)),
+    {ok, Dec} = indra_brokerlink:decode_session_binding_meta(Meta),
+    ?assertEqual(99, maps:get(session_id, Dec)),
+    ?assertEqual(true, maps:get(session_present, Dec)),
+    ?assertEqual(0, maps:get(return_code, Dec)),
+    ?assertEqual(10, maps:get(alias_max, Dec)),
+    Legacy = indra_brokerlink:encode_session_binding_meta(99, false, 2),
+    {ok, LDec} = indra_brokerlink:decode_session_binding_meta(Legacy),
+    ?assertEqual(0, maps:get(alias_max, LDec)).
+
+publish_meta_alias_roundtrip_test() ->
+    %% The /6 form appends the alias; the /5 form decodes with alias 0.
+    Meta = indra_brokerlink:encode_publish_meta(<<"sport/tennis">>, 42, 1, true, false, 3),
+    {ok, Dec} = indra_brokerlink:decode_publish_meta(Meta),
+    ?assertEqual(<<"sport/tennis">>, maps:get(topic, Dec)),
+    ?assertEqual(42, maps:get(packet_id, Dec)),
+    ?assertEqual(3, maps:get(alias, Dec)),
+    %% Alias-by-reference: an empty topic with a nonzero alias decodes.
+    Ref = indra_brokerlink:encode_publish_meta(<<>>, 0, 0, false, false, 3),
+    {ok, RDec} = indra_brokerlink:decode_publish_meta(Ref),
+    ?assertEqual(<<>>, maps:get(topic, RDec)),
+    ?assertEqual(3, maps:get(alias, RDec)),
+    %% Legacy metas without the section decode with alias 0.
+    {ok, LDec} = indra_brokerlink:decode_publish_meta(
+                   indra_brokerlink:encode_publish_meta(<<"t">>, 0, 0, false, false)),
+    ?assertEqual(0, maps:get(alias, LDec)),
+    %% An empty topic without an alias stays malformed, and an empty
+    %% topic is rejected at encode time without one.
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<0, 0, 0, 0, 0, 0, 0>>)),
+    ?assertError(badarg,
+                 indra_brokerlink:encode_publish_meta(<<>>, 0, 0, false, false)).
+
+%%====================================================================
 %% Inbound dispatch through the connection registry (Sprint 3)
 %%====================================================================
 

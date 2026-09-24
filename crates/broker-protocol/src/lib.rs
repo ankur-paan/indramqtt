@@ -1,3 +1,7 @@
+/// MQTT 5 topic-alias helpers (B4-05, T-92). The alias tables themselves
+/// live in the kernel session (`broker-session`); the edge only frames bytes.
+pub mod v5;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

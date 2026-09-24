@@ -658,6 +658,241 @@ recv_all(Sock) ->
     {ok, Bin} = gen_tcp:recv(Sock, 0, ?RECV_TIMEOUT),
     Bin.
 
+%% @private CONNECT with a last will (QoS 0, no retain).
+connect_packet_will(ClientId, WillTopic, WillPayload) ->
+    Flags = 16#02 bor 16#04,  %% clean + will
+    Var = <<0, 4, "MQTT", 4, Flags:8, 60:16/big>>,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary,
+                (byte_size(WillTopic)):16/big, WillTopic/binary,
+                (byte_size(WillPayload)):16/big, WillPayload/binary>>,
+    Body = <<Var/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+%% @doc CONNECT carrying a will forwards it in the bind (F1-01).
+connect_forwards_will_in_bind_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5010}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-will">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [Sent] = wait_frames(Mock, 1),
+        ?assertEqual(16#0010, maps:get(opcode, Sent)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-will">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"will/test">>, maps:get(will_topic, Bind)),
+        ?assertEqual(<<"gone">>, maps:get(will_payload, Bind)),
+        ?assertEqual(0, maps:get(will_qos, Bind)),
+        ?assertEqual(false, maps:get(will_retain, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc FX-01: every CONNECT bind carries the peer address and the B4-05
+%% alias section, so the kernel ban check sees the client IP. A real MQTT
+%% client connects over loopback through the edge to the mock kernel; the
+%% test asserts the bind decodes with peer 127.0.0.1, with and without
+%% credentials and with a will.
+connect_bind_carries_peer_and_alias_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5012}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet(<<"dev-peer">>, true, 60)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-peer">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_bind_carries_peer_with_creds_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5013}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_creds(<<"dev-peer-c">>,
+                                                      <<"alice">>, <<"s3cret">>)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"alice">>, maps:get(username, Bind)),
+        ?assertEqual(<<"s3cret">>, maps:get(password, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_bind_carries_peer_with_will_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5014}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-peer-w">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"will/test">>, maps:get(will_topic, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc Ungraceful close (TCP drops without DISCONNECT) reports
+%% DisconnectIn so the kernel publishes the stored will (F1-01).
+ungraceful_close_reports_disconnect_in_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5011}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-gone">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ok = gen_tcp:close(Client),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        [_, Disc] = wait_frames(Mock, 2),
+        ?assertEqual(16#0040, maps:get(opcode, Disc)),
+        ?assertEqual(5011, maps:get(conn_id, Disc)),
+        {ok, DDec} = indra_brokerlink:decode_disconnect_meta(maps:get(meta, Disc)),
+        ?assertEqual(<<"dev-gone">>, maps:get(client_id, DDec))
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%% @doc Clean DISCONNECT sends Unbind only, never a will notice (F1-01:
+%% a clean close suppresses the will).
+clean_disconnect_sends_unbind_only_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5012}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-clean">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(10, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ok = gen_tcp:send(Client, <<16#E0, 16#00>>),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        Frames = wait_frames(Mock, 2),
+        Opcodes = [maps:get(opcode, F) || F <- Frames],
+        ?assertEqual([16#0010, 16#0012], Opcodes)
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%%====================================================================
+%% B4-05 MQTT 5 topic aliases on the socket
+%%====================================================================
+
+%% @private Minimal MQTT 5 CONNECT carrying a Topic Alias Maximum
+%% (property 34). Empty properties encode as a single zero byte.
+connect_packet_v5(ClientId, AliasMax) ->
+    Flags = 16#02,
+    Var = <<0, 4, "MQTT", 5, Flags:8, 60:16/big>>,
+    Props = case AliasMax of
+        0 -> <<0>>;
+        _ -> <<3, 34, AliasMax:16/big>>
+    end,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary>>,
+    Body = <<Var/binary, Props/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+%% @private Minimal MQTT 5 QoS 0 PUBLISH with a Topic Alias (property
+%% 35). Alias 0 means an explicit on-wire alias 0 section.
+publish_packet_v5(Topic, Alias, Payload) ->
+    Props = <<35, Alias:16/big>>,
+    Body = <<(byte_size(Topic)):16/big, Topic/binary,
+             (byte_size(Props)):8, Props/binary,
+             Payload/binary>>,
+    <<16#30, (byte_size(Body)), Body/binary>>.
+
+%% @doc A 3.1.1 socket never sees the v5 property section: even when
+%% the kernel binding carries a nonzero alias maximum, its CONNACK
+%% stays the 4-byte 3.1.1 shape (B4-05 CONNACK-to-3.1.1 defect).
+connack_v4_socket_ignores_binding_maximum_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5020}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet(<<"dev-v4">>, true, 60)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-v4">>, maps:get(client_id, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0, 10),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc An MQTT 5 socket learns the kernel inbound bound through the
+%% CONNACK alias-maximum property (34).
+connack_v5_socket_carries_binding_maximum_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5021}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_v5(<<"dev-v5">>, 10)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-v5">>, maps:get(client_id, Bind)),
+        ?assertEqual(10, maps:get(client_alias_max, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0, 10),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#06, 16#00, 16#00, 16#03, 34, 16#00, 16#0A>>,
+                     recv_exact(Client, 8)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc A v5 PUBLISH carrying an alias reaches the kernel with its
+%% alias section intact (inbound alias path is live from the socket).
+v5_publish_alias_reaches_kernel_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5022}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_v5(<<"dev-pub">>, 10)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0, 10),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        _ = recv_exact(Client, 8),
+        ok = gen_tcp:send(Client, publish_packet_v5(<<"sensors/temp">>, 7, <<"21.5">>)),
+        [_B, Pub] = wait_frames(Mock, 2),
+        ?assertEqual(16#0020, maps:get(opcode, Pub)),
+        {ok, Dec} = indra_brokerlink:decode_publish_meta(maps:get(meta, Pub)),
+        ?assertEqual(<<"sensors/temp">>, maps:get(topic, Dec)),
+        ?assertEqual(7, maps:get(alias, Dec)),
+        ?assertEqual(<<"21.5">>, maps:get(payload, Pub))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
 %%====================================================================
 %% PERF-09 bounded, counted edge ingress
 %%====================================================================

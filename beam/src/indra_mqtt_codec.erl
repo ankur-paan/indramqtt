@@ -13,21 +13,47 @@
          encode_remaining_length/1,
          decode_connect/1,
          encode_connack/2,
+         encode_connack/3,
          connack_return_code/1,
-         decode_subscribe/1,
-         encode_suback/2,
-         decode_publish/2,
-         encode_publish/4,
+          decode_subscribe/1,
+          encode_suback/2,
+          decode_publish/2,
+          decode_publish/3,
+          encode_publish/4,
          encode_publish/6,
+         encode_publish/7,
          encode_puback/1,
          encode_pubrec/1,
+         encode_pubrec/2,
          encode_pubrel/1,
          encode_pubcomp/1,
          packet_type_atom/1,
          packet_type_code/1]).
 
+%% Topic-alias property helpers (B4-05, CONNECT/CONNACK/PUBLISH only).
+%% The edge decodes 3.1.1 plus the MQTT 5 alias properties (34/35) so a
+%% v5 client can negotiate and use aliases on the socket; 3.1.1 clients
+%% keep the previous framing exactly. Table ownership: the kernel session
+%% holds both tables; CONNECT writes the two maxima, PUBLISH writes
+%% inbound entries, delivery writes outbound entries. The helpers below
+%% frame the on-wire property values and are called by the CONNACK and
+%% PUBLISH paths (never test-only).
+-export([encode_alias_maximum/1,
+         decode_alias_maximum/1,
+         encode_topic_alias/1,
+         decode_topic_alias/1,
+         alias_in_range/2]).
+
 -define(MAX_REMAINING, 268435455).
 -define(MAX_TOPIC_LEN, 65535).
+%% Property identifiers (CONNECT/CONNACK/PUBLISH properties).
+-define(ALIAS_MAXIMUM_PROPERTY_ID, 34).
+%% Property identifier for the PUBLISH alias property.
+-define(TOPIC_ALIAS_PROPERTY_ID, 35).
+%% Reason code rejecting an unusable alias.
+-define(REASON_TOPIC_ALIAS_INVALID, 16#94).
+%% Largest alias value the wire format carries (u16, minus 0).
+-define(MAX_TOPIC_ALIAS, 65535).
 
 -type packet_map() :: #{type := 1..14,
                         type_atom := atom(),
@@ -35,7 +61,7 @@
                         remaining_length := non_neg_integer(),
                         payload := binary()}.
 -type connect_map() :: #{protocol_name := binary(),
-                         protocol_level := 4,
+                         protocol_level := 4 | 5,
                          clean_start := boolean(),
                          keepalive := 0..65535,
                          client_id := binary(),
@@ -45,7 +71,10 @@
                          password := binary() | undefined,
                          will_flag := boolean(),
                          will_qos := 0..2,
-                         will_retain := boolean()}.
+                         will_retain := boolean(),
+                         will_topic := binary() | undefined,
+                         will_payload := binary() | undefined,
+                         alias_max := 0..65535}.
 -type subscribe_map() :: #{packet_id := 1..65535,
                            subscriptions := [{binary(), 0..2}]}.
 -type publish_map() :: #{topic := binary(),
@@ -53,6 +82,8 @@
                          qos := 0..2,
                          retain := boolean(),
                          dup := boolean(),
+                         alias := 0..65535,
+                         alias_present := boolean(),
                          payload := binary()}.
 
 %%====================================================================
@@ -122,19 +153,27 @@ decode_remaining_length(Bin) when is_binary(Bin) ->
 encode_remaining_length(N) when is_integer(N), N >= 0, N =< ?MAX_REMAINING ->
     encode_rl(N, <<>>).
 
-%% @doc Decode an MQTT 3.1.1 CONNECT variable header + payload.
+%% @doc Decode an MQTT CONNECT variable header + payload (B4-05: 3.1.1
+%% and MQTT 5).
 %%
 %% Takes the zero-copy {@code payload} slice produced by
 %% {@code decode_packet/1} for a CONNECT packet and extracts the
 %% connection parameters the edge needs for the BrokerLink handshake.
-%% All returned binaries reference the input (no copying).
+%% All returned binaries reference the input (no copying). Level 5
+%% carries a properties section after the keepalive; the Topic Alias
+%% Maximum (property 34) is extracted into {@code alias_max} (the
+%% client's receive limit bounding the kernel outbound table, 0 when
+%% absent). Level 4 has no properties and always reports
+%% {@code alias_max => 0}.
 -spec decode_connect(binary()) -> {ok, connect_map()} | {error, term()}.
 decode_connect(<<NameLen:16/big, Rest/binary>>) ->
     case Rest of
         <<ProtoName:NameLen/binary, Level:8, Flags:8, Keepalive:16/big, Payload/binary>> ->
             case {ProtoName, Level} of
                 {<<"MQTT">>, 4} ->
-                    decode_connect_flags(Flags, Keepalive, Payload);
+                    decode_connect_flags(Flags, Keepalive, Payload, 4, 0);
+                {<<"MQTT">>, 5} ->
+                    decode_connect_v5(Flags, Keepalive, Payload);
                 _ ->
                     {error, {unsupported_protocol, ProtoName, Level}}
             end;
@@ -151,6 +190,30 @@ encode_connack(SessionPresent, ReturnCode)
        is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255 ->
     SP = case SessionPresent of true -> 1; false -> 0 end,
     <<16#20, 16#02, SP:8, ReturnCode:8>>.
+
+%% @doc Encode an MQTT 5 CONNACK carrying the Topic Alias Maximum (B4-05).
+%% MQTT 5 peers only: the caller must gate on the negotiated protocol
+%% level and use {@link encode_connack/2} for 3.1.1 peers (a property
+%% section on a 3.1.1 CONNACK breaks their fixed 4-byte shape).
+%% AliasMax 0 encodes exactly like {@link encode_connack/2} (no
+%% property); a nonzero maximum appends the alias-maximum property
+%% (`34:u8 | value:u16be' framed by {@link encode_alias_maximum/1}) after
+%% a one-byte property length, so a socket client can negotiate aliases.
+%% The kernel inbound bound rides here; the edge calls this from the
+%% session-binding path for level-5 bindings that carry a maximum.
+-spec encode_connack(boolean(), 0..255, 0..65535) -> binary().
+encode_connack(SessionPresent, ReturnCode, 0) ->
+    encode_connack(SessionPresent, ReturnCode);
+encode_connack(SessionPresent, ReturnCode, AliasMax)
+  when is_boolean(SessionPresent),
+       is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255,
+       is_integer(AliasMax), AliasMax >= 1, AliasMax =< ?MAX_TOPIC_ALIAS ->
+    SP = case SessionPresent of true -> 1; false -> 0 end,
+    MaxBin = encode_alias_maximum(AliasMax),
+    Props = <<?ALIAS_MAXIMUM_PROPERTY_ID:8, MaxBin/binary>>,
+    Body = <<SP:8, ReturnCode:8, (byte_size(Props)):8, Props/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#20, RL/binary, Body/binary>>.
 
 %% @doc Map a kernel bind return code to an MQTT 3.1.1 CONNACK return
 %% code. The kernel answers with MQTT 5 reason codes (e.g. 16#86 bad
@@ -201,17 +264,37 @@ encode_suback(PacketId, Codes)
 %%
 %% Flags is the low nibble of the fixed header byte (DUP | QoS(2) |
 %% RETAIN). Returns topic, packet id (0 when QoS 0), flags and the raw
-%% zero-copy application payload.
+%% zero-copy application payload. This is the 3.1.1 form (protocol
+%% level 4): the wire carries no properties, an empty topic is
+%% malformed, and the alias is always reported absent
+%% (`alias => 0, alias_present => false').
 -spec decode_publish(binary(), 0..15) -> {ok, publish_map()} | {error, term()}.
-decode_publish(Payload, Flags)
-  when is_binary(Payload), is_integer(Flags), Flags >= 0, Flags =< 15 ->
+decode_publish(Payload, Flags) ->
+    decode_publish(Payload, Flags, 4).
+
+%% @doc Decode an MQTT PUBLISH payload for the given protocol level
+%% (B4-05: 4 or 5).
+%%
+%% Level 4 behaves exactly like {@link decode_publish/2}. Level 5
+%% parses the MQTT 5 property section (`Remaining | properties |
+%% payload') and extracts the Topic Alias (property 35): absent means
+%% "no alias carried" (`alias => 0, alias_present => false'), while an
+%% explicit on-wire alias 0 (`alias => 0, alias_present => true') is a
+%% protocol error the kernel rejects with DISCONNECT 0x94. An empty
+%% topic is accepted only when the alias property is present
+%% (alias-by-reference); otherwise the topic must be non-empty and
+%% wildcard-free as before.
+-spec decode_publish(binary(), 0..15, 4 | 5) -> {ok, publish_map()} | {error, term()}.
+decode_publish(Payload, Flags, Level)
+  when is_binary(Payload), is_integer(Flags), Flags >= 0, Flags =< 15,
+       (Level =:= 4 orelse Level =:= 5) ->
     Qos = (Flags band 16#06) bsr 1,
     Dup = (Flags band 16#08) =/= 0,
     Retain = (Flags band 16#01) =/= 0,
     case Qos of
         Q when Q > 2 ->
             {error, {invalid_publish_qos, Q}};
-        _ ->
+        _ when Level =:= 4 ->
             case Payload of
                 <<TopicLen:16/big, Rest/binary>> when TopicLen > 0 ->
                     case Rest of
@@ -225,7 +308,9 @@ decode_publish(Payload, Flags)
                     end;
                 _ ->
                     {error, malformed_publish_topic}
-            end
+            end;
+        _ ->
+            decode_publish_v5(Payload, Qos, Dup, Retain)
     end.
 
 has_wildcard(Topic) ->
@@ -258,6 +343,37 @@ encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload)
     RL = encode_remaining_length(byte_size(Body)),
     <<3:4, Flags:4, RL/binary, Body/binary>>.
 
+%% @doc Encode an outgoing MQTT PUBLISH packet with a Topic Alias (B4-05).
+%% Alias 0 encodes exactly like {@link encode_publish/6} (no property, so
+%% 3.1.1 peers see no change); a nonzero alias appends the alias property
+%% (`35:u8 | value:u16be' framed by {@link encode_topic_alias/1}) after a
+%% one-byte property length between the packet id and the payload, so a
+%% socket subscriber can observe the kernel-assigned alias. The caller
+%% must ensure `alias_in_range(Alias, Max)'; 0 means "full topic, no alias".
+-spec encode_publish(binary(), 0..65535, 0..2, boolean(), boolean(), binary(), 0..65535) -> binary().
+encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload, 0) ->
+    encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload);
+encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload, Alias)
+  when is_binary(Topic), byte_size(Topic) >= 1, byte_size(Topic) =< ?MAX_TOPIC_LEN,
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup), is_binary(Payload),
+       is_integer(Alias), Alias >= 1, Alias =< ?MAX_TOPIC_ALIAS ->
+    ok = validate_publish_id(QoS, PacketId),
+    AliasBin = encode_topic_alias(Alias),
+    Props = <<?TOPIC_ALIAS_PROPERTY_ID:8, AliasBin/binary>>,
+    Header = case QoS of
+        0 -> <<(byte_size(Topic)):16/big, Topic/binary, (byte_size(Props)):8, Props/binary>>;
+        _ -> <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big,
+               (byte_size(Props)):8, Props/binary>>
+    end,
+    Body = <<Header/binary, Payload/binary>>,
+    Flags = (case Dup of true -> 16#08; false -> 0 end)
+        bor (QoS bsl 1)
+        bor (case Retain of true -> 16#01; false -> 0 end),
+    RL = encode_remaining_length(byte_size(Body)),
+    <<3:4, Flags:4, RL/binary, Body/binary>>.
+
 %% @doc Encode an MQTT PUBACK packet for a QoS 1 delivery.
 -spec encode_puback(1..65535) -> binary().
 encode_puback(PacketId)
@@ -269,6 +385,18 @@ encode_puback(PacketId)
 encode_pubrec(PacketId)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
     <<16#50, 16#02, PacketId:16/big>>.
+
+%% @doc Encode an MQTT PUBREC packet carrying a reason code (B4-05: 0x94
+%% Topic Alias Invalid on an alias reject). RC 0 encodes exactly like
+%% {@link encode_pubrec/1}; a nonzero RC appends the MQTT 5 reason code
+%% so the publisher observes the rejection instead of a bare PUBREC.
+-spec encode_pubrec(1..65535, 0..255) -> binary().
+encode_pubrec(PacketId, 0) ->
+    encode_pubrec(PacketId);
+encode_pubrec(PacketId, RC)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_integer(RC), RC >= 0, RC =< 255 ->
+    <<16#50, 16#03, PacketId:16/big, RC:8>>.
 
 %% @doc Encode an MQTT PUBREL packet for a QoS 2 exchange (D1-01).
 %% Fixed-header flags are 0010 per MQTT 3.1.1 §3.6.1; there is no DUP bit.
@@ -282,6 +410,40 @@ encode_pubrel(PacketId)
 encode_pubcomp(PacketId)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
     <<16#70, 16#02, PacketId:16/big>>.
+
+%% @doc Encode a Topic Alias Maximum property value (u16, big-endian).
+-spec encode_alias_maximum(0..65535) -> binary().
+encode_alias_maximum(Max)
+  when is_integer(Max), Max >= 0, Max =< ?MAX_TOPIC_ALIAS ->
+    <<Max:16/big>>.
+
+%% @doc Decode a Topic Alias Maximum property value.
+-spec decode_alias_maximum(binary()) -> {ok, 0..65535} | {error, term()}.
+decode_alias_maximum(<<Max:16/big>>) ->
+    {ok, Max};
+decode_alias_maximum(_) ->
+    {error, malformed_alias_maximum}.
+
+%% @doc Encode a PUBLISH Topic Alias property value (u16, big-endian).
+-spec encode_topic_alias(0..65535) -> binary().
+encode_topic_alias(Alias)
+  when is_integer(Alias), Alias >= 0, Alias =< ?MAX_TOPIC_ALIAS ->
+    <<Alias:16/big>>.
+
+%% @doc Decode a PUBLISH Topic Alias property value.
+-spec decode_topic_alias(binary()) -> {ok, 0..65535} | {error, term()}.
+decode_topic_alias(<<Alias:16/big>>) ->
+    {ok, Alias};
+decode_topic_alias(_) ->
+    {error, malformed_topic_alias}.
+
+%% @doc True when Alias may be used under Max (1..=Max, Max > 0).
+-spec alias_in_range(0..65535, 0..65535) -> boolean().
+alias_in_range(0, _) -> false;
+alias_in_range(_, 0) -> false;
+alias_in_range(Alias, Max)
+  when is_integer(Alias), is_integer(Max) ->
+    Alias =< Max.
 
 %% @doc Map a 4-bit packet type code to its atom name.
 -spec packet_type_atom(0..15) -> atom().
@@ -371,11 +533,15 @@ validate_suback_codes([C | Rest]) when C >= 0, C =< 2 -> validate_suback_codes(R
 validate_suback_codes(_) -> erlang:error(badarg).
 
 decode_publish_tail(0, Topic, Dup, Retain, AppPayload) ->
+    %% The 3.1.1 wire carries no alias property, so the edge always
+    %% reports the alias absent here.
     {ok, #{topic => Topic,
            packet_id => 0,
            qos => 0,
            retain => Retain,
            dup => Dup,
+           alias => 0,
+           alias_present => false,
            payload => AppPayload}};
 decode_publish_tail(Qos, Topic, Dup, Retain, Tail) ->
     case Tail of
@@ -385,17 +551,88 @@ decode_publish_tail(Qos, Topic, Dup, Retain, Tail) ->
                    qos => Qos,
                    retain => Retain,
                    dup => Dup,
+                   alias => 0,
+                   alias_present => false,
                    payload => AppPayload}};
         _ ->
             {error, malformed_publish_packet_id}
+    end.
+
+%% @private Decode a level-5 PUBLISH body: topic, packet id, MQTT 5
+%% properties (Topic Alias 35 extracted), then the application payload.
+decode_publish_v5(<<TopicLen:16/big, Rest/binary>>, Qos, Dup, Retain) ->
+    case Rest of
+        <<Topic:TopicLen/binary, Tail/binary>> ->
+            case TopicLen > 0 andalso has_wildcard(Topic) of
+                true ->
+                    {error, invalid_publish_topic};
+                false ->
+                    decode_publish_v5_tail(Qos, Topic, TopicLen, Dup, Retain, Tail)
+            end;
+        _ ->
+            {error, truncated_publish}
+    end;
+decode_publish_v5(_, _, _, _) ->
+    {error, malformed_publish_topic}.
+
+%% @private After the v5 topic: packet id (QoS > 0), then the property
+%% section, then the payload.
+decode_publish_v5_tail(Qos, Topic, TopicLen, Dup, Retain, Tail) ->
+    case Qos of
+        0 ->
+            decode_publish_v5_props(Qos, 0, Topic, TopicLen, Dup, Retain, Tail);
+        _ ->
+            case Tail of
+                <<PacketId:16/big, Rest/binary>> when PacketId =/= 0 ->
+                    decode_publish_v5_props(Qos, PacketId, Topic, TopicLen,
+                                            Dup, Retain, Rest);
+                _ ->
+                    {error, malformed_publish_packet_id}
+            end
+    end.
+
+%% @private Parse the v5 property section and build the publish map.
+decode_publish_v5_props(Qos, PacketId, Topic, TopicLen, Dup, Retain, Tail) ->
+    case decode_varint(Tail) of
+        {ok, PropLen, Rest} ->
+            case byte_size(Rest) < PropLen of
+                true ->
+                    {error, truncated_publish};
+                false ->
+                    <<Props:PropLen/binary, AppPayload/binary>> = Rest,
+                    case parse_publish_alias(Props) of
+                        {ok, Alias, AliasPresent} ->
+                            case TopicLen =:= 0 andalso not AliasPresent of
+                                true ->
+                                    {error, malformed_publish_topic};
+                                false ->
+                                    {ok, #{topic => Topic,
+                                           packet_id => PacketId,
+                                           qos => Qos,
+                                           retain => Retain,
+                                           dup => Dup,
+                                           alias => Alias,
+                                           alias_present => AliasPresent,
+                                           payload => AppPayload}}
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        {error, _} = Err ->
+            Err
     end.
 
 validate_publish_id(0, _) -> ok;
 validate_publish_id(_, PacketId) when PacketId >= 1 -> ok;
 validate_publish_id(_, _) -> erlang:error(badarg).
 
-%% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3.
+%% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3 (shared by v5: the
+%% flag byte is unchanged, only the properties section is new).
 decode_connect_flags(Flags, Keepalive, Payload) ->
+    decode_connect_flags(Flags, Keepalive, Payload, 4, 0).
+
+decode_connect_flags(Flags, Keepalive, Payload, Level, AliasMax) ->
     Username = (Flags band 16#80) =/= 0,
     Password = (Flags band 16#40) =/= 0,
     WillRetain = (Flags band 16#20) =/= 0,
@@ -413,9 +650,9 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
             case skip_connect_string(Payload) of
                 {ok, ClientId, Rest} ->
                     case take_connect_options(Rest, WillFlag, Username, Password) of
-                        {ok, User, Pass} ->
+                        {ok, User, Pass, WillTopic, WillPayload} ->
                             {ok, #{protocol_name => <<"MQTT">>,
-                                   protocol_level => 4,
+                                   protocol_level => Level,
                                    clean_start => CleanStart,
                                    keepalive => Keepalive,
                                    client_id => ClientId,
@@ -425,7 +662,10 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
                                    password => Pass,
                                    will_flag => WillFlag,
                                    will_qos => WillQos,
-                                   will_retain => WillRetain}};
+                                   will_retain => WillRetain,
+                                   will_topic => WillTopic,
+                                   will_payload => WillPayload,
+                                   alias_max => AliasMax}};
                         {error, _} = Err ->
                             Err
                     end;
@@ -433,6 +673,244 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
                     Err
             end
     end.
+
+%% @private Decode a level-5 CONNECT: properties (Topic Alias Maximum
+%% extracted) then the payload with its will-properties section.
+decode_connect_v5(Flags, Keepalive, Payload) ->
+    case decode_varint(Payload) of
+        {ok, PropLen, Rest} ->
+            case byte_size(Rest) < PropLen of
+                true ->
+                    {error, truncated_connect};
+                false ->
+                    <<Props:PropLen/binary, Tail/binary>> = Rest,
+                    case parse_connect_alias_max(Props) of
+                        {ok, AliasMax} ->
+                            decode_connect_v5_tail(Flags, Keepalive, AliasMax, Tail);
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private After the v5 CONNECT properties: client id, will properties
+%% plus will topic/payload when the will flag is set, then credentials.
+decode_connect_v5_tail(Flags, Keepalive, AliasMax, Tail) ->
+    Username = (Flags band 16#80) =/= 0,
+    Password = (Flags band 16#40) =/= 0,
+    WillRetain = (Flags band 16#20) =/= 0,
+    WillQos = (Flags band 16#18) bsr 3,
+    WillFlag = (Flags band 16#04) =/= 0,
+    CleanStart = (Flags band 16#02) =/= 0,
+    Reserved = (Flags band 16#01) =/= 0,
+    Valid = (not Reserved) andalso (WillQos =< 2)
+        andalso (WillFlag orelse ((not WillRetain) andalso WillQos =:= 0))
+        andalso ((not Password) orelse Username),
+    case Valid of
+        false ->
+            {error, {invalid_connect_flags, Flags}};
+        true ->
+            case skip_connect_string(Tail) of
+                {ok, ClientId, Rest} ->
+                    case skip_will_properties(Rest, WillFlag) of
+                        {ok, Rest1} ->
+                            case take_connect_options(Rest1, WillFlag, Username, Password) of
+                                {ok, User, Pass, WillTopic, WillPayload} ->
+                                    {ok, #{protocol_name => <<"MQTT">>,
+                                           protocol_level => 5,
+                                           clean_start => CleanStart,
+                                           keepalive => Keepalive,
+                                           client_id => ClientId,
+                                           username_flag => Username,
+                                           password_flag => Password,
+                                           username => User,
+                                           password => Pass,
+                                           will_flag => WillFlag,
+                                           will_qos => WillQos,
+                                           will_retain => WillRetain,
+                                           will_topic => WillTopic,
+                                           will_payload => WillPayload,
+                                           alias_max => AliasMax}};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end
+    end.
+
+%% @private Skip the will-properties section (present only when the
+%% will flag is set): a variable-byte length followed by that many
+%% property bytes.
+skip_will_properties(Bin, false) ->
+    {ok, Bin};
+skip_will_properties(Bin, true) ->
+    case decode_varint(Bin) of
+        {ok, Len, Rest} ->
+            case byte_size(Rest) < Len of
+                true -> {error, truncated_connect};
+                false ->
+                    <<_:Len/binary, Tail/binary>> = Rest,
+                    {ok, Tail}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private MQTT variable-byte integer (property lengths and ids):
+%% up to 4 bytes, bit 7 is the continuation flag. Inside an already
+%% framed packet a short input is malformed, never "more".
+decode_varint(Bin) when is_binary(Bin) ->
+    decode_varint(Bin, 0, 0).
+
+decode_varint(<<>>, _, _) ->
+    {error, truncated_connect};
+decode_varint(<<Byte:8, Rest/binary>>, Value, Shift) when Shift < 28 ->
+    Value1 = Value + ((Byte band 16#7F) bsl Shift),
+    case Byte band 16#80 of
+        0 ->
+            {ok, Value1, Rest};
+        _ ->
+            decode_varint(Rest, Value1, Shift + 7)
+    end;
+decode_varint(_, _, _) ->
+    {error, malformed_varint}.
+
+%% @private Extract the Topic Alias Maximum (property 34, u16) from a
+%% CONNECT properties block. Absent means 0 (client accepts no
+%% aliases). A duplicate or out-of-range value fails closed.
+parse_connect_alias_max(Props) ->
+    parse_connect_alias_max(Props, undefined).
+
+parse_connect_alias_max(<<>>, undefined) ->
+    {ok, 0};
+parse_connect_alias_max(<<>>, {ok, Max}) ->
+    {ok, Max};
+parse_connect_alias_max(Bin, Seen) ->
+    case decode_varint(Bin) of
+        {ok, 34, Rest} ->
+            case Rest of
+                <<Max:16/big, Tail/binary>> ->
+                    case Seen of
+                        undefined -> parse_connect_alias_max(Tail, {ok, Max});
+                        _ -> {error, malformed_connect_properties}
+                    end;
+                _ ->
+                    {error, truncated_connect}
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} ->
+                    parse_connect_alias_max(Tail, Seen);
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private Extract the Topic Alias (property 35, u16) from a PUBLISH
+%% properties block. Returns `{ok, Alias, Present}': absent means
+%% `{ok, 0, false}', an explicit on-wire 0 means `{ok, 0, true}'
+%% (a protocol error the kernel rejects with DISCONNECT 0x94).
+parse_publish_alias(Props) ->
+    parse_publish_alias(Props, undefined).
+
+parse_publish_alias(<<>>, undefined) ->
+    {ok, 0, false};
+parse_publish_alias(<<>>, {ok, Alias}) ->
+    {ok, Alias, true};
+parse_publish_alias(Bin, Seen) ->
+    case decode_varint(Bin) of
+        {ok, 35, Rest} ->
+            case Rest of
+                <<Alias:16/big, Tail/binary>> ->
+                    case Seen of
+                        undefined -> parse_publish_alias(Tail, {ok, Alias});
+                        _ -> {error, malformed_publish_properties}
+                    end;
+                _ ->
+                    {error, truncated_publish}
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} ->
+                    parse_publish_alias(Tail, Seen);
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            case Err of
+                {error, truncated_connect} -> {error, truncated_publish};
+                _ -> Err
+            end
+    end.
+
+%% @private Skip one property value by its identifier. Lengths follow
+%% MQTT 5.0 §2.2.2: u8, u16, u32, variable-byte integer, UTF-8 string,
+%% binary data, or a string pair (user property 38). Unknown
+%% identifiers fail closed: the edge closes instead of misframing the
+%% properties block. Reason: a skipped length we do not know would
+%% desynchronise the whole packet.
+skip_property(1, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(23, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(25, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(36, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(37, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(40, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(41, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(42, <<_:8, Tail/binary>>) -> {ok, Tail};
+skip_property(19, <<_:16/big, Tail/binary>>) -> {ok, Tail};
+skip_property(33, <<_:16/big, Tail/binary>>) -> {ok, Tail};
+skip_property(34, <<_:16/big, Tail/binary>>) -> {ok, Tail};
+skip_property(35, <<_:16/big, Tail/binary>>) -> {ok, Tail};
+skip_property(2, <<_:32/big, Tail/binary>>) -> {ok, Tail};
+skip_property(17, <<_:32/big, Tail/binary>>) -> {ok, Tail};
+skip_property(39, <<_:32/big, Tail/binary>>) -> {ok, Tail};
+skip_property(11, Bin) ->
+    case decode_varint(Bin) of
+        {ok, _, Tail} -> {ok, Tail};
+        {error, _} = Err -> Err
+    end;
+skip_property(3, Bin) -> skip_utf8(Bin);
+skip_property(8, Bin) -> skip_utf8(Bin);
+skip_property(18, Bin) -> skip_utf8(Bin);
+skip_property(28, Bin) -> skip_utf8(Bin);
+skip_property(9, Bin) -> skip_binary_data(Bin);
+skip_property(29, Bin) -> skip_binary_data(Bin);
+skip_property(38, Bin) ->
+    case skip_utf8(Bin) of
+        {ok, Tail} -> skip_utf8(Tail);
+        {error, _} = Err -> Err
+    end;
+skip_property(Id, _) -> {error, {unknown_property, Id}}.
+
+%% @private Skip one length-prefixed UTF-8 string inside properties.
+skip_utf8(<<Len:16/big, Rest/binary>>) ->
+    case byte_size(Rest) < Len of
+        true -> {error, truncated_publish};
+        false ->
+            <<_:Len/binary, Tail/binary>> = Rest,
+            {ok, Tail}
+    end;
+skip_utf8(_) ->
+    {error, truncated_publish}.
+
+%% @private Skip one length-prefixed binary data value in properties.
+skip_binary_data(<<Len:16/big, Rest/binary>>) ->
+    case byte_size(Rest) < Len of
+        true -> {error, truncated_publish};
+        false ->
+            <<_:Len/binary, Tail/binary>> = Rest,
+            {ok, Tail}
+    end;
+skip_binary_data(_) ->
+    {error, truncated_publish}.
 
 %% @private Skip one length-prefixed UTF-8 string, returning it plus the tail.
 skip_connect_string(<<Len:16/big, Rest/binary>>) ->
@@ -443,23 +921,26 @@ skip_connect_string(<<Len:16/big, Rest/binary>>) ->
 skip_connect_string(_) ->
     {error, truncated_connect}.
 
-%% @private Take optional CONNECT fields, capturing username/password
-%% values (will topic/message stay opaque to the edge). Username and
-%% password come back as `undefined` when their flags are clear.
+%% @private Take optional CONNECT fields, capturing the will topic and
+%% message when the will flag is set (forwarded to the kernel in the
+%% bind; the kernel owns the session and the publish decision) plus
+%% username/password values. Username and password come back as
+%% `undefined' when their flags are clear; will topic and payload come
+%% back as `undefined' when the will flag is clear.
 take_connect_options(Rest, false, false, false) ->
     case Rest of
-        <<>> -> {ok, undefined, undefined};
+        <<>> -> {ok, undefined, undefined, undefined, undefined};
         _ -> {error, trailing_connect_bytes}
     end;
 take_connect_options(Rest, WillFlag, Username, Password) ->
     case take_optional_string(Rest, WillFlag) of
-        {ok, _, Rest1} ->
+        {ok, WillTopic, Rest1} ->
             case take_optional_string(Rest1, WillFlag) of
-                {ok, _, Rest2} ->
+                {ok, WillPayload, Rest2} ->
                     case take_optional_string(Rest2, Username) of
                         {ok, User, Rest3} ->
                             case take_optional_string(Rest3, Password) of
-                                {ok, Pass, <<>>} -> {ok, User, Pass};
+                                {ok, Pass, <<>>} -> {ok, User, Pass, WillTopic, WillPayload};
                                 {ok, _, _} -> {error, trailing_connect_bytes};
                                 Err -> Err
                             end;

@@ -107,13 +107,15 @@ pub struct ApiState {
     /// snapshot clone and never touch the per-message path.
     pub slow_subs_settings: Arc<crate::v5::slow_subscriptions::SlowSubsSettingsStore>,
     /// Packet-tracing flag for `GET/PUT /api/v5/tracing` (W1-32):
-    /// single atomic bool. Management-plane only; never touched on the
-    /// per-message path.
+    /// single atomic bool. Session lifecycle raises it while a session
+    /// exists and lowers it when none remains; the kernel publish event
+    /// reads it first as its cheap off-state check (F1-04, T-74).
     pub tracing: Arc<crate::v5::tracing::TracingFlagStore>,
     /// Trace-session registry for `GET/POST/DELETE /api/v5/trace` (W1-33)
     /// plus `DELETE /api/v5/trace/{name}` (W1-34):
-    /// bounded map of capture sessions. Management-plane only; never
-    /// touched on the per-message path.
+    /// bounded map of capture sessions. Reads and writes are
+    /// management-plane only; the kernel publish event appends through
+    /// `TraceStore::capture_publish` (F1-04, T-74).
     pub traces: Arc<crate::v5::trace::TraceStore>,
     /// Auto-subscribe list for `GET/PUT /api/v5/mqtt/auto_subscribe`
     /// (W1-39): bounded validated list plus the connect-time hook. The
@@ -124,6 +126,32 @@ pub struct ApiState {
     /// stored token and trusted signing set. Management-plane only; never
     /// touched on the per-message path.
     pub licence: Arc<crate::licence::LicenceStore>,
+    /// Ordered authenticator chain for `GET/POST /api/v5/authentication`
+    /// (W2-02): bounded ordered list plus the CONNECT-time consult. The
+    /// routes read one bounded snapshot per request; the kernel CONNECT
+    /// path loads one lock-free snapshot per connect
+    /// (`crates/broker-node/src/main.rs`, CONNECT handling) and never
+    /// takes the chain write lock; publish and deliver never touch it.
+    pub authn_chain: Arc<broker_auth::AuthnChain>,
+    /// Node authentication cache for `GET
+    /// /api/v5/authentication/node_cache/status` and `POST
+    /// /api/v5/authentication/node_cache/reset` (W2-03): bounded
+    /// per-username record of successful credentialed CONNECTs. The
+    /// routes read one bounded snapshot per request; the kernel CONNECT
+    /// path records one entry per success
+    /// (`crates/broker-node/src/main.rs`, CONNECT handling, plus the
+    /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
+    /// deliver never touch it.
+    pub authn_node_cache: Arc<broker_auth::NodeAuthCache>,
+    /// Global authentication settings for `GET/PUT
+    /// /api/v5/authentication/settings` (W2-05): single validated struct
+    /// with registry persistence plus a lock-free CONNECT snapshot. The
+    /// routes read one snapshot per request; the kernel CONNECT path
+    /// loads one lock-free snapshot per connect
+    /// (`crates/broker-node/src/main.rs`, CONNECT handling, plus the
+    /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
+    /// deliver never touch it.
+    pub authn_settings: Arc<crate::v5::authn_settings::AuthnSettingsStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -156,12 +184,45 @@ impl ApiState {
         if let Err(error) = engine.seed_from_registry(&config) {
             panic!("invalid stored rules snapshot: {error}");
         }
+        // Rule spill accounting (B4-07): mirror the shared engine's
+        // ingress spill counters into these metrics. First attach wins,
+        // so a kernel-shared engine keeps the kernel's mirror while
+        // standalone engines report here; memory-only inputs only ever
+        // count refusals.
+        engine.set_metrics(&metrics);
         // Boot replay (W0-23): merge the persisted connectors into the
         // v5 store and re-register every live sink through the same path
         // `create_connector` uses. An empty snapshot is a no-op (today's
         // empty behaviour); an invalid snapshot fails boot loudly
         // instead of being skipped silently.
         crate::v5::rules::seed_connectors_from_registry(&config, &engine);
+        // Boot seeding (W2-02): route the loaded authenticator chain into
+        // a shared chain instance so management reads and the CONNECT
+        // consult observe the same order without a restart. An empty
+        // snapshot is a no-op (today's empty behaviour).
+        let authn_chain = Arc::new(broker_auth::AuthnChain::from_registry(&config));
+        // Boot seeding (W2-03): route the loaded node-cache config into
+        // a shared cache instance so management reads and the CONNECT
+        // recorder observe the same enabled flag and cap without a
+        // restart. Cached entries always start empty (memory-only).
+        let authn_node_cache = Arc::new(broker_auth::NodeAuthCache::from_registry(&config));
+        // Boot seeding (W2-05): route the loaded authentication
+        // settings into a shared store so management reads and the
+        // CONNECT consult observe the same snapshot without a restart.
+        // The subscriber keeps the node cache's enabled flag and cap in
+        // sync with the settings' cache half on every validated replace.
+        let authn_settings = Arc::new(broker_auth::AuthnSettingsStore::from_registry(&config));
+        {
+            let cache = Arc::clone(&authn_node_cache);
+            authn_settings.set_subscriber(Arc::new(
+                move |next: &broker_config::AuthnSettingsConf| {
+                    cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+            let current = authn_settings.get();
+            authn_node_cache
+                .apply_settings(current.node_cache.enable, current.node_cache.max_count);
+        }
         Self {
             engine,
             sessions,
@@ -189,6 +250,9 @@ impl ApiState {
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
+            authn_chain,
+            authn_node_cache,
+            authn_settings,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -201,6 +265,19 @@ impl ApiState {
     pub fn standalone(engine: Arc<RuleEngine>) -> Self {
         let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
         drop(edge_rx);
+        // Standalone settings store shares its subscriber with the very
+        // node-cache instance below, so validated replaces keep the
+        // cache's enabled flag and cap in sync without a restart.
+        let authn_node_cache = Arc::new(broker_auth::NodeAuthCache::new());
+        let authn_settings = Arc::new(broker_auth::AuthnSettingsStore::new());
+        {
+            let cache = Arc::clone(&authn_node_cache);
+            authn_settings.set_subscriber(Arc::new(
+                move |next: &broker_config::AuthnSettingsConf| {
+                    cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+        }
         Self {
             engine,
             sessions: Arc::new(SessionManager::new()),
@@ -228,6 +305,9 @@ impl ApiState {
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
+            authn_chain: Arc::new(broker_auth::AuthnChain::new()),
+            authn_node_cache,
+            authn_settings,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -1669,6 +1749,7 @@ async fn get_metrics(State(state): State<ApiState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use broker_auth::Authenticator;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1691,6 +1772,7 @@ mod tests {
     struct TestState {
         engine: Arc<RuleEngine>,
         sessions: Arc<SessionManager>,
+        router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
@@ -1720,7 +1802,7 @@ mod tests {
             let api_state = ApiState::new(
                 engine.clone(),
                 sessions.clone(),
-                sub_router,
+                sub_router.clone(),
                 metrics.clone(),
                 auth.clone(),
                 conns.clone(),
@@ -1731,6 +1813,7 @@ mod tests {
             let state = TestState {
                 engine: engine.clone(),
                 sessions: sessions.clone(),
+                router: sub_router.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
                 admin_users: api_state.admin_users.clone(),
@@ -2947,6 +3030,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             payload: bytes::Bytes::from_static(b"hello"),
+            enqueued_at: std::time::Instant::now(),
         }));
 
         let (status, body) = server
@@ -2986,6 +3070,7 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 retain: false,
                 payload: bytes::Bytes::from_static(b"x"),
+                enqueued_at: std::time::Instant::now(),
             }));
         }
 
@@ -3097,6 +3182,120 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["data"].as_array().expect("data").len(), 1);
         assert_eq!(body["meta"]["hasnext"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn client_authz_cache_read_clear_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Connect through the broker: the console CONNECT creates the
+        // session, so the cache starts life empty. An empty cache reads
+        // as an empty list.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-1", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // Populate through normal authorized activity through the broker:
+        // a console SUBSCRIBE (real subscribe authorization) plus a
+        // console PUBLISH from a second connection (real publish
+        // authorization) that delivers to the subscriber.
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/1", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let mut publisher = WsClient::connect(server.port).await;
+        publisher
+            .send_bin(&mqtt_connect("w2-01-cache-2", None, None))
+            .await;
+        let connack = publisher.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        publisher
+            .send_bin(&mqtt_publish("conf/authz/1", 0, 0, b"hi"))
+            .await;
+        // Deliver proves the publish rode the broker route path.
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+
+        // Read-hit shape: each decision present with per-entry fields.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        let subscribe = entries
+            .iter()
+            .find(|e| e["topic"] == json!("conf/authz/1"))
+            .expect("subscribe decision present");
+        assert_eq!(subscribe["access"]["action_type"], json!("subscribe"));
+        assert_eq!(subscribe["result"], json!("allow"));
+        assert!(subscribe["updated_time"].is_number());
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        let publish = entries
+            .iter()
+            .find(|e| e["topic"] == json!("conf/authz/1"))
+            .expect("publish decision present");
+        assert_eq!(publish["access"]["action_type"], json!("publish"));
+        assert_eq!(publish["result"], json!("allow"));
+        assert!(publish["updated_time"].is_number());
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-1/authorization/cache?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("list").len(), 1);
+
+        // Clear evicts; the next read is empty. Clearing again still
+        // succeeds (204).
+        let (status, _) = server
+            .delete_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, _) = server
+            .delete_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // Unknown client ids are 404 with the documented error shape.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/no-such-client/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .delete_auth("/api/v5/clients/no-such-client/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
     }
 
     #[tokio::test]
@@ -4415,7 +4614,6 @@ mod tests {
         let token = server.login_as_admin().await;
 
         for (method, path) in [
-            ("GET", "/api/v5/authentication"),
             ("GET", "/api/v5/authentication/x"),
             ("GET", "/api/v5/authorization/sources"),
             ("GET", "/api/v5/authorization/settings"),
@@ -4428,6 +4626,781 @@ mod tests {
                 .await;
             assert_eq!(status, 404, "{method} {path} must be gone");
         }
+    }
+
+    #[tokio::test]
+    async fn authn_chain_list_create_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty chain reads as an empty collection, not an error.
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Create one built-in entry.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["id"], json!("password_based:built_in_database"));
+        assert_eq!(created["mechanism"], json!("password_based"));
+        assert_eq!(created["backend"], json!("built_in_database"));
+        assert_eq!(created["enable"], json!(true));
+        // No invented fields: exactly the documented slot fields.
+        let obj = created.as_object().expect("entry is an object");
+        for key in obj.keys() {
+            assert!(
+                ["id", "mechanism", "backend", "enable", "config"].contains(&key.as_str()),
+                "unexpected field {key} in chain entry"
+            );
+        }
+
+        // List again: the entry is present in order.
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], json!("password_based:built_in_database"));
+        assert_eq!(body["meta"]["count"], json!(1));
+
+        // Re-creating the same id is a clean duplicate rejection, never
+        // a silent overwrite.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert!(body["message"].is_string());
+
+        // Malformed bodies are client errors with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+
+        // Unknown backends are rejected, never stored.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "nope"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Second entry keeps insertion order; paging slices after filtering.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication?page=2&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(body["meta"]["page"], json!(2));
+        assert_eq!(body["meta"]["limit"], json!(1));
+        assert_eq!(body["meta"]["count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn authn_chain_drives_connect_and_survives_restart() {
+        // Broker consult through the console CONNECT path: an empty chain
+        // preserves today's open behaviour, while a chain with no live
+        // backend fails closed without creating a session.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let mut anon = WsClient::connect(server.port).await;
+        anon.send_bin(&mqtt_connect("w2-02-open", None, None)).await;
+        let connack = anon.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let mut refused = WsClient::connect(server.port).await;
+        refused
+            .send_bin(&mqtt_connect("w2-02-closed", None, None))
+            .await;
+        let connack = refused.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0x86);
+
+        // Restart persistence through the config registry: the chain
+        // survives a rebuild from the same data dir.
+        let dir = unique_data_dir("authn-chain");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted too, so the rebooted node logs in
+        // with the changed password (`login_as_admin` only fits fresh
+        // servers still on the default password).
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], json!("password_based:built_in_database"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn authn_chain_order_replace_round_trip_and_rejects_unknown() {
+        // Order-replace through the broker: create two entries, set an
+        // explicit order, list expecting the new order; an unknown id
+        // and a partial list are rejected with no change applied.
+        // Management-plane only; publish and deliver never touch this
+        // store, and the CONNECT path keeps reading its lock-free
+        // snapshot.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Explicit order applies: mysql first.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+
+        // Unknown ids are rejected with the documented shape and apply
+        // nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([
+                    {"id": "password_based:mysql"},
+                    {"id": "password_based:built_in_database"},
+                    {"id": "password_based:nowhere"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+
+        // Partial lists are rejected with no change applied.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+
+        // Malformed bodies are client errors with the documented shape.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"not-id": "password_based:mysql"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Order persists across a restart through the config registry.
+        let dir = unique_data_dir("authn-order");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn authn_entry_read_update_delete_round_trip() {
+        // Per-id read/update/delete through the broker management plane
+        // on the real chain store: create two entries, read one back,
+        // update with a valid body and read again, delete then read 404,
+        // delete unknown 404, invalid updates rejected without applying,
+        // deleting the last entry refused, and delete-then-recreate of
+        // the same id works. Management-plane only; the CONNECT path
+        // keeps reading its lock-free snapshot and publish/deliver never
+        // touch this store.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Read one entry by id; the shape carries only the stored slot
+        // fields, never invented measurements.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+        assert_eq!(body["mechanism"], json!("password_based"));
+        assert_eq!(body["backend"], json!("mysql"));
+        assert_eq!(body["enable"], json!(true));
+        let obj = body.as_object().expect("entry is an object");
+        for key in obj.keys() {
+            assert!(
+                ["id", "mechanism", "backend", "enable", "config"].contains(&key.as_str()),
+                "unexpected field {key} in chain entry"
+            );
+        }
+
+        // Unknown ids miss with the documented shape.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:nowhere", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Valid update replaces and reads back.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:mysql",
+                json!({"enable": false, "config": {"pool_size": 4}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["config"], json!({"pool_size": 4}));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["config"], json!({"pool_size": 4}));
+
+        // Invalid updates are client errors and apply nothing.
+        for bad in [
+            json!({"backend": "nope"}),
+            json!({"mechanism": "nope"}),
+            json!({"enable": "yes"}),
+            json!({"config": "yes"}),
+            json!({"id": "password_based:other"}),
+            json!([1, 2]),
+        ] {
+            let (status, body) = server
+                .put_auth("/api/v5/authentication/password_based:mysql", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        // Unknown ids fail updates with 404 even for valid bodies.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:nowhere",
+                json!({"enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["backend"], json!("mysql"));
+        assert_eq!(body["enable"], json!(false));
+
+        // Delete removes and reports; the deleted id reads 404 after.
+        let (status, _) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Deleting an unknown id is 404.
+        let (status, body) = server
+            .delete_auth("/api/v5/authentication/password_based:nowhere", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Deleting then re-creating the same id works (no tombstone).
+        let (status, recreated) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(recreated["id"], json!("password_based:mysql"));
+
+        // Deleting the last remaining entry is refused instead of
+        // leaving authentication open.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authentication/password_based:built_in_database",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+    }
+
+    #[tokio::test]
+    async fn authn_entry_update_delete_persist_across_restart() {
+        // Per-id update/delete persist through the config registry: a
+        // validated update and a removal survive a rebuild from the same
+        // data dir. Management-plane only; publish and deliver never
+        // touch this store.
+        let dir = unique_data_dir("authn-entry");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:mysql",
+                json!({"enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:built_in_database"));
+        let (status, _) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 404);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn authn_node_cache_status_reset_round_trip() {
+        // Status over real state plus a reset that actually evicts:
+        // read the documented fields, populate the cache through
+        // authentications through the broker, reset, then read an empty
+        // cache. Management-plane only; publish and deliver never touch
+        // the store.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state
+            .auth
+            .add_user("w2-03-user", b"W2-03-pass!")
+            .expect("test user persists");
+
+        // Empty cache reads as size zero, never an error.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["count"], json!(0));
+        assert!(body["max_size"].is_number());
+        assert!(body["max_count"].is_number());
+
+        // Populate through a real credentialed CONNECT through the
+        // broker (console path authenticates against the same store).
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect(
+                "w2-03-cache-1",
+                Some("w2-03-user"),
+                Some(b"W2-03-pass!"),
+            ))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["size"], json!(1));
+        assert_eq!(body["count"], json!(1));
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/node_cache/status?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["size"], json!(1));
+
+        // Reset evicts; the next read is empty. Resetting again still
+        // succeeds (204).
+        let (status, _) = server
+            .post_auth("/api/v5/authentication/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["count"], json!(0));
+        let (status, _) = server
+            .post_auth("/api/v5/authentication/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn authn_settings_replace_round_trip_drives_connect_and_survives_restart() {
+        // Settings round trip through the broker: GET defaults, PUT a
+        // full valid update, GET expecting the update; a console CONNECT
+        // still succeeds (the settings consult never breaks the open
+        // broker) and a subscribe/publish/deliver flow proves publish
+        // and deliver never touch this store. An invalid PUT is rejected
+        // with no change; the node-cache subscriber keeps the status cap
+        // in sync. Settings persist across a restart via the registry.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Defaults read back with the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(false));
+        assert_eq!(body["node_cache"]["enable"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(10000));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("1h"));
+
+        // Full valid replace through the broker.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({
+                    "ignore_backend_failures": true,
+                    "node_cache": {
+                        "enable": true,
+                        "cache_ttl": "30s",
+                        "cleanup_interval": "1m",
+                        "stat_update_interval": "5s",
+                        "max_count": 5000,
+                        "max_memory": "100MB",
+                    },
+                    "builtin_record_count_refresh_interval": "30m",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+        assert_eq!(body["node_cache"]["cache_ttl"], json!("30s"));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("30m"));
+
+        // The subscriber keeps the node-cache status cap in sync with
+        // the settings' cache half without a restart.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["max_count"], json!(5000));
+
+        // The CONNECT consult never breaks the open broker: a console
+        // CONNECT still succeeds, and a subscribe/publish/deliver flow
+        // proves publish and deliver never touch this store.
+        let mut sub = WsClient::connect(server.port).await;
+        sub.send_bin(&mqtt_connect("w2-05-sub", None, None)).await;
+        let connack = sub.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        sub.send_bin(&mqtt_subscribe(7, &[("w2-05/t", 1)])).await;
+        let suback = sub.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        let mut publ = WsClient::connect(server.port).await;
+        publ.send_bin(&mqtt_connect("w2-05-pub", None, None)).await;
+        let connack = publ.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        publ.send_bin(&mqtt_publish("w2-05/t", 42, 1, b"hi-w2-05"))
+            .await;
+        let puback = publ.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let delivery = sub.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        assert!(delivery.ends_with(b"hi-w2-05"));
+
+        // Unknown fields are rejected fail-closed with no change applied.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"ignore_backend_failures": true, "bogus": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"node_cache": {"max_count": 0}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+
+        // Partial bodies replace: missing fields reset to defaults.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"ignore_backend_failures": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(false));
+        assert_eq!(body["node_cache"]["max_count"], json!(10000));
+
+        // Persistence across a restart through the config registry.
+        let dir = unique_data_dir("authn-settings");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({
+                    "ignore_backend_failures": true,
+                    "node_cache": {
+                        "enable": true,
+                        "cache_ttl": "30s",
+                        "cleanup_interval": "1m",
+                        "stat_update_interval": "5s",
+                        "max_count": 5000,
+                        "max_memory": "100MB",
+                    },
+                    "builtin_record_count_refresh_interval": "30m",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("30m"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -6918,6 +7891,70 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn test_ws_subscribe_quota_denied_with_0x97() {
+        // B4-08 bound: a full subscription table denies the console
+        // subscribe fail closed with 0x97 Quota Exceeded and changes no
+        // session state. Fills the shared router to MAX_SUBSCRIPTIONS
+        // with three-level filters so each path copy stays small.
+        let (server, state) = TestServer::start().await;
+        for i in 0..broker_router::MAX_SUBSCRIPTIONS {
+            let a = i / 10_000;
+            let b = (i / 100) % 100;
+            let c = i % 100;
+            let filter = broker_protocol::TopicFilter::new(format!("quota/fill/{a}/{b:02}/{c:02}"))
+                .expect("valid fill filter");
+            assert!(
+                state.router.subscribe(
+                    &filter,
+                    broker_router::Subscription::new(
+                        format!("fill-{i}"),
+                        i as u64,
+                        broker_protocol::QoS::AtMostOnce
+                    )
+                ),
+                "fill subscribe {i} must succeed"
+            );
+        }
+
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("console-q", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+
+        client
+            .send_bin(&mqtt_subscribe(9, &[("quota/probe", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(
+            &suback[4..],
+            &[0x97],
+            "quota denial must yield 0x97, not success"
+        );
+
+        // The failed subscribe registers nothing: no session mirror, no
+        // router entry.
+        let session = state.sessions.get("console-q").expect("session row");
+        assert!(
+            session
+                .subscriptions
+                .read()
+                .keys()
+                .all(|f| f.as_str() != "quota/probe"),
+            "quota-denied subscribe must leave the session unchanged"
+        );
+        assert!(
+            state
+                .router
+                .matches(&broker_protocol::Topic::new("quota/probe").expect("valid probe topic"))
+                .is_empty(),
+            "quota-denied subscribe must leave the router unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn removed_gateway_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -7185,6 +8222,245 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let data = body["data"].as_array().expect("data is a list");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0], json!({"user_id": "mqtt-alice"}));
+    }
+
+    #[tokio::test]
+    async fn authn_import_users_batch_round_trip_rejects_bad_and_duplicate() {
+        // W2-07 failing test: import two users to a fresh authenticator,
+        // list expecting both; re-import one duplicate expecting clean
+        // rejection with the store intact. Before: 404 (no route).
+        // Management-plane only: the import locks only the user map
+        // (`crates/broker-auth/src/lib.rs`, `MemoryAuth::import_users`);
+        // the broker event driving it is the management POST, and CONNECT
+        // consults the same map
+        // (`crates/broker-node/src/main.rs`, CONNECT handling).
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-a", "password": "Imp0rt-a!"},
+                    {"user_id": "w2-07-b", "password": "Imp0rt-b!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["success"], json!(2));
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(data.contains(&json!({"user_id": "w2-07-a"})));
+        assert!(data.contains(&json!({"user_id": "w2-07-b"})));
+
+        // The imported credentials authenticate through the broker state:
+        // `MemoryAuth::authenticate` accepts the new password and refuses
+        // a wrong one (the same call the kernel CONNECT path makes).
+        assert!(state
+            .auth
+            .authenticate("w2-07-c1", Some("w2-07-a"), Some(b"Imp0rt-a!"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate("w2-07-c1", Some("w2-07-a"), Some(b"wrong"))
+            .await
+            .is_err());
+
+        // Re-import with one duplicate: clean rejection, store intact.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-b", "password": "Imp0rt-b!"},
+                    {"user_id": "w2-07-c", "password": "Imp0rt-c!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert!(!data.contains(&json!({"user_id": "w2-07-c"})));
+
+        // Duplicate within the batch is rejected the same way.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-d", "password": "Imp0rt-d!"},
+                    {"user_id": "w2-07-d", "password": "Imp0rt-d!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Malformed batches are client errors with the documented shape
+        // and apply nothing.
+        for bad in [
+            json!([]),
+            json!([{"user_id": "w2-07-e"}]),
+            json!([{"user_id": "", "password": "Imp0rt-e!"}]),
+            json!([{"user_id": "w2-07-e", "password": ""}]),
+            json!({"not-users": []}),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/authentication/password_based:built_in_database/import_users",
+                    bad,
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+
+        // Unknown authenticator ids are 404 with the documented code,
+        // not an empty body.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:nowhere/import_users",
+                json!([{"user_id": "w2-07-x", "password": "Imp0rt-x!"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Non-built-in backends cannot be imported into the built-in map.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:mysql/import_users",
+                json!([{"user_id": "w2-07-y", "password": "Imp0rt-y!"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn authn_imported_users_connect_and_persist() {
+        // Imported users persist across a restart and authenticate a real
+        // broker CONNECT through the console path (connect, not only the
+        // store): the imported credential gets CONNACK 0 over the live
+        // WebSocket console, a wrong password does not.
+        let dir = unique_data_dir("authn-import");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-persist", "password": "Persist1!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let mut ok = WsClient::connect(server.port).await;
+        ok.send_bin(&mqtt_connect(
+            "w2-07-persist-ok",
+            Some("w2-07-persist"),
+            Some(b"Persist1!"),
+        ))
+        .await;
+        let connack = ok.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        drop(ok);
+
+        let mut bad = WsClient::connect(server.port).await;
+        bad.send_bin(&mqtt_connect(
+            "w2-07-persist-bad",
+            Some("w2-07-persist"),
+            Some(b"wrong"),
+        ))
+        .await;
+        let connack = bad.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_ne!(connack[3], 0);
+        drop(bad);
+        drop(server);
+        drop(registry);
+
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(data.contains(&json!({"user_id": "w2-07-persist"})));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

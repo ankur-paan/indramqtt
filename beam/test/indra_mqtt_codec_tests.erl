@@ -229,7 +229,17 @@ decode_connect_persistent_with_auth_and_will_test() ->    %% Flags C0 (username+
     ?assertEqual(true, maps:get(password_flag, Conn)),
     ?assertEqual(true, maps:get(will_flag, Conn)),
     ?assertEqual(1, maps:get(will_qos, Conn)),
-    ?assertEqual(false, maps:get(will_retain, Conn)).
+    ?assertEqual(false, maps:get(will_retain, Conn)),
+    %% F1-01: the will topic and message are captured for the bind.
+    ?assertEqual(<<"wt">>, maps:get(will_topic, Conn)),
+    ?assertEqual(<<"wm">>, maps:get(will_payload, Conn)).
+
+decode_connect_no_will_has_no_will_strings_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(false, maps:get(will_flag, Conn)),
+    ?assertEqual(undefined, maps:get(will_topic, Conn)),
+    ?assertEqual(undefined, maps:get(will_payload, Conn)).
 
 decode_connect_captures_username_password_test() ->
     %% Flags C0 (username+password) | 02 (clean): 0xC2.
@@ -250,16 +260,39 @@ decode_connect_anonymous_has_no_credentials_test() ->
     ?assertEqual(undefined, maps:get(password, Conn)).
 
 decode_connect_unsupported_protocol_test() ->
-    %% Level 5 (MQTT 5.0) is outside the 3.1.1 edge scope.
-    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
-    Body = <<Var/binary, 0, 1, "a">>,
-    ?assertEqual({error, {unsupported_protocol, <<"MQTT">>, 5}},
-                 indra_mqtt_codec:decode_connect(Body)),
-    %% Legacy MQIsdp name rejected as well.
+    %% Legacy MQIsdp name rejected, as is an unknown level.
     Var3 = <<0, 6, "MQIsdp", 3, 16#02, 0, 60>>,
     Body3 = <<Var3/binary, 0, 1, "a">>,
     ?assertEqual({error, {unsupported_protocol, <<"MQIsdp">>, 3}},
-                 indra_mqtt_codec:decode_connect(Body3)).
+                 indra_mqtt_codec:decode_connect(Body3)),
+    Var6 = <<0, 4, "MQTT", 6, 16#02, 0, 60>>,
+    Body6 = <<Var6/binary, 0, 1, "a">>,
+    ?assertEqual({error, {unsupported_protocol, <<"MQTT">>, 6}},
+                 indra_mqtt_codec:decode_connect(Body6)).
+
+decode_connect_v5_minimal_test() ->
+    %% Level 5 with empty properties decodes like 3.1.1 plus the
+    %% level and a zero alias maximum (B4-05).
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    Body = <<Var/binary, 0, 0, 1, "a">>,
+    {ok, Conn} = indra_mqtt_codec:decode_connect(Body),
+    ?assertEqual(5, maps:get(protocol_level, Conn)),
+    ?assertEqual(<<"a">>, maps:get(client_id, Conn)),
+    ?assertEqual(0, maps:get(alias_max, Conn)).
+
+decode_connect_v5_alias_maximum_test() ->
+    %% Level 5 carrying Topic Alias Maximum (property 34 = 10).
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    Body = <<Var/binary, 3, 34, 0, 10, 0, 1, "a">>,
+    {ok, Conn} = indra_mqtt_codec:decode_connect(Body),
+    ?assertEqual(5, maps:get(protocol_level, Conn)),
+    ?assertEqual(10, maps:get(alias_max, Conn)).
+
+decode_connect_v4_reports_zero_alias_max_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(4, maps:get(protocol_level, Conn)),
+    ?assertEqual(0, maps:get(alias_max, Conn)).
 
 decode_connect_reserved_flag_rejected_test() ->
     ?assertEqual({error, {invalid_connect_flags, 16#03}},
@@ -502,3 +535,76 @@ connack_return_code_maps_kernel_reason_codes_test() ->
     ?assertEqual(4, indra_mqtt_codec:connack_return_code(16#86)),
     ?assertEqual(5, indra_mqtt_codec:connack_return_code(16#87)),
     ?assertEqual(3, indra_mqtt_codec:connack_return_code(16#8B)).
+
+alias_property_helpers_roundtrip_test() ->
+    %% Topic Alias Maximum property values round-trip (B4-05).
+    lists:foreach(fun(Max) ->
+                          ?assertEqual({ok, Max},
+                                       indra_mqtt_codec:decode_alias_maximum(
+                                         indra_mqtt_codec:encode_alias_maximum(Max)))
+                  end, [0, 1, 10, 65535]),
+    ?assertEqual({error, malformed_alias_maximum},
+                 indra_mqtt_codec:decode_alias_maximum(<<0>>)),
+    %% Topic Alias property values round-trip.
+    lists:foreach(fun(Alias) ->
+                          ?assertEqual({ok, Alias},
+                                       indra_mqtt_codec:decode_topic_alias(
+                                         indra_mqtt_codec:encode_topic_alias(Alias)))
+                  end, [0, 1, 7, 65535]),
+    ?assertEqual({error, malformed_topic_alias},
+                 indra_mqtt_codec:decode_topic_alias(<<>>)).
+
+alias_in_range_rejects_zero_and_over_max_test() ->
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(0, 10)),
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(1, 0)),
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(11, 10)),
+    ?assertEqual(true, indra_mqtt_codec:alias_in_range(1, 10)),
+    ?assertEqual(true, indra_mqtt_codec:alias_in_range(10, 10)).
+
+decode_publish_reports_zero_alias_test() ->
+    %% The 3.1.1 wire carries no alias property, so the edge always
+    %% reports the alias absent (B4-05).
+    Body = <<0, 1, "t", "hi">>,
+    Bin = <<16#30, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                maps:get(flags, Pkt)),
+    ?assertEqual(0, maps:get(alias, Pub)),
+    ?assertEqual(false, maps:get(alias_present, Pub)).
+
+decode_publish_v5_alias_property_test() ->
+    %% Level 5 QoS 0: topic "t" plus Topic Alias 7 (property 35).
+    %% Properties block is <<3, 35, 0, 7>> (length 3, id 35, value 7).
+    Body = <<0, 1, "t", 3, 35, 0, 7, "hi">>,
+    {ok, Pub} = indra_mqtt_codec:decode_publish(Body, 0, 5),
+    ?assertEqual(<<"t">>, maps:get(topic, Pub)),
+    ?assertEqual(7, maps:get(alias, Pub)),
+    ?assertEqual(true, maps:get(alias_present, Pub)),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
+
+decode_publish_v5_empty_topic_alias_reference_test() ->
+    %% Level 5 alias-by-reference: empty topic with alias 7 resolves
+    %% downstream; the payload still arrives intact.
+    Body = <<0, 0, 3, 35, 0, 7, "hi">>,
+    {ok, Pub} = indra_mqtt_codec:decode_publish(Body, 0, 5),
+    ?assertEqual(<<>>, maps:get(topic, Pub)),
+    ?assertEqual(7, maps:get(alias, Pub)),
+    ?assertEqual(true, maps:get(alias_present, Pub)),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
+
+decode_publish_v5_no_alias_reports_absent_test() ->
+    %% Level 5 without properties (length 0) reports the alias absent,
+    %% never an explicit 0.
+    Body = <<0, 1, "t", 0, "hi">>,
+    {ok, Pub} = indra_mqtt_codec:decode_publish(Body, 0, 5),
+    ?assertEqual(0, maps:get(alias, Pub)),
+    ?assertEqual(false, maps:get(alias_present, Pub)).
+
+decode_publish_v5_empty_topic_without_alias_rejected_test() ->
+    %% Empty topic with no alias property is malformed on either level.
+    ?assertEqual({error, malformed_publish_topic},
+                 indra_mqtt_codec:decode_publish(<<0, 0, 0, "hi">>, 0, 5)).
+
+decode_publish_level4_still_rejects_empty_topic_test() ->
+    ?assertEqual({error, malformed_publish_topic},
+                 indra_mqtt_codec:decode_publish(<<0, 0, "hi">>, 0, 4)).

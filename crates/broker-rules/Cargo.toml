@@ -9,6 +9,7 @@ repository.workspace = true
 broker-protocol = { workspace = true }
 broker-connectors = { workspace = true }
 broker-config = { workspace = true }
+broker-observability = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }

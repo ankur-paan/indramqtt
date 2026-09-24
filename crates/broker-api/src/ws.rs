@@ -461,6 +461,28 @@ async fn handle_packet(
         // First packet must be CONNECT.
         (true, 1) => {
             let conn = decode_connect(payload, flags).ok_or(())?;
+            // W2-02: authenticator-chain consult. Loads one lock-free
+            // snapshot per connect and never takes the chain write lock;
+            // publish and deliver never touch this store. A non-empty
+            // chain with no enabled built-in slot fails closed (no live
+            // backend can execute), mirroring the BrokerLink bind path.
+            if !state.authn_chain.built_in_available() {
+                send_bin(socket, encode_connack(false, 0x86)).await;
+                return Err(());
+            }
+            // W2-05: authentication-settings consult. Loads one lock-free
+            // snapshot per connect to observe the backend-failure flag
+            // and never takes the settings write lock; publish and
+            // deliver never touch this store. Only the built-in database
+            // executes: an outage still fails closed (deny access and
+            // log) even when the flag is set, until the checker pins the
+            // intended behaviour.
+            if state.authn_settings.ignore_backend_failures() {
+                tracing::debug!(
+                    client_id = %conn.client_id,
+                    "ignore_backend_failures is set: console CONNECT still fails closed on auth failure"
+                );
+            }
             // A non-empty user store always wins: unauthenticated console
             // clients are rejected whenever users exist, exactly like the
             // BrokerLink bind path (0x87, not authorized).
@@ -479,6 +501,10 @@ async fn handle_packet(
                     send_bin(socket, encode_connack(false, 0x86)).await;
                     return Err(());
                 }
+                // W2-03: record the successful credentialed CONNECT in the
+                // node auth cache (one short lock, CONNECT-only; publish
+                // and deliver never touch this store).
+                state.authn_node_cache.record_success(username);
             }
             // Connection quotas apply to console clients exactly like
             // edge binds (release happens in teardown via unbind). The
@@ -571,10 +597,26 @@ async fn handle_subscribe(
                     .await
                     .is_err()
                 {
+                    // Per-client decision cache (W2-01): record the denial
+                    // for the management read. Bounded per-session insert
+                    // on the console subscribe event only.
+                    if let Some(session) = state.sessions.get(&sess.client_id) {
+                        session.record_authz_decision(
+                            "subscribe",
+                            filter.as_str(),
+                            sub.qos,
+                            false,
+                            false,
+                        );
+                    }
                     0x87
                 } else {
                     let qos = QoS::try_from(sub.qos).expect("validated above");
-                    state.router.subscribe(
+                    // B4-08 bound: a new entry past the subscription-table
+                    // cap is denied fail closed with 0x97 Quota Exceeded
+                    // (the same code the kernel subscribe path reports),
+                    // registering nothing and changing no session state.
+                    let stored = state.router.subscribe(
                         &filter,
                         Subscription {
                             client_id: sess.client_id.clone().into(),
@@ -583,11 +625,29 @@ async fn handle_subscribe(
                             group: None,
                         },
                     );
-                    state
-                        .sessions
-                        .add_subscription(&sess.client_id, filter.clone(), qos);
-                    sess.subscriptions.push(filter);
-                    sub.qos
+                    if !stored {
+                        0x97
+                    } else {
+                        // Per-client decision cache (W2-01): record the
+                        // grant alongside the session mirror below. Same
+                        // bounded insert, same event. Recorded only after
+                        // the router accepts the entry so a quota denial
+                        // records nothing.
+                        if let Some(session) = state.sessions.get(&sess.client_id) {
+                            session.record_authz_decision(
+                                "subscribe",
+                                filter.as_str(),
+                                sub.qos,
+                                false,
+                                true,
+                            );
+                        }
+                        state
+                            .sessions
+                            .add_subscription(&sess.client_id, filter.clone(), qos);
+                        sess.subscriptions.push(filter);
+                        sub.qos
+                    }
                 }
             }
             _ => 0x80,
@@ -627,12 +687,26 @@ async fn handle_publish(
         return Ok(());
     }
     let topic = Topic::new(publish.topic.clone()).map_err(|_| ())?;
-    if state
+    // Per-client decision cache (W2-01): record the console publish
+    // decision for the management read. One bounded per-session insert
+    // on the console publish event only; delivery never touches it.
+    let publish_allowed = state
         .auth
         .authorize_publish(&sess.client_id, &topic)
         .await
-        .is_err()
-    {
+        .is_ok();
+    if let Some(session) = state.sessions.get(&sess.client_id) {
+        // Console publishes never carry retain (no retain flag on the
+        // console path), so the entry records `retain = false`.
+        session.record_authz_decision(
+            "publish",
+            topic.as_str(),
+            u8::from(publish.qos),
+            false,
+            publish_allowed,
+        );
+    }
+    if !publish_allowed {
         if publish.qos == QoS::AtLeastOnce {
             send_bin(socket, encode_puback(publish.packet_id)).await;
         }
