@@ -7,6 +7,10 @@
 //! contract matches the other analytical sinks: failed flushes keep
 //! the buffer, engage backoff, and propagate the error.
 //!
+//! The write path speaks the vendor InfluxDB v2 write API (line
+//! protocol over HTTP, `org`/`bucket`/`precision` query parameters,
+//! `Authorization: Token <token>`) through the maintained `reqwest`
+//! client (MIT/Apache-2.0): no hand-rolled HTTP, no extra vendor crate.
 //! Authentication uses `Authorization: Token <token>`. The measurement
 //! template supports a literal name or a `{topic}` placeholder (topic
 //! with line-protocol escaping applied).
@@ -15,7 +19,7 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +27,17 @@ use super::{BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
 /// Write precisions accepted as the `precision` query parameter.
 const ALLOWED_PRECISIONS: &[&str] = &["s", "ms", "us", "ns"];
+
+/// Max buffered rows per sink: 10_000. A disconnected server must not
+/// grow the queue without bound, so the default is finite: 10_000 rows
+/// of ~200 B line protocol stay under ~2 MiB while still absorbing a
+/// burst behind the rule engine's bounded queue (the connector's send
+/// path runs behind that queue, so this is a backstop, not new work on
+/// the publish path).
+// TODO(parity): whether this bound should be operator-configurable
+// (e.g. an optional `buffer_capacity`) is open; the code never chooses
+// unbounded.
+const MAX_BUFFERED_ROWS: usize = 10_000;
 
 /// InfluxDB sink configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,13 +149,29 @@ struct InfluxRow {
 }
 
 fn render_line(config: &InfluxDbSinkConfig, topic: &Topic, payload: &str, qos: QoS) -> String {
+    render_line_at(
+        config,
+        topic,
+        payload,
+        qos,
+        timestamp_for(&config.precision),
+    )
+}
+
+fn render_line_at(
+    config: &InfluxDbSinkConfig,
+    topic: &Topic,
+    payload: &str,
+    qos: QoS,
+    timestamp: i64,
+) -> String {
     format!(
         "{},topic={} qos={}i,payload=\"{}\" {}",
         config.measurement_for(topic.as_str()),
         escape_tag(topic.as_str()),
         u8::from(qos),
         escape_field_string(payload),
-        timestamp_for(&config.precision),
+        timestamp,
     )
 }
 
@@ -151,6 +182,13 @@ pub struct InfluxDbSink {
     buffer: parking_lot::Mutex<BatchQueue<InfluxRow>>,
     backoff: parking_lot::Mutex<BackoffState>,
     sent_batches: AtomicU64,
+    /// Last emitted timestamp in the configured precision. InfluxDB
+    /// overwrites points that share measurement, tag set, field key and
+    /// timestamp, so rapid writes at coarse precisions (e.g. ms) would
+    /// collapse into one stored point; the sink hands out strictly
+    /// increasing timestamps (bumping by one unit on collision) so every
+    /// buffered row survives the round trip.
+    last_timestamp: AtomicI64,
 }
 
 impl InfluxDbSink {
@@ -163,6 +201,7 @@ impl InfluxDbSink {
             client,
             backoff: parking_lot::Mutex::new(BackoffState::default()),
             sent_batches: AtomicU64::new(0),
+            last_timestamp: AtomicI64::new(0),
         })
     }
 
@@ -176,6 +215,28 @@ impl InfluxDbSink {
 
     pub fn buffered_rows(&self) -> usize {
         self.buffer.lock().len()
+    }
+
+    /// Next timestamp in the configured precision, strictly greater
+    /// than every previously handed-out timestamp. Uses the wall clock
+    /// when it has advanced, otherwise bumps the last value by one
+    /// precision unit so concurrent or sub-precision writes never share
+    /// a timestamp on the same series.
+    fn next_timestamp(&self) -> i64 {
+        let mut last = self.last_timestamp.load(Ordering::Relaxed);
+        loop {
+            let now = timestamp_for(&self.config.precision);
+            let next = if now > last { now } else { last + 1 };
+            match self.last_timestamp.compare_exchange_weak(
+                last,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => last = actual,
+            }
+        }
     }
 
     /// Write URL: `{endpoint}/api/v2/write`.
@@ -231,7 +292,9 @@ impl InfluxDbSink {
 
     /// Validate one event into a buffered line. Returns true when the
     /// batch is full (caller flushes). Rejects empty topics and
-    /// non-UTF-8 payloads (string field values must be UTF-8).
+    /// non-UTF-8 payloads (string field values must be UTF-8). Fails
+    /// closed with a connection error once `MAX_BUFFERED_ROWS` rows are
+    /// buffered instead of growing without bound.
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<bool> {
         if topic.as_str().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -240,9 +303,25 @@ impl InfluxDbSink {
         }
         let payload = std::str::from_utf8(payload)
             .map_err(|_| ConnectorError::Dispatch("influxdb payload must be UTF-8".to_string()))?;
-        Ok(self.buffer.lock().push(InfluxRow {
-            line: render_line(&self.config, topic, payload, qos),
-        }))
+        // Render through the shared line builder so measurement/tag/field
+        // escaping lives in one place, then swap in a strictly increasing
+        // timestamp: the server overwrites points that share measurement,
+        // tag set, field key and timestamp, so rapid writes at coarse
+        // precisions would otherwise collapse into one stored point.
+        let rendered = render_line(&self.config, topic, payload, qos);
+        let prefix = rendered
+            .rsplit_once(' ')
+            .map(|(prefix, _)| prefix.to_string())
+            .unwrap_or(rendered);
+        let timestamp = self.next_timestamp();
+        let line = format!("{prefix} {timestamp}");
+        let mut queue = self.buffer.lock();
+        if queue.len() >= MAX_BUFFERED_ROWS {
+            return Err(ConnectorError::Connection(format!(
+                "influxdb buffer full ({MAX_BUFFERED_ROWS} rows): failing closed"
+            )));
+        }
+        Ok(queue.push(InfluxRow { line }))
     }
 }
 
@@ -507,5 +586,378 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 1);
         assert!(sink.flush().await.is_err());
         assert_eq!(sink.sent_batches(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_goes_through_manager() {
+        // Broker path (publish, deliver): ConnectorManager::send ->
+        // Sink::send -> POST /api/v2/write with Token auth against the
+        // loopback server. This is the same path the rule engine's
+        // ForwardConnector action drives; never `sink.send` directly.
+        use crate::ConnectorManager;
+        let captured = Arc::new(Captured::default());
+        let port = serve_captured(captured.clone()).await;
+        let mut config = test_config(&format!("http://127.0.0.1:{port}"));
+        config.batch_size = 1;
+        let sink = Arc::new(InfluxDbSink::new(config, test_client()).unwrap());
+        assert_eq!(sink.kind(), "influxdb");
+        let manager = ConnectorManager::new();
+        manager.register("qual-influx", sink.clone());
+
+        let topic = Topic::new("sensors/t1").unwrap();
+        manager
+            .send(
+                "qual-influx",
+                &topic,
+                &Bytes::from_static(b"on"),
+                QoS::AtMostOnce,
+            )
+            .await
+            .expect("broker send delivers");
+        assert_eq!(sink.sent_batches(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(captured.auth.lock().unwrap().as_str(), "Token secret");
+        let body = captured.body.lock().unwrap().clone();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.starts_with("mqtt_events,topic=sensors/t1 qos=0i,payload=\"on\" "));
+    }
+
+    #[test]
+    fn test_buffer_bound_fails_closed() {
+        // Backstop bound (publish path): past MAX_BUFFERED_ROWS the sink
+        // fails closed instead of growing without bound.
+        let mut config = test_config("http://127.0.0.1:1");
+        config.batch_size = usize::MAX / 2;
+        let sink = InfluxDbSink::new(config, test_client()).unwrap();
+        let topic = Topic::new("sensors/t1").unwrap();
+        for _ in 0..MAX_BUFFERED_ROWS {
+            sink.buffer_row(&topic, &Bytes::from_static(b"x"), QoS::AtMostOnce)
+                .expect("row fits under the bound");
+        }
+        assert_eq!(sink.buffered_rows(), MAX_BUFFERED_ROWS);
+        let err = sink
+            .buffer_row(&topic, &Bytes::from_static(b"x"), QoS::AtMostOnce)
+            .expect_err("full buffer must fail closed");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "buffer-full must be a connection error, got {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), MAX_BUFFERED_ROWS);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_now_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0)
+    }
+
+    /// Parse the vendor query CSV into `(value, time, ts_ns)` rows.
+    /// Skips `#` annotations and the header; strips surrounding quotes
+    /// so quoted string fields compare equal to what was written.
+    fn parse_query_csv(body: &str) -> Vec<(String, String, i64)> {
+        let mut value_idx: Option<usize> = None;
+        let mut time_idx: Option<usize> = None;
+        let mut ts_idx: Option<usize> = None;
+        let mut rows = Vec::new();
+        for raw in body.lines() {
+            let line = raw.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cells: Vec<&str> = line.split(',').collect();
+            let stripped: Vec<String> = cells
+                .iter()
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .collect();
+            if stripped.iter().any(|c| c == "_value") && stripped.iter().any(|c| c == "_time") {
+                value_idx = stripped.iter().position(|c| c == "_value");
+                time_idx = stripped.iter().position(|c| c == "_time");
+                ts_idx = stripped.iter().position(|c| c == "ts");
+                continue;
+            }
+            // Data rows start with the empty table-key columns (`,,`).
+            if line.starts_with(',') {
+                if let (Some(vi), Some(ti), Some(tsi)) = (value_idx, time_idx, ts_idx) {
+                    if cells.len() > vi && cells.len() > ti && cells.len() > tsi {
+                        let value = cells[vi].trim().trim_matches('"').to_string();
+                        let time = cells[ti].trim().trim_matches('"').to_string();
+                        let ts: i64 = cells[tsi].trim().trim_matches('"').parse().unwrap_or(-1);
+                        rows.push((value, time, ts));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Qualification against a real server through the maintained
+    /// `reqwest` line-protocol write path.
+    ///
+    /// Run with e.g.:
+    /// `INFLUXDB_ENDPOINT=http://127.0.0.1:8086 INFLUXDB_ORG=qual-org \
+    ///  INFLUXDB_BUCKET=qual-b322 INFLUXDB_TOKEN=qual-token-1 \
+    ///  cargo test -p broker-connectors --lib influxdb::tests::test_qualify_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Ensures the bucket exists, streams 2000 points through the
+    /// broker's rule path ([`crate::ConnectorManager`] ->
+    /// [`InfluxDbSink`], Token auth, ms precision), asserts the exact
+    /// query-back count plus values and timestamps from the server
+    /// (not the counters), proves a bad Token fails closed as a
+    /// dispatch error, then deletes the qualification measurement.
+    #[tokio::test]
+    #[ignore = "needs a real server (see INFLUXDB_* env)"]
+    async fn test_qualify_write_path() {
+        use crate::ConnectorManager;
+        let endpoint = qual_env("INFLUXDB_ENDPOINT").unwrap_or_else(|| {
+            panic!(
+                "INFLUXDB_ENDPOINT must point at a real server for qualification; failing closed"
+            )
+        });
+        let org = qual_env("INFLUXDB_ORG").unwrap_or_else(|| {
+            panic!("INFLUXDB_ORG must be set for qualification; failing closed")
+        });
+        let bucket = qual_env("INFLUXDB_BUCKET").unwrap_or_else(|| {
+            panic!("INFLUXDB_BUCKET must be set for qualification; failing closed")
+        });
+        let token = qual_env("INFLUXDB_TOKEN").unwrap_or_else(|| {
+            panic!("INFLUXDB_TOKEN must be set for qualification; failing closed")
+        });
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("qual http client");
+
+        // Server identity for the report (best effort; never a constant
+        // standing in for a measurement: omit when unreachable).
+        match client
+            .get(format!("{endpoint}/health"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(response) => match response.json::<serde_json::Value>().await {
+                Ok(health) => {
+                    let version = health
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let status = health
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    eprintln!(
+                        "qual server: version={version} status={status} endpoint={endpoint} org={org} bucket={bucket}"
+                    );
+                }
+                Err(e) => eprintln!("qual server: health parse failed: {e}"),
+            },
+            Err(e) => eprintln!("qual server: health unreachable (tolerated): {e}"),
+        }
+
+        // Ensure the bucket exists (the setup creates it; create when
+        // missing so a fresh server still qualifies; 422 means exists).
+        let buckets_url = format!("{endpoint}/api/v2/buckets");
+        let found: bool = match client
+            .get(&buckets_url)
+            .query(&[("org", org.as_str()), ("name", bucket.as_str())])
+            .header("Authorization", format!("Token {token}"))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                let has = text.contains(&format!("\"name\":\"{bucket}\""))
+                    || text.contains(&format!("\"name\": \"{bucket}\""));
+                eprintln!("qual bucket check: status={status} found={has}");
+                has
+            }
+            Err(e) => {
+                eprintln!("qual bucket check unreachable (tolerated): {e}");
+                true
+            }
+        };
+        if !found {
+            let create = client
+                .post(&buckets_url)
+                .header("Authorization", format!("Token {token}"))
+                .json(&serde_json::json!({
+                    "org": org,
+                    "name": bucket,
+                    "retentionRules": [],
+                }))
+                .send()
+                .await
+                .expect("qual create bucket");
+            let status = create.status();
+            let text = create.text().await.unwrap_or_default();
+            // 201 created, 422 already exists: both mean the bucket is there.
+            assert!(
+                status.as_u16() == 201 || status.as_u16() == 422 || text.contains(&bucket),
+                "qual create bucket: status={status} body={text}"
+            );
+            eprintln!("qual bucket ensured: status={status} bucket={bucket}");
+        } else {
+            eprintln!("qual bucket present: bucket={bucket}");
+        }
+
+        // Unique measurement per run so reruns never mix rows.
+        let measurement = format!("qual_b322_m_{}", qual_now_nanos() % 1_000_000);
+        let config = InfluxDbSinkConfig {
+            endpoint: endpoint.clone(),
+            bucket: bucket.clone(),
+            org: org.clone(),
+            token: token.clone(),
+            measurement_template: measurement.clone(),
+            precision: "ms".to_string(),
+            batch_size: 200,
+            batch_timeout_ms: 60_000,
+            request_timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        let sink = Arc::new(InfluxDbSink::new(config.clone(), client.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "influxdb");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = Arc::new(ConnectorManager::new());
+        manager.register("qual-influx", sink.clone());
+
+        const POINTS: usize = 2000;
+        let topic = Topic::new("qual/b322").unwrap();
+        let t0 = qual_now_nanos();
+        for seq in 0..POINTS {
+            let payload = Bytes::from(format!("qual-{seq:04}"));
+            manager
+                .send("qual-influx", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        let t1 = qual_now_nanos();
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(
+            sink.sent_batches(),
+            10,
+            "2000 points at batch_size 200 flush exactly 10 batches"
+        );
+        eprintln!("qual rows sent: records={POINTS} measurement={measurement}");
+
+        // Query-back from the server, not the counters: exact count, no
+        // tolerance (the protocol permits duplicates, never loss).
+        let flux = format!(
+            "from(bucket:\"{bucket}\") |> range(start:-7d) \
+             |> filter(fn:(r)=> r[\"_measurement\"]==\"{measurement}\" and r[\"_field\"]==\"payload\") \
+             |> map(fn:(r)=> ({{_value: r._value, _time: r._time, ts: int(v: r._time)}})) \
+             |> keep(columns:[\"_value\",\"_time\",\"ts\"])"
+        );
+        let query_url = format!("{endpoint}/api/v2/query");
+        let mut rows: Vec<(String, String, i64)> = Vec::new();
+        for _ in 0..30 {
+            let response = client
+                .post(format!("{query_url}?org={org}"))
+                .header("Authorization", format!("Token {token}"))
+                .header("Content-Type", "application/vnd.flux")
+                .header("Accept", "application/csv")
+                .body(flux.clone())
+                .send()
+                .await
+                .expect("qual query");
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            assert!(
+                status.is_success(),
+                "qual query failed: status={status} body={text}"
+            );
+            rows = parse_query_csv(&text);
+            if rows.len() == POINTS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert_eq!(
+            rows.len(),
+            POINTS,
+            "qual count: expected {POINTS} rows for {measurement}, got {}",
+            rows.len()
+        );
+
+        // Values: every written payload is present exactly once.
+        let mut values: Vec<String> = rows.iter().map(|(v, _, _)| v.clone()).collect();
+        values.sort();
+        let mut expected: Vec<String> = (0..POINTS).map(|seq| format!("qual-{seq:04}")).collect();
+        expected.sort();
+        assert_eq!(values, expected, "qual values must round-trip exactly");
+        // Timestamps: every point carries a server timestamp inside the
+        // write window (2 min skew each side for clock drift).
+        for (_, time, ts) in &rows {
+            assert!(!time.is_empty(), "qual timestamp present");
+            assert!(
+                *ts >= t0 - 120_000_000_000 && *ts <= t1 + 120_000_000_000,
+                "qual timestamp {time} ({ts}) outside write window [{t0}, {t1}]"
+            );
+        }
+        eprintln!("qual rows asserted: count={POINTS} measurement={measurement}");
+
+        // Bad Token fails closed as a terminal dispatch error (401) and
+        // keeps the row.
+        let bad_config = InfluxDbSinkConfig {
+            token: "qual-bad-token".to_string(),
+            batch_size: 10,
+            ..config.clone()
+        };
+        let bad_sink =
+            Arc::new(InfluxDbSink::new(bad_config, client.clone()).expect("qual bad sink"));
+        let bad_manager = Arc::new(ConnectorManager::new());
+        bad_manager.register("qual-influx-bad", bad_sink.clone());
+        bad_manager
+            .send(
+                "qual-influx-bad",
+                &topic,
+                &Bytes::from_static(b"qual-bad"),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad buffer");
+        let err = bad_sink.flush().await.expect_err("bad token must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "bad Token must be terminal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("401"),
+            "bad Token must surface 401, got {err:?}"
+        );
+        assert_eq!(bad_sink.buffered_rows(), 1);
+        eprintln!("qual auth failure asserted: bad Token is a 401 dispatch error");
+
+        // Cleanup: delete the qualification measurement (best effort; a
+        // failure is logged, not hidden).
+        let delete_body = serde_json::json!({
+            "start": "1970-01-01T00:00:00Z",
+            "stop": "2030-01-01T00:00:00Z",
+            "predicate": format!("_measurement=\"{measurement}\""),
+        });
+        match client
+            .post(format!(
+                "{endpoint}/api/v2/delete?org={org}&bucket={bucket}"
+            ))
+            .header("Authorization", format!("Token {token}"))
+            .json(&delete_body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                eprintln!("qual cleanup: deleted measurement {measurement} status={status}");
+            }
+            Err(e) => eprintln!("qual cleanup FAILED for {measurement} (tolerated): {e}"),
+        }
+        eprintln!("qual done: rows={POINTS} measurement={measurement} cleaned measurement");
     }
 }

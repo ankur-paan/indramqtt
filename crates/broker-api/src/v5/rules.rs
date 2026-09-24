@@ -733,7 +733,7 @@ async fn register_live_sink(
             } else {
                 format!("redis://:{}@{}", pass, servers)
             };
-            if let Ok(transport) = broker_connectors::redis::TcpRedisTransport::new(&endpoint) {
+            if let Ok(transport) = broker_connectors::redis::DriverRedisTransport::new(&endpoint) {
                 let config = broker_connectors::redis::RedisSinkConfig {
                     endpoint,
                     command: broker_connectors::redis::RedisCommandKind::HSet {
@@ -839,21 +839,19 @@ async fn register_live_sink(
                 .or_else(|| body.get("servers"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:9092");
-            if let Ok(transport) = broker_connectors::kafka::TcpKafkaTransport::new(
-                servers,
-                format!("indramqtt-{}", name),
-                "1",
-            ) {
-                let config = broker_connectors::kafka::KafkaSinkConfig {
-                    bootstrap_servers: servers.to_string(),
-                    topic_template: "events-${topic}".to_string(),
-                    partition_key_field: None,
-                    partitions: 1,
-                    client_id: format!("indramqtt-{}", name),
-                    acks: "1".to_string(),
-                    batch_max_records: 1,
-                    batch_max_bytes: 65536,
-                };
+            let config = broker_connectors::kafka::KafkaSinkConfig {
+                bootstrap_servers: servers.to_string(),
+                topic_template: "events-${topic}".to_string(),
+                partition_key_field: None,
+                partitions: 1,
+                client_id: format!("indramqtt-{}", name),
+                acks: "1".to_string(),
+                batch_max_records: 1,
+                batch_max_bytes: 65536,
+            };
+            // Production write path on the maintained `rdkafka` driver;
+            // the hand-written TCP framing stays for offline unit tests.
+            if let Ok(transport) = broker_connectors::kafka::RdkafkaKafkaTransport::new(&config) {
                 if let Ok(sink) =
                     broker_connectors::kafka::KafkaSink::new(config, Arc::new(transport))
                 {
@@ -883,7 +881,8 @@ async fn register_live_sink(
                 "postgres://{}:{}@{}/{}",
                 username, password, server, database
             );
-            if let Ok(transport) = broker_connectors::postgres::TcpPgTransport::new(&conn_url, 1) {
+            if let Ok(transport) = broker_connectors::postgres::DriverPgTransport::new(&conn_url, 1)
+            {
                 let config = broker_connectors::postgres::PostgreSqlSinkConfig {
                     connection_url: conn_url,
                     sql_template: "INSERT INTO test_telemetry (clientid, topic, payload, timestamp) VALUES ('rule-engine', $1, $3, 0)".to_string(),
@@ -921,7 +920,8 @@ async fn register_live_sink(
             } else {
                 format!("mysql://{}:{}@{}/{}", username, password, server, database)
             };
-            if let Ok(transport) = broker_connectors::mysql::TcpMySqlTransport::new(&conn_url, 1) {
+            if let Ok(transport) = broker_connectors::mysql::DriverMySqlTransport::new(&conn_url, 1)
+            {
                 let config = broker_connectors::mysql::MySqlSinkConfig {
                     connection_url: conn_url,
                     sql_template:
@@ -962,7 +962,7 @@ async fn register_live_sink(
                 format!("amqp://{}:{}@{}/", username, password, endpoint)
             };
             if let Ok(transport) =
-                broker_connectors::rabbitmq::TcpRabbitTransport::new(&full_endpoint)
+                broker_connectors::rabbitmq::LapinRabbitTransport::new(&full_endpoint)
             {
                 let config = broker_connectors::rabbitmq::RabbitMqSinkConfig {
                     endpoint: full_endpoint,
@@ -1073,7 +1073,7 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 protocol: broker_connectors::MqttBridgeProtocol::V311,
             };
-            if let Ok(transport) = broker_connectors::TcpMqttBridgeTransport::new(&config) {
+            if let Ok(transport) = broker_connectors::RumqttcMqttBridgeTransport::new(&config) {
                 if let Ok(sink) =
                     broker_connectors::MqttBridgeSink::new(config, Arc::new(transport))
                 {
@@ -1355,7 +1355,7 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::NativeCouchbaseTransport::new(&config) {
+            if let Ok(transport) = broker_connectors::DriverCouchbaseTransport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::CouchbaseSink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -1837,8 +1837,12 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
+            // No-redirect client: the transport replays auth + label
+            // itself on the FE 307 -> BE hop (a stock client strips
+            // Authorization when the BE is a different origin).
             let client = reqwest::Client::builder()
                 .timeout(config.timeout())
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default();
             if let Ok(transport) =
@@ -1958,12 +1962,8 @@ async fn register_live_sink(
                 max_retries: 3,
                 request_timeout_ms: timeout_ms,
             };
-            let client = reqwest::Client::builder()
-                .timeout(config.timeout())
-                .build()
-                .unwrap_or_default();
             if let Ok(transport) =
-                broker_connectors::elasticsearch::HttpElasticsearchTransport::new(&config, client)
+                broker_connectors::elasticsearch::DriverElasticsearchTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
@@ -2201,15 +2201,18 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+            // Bounded by default: 64 MiB active segment caps the recovery
+            // scan, 10 retained segments cap total disk (~640 MiB + active)
+            // so a forgotten connector cannot fill the disk.
             let config = broker_connectors::disk_log::DiskLogSinkConfig {
                 directory: dir.to_string(),
                 filename_prefix: prefix.to_string(),
                 filename_extension: ext.to_string(),
                 format: broker_connectors::disk_log::DiskLogFormat::Ndjson,
-                max_file_size_bytes: None,
+                max_file_size_bytes: Some(67_108_864),
                 max_file_age_secs: None,
                 compression: broker_connectors::disk_log::DiskLogCompression::None,
-                max_backup_files: None,
+                max_backup_files: Some(10),
                 max_retention_days: None,
                 sync_mode: broker_connectors::disk_log::DiskSyncMode::EveryBatch,
                 timeout_ms,
@@ -2217,7 +2220,7 @@ async fn register_live_sink(
             if let Ok(writer) = broker_connectors::disk_log::FileDiskLogWriter::open(&config).await
             {
                 if let Ok(sink) =
-                    broker_connectors::disk_log::DiskLogSink::new(config, Arc::new(writer))
+                    broker_connectors::disk_log::DiskLogSink::open(config, Arc::new(writer)).await
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -2359,9 +2362,7 @@ async fn register_live_sink(
                 batch_timeout_ms: 10,
                 timeout_ms,
             };
-            if let Ok(transport) =
-                broker_connectors::s3::HttpS3Transport::new(&config, reqwest::Client::new())
-            {
+            if let Ok(transport) = broker_connectors::s3::SdkS3Transport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::s3::S3Sink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -2565,10 +2566,7 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::dynamodb::HttpDynamoDbTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) = broker_connectors::dynamodb::SdkDynamoDbTransport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::dynamodb::DynamoDbSink::new(config, transport)
                 {
@@ -3173,10 +3171,9 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::gcp_pubsub::HttpGcpPubSubTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors::gcp_pubsub::SdkGcpPubSubTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
                     broker_connectors::gcp_pubsub::GcpPubSubSink::new(config, transport)
@@ -3346,6 +3343,14 @@ async fn register_live_sink(
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // The operator's extra CA bundle rides the same path the
+            // stored connector body keeps: without it a private-CA
+            // bridge fails closed at TLS verification.
+            let ca_bundle_pem = body
+                .get("ca_bundle_pem")
+                .or_else(|| body.get("ca_bundle"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let algorithm = match body.get("algorithm").and_then(|v| v.as_str()) {
                 Some("ES256") | Some("es256") => broker_connectors::gcp_iot::GcpIotAlgorithm::Es256,
@@ -3366,8 +3371,9 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 max_retries: Some(3),
                 timeout_ms,
+                ca_bundle_pem,
             };
-            if let Ok(transport) = broker_connectors::gcp_iot::TcpGcpIotTransport::new(endpoint) {
+            if let Ok(transport) = broker_connectors::gcp_iot::TlsGcpIotTransport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::gcp_iot::GcpIotSink::new(config, transport) {
                     let sink = Arc::new(sink);

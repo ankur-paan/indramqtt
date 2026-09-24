@@ -418,6 +418,267 @@ impl S3Transport for HttpS3Transport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (`aws-sdk-s3`).
+// ---------------------------------------------------------------------------
+
+/// Single-PUT ceiling: bodies at or below this size upload with one
+/// `PutObject`; larger bodies ride `CreateMultipartUpload` /
+/// `UploadPart` / `CompleteMultipartUpload`. The value is the vendor
+/// limit, not a tuning choice: S3 rejects any non-final multipart
+/// part below 5 MiB.
+pub(crate) const S3_MULTIPART_THRESHOLD_BYTES: usize = 5 * 1024 * 1024;
+/// One multipart part: the same 5 MiB vendor minimum, so a 6.5 MiB
+/// body uploads as exactly two parts.
+pub(crate) const S3_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+
+/// Retryable S3 failure text: clock skew (the SigV4 signer retries
+/// with corrected time), throttling / slow-down, request-limit,
+/// internal failures, timeouts and transport errors. The sink retries
+/// these with backoff; anything else (auth, missing bucket,
+/// validation) is terminal. Matching is by error text so it stays
+/// correct across driver revisions without depending on generated
+/// variant names.
+// TODO(parity): the retry-vs-terminal split per S3 error code is not
+// pinned by the spec; recheck this list against the structured
+// S3 error variants on driver upgrades.
+fn is_retryable_s3_error(text: &str) -> bool {
+    const RETRYABLE: &[&str] = &[
+        "requesttimetooskewed",
+        "clock",
+        "skew",
+        "slowdown",
+        "pleasetryagain",
+        "throttl",
+        "toomanyrequests",
+        "requesttimeout",
+        "internalerror",
+        "internal error",
+        "internalservererror",
+        "internalfailure",
+        "serviceunavailable",
+        "timeout",
+        "timed out",
+        "connection",
+        "dispatch",
+        "unavailable",
+    ];
+    let lower = text.to_lowercase();
+    RETRYABLE.iter().any(|marker| lower.contains(marker))
+}
+
+fn classify_s3_sdk_error(text: String) -> ConnectorError {
+    if is_retryable_s3_error(&text) {
+        ConnectorError::Connection(text)
+    } else {
+        ConnectorError::Dispatch(text)
+    }
+}
+
+/// Production transport on the maintained `aws-sdk-s3` driver:
+/// `PutObject` with driver-owned SigV4 (static access-key
+/// credentials, endpoint override for local servers, path-style
+/// addressing so IP/`localhost` endpoints keep working), multipart
+/// above [`S3_MULTIPART_THRESHOLD_BYTES`]. One driver round trip is
+/// bounded by the configured request timeout so a slow server
+/// surfaces as a retryable connection error instead of stalling the
+/// rule path. Empty credentials mean the driver's default chain is
+/// used (anonymous local testing); the write still fails closed when
+/// no credentials resolve.
+pub struct SdkS3Transport {
+    client: aws_sdk_s3::Client,
+    timeout: Duration,
+    multipart_uploads: AtomicU64,
+}
+
+impl SdkS3Transport {
+    pub fn new(config: &S3SinkConfig) -> Result<Self> {
+        config.validate()?;
+        let region = aws_sdk_s3::config::Region::new(config.region.clone());
+        let mut builder = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(region)
+            // Path-style (`/<bucket>/<key>`) is required for IP and
+            // `localhost` endpoints (virtual-hosted style would dial
+            // `<bucket>.127.0.0.1`); the real service accepts it too.
+            .force_path_style(true)
+            .endpoint_url(config.endpoint.trim_end_matches('/'));
+        if !config.access_key_id.is_empty() {
+            let credentials = aws_sdk_s3::config::Credentials::new(
+                config.access_key_id.clone(),
+                config.secret_access_key.clone(),
+                None,
+                None,
+                "indramqtt-static",
+            );
+            builder = builder.credentials_provider(
+                aws_sdk_s3::config::SharedCredentialsProvider::new(credentials),
+            );
+        }
+        let sdk_config = builder.build();
+        Ok(Self {
+            client: aws_sdk_s3::Client::from_conf(sdk_config),
+            timeout: config.timeout(),
+            multipart_uploads: AtomicU64::new(0),
+        })
+    }
+
+    /// Borrow the driver client (bucket setup and read-back for
+    /// qualification; the write path stays behind the trait).
+    pub fn client(&self) -> &aws_sdk_s3::Client {
+        &self.client
+    }
+
+    /// Multipart uploads completed through this transport (the
+    /// qualification asserts exactly one for its large object).
+    pub fn multipart_uploads(&self) -> u64 {
+        self.multipart_uploads.load(Ordering::Relaxed)
+    }
+
+    async fn put_single(&self, put: &S3Put, timeout: Duration) -> Result<()> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&put.bucket)
+            .key(&put.key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(put.body.clone()))
+            .content_type(put.content_type);
+        if let Some(encoding) = put.content_encoding {
+            request = request.content_encoding(encoding);
+        }
+        tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "s3 driver timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            })?
+            .map(|_| ())
+            .map_err(|e| classify_s3_sdk_error(format!("s3 put failed: {e:?} ({e})")))
+    }
+
+    async fn put_multipart(&self, put: &S3Put, timeout: Duration) -> Result<()> {
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&put.bucket)
+            .key(&put.key)
+            .content_type(put.content_type);
+        if let Some(encoding) = put.content_encoding {
+            create = create.content_encoding(encoding);
+        }
+        let upload_id = tokio::time::timeout(timeout, create.send())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "s3 driver timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            })?
+            .map_err(|e| {
+                classify_s3_sdk_error(format!("s3 create multipart upload failed: {e:?} ({e})"))
+            })?
+            .upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ConnectorError::Dispatch("s3 create multipart upload returned no id".to_string())
+            })?;
+        let mut parts = Vec::new();
+        let mut part_number: i32 = 1;
+        let mut failed: Option<ConnectorError> = None;
+        for chunk in put.body.chunks(S3_MULTIPART_PART_BYTES) {
+            let output = tokio::time::timeout(
+                timeout,
+                self.client
+                    .upload_part()
+                    .bucket(&put.bucket)
+                    .key(&put.key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(chunk.to_vec()))
+                    .send(),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "s3 driver timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            });
+            match output {
+                Ok(Ok(part)) => {
+                    let completed = aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(part_number)
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .build();
+                    parts.push(completed);
+                    part_number += 1;
+                }
+                Ok(Err(e)) => {
+                    failed = Some(classify_s3_sdk_error(format!(
+                        "s3 upload part {part_number} failed: {e:?} ({e})"
+                    )));
+                    break;
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failed {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&put.bucket)
+                .key(&put.key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(error);
+        }
+        let completed_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        tokio::time::timeout(
+            timeout,
+            self.client
+                .complete_multipart_upload()
+                .bucket(&put.bucket)
+                .key(&put.key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed_upload)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "s3 driver timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
+        .map(|_| ())
+        .map_err(|e| {
+            classify_s3_sdk_error(format!("s3 complete multipart upload failed: {e:?} ({e})"))
+        })?;
+        self.multipart_uploads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl S3Transport for SdkS3Transport {
+    async fn put_object(&self, put: &S3Put) -> Result<()> {
+        let timeout = self.timeout;
+        if put.body.len() > S3_MULTIPART_THRESHOLD_BYTES {
+            self.put_multipart(put, timeout).await
+        } else {
+            self.put_single(put, timeout).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -1053,5 +1314,445 @@ mod tests {
         assert_eq!(sink.sent_objects(), 2);
         assert_eq!(sink.sent_records(), 3);
         assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[test]
+    fn test_sdk_error_classification() {
+        // SigV4 clock skew retries with corrected time; throttling and
+        // transport failures retry; auth and validation do not.
+        for retryable in [
+            "RequestTimeTooSkewed: The difference between the request time and the server time is too large",
+            "RequestTimeTooSkewed (clock skew)",
+            "SlowDown: Please reduce your request rate",
+            "Throttling: Rate exceeded",
+            "InternalError: We encountered an internal error",
+            "ServiceUnavailable: retry later",
+            "s3 put failed: dispatch failure",
+            "s3 driver timed out after 30000ms",
+        ] {
+            assert!(
+                is_retryable_s3_error(retryable),
+                "{retryable:?} must be retryable"
+            );
+            assert!(
+                matches!(
+                    classify_s3_sdk_error(retryable.to_string()),
+                    ConnectorError::Connection(_)
+                ),
+                "{retryable:?} must classify as a connection error"
+            );
+        }
+        for terminal in [
+            "AccessDenied: Access Denied",
+            "InvalidAccessKeyId: The AWS Access Key Id you provided does not exist",
+            "NoSuchBucket: The specified bucket does not exist",
+            "s3 bucket must be 3..=63 chars",
+        ] {
+            assert!(
+                !is_retryable_s3_error(terminal),
+                "{terminal:?} must be terminal"
+            );
+            assert!(
+                matches!(
+                    classify_s3_sdk_error(terminal.to_string()),
+                    ConnectorError::Dispatch(_)
+                ),
+                "{terminal:?} must classify as a dispatch error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sdk_transport_construction() {
+        // Building the driver client performs no I/O, so this runs
+        // offline: valid config builds, invalid config fails closed.
+        let config = test_config();
+        let transport = SdkS3Transport::new(&config).expect("sdk transport builds offline");
+        assert_eq!(transport.multipart_uploads(), 0);
+
+        let mut bad = test_config();
+        bad.endpoint = "127.0.0.1:9000".to_string();
+        assert!(SdkS3Transport::new(&bad).is_err());
+        let mut bad_region = test_config();
+        bad_region.region = String::new();
+        assert!(SdkS3Transport::new(&bad_region).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must be set for qualification; failing closed instead of passing vacuously"
+            )
+        })
+    }
+
+    /// Qualification against real Amazon S3 via the maintained
+    /// `aws-sdk-s3` driver.
+    ///
+    /// Run with e.g.:
+    /// `S3_BUCKET=<empty bucket> S3_REGION=ap-south-1 AWS_ACCESS_KEY_ID=<key> AWS_SECRET_ACCESS_KEY=<secret> \
+    ///  cargo test -p broker-connectors --lib s3::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// The pipeline creates an empty bucket and deletes it and its
+    /// contents after the run. Streams 500 events through the broker
+    /// ([`crate::ConnectorManager`] -> [`S3Sink`] on
+    /// [`SdkS3Transport`], never `sink.send` directly) with a
+    /// date-partitioned key template and gzip framing, lists the keys
+    /// back and asserts exactly 500 with bytes that gunzip to the
+    /// NDJSON rows sent, proves a clock-skew failure classifies
+    /// retryable and requeues without loss, then asserts one object
+    /// above the 5 MiB part size uploads via multipart and reads back
+    /// intact. Panics when its environment is missing (fail closed,
+    /// never skips).
+    #[tokio::test]
+    #[ignore = "needs real Amazon S3 (see S3_BUCKET/S3_REGION/AWS_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use std::collections::{HashMap, HashSet};
+
+        const EVENTS: usize = 500;
+
+        let bucket = qual_require("S3_BUCKET");
+        let region = qual_env("S3_REGION")
+            .or_else(|| qual_env("AWS_REGION"))
+            .or_else(|| qual_env("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| "ap-south-1".to_string());
+        let endpoint =
+            qual_env("S3_ENDPOINT").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        let access_key = qual_env("S3_ACCESS_KEY_ID")
+            .or_else(|| qual_env("AWS_ACCESS_KEY_ID"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "S3_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID must be set for qualification; \
+                     failing closed instead of passing vacuously"
+                )
+            });
+        let secret_key = qual_env("S3_SECRET_ACCESS_KEY")
+            .or_else(|| qual_env("AWS_SECRET_ACCESS_KEY"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "S3_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY must be set for qualification; \
+                     failing closed instead of passing vacuously"
+                )
+            });
+        if qual_env("S3_SESSION_TOKEN")
+            .or_else(|| qual_env("AWS_SESSION_TOKEN"))
+            .is_some()
+        {
+            // TODO(parity): S3SinkConfig carries no session-token field,
+            // so temporary credentials cannot be used; do temporary
+            // credentials need a config field, or are long-term keys
+            // the supported path?
+            panic!(
+                "session-token credentials are not supported by S3SinkConfig; \
+                 qualify with long-term access keys instead"
+            );
+        }
+
+        let mut config = test_config();
+        config.endpoint = endpoint.clone();
+        config.bucket = bucket.clone();
+        config.region = region.clone();
+        config.access_key_id = access_key;
+        config.secret_access_key = secret_key;
+        config.key_template = "qual-b340/${YYYY}/${MM}/${DD}/${topic}_${seq}.ndjson.gz".to_string();
+        config.compression = S3Compression::Gzip;
+        config.batch_size = 1;
+        config.batch_bytes = 5 * 1024 * 1024;
+        config.batch_timeout_ms = 60_000;
+        config.timeout_ms = Some(30_000);
+        config.validate().expect("qual config validates");
+
+        let transport = Arc::new(SdkS3Transport::new(&config).expect("qual transport"));
+        let client = transport.client().clone();
+
+        // The pipeline creates the bucket; fail closed when it is not
+        // there instead of writing nowhere.
+        let head = client
+            .head_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual HeadBucket {bucket} failed: {e:?} ({e})"));
+        // TODO(parity): S3 exposes no server-version API, so the
+        // report carries the endpoint plus region plus HeadBucket
+        // output instead of a version string; is that an acceptable
+        // "server version"?
+        eprintln!("qual server: endpoint={endpoint} region={region} bucket={bucket} head={head:?}");
+
+        let sink = Arc::new(S3Sink::new(config, transport.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "s3");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = ConnectorManager::new();
+        manager.register("qual-s3", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..EVENTS {
+            let payload = Bytes::from(format!(r#"{{"seq":{seq}}}"#));
+            manager
+                .send("qual-s3", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_objects(), EVENTS as u64);
+        assert_eq!(sink.sent_records(), EVENTS as u64);
+        eprintln!("qual rows sent: records={EVENTS} objects={EVENTS} bucket={bucket}");
+
+        // Row counts asserted back from the server, not the counters:
+        // exactly 500 keys under the run prefix.
+        let prefix = "qual-b340/";
+        let mut keys: Vec<String> = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let page = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(prefix)
+                .set_continuation_token(continuation)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual list failed: {e:?} ({e})"));
+            for object in page.contents() {
+                if let Some(key) = object.key() {
+                    keys.push(key.to_string());
+                }
+            }
+            if page.is_truncated().unwrap_or(false) {
+                continuation = page.next_continuation_token().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        keys.sort();
+        assert_eq!(
+            keys.len(),
+            EVENTS,
+            "qual key count mismatch: got {} of {EVENTS}",
+            keys.len()
+        );
+        eprintln!("qual rows asserted: keys={EVENTS} prefix={prefix}");
+
+        // Every object gunzips to the NDJSON row sent (loss is a
+        // defect; duplicates would surface as a count mismatch above).
+        let mut seen: HashSet<i64> = HashSet::new();
+        for key in &keys {
+            let object = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual GET {key} failed: {e:?} ({e})"));
+            let bytes = object
+                .body
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("qual GET {key} body failed: {e:?}"))
+                .into_bytes();
+            let mut decoder = GzDecoder::new(&bytes[..]);
+            let mut raw = Vec::new();
+            decoder
+                .read_to_end(&mut raw)
+                .unwrap_or_else(|e| panic!("qual gunzip {key} failed: {e:?}"));
+            let text =
+                String::from_utf8(raw).unwrap_or_else(|e| panic!("qual utf8 {key} failed: {e}"));
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 1, "qual {key} must hold one NDJSON row");
+            let row: serde_json::Value = serde_json::from_str(lines[0])
+                .unwrap_or_else(|e| panic!("qual NDJSON {key} failed: {e}"));
+            assert_eq!(row["topic"], "sensors/qual", "qual {key} topic");
+            let seq = row["payload"]["seq"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("qual {key} row has no payload.seq: {row}"));
+            assert!(
+                (0..EVENTS as i64).contains(&seq),
+                "qual {key} seq {seq} out of range"
+            );
+            assert!(seen.insert(seq), "qual duplicate seq {seq}");
+        }
+        for seq in 0..EVENTS as i64 {
+            assert!(seen.contains(&seq), "qual missing seq {seq}");
+        }
+        eprintln!("qual rows asserted: gunzip ndjson intact={EVENTS}");
+
+        // SigV4 clock-skew retry: the skew text classifies retryable,
+        // the failed flush restores the buffer, the next flush lands.
+        struct ClockSkewOnceTransport {
+            puts: parking_lot::Mutex<Vec<S3Put>>,
+            skewed: parking_lot::Mutex<bool>,
+        }
+        #[async_trait]
+        impl S3Transport for ClockSkewOnceTransport {
+            async fn put_object(&self, put: &S3Put) -> Result<()> {
+                let mut skewed = self.skewed.lock();
+                if !*skewed {
+                    *skewed = true;
+                    return Err(classify_s3_sdk_error(
+                        "RequestTimeTooSkewed: The difference between the request time and the server time is too large".to_string(),
+                    ));
+                }
+                self.puts.lock().push(put.clone());
+                Ok(())
+            }
+        }
+        let skew_transport = Arc::new(ClockSkewOnceTransport {
+            puts: parking_lot::Mutex::new(Vec::new()),
+            skewed: parking_lot::Mutex::new(false),
+        });
+        let mut skew_config = test_config();
+        skew_config.batch_size = 10;
+        let skew_sink = Arc::new(S3Sink::new(skew_config, skew_transport.clone()).unwrap());
+        let skew_manager = ConnectorManager::new();
+        skew_manager.register("qual-s3-skew", skew_sink.clone());
+        skew_manager
+            .send(
+                "qual-s3-skew",
+                &Topic::new("sensors/skew").unwrap(),
+                &Bytes::from(r#"{"seq":0}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual skew buffer");
+        let err = skew_sink
+            .flush()
+            .await
+            .expect_err("clock skew must fail the first flush");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "clock skew must be a retryable connection error, got {err:?}"
+        );
+        assert_eq!(skew_sink.buffered_rows(), 1, "skewed rows must be retained");
+        // First flush engaged the sink's 2s backoff; reset it to simulate
+        // the backoff window expiring so the retry reaches the transport.
+        *skew_sink.backoff.lock() = crate::BackoffState::default();
+        skew_sink.flush().await.expect("qual skew retry");
+        assert_eq!(skew_sink.sent_records(), 1);
+        assert_eq!(skew_transport.puts.lock().len(), 1);
+        eprintln!("qual clock-skew: retryable, 1 row retained then landed");
+
+        // Multipart: one object above the 5 MiB part size uploads via
+        // `CreateMultipartUpload` / `UploadPart` /
+        // `CompleteMultipartUpload` and reads back intact.
+        let blob = "x".repeat(6_500_000);
+        let mut large_config = test_config();
+        large_config.endpoint = endpoint.clone();
+        large_config.bucket = bucket.clone();
+        large_config.region = region.clone();
+        large_config.access_key_id = qual_env("S3_ACCESS_KEY_ID")
+            .or_else(|| qual_env("AWS_ACCESS_KEY_ID"))
+            .unwrap();
+        large_config.secret_access_key = qual_env("S3_SECRET_ACCESS_KEY")
+            .or_else(|| qual_env("AWS_SECRET_ACCESS_KEY"))
+            .unwrap();
+        large_config.key_template =
+            "qual-b340-large/${YYYY}/${MM}/${DD}/large_${seq}.ndjson".to_string();
+        large_config.compression = S3Compression::None;
+        large_config.batch_size = 1_000_000;
+        large_config.batch_bytes = 64 * 1024 * 1024;
+        large_config.batch_timeout_ms = 60_000;
+        large_config.timeout_ms = Some(120_000);
+        large_config
+            .validate()
+            .expect("qual large config validates");
+        let large_transport =
+            Arc::new(SdkS3Transport::new(&large_config).expect("qual large transport"));
+        let large_sink =
+            Arc::new(S3Sink::new(large_config, large_transport.clone()).expect("qual large sink"));
+        let large_manager = ConnectorManager::new();
+        large_manager.register("qual-s3-large", large_sink.clone());
+        let large_payload = Bytes::from(format!(r#"{{"blob":"{blob}"}}"#));
+        large_manager
+            .send(
+                "qual-s3-large",
+                &Topic::new("sensors/large").unwrap(),
+                &large_payload,
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual large send");
+        large_sink.flush().await.expect("qual large flush");
+        assert_eq!(large_sink.sent_records(), 1);
+        assert_eq!(
+            large_transport.multipart_uploads(),
+            1,
+            "the large object must ride the multipart path"
+        );
+        let mut large_keys: Vec<String> = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let page = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix("qual-b340-large/")
+                .set_continuation_token(continuation)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual large list failed: {e:?} ({e})"));
+            for object in page.contents() {
+                if let Some(key) = object.key() {
+                    large_keys.push(key.to_string());
+                }
+            }
+            if page.is_truncated().unwrap_or(false) {
+                continuation = page.next_continuation_token().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(large_keys.len(), 1, "one large object, got {large_keys:?}");
+        let large_object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&large_keys[0])
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual large GET failed: {e:?} ({e})"));
+        let large_bytes = large_object
+            .body
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("qual large body failed: {e:?}"))
+            .into_bytes();
+        assert!(
+            large_bytes.len() > S3_MULTIPART_THRESHOLD_BYTES,
+            "large object must exceed the part size, got {}",
+            large_bytes.len()
+        );
+        let large_text = String::from_utf8(large_bytes.to_vec()).expect("qual large utf8");
+        assert_eq!(large_text.lines().count(), 1);
+        let large_row: serde_json::Value =
+            serde_json::from_str(large_text.trim_end()).expect("qual large NDJSON");
+        assert_eq!(
+            large_row["payload"]["blob"].as_str().map(str::len),
+            Some(6_500_000),
+            "large payload must round-trip intact"
+        );
+        eprintln!(
+            "qual multipart: 1 object above {} bytes in 2 parts, content intact",
+            S3_MULTIPART_THRESHOLD_BYTES
+        );
+
+        // Cleanup what the pipeline does not own: the large object is
+        // deleted; the 500 run objects stay for the pipeline's bucket
+        // teardown (it deletes the bucket and its contents).
+        let mut deleted: HashMap<String, bool> = HashMap::new();
+        for key in &large_keys {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual cleanup {key} failed: {e:?} ({e})"));
+            deleted.insert(key.clone(), true);
+        }
+        assert_eq!(deleted.len(), 1);
+        eprintln!("qual cleanup: deleted 1 large object; 500 run objects left for bucket teardown");
     }
 }

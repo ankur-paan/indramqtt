@@ -3,6 +3,17 @@
 //! Buffers MQTT events and flushes full or stale batches with one
 //! `POST /_bulk` carrying newline-delimited action/source pairs:
 //! `{"index":{"_index":"<index>","_id":"<id>"}}` + the document.
+//! Production writes go through the maintained official
+//! `elasticsearch` driver ([`DriverElasticsearchTransport`]): the
+//! driver holds the HTTP pool and TLS, and each flush sends the
+//! sink-rendered NDJSON with the configured Basic/ApiKey
+//! `Authorization` value. The legacy [`HttpElasticsearchTransport`]
+//! (plain `reqwest`) is retained for offline unit tests and for
+//! OpenSearch nodes the driver's product check refuses.
+//! TODO(parity): the official driver checks the `X-Elastic-Product`
+//! response header, so OpenSearch clusters fail closed on the driver
+//! path; does the OpenSearch-compatible deployment need the HTTP
+//! fallback wired instead of the driver?
 //! Index names resolve `${YYYY}`/`${MM}`/`${DD}`/`${topic}` at flush
 //! time (`iot-telemetry-${YYYY.MM.dd}` works: each variable
 //! substitutes independently). Document ids come from an optional
@@ -381,6 +392,11 @@ impl ElasticsearchTransport for MockElasticsearchTransport {
 /// HTTP transport: `POST {endpoint}/_bulk` as `application/x-ndjson`.
 /// Transport errors are connection failures; status mapping follows
 /// [`BulkOutcome`] (429/503 retryable, other non-2xx fatal).
+///
+/// Retained for offline unit tests and for servers the official driver
+/// refuses (its transport checks the `X-Elastic-Product` response
+/// header, so OpenSearch nodes fail closed here); production wiring
+/// uses [`DriverElasticsearchTransport`].
 pub struct HttpElasticsearchTransport {
     url: String,
     client: reqwest::Client,
@@ -416,6 +432,83 @@ impl ElasticsearchTransport for HttpElasticsearchTransport {
             200..=299 => match response.bytes().await {
                 Ok(body) => BulkOutcome::Indexed {
                     body: body.to_vec(),
+                },
+                Err(e) => BulkOutcome::IndexedUnverified(e.to_string()),
+            },
+            429 | 503 => BulkOutcome::Retryable(status),
+            _ => BulkOutcome::Failed(status),
+        })
+    }
+}
+
+/// Production transport on the official `elasticsearch` driver.
+///
+/// The driver owns the connection pool, keep-alive and TLS; each
+/// `_bulk` ships as one `POST /_bulk` of the sink-rendered NDJSON
+/// (per-document indices preserved) with the configured
+/// `Authorization` value attached per request, so Basic and ApiKey
+/// both travel through the driver. Status mapping follows
+/// [`BulkOutcome`] (429/503 retryable, other non-2xx fatal);
+/// driver errors are connection failures.
+///
+/// Bound: one in-flight `_bulk` per `flush` (the batch itself is
+/// bounded by `batch_size`, default 500); no background queue.
+pub struct DriverElasticsearchTransport {
+    client: elasticsearch::Elasticsearch,
+    timeout: Duration,
+}
+
+impl DriverElasticsearchTransport {
+    pub fn new(config: &ElasticsearchSinkConfig) -> Result<Self> {
+        config.validate()?;
+        let endpoint = config.endpoint.trim_end_matches('/').to_string();
+        let transport = elasticsearch::http::transport::Transport::single_node(endpoint.as_str())
+            .map_err(|e| {
+            ConnectorError::Connection(format!("elasticsearch driver transport: {e}"))
+        })?;
+        Ok(Self {
+            client: elasticsearch::Elasticsearch::new(transport),
+            timeout: config.timeout(),
+        })
+    }
+
+    /// Borrow the driver client (index setup and query-back for
+    /// qualification; the write path stays behind the trait).
+    pub fn client(&self) -> &elasticsearch::Elasticsearch {
+        &self.client
+    }
+}
+
+#[async_trait]
+impl ElasticsearchTransport for DriverElasticsearchTransport {
+    async fn bulk_post(&self, body: Vec<u8>, auth: Option<String>) -> Result<BulkOutcome> {
+        use elasticsearch::http::Method;
+        let mut headers = http::HeaderMap::new();
+        if let Some(value) = auth {
+            let header_value: http::HeaderValue = value.parse().map_err(|_| {
+                ConnectorError::Dispatch(
+                    "elasticsearch authorization header is not ASCII".to_string(),
+                )
+            })?;
+            headers.insert(http::header::AUTHORIZATION, header_value);
+        }
+        let response = self
+            .client
+            .send(
+                Method::Post,
+                "/_bulk",
+                headers,
+                Option::<&serde_json::Value>::None,
+                Some(body.as_slice()),
+                Some(self.timeout),
+            )
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("elasticsearch bulk failed: {e}")))?;
+        let status = response.status_code().as_u16();
+        Ok(match status {
+            200..=299 => match response.text().await {
+                Ok(text) => BulkOutcome::Indexed {
+                    body: text.into_bytes(),
                 },
                 Err(e) => BulkOutcome::IndexedUnverified(e.to_string()),
             },
@@ -1371,5 +1464,362 @@ mod tests {
         assert_eq!(transport.calls(), 0);
         assert_eq!(sink.rejected_docs(), 2);
         assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Require a non-empty qualification variable; panics (fail closed)
+    /// when it is missing instead of passing vacuously.
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must be set for qualification; failing closed instead of passing vacuously"
+            )
+        })
+    }
+
+    /// Raw admin call through the official driver client (index setup,
+    /// refresh and query-back). Auth rides the same `Authorization`
+    /// value the sink attaches to its `_bulk` posts.
+    async fn qual_send(
+        client: &elasticsearch::Elasticsearch,
+        method: elasticsearch::http::Method,
+        path: &str,
+        auth: &Option<String>,
+        body: &[u8],
+    ) -> (u16, String) {
+        let mut headers = http::HeaderMap::new();
+        if let Some(value) = auth {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                value
+                    .parse::<http::HeaderValue>()
+                    .expect("qual auth header"),
+            );
+        }
+        let response = client
+            .send(
+                method,
+                path,
+                headers,
+                Option::<&serde_json::Value>::None,
+                Some(body),
+                Some(Duration::from_secs(15)),
+            )
+            .await
+            .expect("qual admin request");
+        let status = response.status_code().as_u16();
+        let text = response.text().await.expect("qual admin body");
+        (status, text)
+    }
+
+    /// Qualification against a real Elasticsearch / OpenSearch server
+    /// via the official `elasticsearch` driver.
+    ///
+    /// Run with e.g.:
+    /// `ELASTICSEARCH_URL=http://127.0.0.1:9200 ELASTICSEARCH_INDEX=qual-es-b317-docs \
+    ///  ELASTICSEARCH_TEMPLATE=qual-es-b317-tpl \
+    ///  cargo test -p broker-connectors --lib elasticsearch::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates an index template + index, streams 2000 docs (10 keys x
+    /// 200 rows) through the broker's rule path
+    /// ([`crate::ConnectorManager`] -> [`ElasticsearchSink`] on
+    /// [`DriverElasticsearchTransport`], which is exactly what the rule
+    /// engine's `ForwardConnector` action calls; never `sink.send`
+    /// directly), refreshes, asserts `_count` returns 2000 and every
+    /// key reads back exactly 200 rows, proves a scripted 429 backs
+    /// off without loss, then deletes the index + template it created.
+    /// Panics when its environment is missing (fail closed, never
+    /// skips).
+    #[tokio::test]
+    #[ignore = "needs a real Elasticsearch/OpenSearch server (see ELASTICSEARCH_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use elasticsearch::http::Method;
+
+        let endpoint = qual_require("ELASTICSEARCH_URL");
+        let index = qual_require("ELASTICSEARCH_INDEX");
+        let template = qual_require("ELASTICSEARCH_TEMPLATE");
+        let auth = match (
+            qual_env("ELASTICSEARCH_USERNAME"),
+            qual_env("ELASTICSEARCH_PASSWORD"),
+        ) {
+            (Some(username), Some(password)) => ElasticsearchAuth::Basic { username, password },
+            _ => match qual_env("ELASTICSEARCH_API_KEY") {
+                Some(key) => ElasticsearchAuth::ApiKey { key },
+                None => ElasticsearchAuth::None,
+            },
+        };
+        let auth_header = auth.header_value().expect("qual auth header");
+
+        let config = ElasticsearchSinkConfig {
+            endpoint: endpoint.clone(),
+            index_template: index.clone(),
+            doc_id_template: None,
+            auth,
+            batch_size: 500,
+            batch_timeout_ms: 50,
+            max_retries: 5,
+            request_timeout_ms: Some(15_000),
+        };
+        config.validate().expect("qual config validates");
+
+        let transport =
+            Arc::new(DriverElasticsearchTransport::new(&config).expect("qual transport"));
+        let client = transport.client();
+
+        // Server version for the report when the server reports one;
+        // otherwise it is omitted (never a constant standing in for a
+        // measurement).
+        let (status, info) = qual_send(client, Method::Get, "/", &auth_header, b"").await;
+        assert!(
+            (200..300).contains(&status),
+            "server info must succeed, got {status}: {info}"
+        );
+        let version: Option<String> = serde_json::from_str::<serde_json::Value>(&info)
+            .ok()
+            .and_then(|info| {
+                info.get("version")
+                    .and_then(|version| version.get("number"))
+                    .and_then(|number| number.as_str())
+                    .map(str::to_string)
+            });
+        match version {
+            Some(version) => {
+                eprintln!("qual server: version={version} endpoint={endpoint} index={index}");
+            }
+            None => {
+                eprintln!("qual server: version unavailable endpoint={endpoint} index={index}");
+            }
+        }
+
+        // Fresh index (delete stale, create) plus a composable index
+        // template covering it; legacy `_template` is the fallback for
+        // servers without composable templates.
+        let (status, _) = qual_send(
+            client,
+            Method::Delete,
+            format!("/{index}").as_str(),
+            &auth_header,
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status) || status == 404,
+            "stale delete must succeed or 404, got {status}"
+        );
+        let template_body = serde_json::json!({
+            "index_patterns": [index.as_str()],
+            "template": {"settings": {"number_of_shards": 1, "number_of_replicas": 0}},
+        })
+        .to_string();
+        let (status, body) = qual_send(
+            client,
+            Method::Put,
+            format!("/_index_template/{template}").as_str(),
+            &auth_header,
+            template_body.as_bytes(),
+        )
+        .await;
+        if !(200..300).contains(&status) {
+            let (legacy_status, legacy_body) = qual_send(
+                client,
+                Method::Put,
+                format!("/_template/{template}").as_str(),
+                &auth_header,
+                template_body.as_bytes(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&legacy_status),
+                "index template must be accepted, got {status}: {body} / legacy {legacy_status}: {legacy_body}"
+            );
+        }
+        let (status, body) = qual_send(
+            client,
+            Method::Put,
+            format!("/{index}").as_str(),
+            &auth_header,
+            b"{}".as_slice(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "index create must succeed, got {status}: {body}"
+        );
+
+        let sink = Arc::new(ElasticsearchSink::new(config, transport.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "elasticsearch");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it and
+        // never `sink.send` directly.
+        const KEYS: u32 = 10;
+        const ROWS_PER_KEY: u32 = 200;
+        const ROWS_TOTAL: u32 = KEYS * ROWS_PER_KEY;
+        let manager = ConnectorManager::new();
+        manager.register("qual-es", sink.clone());
+
+        for seq in 0..ROWS_TOTAL {
+            let key = seq % KEYS;
+            let topic = Topic::new(format!("qual/es/{key:02}")).expect("qual topic");
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"qual-{seq:04}","seq":{seq},"temperature":{:.2}}}"#,
+                20.0 + f64::from(seq) * 0.01
+            ));
+            manager
+                .send("qual-es", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), u64::from(ROWS_TOTAL));
+        eprintln!("qual rows sent: records={ROWS_TOTAL} keys={KEYS} index={index}");
+
+        // Row count asserted back from the server, not the counters.
+        let (status, body) = qual_send(
+            client,
+            Method::Post,
+            format!("/{index}/_refresh").as_str(),
+            &auth_header,
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "refresh must succeed, got {status}: {body}"
+        );
+        let (status, body) = qual_send(
+            client,
+            Method::Get,
+            format!("/{index}/_count").as_str(),
+            &auth_header,
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "count must succeed, got {status}: {body}"
+        );
+        let count: u64 = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|count| count.get("count")?.as_u64())
+            .expect("count body carries a count");
+        assert_eq!(count, u64::from(ROWS_TOTAL));
+
+        // Exact counts by key: every key present with exactly its share.
+        // At-least-once permits duplicates, never loss, and the bulk
+        // write path is synchronous, so each key must read back whole.
+        // The per-document `topic` field is read back from `_source`
+        // (no mapping assumption beyond the stored source).
+        let search_body = serde_json::json!({"size": ROWS_TOTAL, "query": {"match_all": {}}})
+            .to_string()
+            .into_bytes();
+        let (status, body) = qual_send(
+            client,
+            Method::Post,
+            format!("/{index}/_search").as_str(),
+            &auth_header,
+            &search_body,
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "search must succeed, got {status}: {body}"
+        );
+        let search: serde_json::Value =
+            serde_json::from_str(&body).expect("search body carries hits");
+        let hits = search
+            .get("hits")
+            .and_then(|hits| hits.get("hits"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search body carries hits.hits");
+        assert_eq!(hits.len(), ROWS_TOTAL as usize, "qual hits: {body}");
+        let mut per_key = std::collections::HashMap::<String, u64>::new();
+        for hit in hits {
+            let topic = hit
+                .get("_source")
+                .and_then(|source| source.get("topic"))
+                .and_then(serde_json::Value::as_str)
+                .expect("search hit carries _source.topic");
+            *per_key.entry(topic.to_string()).or_default() += 1;
+        }
+        assert_eq!(per_key.len(), KEYS as usize, "qual keys: {per_key:?}");
+        for key in 0..KEYS {
+            let expected = format!("qual/es/{key:02}");
+            assert_eq!(
+                per_key.get(&expected),
+                Some(&u64::from(ROWS_PER_KEY)),
+                "qual key {expected:?} count mismatch: {per_key:?}"
+            );
+        }
+        eprintln!(
+            "qual rows asserted: count={ROWS_TOTAL} each of {KEYS} keys={ROWS_PER_KEY} index={index}"
+        );
+
+        // A 429 engages backoff and restores the buffer: nothing is
+        // lost (mock path through the same manager, no sleep with
+        // max_retries=0).
+        let mut throttle_config = test_config();
+        throttle_config.batch_size = 10;
+        throttle_config.max_retries = 0;
+        let (throttle_sink, throttle_transport) = test_sink(throttle_config);
+        throttle_transport.script_statuses(vec![429]);
+        let throttle_manager = ConnectorManager::new();
+        throttle_manager.register("qual-es-throttle", throttle_sink.clone());
+        let throttle_topic = Topic::new("qual/es/throttle").unwrap();
+        throttle_manager
+            .send(
+                "qual-es-throttle",
+                &throttle_topic,
+                &Bytes::from(r#"{"v":1}"#),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        let err = throttle_sink.flush().await.expect_err("429 must back off");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        assert_eq!(throttle_sink.buffered_rows(), 1);
+        // Backoff engaged: immediate retry fails fast, no new call.
+        assert!(throttle_sink.flush().await.is_err());
+        assert_eq!(throttle_transport.calls(), 1);
+
+        // Cleanup the index + template we created.
+        let (status, body) = qual_send(
+            client,
+            Method::Delete,
+            format!("/{index}").as_str(),
+            &auth_header,
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "qual cleanup index, got {status}: {body}"
+        );
+        let (status, _) = qual_send(
+            client,
+            Method::Delete,
+            format!("/_index_template/{template}").as_str(),
+            &auth_header,
+            b"",
+        )
+        .await;
+        if !(200..300).contains(&status) {
+            let (legacy_status, legacy_body) = qual_send(
+                client,
+                Method::Delete,
+                format!("/_template/{template}").as_str(),
+                &auth_header,
+                b"",
+            )
+            .await;
+            assert!(
+                (200..300).contains(&legacy_status),
+                "qual cleanup template, got {status} / legacy {legacy_status}: {legacy_body}"
+            );
+        }
+        eprintln!("qual cleanup: deleted index {index} and template {template}");
     }
 }

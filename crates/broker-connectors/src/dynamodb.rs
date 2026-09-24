@@ -3,7 +3,15 @@
 //! Buffers MQTT events as DynamoDB items and writes them with
 //! `BatchWriteItem` (`DynamoDB_20120810.BatchWriteItem` over HTTP
 //! POST, `application/x-amz-json-1.0`), signed with AWS Signature
-//! Version 4 for service `dynamodb` via the shared signer in `super`.
+//! Version 4 for service `dynamodb`.
+//!
+//! The write path runs on the maintained `aws-sdk-dynamodb` driver
+//! ([`SdkDynamoDbTransport`] below): typed `AttributeValue` maps
+//! with driver-owned SigV4 (static access-key credentials, session
+//! token when configured, endpoint override for local servers). The
+//! legacy hand-written [`HttpDynamoDbTransport`] (shared signer in
+//! `super`) is retained for endpoint overrides and offline unit
+//! tests only; production wiring uses the driver transport.
 //! Keys derive from templates, TTL attributes compute as
 //! `now + ttl_secs`, and whole JSON documents unpack into typed
 //! attributes (`S`, `N`, `BOOL`, `M`, `L`, `NULL`).
@@ -742,6 +750,241 @@ impl DynamoDbTransport for HttpDynamoDbTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (`aws-sdk-dynamodb`).
+// ---------------------------------------------------------------------------
+
+/// Convert one DynamoDB-JSON attribute (`{"S": ...}`, `{"N": ...}`,
+/// `{"BOOL": ...}`, `{"NULL": ...}`, `{"M": ...}`, `{"L": ...}`) into
+/// the driver's typed `AttributeValue`. Only the shapes
+/// [`dynamodb_attribute`] emits are accepted; anything else is a
+/// terminal dispatch error (fail closed, never a guessed type).
+pub fn attribute_value_from_dynamodb_json(
+    value: &serde_json::Value,
+) -> Result<aws_sdk_dynamodb::types::AttributeValue> {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let obj = value.as_object().ok_or_else(|| {
+        ConnectorError::Dispatch("dynamodb attribute must be a typed object".to_string())
+    })?;
+    if let Some(text) = obj.get("S").and_then(|v| v.as_str()) {
+        return Ok(AttributeValue::S(text.to_string()));
+    }
+    if let Some(number) = obj.get("N").and_then(|v| v.as_str()) {
+        return Ok(AttributeValue::N(number.to_string()));
+    }
+    if let Some(flag) = obj.get("BOOL").and_then(|v| v.as_bool()) {
+        return Ok(AttributeValue::Bool(flag));
+    }
+    if let Some(null) = obj.get("NULL").and_then(|v| v.as_bool()) {
+        return Ok(AttributeValue::Null(null));
+    }
+    if let Some(map) = obj.get("M").and_then(|v| v.as_object()) {
+        let mut fields = HashMap::with_capacity(map.len());
+        for (key, field) in map {
+            fields.insert(key.clone(), attribute_value_from_dynamodb_json(field)?);
+        }
+        return Ok(AttributeValue::M(fields));
+    }
+    if let Some(list) = obj.get("L").and_then(|v| v.as_array()) {
+        let mut items = Vec::with_capacity(list.len());
+        for entry in list {
+            items.push(attribute_value_from_dynamodb_json(entry)?);
+        }
+        return Ok(AttributeValue::L(items));
+    }
+    Err(ConnectorError::Dispatch(
+        "dynamodb attribute has an unsupported type (expected S/N/BOOL/NULL/M/L)".to_string(),
+    ))
+}
+
+/// Convert one item body from [`build_item_body`] into the driver's
+/// attribute map for `PutRequest`.
+pub fn item_body_to_attribute_map(
+    body: &str,
+) -> Result<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> {
+    let doc: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| ConnectorError::Dispatch(format!("dynamodb item is not JSON: {e}")))?;
+    let map = doc.as_object().ok_or_else(|| {
+        ConnectorError::Dispatch("dynamodb item must be a JSON object".to_string())
+    })?;
+    let mut out = HashMap::with_capacity(map.len());
+    for (key, value) in map {
+        out.insert(key.clone(), attribute_value_from_dynamodb_json(value)?);
+    }
+    Ok(out)
+}
+
+/// Retryable DynamoDB failure text: provisioned-throughput exceeded,
+/// throttling, request-limit, write conflicts, internal failures,
+/// timeouts and transport errors. The sink retries these with
+/// jittered backoff; anything else (validation, missing resources,
+/// auth) is terminal. Matching is by error text so it stays correct
+/// across driver revisions without depending on generated variant
+/// names.
+// TODO(parity): the retry-vs-terminal split per BatchWriteItem error
+// code is not pinned by the spec; recheck this list against the
+// structured BatchWriteItemError variants on driver upgrades.
+fn is_retryable_dynamodb_error(text: &str) -> bool {
+    const RETRYABLE: &[&str] = &[
+        "provisionedthroughputexceeded",
+        "throttl",
+        "requestlimitexceeded",
+        "replicatedwriteconflict",
+        "internalservererror",
+        "internalfailure",
+        "serviceunavailable",
+        "timeout",
+        "timed out",
+        "connection",
+        "dispatch",
+        "unavailable",
+    ];
+    let lower = text.to_lowercase();
+    RETRYABLE.iter().any(|marker| lower.contains(marker))
+}
+
+fn classify_dynamodb_sdk_error(text: String) -> ConnectorError {
+    if is_retryable_dynamodb_error(&text) {
+        ConnectorError::Connection(text)
+    } else {
+        ConnectorError::Dispatch(text)
+    }
+}
+
+/// Map driver-returned unprocessed `WriteRequest`s back to the
+/// request's row positions by structural match (first-unmatched
+/// wins), mirroring the legacy HTTP transport. Absent or empty means
+/// everything was written. An entry that matches nothing fails
+/// closed as a connection error so the sink retries the whole batch
+/// instead of dropping it.
+fn map_unprocessed_indices(
+    pending: &[HashMap<String, aws_sdk_dynamodb::types::AttributeValue>],
+    unprocessed: Option<&HashMap<String, Vec<aws_sdk_dynamodb::types::WriteRequest>>>,
+    table: &str,
+) -> Result<Vec<usize>> {
+    let empty: Vec<aws_sdk_dynamodb::types::WriteRequest> = Vec::new();
+    let entries = unprocessed
+        .and_then(|map| map.get(table))
+        .map(Vec::as_slice)
+        .unwrap_or(&empty);
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut used = vec![false; pending.len()];
+    let mut indices = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(item) = entry.put_request().map(|put| put.item()) else {
+            return Err(ConnectorError::Connection(
+                "dynamodb returned an unprocessed entry without an item; retrying whole batch"
+                    .to_string(),
+            ));
+        };
+        let Some(position) = pending
+            .iter()
+            .enumerate()
+            .position(|(index, map)| !used[index] && map == item)
+        else {
+            return Err(ConnectorError::Connection(
+                "dynamodb returned an unprocessed item that was never sent; retrying whole batch"
+                    .to_string(),
+            ));
+        };
+        used[position] = true;
+        indices.push(position);
+    }
+    Ok(indices)
+}
+
+/// Production transport on the maintained `aws-sdk-dynamodb` driver:
+/// `BatchWriteItem` with driver-owned SigV4 (static access-key
+/// credentials, session token when configured, endpoint override for
+/// local servers). One driver round trip is bounded by the configured
+/// request timeout so a slow server surfaces as a retryable
+/// connection error instead of stalling the rule path.
+pub struct SdkDynamoDbTransport {
+    client: aws_sdk_dynamodb::Client,
+    timeout: Duration,
+}
+
+impl SdkDynamoDbTransport {
+    pub fn new(config: &DynamoDbSinkConfig) -> Result<Self> {
+        config.validate()?;
+        let region = aws_sdk_dynamodb::config::Region::new(config.region.clone());
+        let credentials = aws_sdk_dynamodb::config::Credentials::new(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            config.session_token.clone(),
+            None,
+            "indramqtt-static",
+        );
+        let provider = aws_sdk_dynamodb::config::SharedCredentialsProvider::new(credentials);
+        let mut builder = aws_sdk_dynamodb::Config::builder()
+            .behavior_version_latest()
+            .region(region)
+            .credentials_provider(provider);
+        if let Some(endpoint) = &config.endpoint {
+            builder = builder.endpoint_url(endpoint.trim_end_matches('/'));
+        }
+        let sdk_config = builder.build();
+        Ok(Self {
+            client: aws_sdk_dynamodb::Client::from_conf(sdk_config),
+            timeout: config.timeout(),
+        })
+    }
+
+    /// Borrow the driver client (table setup and query-back for
+    /// qualification; the write path stays behind the trait).
+    pub fn client(&self) -> &aws_sdk_dynamodb::Client {
+        &self.client
+    }
+
+    /// Test hook proving `new` stores the configured timeout; the
+    /// production path applies `self.timeout` to the driver call.
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+#[async_trait]
+impl DynamoDbTransport for SdkDynamoDbTransport {
+    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>> {
+        use aws_sdk_dynamodb::types::{PutRequest, WriteRequest};
+        // Owned attribute maps ride alongside the request so
+        // unprocessed entries map back structurally.
+        let mut pending = Vec::with_capacity(req.items.len());
+        let mut writes = Vec::with_capacity(req.items.len());
+        for item in &req.items {
+            let map = item_body_to_attribute_map(&item.body)?;
+            let put = PutRequest::builder()
+                .set_item(Some(map.clone()))
+                .build()
+                .map_err(|e| ConnectorError::Dispatch(format!("dynamodb put build: {e}")))?;
+            writes.push(WriteRequest::builder().put_request(put).build());
+            pending.push(map);
+        }
+        let mut request_items = HashMap::with_capacity(1);
+        request_items.insert(req.table.clone(), writes);
+        let timeout = self.timeout;
+        let output = tokio::time::timeout(
+            timeout,
+            self.client
+                .batch_write_item()
+                .set_request_items(Some(request_items))
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "dynamodb driver timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
+        .map_err(|e| classify_dynamodb_sdk_error(format!("dynamodb write failed: {e:?} ({e})")))?;
+        map_unprocessed_indices(&pending, output.unprocessed_items(), &req.table)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -1250,5 +1493,437 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_sdk_item_conversion_keeps_types() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        // Keys + TTL + mapped scalar from the standard fixture.
+        let body = build_item_body(
+            &test_config(),
+            "t",
+            br#"{"client_id":"d","temperature":84.2}"#,
+            QoS::AtMostOnce,
+            0,
+        )
+        .unwrap();
+        let map = item_body_to_attribute_map(&body).unwrap();
+        assert_eq!(map["device_id"], AttributeValue::S("d".to_string()));
+        assert_eq!(map["timestamp"], AttributeValue::N("0".to_string()));
+        assert_eq!(map["expire_at"], AttributeValue::N("86400".to_string()));
+        assert_eq!(map["temperature"], AttributeValue::N("84.2".to_string()));
+
+        // Whole-document unpack preserves S/N/BOOL/M/L/NULL typing.
+        let mut config = test_config();
+        config.sort_key = None;
+        config.ttl_attribute = None;
+        config.ttl_secs = None;
+        config.attributes_mapping = HashMap::from([("doc".to_string(), "${payload}".to_string())]);
+        let body = build_item_body(
+            &config,
+            "t",
+            br#"{"client_id":"d","temperature":84.2,"ok":true,"meta":{"line":1},"tags":["a"],"nothing":null}"#,
+            QoS::AtMostOnce,
+            0,
+        )
+        .unwrap();
+        let map = item_body_to_attribute_map(&body).unwrap();
+        assert_eq!(map["client_id"], AttributeValue::S("d".to_string()));
+        assert_eq!(map["temperature"], AttributeValue::N("84.2".to_string()));
+        assert_eq!(map["ok"], AttributeValue::Bool(true));
+        assert_eq!(map["nothing"], AttributeValue::Null(true));
+        assert_eq!(
+            map["meta"],
+            AttributeValue::M(HashMap::from([(
+                "line".to_string(),
+                AttributeValue::N("1".to_string())
+            )]))
+        );
+        assert_eq!(
+            map["tags"],
+            AttributeValue::L(vec![AttributeValue::S("a".to_string())])
+        );
+
+        // Shapes the sink never emits are rejected, never guessed.
+        assert!(attribute_value_from_dynamodb_json(&serde_json::json!({"SS": ["a"]})).is_err());
+        assert!(attribute_value_from_dynamodb_json(&serde_json::json!({"B": "aGk="})).is_err());
+        assert!(attribute_value_from_dynamodb_json(&serde_json::json!("plain")).is_err());
+        assert!(item_body_to_attribute_map("not json").is_err());
+    }
+
+    #[test]
+    fn test_sdk_error_classification() {
+        // Provisioned-throughput and throttling take the retry path.
+        for retryable in [
+            "ProvisionedThroughputExceededException: exceeded throughput",
+            "ThrottlingException: rate exceeded",
+            "RequestLimitExceeded",
+            "ReplicatedWriteConflictException",
+            "InternalServerError",
+            "dynamodb driver timed out after 5000ms",
+            "dispatch failure: connection reset",
+            "ServiceUnavailable",
+        ] {
+            assert!(
+                is_retryable_dynamodb_error(retryable),
+                "must retry: {retryable}"
+            );
+            assert!(
+                matches!(
+                    classify_dynamodb_sdk_error(retryable.to_string()),
+                    ConnectorError::Connection(_)
+                ),
+                "must be a connection error: {retryable}"
+            );
+        }
+        // Validation, missing resources and auth are terminal.
+        for terminal in [
+            "ValidationException: unsupported document",
+            "ResourceNotFoundException: table missing",
+            "AccessDeniedException: not authorized",
+        ] {
+            assert!(
+                !is_retryable_dynamodb_error(terminal),
+                "must not retry: {terminal}"
+            );
+            assert!(
+                matches!(
+                    classify_dynamodb_sdk_error(terminal.to_string()),
+                    ConnectorError::Dispatch(_)
+                ),
+                "must be a dispatch error: {terminal}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sdk_unprocessed_index_mapping() {
+        use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+        let write = |id: &str| {
+            let put = PutRequest::builder()
+                .set_item(Some(HashMap::from([(
+                    "id".to_string(),
+                    AttributeValue::S(id.to_string()),
+                )])))
+                .build()
+                .expect("put builds");
+            WriteRequest::builder().put_request(put).build()
+        };
+        let pending: Vec<HashMap<String, AttributeValue>> = vec![
+            HashMap::from([("id".to_string(), AttributeValue::S("a".to_string()))]),
+            HashMap::from([("id".to_string(), AttributeValue::S("b".to_string()))]),
+        ];
+        // Unprocessed carries the second row alone: selective retry.
+        let unprocessed = HashMap::from([("telemetry_table".to_string(), vec![write("b")])]);
+        assert_eq!(
+            map_unprocessed_indices(&pending, Some(&unprocessed), "telemetry_table").unwrap(),
+            vec![1]
+        );
+        // Absent, empty or other-table means everything was written.
+        assert!(map_unprocessed_indices(&pending, None, "telemetry_table")
+            .unwrap()
+            .is_empty());
+        assert!(
+            map_unprocessed_indices(&pending, Some(&HashMap::new()), "telemetry_table")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(map_unprocessed_indices(
+            &pending,
+            Some(&HashMap::from([("other".to_string(), vec![write("a")])])),
+            "telemetry_table"
+        )
+        .unwrap()
+        .is_empty());
+        // An unprocessed item that was never sent fails closed: the
+        // caller retries the whole batch instead of dropping it.
+        let ghost = HashMap::from([("telemetry_table".to_string(), vec![write("ghost")])]);
+        assert!(map_unprocessed_indices(&pending, Some(&ghost), "telemetry_table").is_err());
+    }
+
+    #[test]
+    fn test_sdk_transport_construction() {
+        let config = test_config();
+        // Building the driver client is lazy: no I/O, safe offline.
+        let transport = SdkDynamoDbTransport::new(&config).expect("sdk transport builds");
+        assert_eq!(transport.timeout(), config.timeout());
+        let mut bad = test_config();
+        bad.table_name.clear();
+        assert!(SdkDynamoDbTransport::new(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_unreachable_fails_closed_through_manager() {
+        // Unreachable server through the broker path: connection
+        // failure, never access granted.
+        use crate::ConnectorManager;
+        let mut config = test_config();
+        config.endpoint = Some("http://127.0.0.1:1".to_string());
+        config.batch_size = Some(1);
+        config.timeout_ms = Some(500);
+        let transport = Arc::new(SdkDynamoDbTransport::new(&config).expect("sdk transport"));
+        let sink = Arc::new(DynamoDbSink::new(config, transport).expect("sink"));
+        assert_eq!(sink.kind(), "dynamodb");
+        let manager = ConnectorManager::new();
+        manager.register("ddb-dead", sink.clone());
+        let err = manager
+            .send(
+                "ddb-dead",
+                &Topic::new("sensors/qual").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("unreachable must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "unreachable must be a connection failure, got {err:?}"
+        );
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real DynamoDB server via the maintained
+    /// `aws-sdk-dynamodb` driver.
+    ///
+    /// Run with e.g.:
+    /// `DYNAMODB_ENDPOINT=http://127.0.0.1:8000 DYNAMODB_TABLE=qual_b316 \
+    ///  AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+    ///  cargo test -p broker-connectors --lib dynamodb::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// Creates the table, streams 1000 items through the broker
+    /// ([`crate::ConnectorManager`] -> [`DynamoDbSink`] on
+    /// [`SdkDynamoDbTransport`]), asserts `Scan` count returns 1000,
+    /// proves the mock unprocessed-item path still requeues only
+    /// failed rows and the throttle path backs off, then deletes the
+    /// table it created.
+    #[tokio::test]
+    #[ignore = "needs a real DynamoDB server (see DYNAMODB_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use aws_sdk_dynamodb::types::{
+            AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+            Select,
+        };
+        let endpoint = qual_env("DYNAMODB_ENDPOINT").unwrap_or_else(|| {
+            panic!(
+                "DYNAMODB_ENDPOINT must point at a real DynamoDB server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. DYNAMODB_ENDPOINT=http://127.0.0.1:8000)"
+            )
+        });
+        let table = qual_env("DYNAMODB_TABLE").unwrap_or_else(|| "qual_b316".to_string());
+        let region = qual_env("DYNAMODB_REGION")
+            .or_else(|| qual_env("AWS_REGION"))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        // Static credentials default to the local-server test pair;
+        // real deployments export the usual AWS variables instead.
+        // TODO(parity): DynamoDB exposes no server-version API, so the
+        // report carries the endpoint plus DescribeTable output instead
+        // of a version string; is that an acceptable "server version"?
+        let access_key = qual_env("DYNAMODB_ACCESS_KEY_ID")
+            .or_else(|| qual_env("AWS_ACCESS_KEY_ID"))
+            .unwrap_or_else(|| "test".to_string());
+        let secret_key = qual_env("DYNAMODB_SECRET_ACCESS_KEY")
+            .or_else(|| qual_env("AWS_SECRET_ACCESS_KEY"))
+            .unwrap_or_else(|| "test".to_string());
+
+        let mut config = test_config();
+        config.table_name = table.clone();
+        config.region = region.clone();
+        config.endpoint = Some(endpoint.clone());
+        config.access_key_id = access_key;
+        config.secret_access_key = secret_key;
+        config.partition_key = DynamoKeyConfig {
+            name: "device_id".to_string(),
+            template: "${client_id}".to_string(),
+            key_type: "S".to_string(),
+        };
+        config.sort_key = Some(DynamoKeyConfig {
+            name: "seq".to_string(),
+            // `${timestamp}` (not `${payload.seq}`): validation renders
+            // templates against a dummy payload, so a payload-field
+            // sort key would fail the numeric check before any write.
+            template: "${timestamp}".to_string(),
+            key_type: "N".to_string(),
+        });
+        config.ttl_attribute = None;
+        config.ttl_secs = None;
+        config.attributes_mapping = HashMap::from([(
+            "temperature".to_string(),
+            "${payload.temperature}".to_string(),
+        )]);
+        config.batch_size = Some(25);
+        config.batch_bytes = Some(1_048_576);
+        config.linger_ms = Some(10);
+        config.max_retries = Some(4);
+        config.initial_backoff_ms = Some(1);
+        config.max_backoff_ms = Some(2);
+        config.timeout_ms = Some(15_000);
+        config.validate().expect("qual config validates");
+
+        let transport = Arc::new(SdkDynamoDbTransport::new(&config).expect("qual transport"));
+        let client = transport.client().clone();
+
+        // Fresh table (delete stale, create, wait until describable).
+        let _ = client.delete_table().table_name(&table).send().await;
+        client
+            .create_table()
+            .table_name(&table)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("device_id")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .expect("qual key schema"),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("seq")
+                    .key_type(KeyType::Range)
+                    .build()
+                    .expect("qual sort schema"),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("device_id")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .expect("qual attr def"),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("seq")
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .expect("qual sort def"),
+            )
+            .billing_mode(BillingMode::PayPerRequest)
+            .send()
+            .await
+            .expect("qual create table");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if client
+                    .describe_table()
+                    .table_name(&table)
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("qual table never became describable");
+        let described = client
+            .describe_table()
+            .table_name(&table)
+            .send()
+            .await
+            .expect("qual describe");
+        eprintln!("qual server: endpoint={endpoint} table={table} describe={described:?}");
+
+        let sink = Arc::new(DynamoDbSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "dynamodb");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = ConnectorManager::new();
+        manager.register("qual-ddb", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..1000u32 {
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"dev-{seq:04}","seq":{seq},"temperature":{:.2}}}"#,
+                20.0 + f64::from(seq) * 0.01
+            ));
+            manager
+                .send("qual-ddb", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1000);
+        eprintln!("qual rows sent: records=1000 table={table}");
+
+        // Row count asserted back from the server, not the counters.
+        let mut counted = 0i32;
+        let mut start_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let page = client
+                .scan()
+                .table_name(&table)
+                .select(Select::Count)
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .expect("qual scan");
+            counted += page.count();
+            match page.last_evaluated_key() {
+                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+        assert_eq!(counted, 1000);
+        eprintln!("qual rows asserted: count=1000 table={table}");
+
+        // Unprocessed items still requeue selectively (mock path).
+        let mut mock_config = test_config();
+        mock_config.batch_size = Some(10);
+        mock_config.initial_backoff_ms = Some(1);
+        mock_config.max_backoff_ms = Some(2);
+        let (mock_sink, mock_transport) = test_sink(mock_config);
+        mock_transport.script_outcomes(vec![
+            MockDynamoDbOutcome::Unprocessed(vec![1]),
+            MockDynamoDbOutcome::Accepted,
+        ]);
+        let mock_topic = Topic::new("t").unwrap();
+        for temp in [20.5, 21.5] {
+            mock_sink
+                .send(
+                    &mock_topic,
+                    &Bytes::from(format!("{{\"client_id\":\"d\",\"temperature\":{temp}}}")),
+                    QoS::AtMostOnce,
+                )
+                .await
+                .unwrap();
+        }
+        mock_sink.flush().await.unwrap();
+        assert_eq!(mock_transport.calls(), 2);
+        assert_eq!(mock_transport.captured()[1].items.len(), 1);
+
+        // Provisioned-throughput backoff: throttle exhausts retries,
+        // retains the buffer, then fails fast while backing off.
+        let mut throttle_config = test_config();
+        throttle_config.batch_size = Some(10);
+        throttle_config.max_retries = Some(0);
+        let (throttle_sink, throttle_transport) = test_sink(throttle_config);
+        throttle_transport.script_outcomes(vec![MockDynamoDbOutcome::Throttled]);
+        throttle_sink
+            .send(
+                &mock_topic,
+                &Bytes::from("{\"client_id\":\"d\"}"),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        let err = throttle_sink
+            .flush()
+            .await
+            .expect_err("throttle must exhaust");
+        assert!(matches!(err, ConnectorError::Connection(_)));
+        assert_eq!(throttle_sink.buffered_rows(), 1);
+
+        // Cleanup the table we created.
+        client
+            .delete_table()
+            .table_name(&table)
+            .send()
+            .await
+            .expect("qual cleanup table");
     }
 }

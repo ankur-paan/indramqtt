@@ -67,8 +67,23 @@ fn default_extension() -> String {
     "log".to_string()
 }
 
-/// Disk log configuration. Rotation/retention bounds are optional:
-/// `None` (or 0) disables that axis entirely — unbounded by default.
+/// Default active-segment ceiling: 64 MiB — bounds the recovery scan
+/// (`open` reads the active segment) and keeps one gunzip diff bounded.
+fn default_max_file_size_bytes() -> Option<u64> {
+    Some(67_108_864)
+}
+
+/// Default retained-segment cap: 10 — bounds total disk to ~640 MiB +
+/// active so a forgotten connector cannot fill the disk.
+fn default_max_backup_files() -> Option<usize> {
+    Some(10)
+}
+
+/// Disk log configuration. The backup list accumulates on disk: it is
+/// bounded by default (`max_backup_files` defaults to 10, active segment
+/// defaults to 64 MiB; reasons on the default functions above). `None`
+/// (or 0) explicitly disables an axis — an operator opt-in to unbounded —
+/// while a missing field takes the bounded default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskLogSinkConfig {
     /// Output directory (created on open for file writers).
@@ -83,8 +98,8 @@ pub struct DiskLogSinkConfig {
     #[serde(default)]
     pub format: DiskLogFormat,
     /// Rotate when the active segment would exceed this many bytes
-    /// (`None`/0 disables size rotation).
-    #[serde(default)]
+    /// (default 64 MiB; `None`/0 explicitly disables size rotation).
+    #[serde(default = "default_max_file_size_bytes")]
     pub max_file_size_bytes: Option<u64>,
     /// Rotate when the active segment is older than this many seconds
     /// (`None`/0 disables age rotation).
@@ -93,8 +108,9 @@ pub struct DiskLogSinkConfig {
     /// Compress rotated segments (default none).
     #[serde(default)]
     pub compression: DiskLogCompression,
-    /// Keep up to N rotated segments, pruning oldest (`None`/0 keeps all).
-    #[serde(default)]
+    /// Keep up to N rotated segments, pruning oldest (default 10;
+    /// `None`/0 explicitly keeps all).
+    #[serde(default = "default_max_backup_files")]
     pub max_backup_files: Option<usize>,
     /// Purge rotated segments older than N days (`None`/0 keeps all).
     #[serde(default)]
@@ -354,14 +370,59 @@ impl FileDiskLogWriter {
             .map_err(|e| ConnectorError::Connection(format!("disk log mkdir failed: {e}")))?;
         let dir = PathBuf::from(&config.directory);
         let active = dir.join(config.active_name());
+        // Crash recovery: a kill mid-write can leave a torn tail (bytes
+        // after the last `\n` were never a complete record). Truncate to
+        // the last newline so a reopen never serves a partial row.
+        // PERF(parity): this reads the whole active segment; the fast
+        // version would scan only the tail blocks.
+        match tokio::fs::read(&active).await {
+            Ok(bytes) => {
+                if !bytes.is_empty() && *bytes.last().unwrap_or(&b'\n') != b'\n' {
+                    let keep = bytes
+                        .iter()
+                        .rposition(|b| *b == b'\n')
+                        .map_or(0, |pos| pos + 1);
+                    let dropped = bytes.len() - keep;
+                    let trunc = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&active)
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::Connection(format!("disk log recovery failed: {e}"))
+                        })?;
+                    trunc.set_len(keep as u64).await.map_err(|e| {
+                        ConnectorError::Connection(format!("disk log recovery failed: {e}"))
+                    })?;
+                    trunc.sync_all().await.map_err(|e| {
+                        ConnectorError::Connection(format!("disk log recovery failed: {e}"))
+                    })?;
+                    tracing::warn!(
+                        segment = %config.active_name(),
+                        dropped_bytes = dropped,
+                        "disk log truncated torn tail after restart"
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ConnectorError::Connection(format!(
+                    "disk log recovery read failed: {e}"
+                )));
+            }
+        }
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&active)
             .await
             .map_err(|e| ConnectorError::Connection(format!("disk log open failed: {e}")))?;
-        // Resume numbering past existing backups.
+        // Resume numbering past existing backups. Crash recovery for a
+        // kill between the rename and the gzip finish: an uncompressed
+        // staged `<prefix>.<ext>.<N>` left next to the `.gz` backups is
+        // compressed into `<N>.gz` (overwriting any torn `.gz`) and the
+        // staged file removed, so no torn/uncompressed segment survives.
         let mut next_index = 1u64;
+        let mut staged: Vec<(String, u64)> = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -369,8 +430,47 @@ impl FileDiskLogWriter {
                     backup_index(&config.filename_prefix, &config.filename_extension, &name)
                 {
                     next_index = next_index.max(index + 1);
+                    if config.compression == DiskLogCompression::Gzip && !name.ends_with(".gz") {
+                        staged.push((name, index));
+                    }
                 }
             }
+        }
+        for (staged_name, index) in staged {
+            let staged_path = dir.join(&staged_name);
+            let mut dest_name = format!(
+                "{}.{}.{index}",
+                config.filename_prefix, config.filename_extension
+            );
+            dest_name.push_str(".gz");
+            let dest_path = dir.join(&dest_name);
+            let raw = match tokio::fs::read(&staged_path).await {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(ConnectorError::Connection(format!(
+                        "disk log orphan read failed: {e}"
+                    )));
+                }
+            };
+            let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
+            encoder
+                .write_all(&raw)
+                .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?;
+            let gzipped = encoder
+                .finish()
+                .map_err(|e| ConnectorError::Dispatch(format!("disk log gzip failed: {e}")))?;
+            tokio::fs::write(&dest_path, gzipped).await.map_err(|e| {
+                ConnectorError::Connection(format!("disk log orphan gzip write failed: {e}"))
+            })?;
+            tokio::fs::remove_file(&staged_path).await.map_err(|e| {
+                ConnectorError::Connection(format!("disk log orphan cleanup failed: {e}"))
+            })?;
+            tracing::warn!(
+                staged = %staged_name,
+                dest = %dest_name,
+                "disk log compressed rename-gzip orphan after restart"
+            );
         }
         Ok(Self {
             dir,
@@ -428,9 +528,35 @@ impl DiskLogWriter for FileDiskLogWriter {
         let _ = file_guard.take();
 
         let active = self.active_path();
-        let meta = tokio::fs::metadata(&active)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("disk log stat failed: {e}")))?;
+        let meta = match tokio::fs::metadata(&active).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The active segment vanished under us (operator deleted
+                // it or a crash lost the rename): fail closed — deny this
+                // rotation, log it, recreate empty for the next write.
+                tracing::warn!(
+                    path = %active.display(),
+                    "disk log active segment missing during rotation; failing closed"
+                );
+                let reopened = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&active)
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::Connection(format!("disk log reopen failed: {e}"))
+                    })?;
+                *file_guard = Some(reopened);
+                return Err(ConnectorError::Connection(
+                    "disk log active segment missing; rotation denied".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(ConnectorError::Connection(format!(
+                    "disk log stat failed: {e}"
+                )));
+            }
+        };
         if meta.len() == 0 {
             // Reopen (rotate is also the startup path) and report empty.
             let reopened = tokio::fs::OpenOptions::new()
@@ -624,6 +750,28 @@ impl DiskLogSink {
                 current_bytes: 0,
                 current_created_ms: None,
                 backups: Vec::new(),
+                last_sync_ms: 0,
+            }),
+            written_records: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
+        })
+    }
+
+    /// Reopen path: hydrates the backup list from the writer directory
+    /// listing so count/age retention spans restarts, not just rotations
+    /// in this process. Production (`register_live_sink`, `build_connector`)
+    /// and the crash-recovery qualification use this; fresh in-memory
+    /// tests keep using `new`.
+    pub async fn open(config: DiskLogSinkConfig, writer: Arc<dyn DiskLogWriter>) -> Result<Self> {
+        config.validate()?;
+        let backups = writer.list_backups().await?;
+        Ok(Self {
+            config,
+            writer,
+            state: parking_lot::Mutex::new(DiskLogState {
+                current_bytes: 0,
+                current_created_ms: None,
+                backups,
                 last_sync_ms: 0,
             }),
             written_records: AtomicU64::new(0),
@@ -1105,5 +1253,274 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(writer.flush_count(), 0);
+    }
+
+    /// Qualification against a real local directory via `tokio::fs`
+    /// (the standard library; there is no vendor driver for a local
+    /// append log).
+    ///
+    /// Configures a rotating gzip log, streams 5000 events through the
+    /// broker's connector manager (`ConnectorManager` -> `DiskLogSink`
+    /// on `FileDiskLogWriter`), drops the handles to simulate a kill
+    /// mid-write, appends a torn tail without a trailing newline plus a
+    /// staged rename-gzip orphan, reopens (recovery must truncate the
+    /// torn tail and compress the orphan), reopens the sink (which must
+    /// hydrate backups so retention spans the kill), then asserts no
+    /// torn segment remains, retention pruned to the count cap, every
+    /// retained row gunzips and parses, and the retained sequence
+    /// numbers are a contiguous suffix of what was sent. Removes the
+    /// temp directory it created. Runs offline: needs only a writable
+    /// temp directory.
+    #[tokio::test]
+    async fn test_qualify_file_write_path_crash_recovery() {
+        use crate::ConnectorManager;
+
+        struct DirGuard {
+            path: std::path::PathBuf,
+        }
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "disklog-qual-{}-{}",
+            std::process::id(),
+            crate::now_millis()
+        ));
+        std::fs::create_dir_all(&base).expect("qual temp dir");
+        let _guard = DirGuard { path: base.clone() };
+        let dir = base.to_string_lossy().into_owned();
+
+        let config = DiskLogSinkConfig {
+            directory: dir,
+            filename_prefix: "qual".to_string(),
+            filename_extension: "log".to_string(),
+            format: DiskLogFormat::Ndjson,
+            max_file_size_bytes: Some(32_768),
+            max_file_age_secs: None,
+            compression: DiskLogCompression::Gzip,
+            max_backup_files: Some(8),
+            max_retention_days: None,
+            sync_mode: DiskSyncMode::EveryBatch,
+            timeout_ms: None,
+        };
+        config.validate().expect("qual config validates");
+
+        let writer = Arc::new(
+            FileDiskLogWriter::open(&config)
+                .await
+                .expect("qual open real directory"),
+        );
+        let sink = Arc::new(
+            DiskLogSink::open(config.clone(), writer.clone())
+                .await
+                .expect("qual sink"),
+        );
+        assert_eq!(sink.kind(), "disk_log");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = Arc::new(ConnectorManager::new());
+        manager.register("qual-disk", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..5000u32 {
+            let payload = Bytes::from(format!(r#"{{"seq":{seq}}}"#));
+            manager
+                .send("qual-disk", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.written_records(), 5000, "qual row count");
+        assert!(
+            sink.rotation_count() >= 1,
+            "32 KiB segments must rotate over 5000 rows"
+        );
+        let retained_before = sink.backup_names().len();
+        assert!(
+            retained_before <= 8,
+            "retention cap holds: {retained_before}"
+        );
+        assert!(
+            u64::try_from(retained_before).unwrap_or(u64::MAX) < sink.rotation_count(),
+            "oldest segments pruned: rotations={} retained={retained_before}",
+            sink.rotation_count()
+        );
+        eprintln!(
+            "qual progress: records=5000 rotations={} retained={retained_before}",
+            sink.rotation_count()
+        );
+
+        // Simulate a kill mid-write: drop every handle, then leave an
+        // unflushed torn tail (no trailing newline) in the active
+        // segment the way a torn `write_all` would.
+        drop(manager);
+        drop(sink);
+        drop(writer);
+        let active_path = base.join("qual.log");
+        {
+            use std::io::Write;
+            let mut active = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)
+                .expect("qual torn append");
+            active
+                .write_all(b"{\"torn\": tru")
+                .expect("qual torn bytes");
+        }
+
+        // Simulate a second kill point: crash between the rename and the
+        // gzip finish leaves an uncompressed staged
+        // `<prefix>.<ext>.<N>` next to the `.gz` backups.
+        {
+            use std::io::Write;
+            let staged_path = base.join("qual.log.9000");
+            let mut staged = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&staged_path)
+                .expect("qual staged create");
+            staged
+                .write_all(b"{\"orphan\": true}\n")
+                .expect("qual staged bytes");
+        }
+
+        // Reopen runs crash recovery: the torn tail must be truncated and
+        // the rename-gzip orphan must be compressed to `.gz`.
+        let writer = Arc::new(FileDiskLogWriter::open(&config).await.expect("qual reopen"));
+        let active = tokio::fs::read(&active_path)
+            .await
+            .expect("qual read active");
+        assert!(
+            active.is_empty() || *active.last().unwrap() == b'\n',
+            "active segment has no torn tail"
+        );
+        assert!(
+            !String::from_utf8_lossy(&active).contains("torn"),
+            "torn bytes removed by recovery"
+        );
+        assert!(
+            !base.join("qual.log.9000").exists(),
+            "rename-gzip orphan staged file cleaned"
+        );
+        assert!(
+            base.join("qual.log.9000.gz").exists(),
+            "rename-gzip orphan compressed on recovery"
+        );
+        {
+            let raw = tokio::fs::read(base.join("qual.log.9000.gz"))
+                .await
+                .expect("qual read orphan gz");
+            assert_eq!(&raw[..2], &[0x1f, 0x8b], "orphan gzip magic");
+            assert_eq!(gunzip(&raw), b"{\"orphan\": true}\n");
+            tokio::fs::remove_file(base.join("qual.log.9000.gz"))
+                .await
+                .expect("qual remove orphan gz");
+        }
+
+        // Retention spans the kill: a reopened sink hydrates its backup
+        // list from the directory, not just rotations in this process.
+        let reopened_sink = Arc::new(
+            DiskLogSink::open(config.clone(), writer.clone())
+                .await
+                .expect("qual sink reopen"),
+        );
+        let backups = writer.list_backups().await.expect("qual list");
+        assert_eq!(
+            reopened_sink.backup_names().len(),
+            backups.len(),
+            "reopened sink hydrates backups across kill"
+        );
+        assert!(
+            reopened_sink
+                .backup_names()
+                .iter()
+                .all(|name| backups.iter().any(|b| &b.name == name)),
+            "sink backups match directory listing"
+        );
+        reopened_sink
+            .enforce_retention_at(crate::now_millis())
+            .await
+            .expect("qual retention across kill");
+        let backups_after = writer.list_backups().await.expect("qual list after");
+        assert_eq!(
+            reopened_sink.backup_names().len(),
+            backups_after.len(),
+            "sink retention prunes the reopened directory"
+        );
+
+        // Every segment on disk: no torn tail, gzip magic on backups,
+        // every row parses and carries its sent sequence number.
+        let backups = backups_after;
+        assert!(!backups.is_empty(), "rotated segments exist");
+        assert!(backups.len() <= 8, "retention cap holds on disk");
+        let mut seqs: Vec<u64> = Vec::new();
+        let mut row_total = 0usize;
+        for backup in &backups {
+            assert!(
+                backup.name.starts_with("qual.log."),
+                "backup shape: {}",
+                backup.name
+            );
+            let raw = tokio::fs::read(base.join(&backup.name))
+                .await
+                .expect("qual read backup");
+            assert_eq!(&raw[..2], &[0x1f, 0x8b], "gzip magic: {}", backup.name);
+            let back = gunzip(&raw);
+            assert!(
+                back.ends_with(b"\n"),
+                "backup has no torn tail: {}",
+                backup.name
+            );
+            for line in back.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+                let row: serde_json::Value = serde_json::from_slice(line).expect("qual row parses");
+                assert_eq!(row["topic"], "sensors/qual");
+                let seq = row["payload"]["seq"].as_u64().expect("qual seq");
+                seqs.push(seq);
+                row_total += 1;
+            }
+        }
+        assert!(
+            active.is_empty() || active.ends_with(b"\n"),
+            "active has no torn tail"
+        );
+        for line in active
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let row: serde_json::Value = serde_json::from_slice(line).expect("qual row parses");
+            assert_eq!(row["topic"], "sensors/qual");
+            seqs.push(row["payload"]["seq"].as_u64().expect("qual seq"));
+            row_total += 1;
+        }
+        assert!(
+            row_total > 0 && row_total < 5000,
+            "pruned suffix: {row_total}"
+        );
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), row_total, "no duplicated rows");
+        assert_eq!(*seqs.last().unwrap(), 4999, "newest row retained");
+        assert!(*seqs.first().unwrap() > 0, "oldest rows pruned");
+        for pair in seqs.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "retained suffix contiguous");
+        }
+        eprintln!(
+            "qual asserted: records=5000 retained={row_total} backups={} oldest_seq={} newest_seq=4999",
+            backups.len(),
+            seqs[0]
+        );
+
+        drop(writer);
+        let path = _guard.path.clone();
+        drop(_guard);
+        assert!(
+            !path.exists(),
+            "qual temp directory cleaned up: {}",
+            path.display()
+        );
     }
 }

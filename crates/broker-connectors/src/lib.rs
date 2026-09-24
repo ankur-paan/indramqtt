@@ -133,16 +133,17 @@ pub use couchbase::{
     decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,
     parse_connection_string as parse_couchbase_connection_string, CapturedCouchbaseBatch,
     CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation,
-    CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, KvResponse, MockCouchbaseOutcome,
-    MockCouchbaseTransport, NativeCouchbaseTransport,
+    CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, DriverCouchbaseTransport, KvResponse,
+    MockCouchbaseOutcome, MockCouchbaseTransport, NativeCouchbaseTransport,
 };
 pub use databricks::{
-    parse_statement_state, render_statement_body, CapturedDatabricksStatement, DatabricksConnector,
+    parse_result_rows, parse_statement_id, parse_statement_response, parse_statement_state,
+    render_statement_body, statement_status_url, CapturedDatabricksStatement, DatabricksConnector,
     DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport,
     HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState,
 };
 pub use datalayers::{
-    extract_datalayers_record, extract_microsecond_timestamp, DatalayersConfig,
+    extract_datalayers_record, extract_microsecond_timestamp, parse_count_result, DatalayersConfig,
     DatalayersConnector, DatalayersRecord, DatalayersSink, DatalayersTransport,
     DatalayersWriteRequest, HttpDatalayersTransport, MockDatalayersTransport,
 };
@@ -151,34 +152,34 @@ pub use disk_log::{
     DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter,
 };
 pub use doris::{
-    classify_status as classify_doris_status, parse_load_result, render_body as render_doris_body,
-    CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat, DorisHeaders, DorisLoadResult,
-    DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport, MockDorisOutcome,
-    MockDorisTransport,
+    classify_status as classify_doris_status, doris_http_client, parse_load_result,
+    render_body as render_doris_body, CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat,
+    DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport,
+    MockDorisOutcome, MockDorisTransport,
 };
 pub use dynamodb::{
-    build_item_body, dynamodb_attribute, parse_unprocessed,
-    render_batch_body as render_dynamodb_batch_body, DynamoDbBatchWriteRequest, DynamoDbConnector,
-    DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig, DynamoDbTransport, DynamoKeyConfig,
-    HttpDynamoDbTransport, MockDynamoDbOutcome, MockDynamoDbTransport, DYNAMODB_CONTENT_TYPE,
-    DYNAMODB_TARGET,
+    attribute_value_from_dynamodb_json, build_item_body, dynamodb_attribute,
+    item_body_to_attribute_map, parse_unprocessed, render_batch_body as render_dynamodb_batch_body,
+    DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig,
+    DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome,
+    MockDynamoDbTransport, SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
 };
 pub use elasticsearch::{
-    BulkOutcome, CapturedBulk, ElasticsearchAuth, ElasticsearchConnector, ElasticsearchSink,
-    ElasticsearchSinkConfig, ElasticsearchTransport, HttpElasticsearchTransport,
-    MockElasticsearchTransport,
+    BulkOutcome, CapturedBulk, DriverElasticsearchTransport, ElasticsearchAuth,
+    ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport,
+    HttpElasticsearchTransport, MockElasticsearchTransport,
 };
 pub use gcp_iot::{
     build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
     state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
     GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
-    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport,
+    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, TlsGcpIotTransport,
 };
 pub use gcp_pubsub::{
-    build_jwt_assertion, parse_publish_response, render_publish_body, CapturedGcpPublish, GcpAuth,
-    GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink, GcpPubSubSinkConfig, GcpPubSubTransport,
-    GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome, MockGcpPubSubTransport,
-    GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
+    build_jwt_assertion, driver_message_for, parse_publish_response, render_publish_body,
+    CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink,
+    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome,
+    MockGcpPubSubTransport, SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
 };
 pub use greptimedb::{
     build_greptime_sql_insert, build_influx_line_protocol, extract_greptime_record,
@@ -198,8 +199,10 @@ pub use iotdb::{
     MockIotDbOutcome, MockIotDbTransport,
 };
 pub use kafka::{
-    KafkaRecord, KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport,
-    TcpKafkaTransport,
+    classify_driver_error as classify_kafka_driver_error,
+    is_terminal_driver_message as is_kafka_terminal_driver_message,
+    rdkafka_client_config as rdkafka_kafka_client_config, KafkaRecord, KafkaSink, KafkaSinkConfig,
+    KafkaTransport, MemoryKafkaTransport, RdkafkaKafkaTransport, TcpKafkaTransport,
 };
 pub use kinesis::{
     HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
@@ -216,7 +219,7 @@ pub use mqtt_bridge::{
     decode_publish, decode_remaining_length, encode_publish, encode_remaining_length,
     parse_bridge_address, BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport,
     MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig,
-    MqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport,
+    MqttBridgeTransport, RumqttcMqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport,
 };
 pub use mssql::{
     days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password,
@@ -225,7 +228,8 @@ pub use mssql::{
     NativeMssqlTransport, TdsReply,
 };
 pub use mysql::{
-    MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig, MySqlTransport, TcpMySqlTransport,
+    DriverMySqlTransport, MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig,
+    MySqlTransport, TcpMySqlTransport,
 };
 pub use oci_streaming::{
     authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages,
@@ -254,7 +258,8 @@ pub use oracle::{
     OracleValue,
 };
 pub use postgres::{
-    MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport,
+    DriverPgTransport, MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink,
+    PostgreSqlSinkConfig, TcpPgTransport,
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
@@ -263,12 +268,12 @@ pub use pulsar::{
     TcpPulsarTransport,
 };
 pub use rabbitmq::{
-    AmqpFrame, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig, RabbitMqTransport,
-    TcpRabbitTransport,
+    AmqpFrame, LapinRabbitTransport, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig,
+    RabbitMqTransport, TcpRabbitTransport,
 };
 pub use redis::{
-    MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply, RedisSink, RedisSinkConfig,
-    RedisTransport, TcpRedisTransport,
+    DriverRedisTransport, MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply,
+    RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport,
 };
 pub use redshift::{
     default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
@@ -289,7 +294,7 @@ pub use rocketmq::{
 };
 pub use s3::{
     HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
-    S3Transport, SigV4Request,
+    S3Transport, SdkS3Transport, SigV4Request,
 };
 pub use s3_tables::{
     apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path,
@@ -326,8 +331,8 @@ pub use tdengine::{
     TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport,
 };
 pub use timescaledb::{
-    MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch, TimescaleDbConnector,
-    TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
+    DriverTimescaleDbTransport, MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch,
+    TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
 };
 pub use timestream::{
     render_write_records_body, HttpTimestreamTransport, MockTimestreamOutcome,

@@ -1,16 +1,27 @@
 //! Google Cloud Pub/Sub sink (INDRA-199).
 //!
-//! Buffers MQTT events and publishes them with `POST
-//! /v1/projects/{project}/topics/{topic}:publish`: base64 data,
-//! optional per-message ordering keys, and templated attributes
-//! (`mqtt_topic` / `mqtt_qos` are always injected). Retries cover HTTP
-//! 429 and 500..=504 with jittered backoff; other non-2xx statuses
-//! are terminal dispatch failures.
+//! Buffers MQTT events and publishes them with base64 data, optional
+//! per-message ordering keys, and templated attributes (`mqtt_topic` /
+//! `mqtt_qos` are always injected).
 //!
-//! Authentication: `None` (emulator), `AccessToken` (raw bearer), or
-//! `ServiceAccountKey`, which mints RS256 JWT assertions and exchanges
+//! The write path runs on the maintained `google-cloud-pubsub` driver
+//! ([`SdkGcpPubSubTransport`] below): gRPC `Publisher` publish with
+//! OAuth2 Bearer (anonymous for the emulator, static bearer for raw
+//! access tokens, service-account flow for keys, ADC otherwise). The
+//! legacy hand-written REST [`HttpGcpPubSubTransport`] (`POST
+//! /v1/projects/{project}/topics/{topic}:publish`) is retained for
+//! endpoint overrides and offline unit tests only; production wiring
+//! uses the driver transport.
+//!
+//! Authentication: `None` (emulator / ADC), `AccessToken` (raw bearer),
+//! or `ServiceAccountKey`, which mints RS256 JWT assertions and exchanges
 //! them at the OAuth2 token endpoint with an expiring in-memory cache
-//! (fully in-memory testable against a loopback fake endpoint).
+//! (fully in-memory testable against a loopback fake endpoint). The
+//! driver transport reuses the same [`GcpAuth`] values through
+//! `google-cloud-auth` credentials.
+//!
+//! Retries cover throttles with jittered backoff; terminal dispatch
+//! failures restore the buffer and engage backoff.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -176,26 +187,38 @@ fn default_endpoint() -> Option<String> {
     None
 }
 
+// Vendor limit: a single Publish call accepts at most 1_000 messages, so
+// the default batch fills but never exceeds one request.
 fn default_batch_size() -> Option<usize> {
     Some(1_000)
 }
 
+// Vendor limit: Publish requests are capped at 10 MiB; 8 MiB leaves
+// headroom for base64 expansion, attributes and ordering keys.
 fn default_batch_bytes() -> Option<usize> {
     Some(8_388_608)
 }
 
+// Latency reason: 10ms coalesces bursts into fewer Publish calls while
+// adding negligible delay next to a typical publish round trip.
 fn default_linger_ms() -> Option<u64> {
     Some(10)
 }
 
+// Availability reason: 3 retries ride out transient 429/5xx throttles
+// without holding a batch forever; terminal rejections fail fast.
 fn default_max_retries() -> Option<usize> {
     Some(3)
 }
 
+// Backoff reason: starts above a typical emulator round trip (~1ms) so a
+// single throttle does not spin, well below the 5s request timeout.
 fn default_initial_backoff_ms() -> Option<u64> {
     Some(100)
 }
 
+// Backoff reason: 2s ceiling keeps the worst-case retry burst inside the
+// operator-visible request timeout budget instead of sleeping past it.
 fn default_max_backoff_ms() -> Option<u64> {
     Some(2_000)
 }
@@ -208,8 +231,12 @@ fn is_resource_id(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// GCP Pub/Sub sink configuration. All depths are optional (`None` =
-/// unbounded) with zero clamped ceilings.
+/// GCP Pub/Sub sink configuration. Buffering is bounded by `batch_size`
+/// (default 1000: one Publish call) and `batch_bytes` (default 8 MiB: under
+/// the 10 MiB request ceiling); `None` is an explicit operator opt-in to
+/// unbounded, never the default. Retry/backoff/timeout defaults are finite
+/// (3 retries, 100ms/2s backoff, 5s timeout) so a stuck server cannot hold
+/// a flush forever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcpPubSubSinkConfig {
     /// GCP project id, e.g. `my-iot-project`.
@@ -228,25 +255,29 @@ pub struct GcpPubSubSinkConfig {
     /// Custom attributes with template substitution.
     #[serde(default)]
     pub attributes: HashMap<String, String>,
-    /// Messages per publish call (default 1000).
+    /// Messages per publish call (default 1000: the vendor per-request
+    /// message limit).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Batch byte limit (default 8 MiB).
+    /// Batch byte limit (default 8 MiB: under the 10 MiB request ceiling).
     #[serde(default = "default_batch_bytes")]
     pub batch_bytes: Option<usize>,
-    /// Linger flush window in ms (default 10).
+    /// Linger flush window in ms (default 10: coalesces bursts without
+    /// adding visible latency).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
-    /// Retries on 429/500..=504 (default 3, `None` unbounded, 0 none).
+    /// Retries on 429/500..=504 (default 3: rides out transient throttles;
+    /// `None` is an explicit unbounded opt-in, 0 none).
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<usize>,
-    /// First retry delay in ms (default 100).
+    /// First retry delay in ms (default 100: above a local round trip).
     #[serde(default = "default_initial_backoff_ms")]
     pub initial_backoff_ms: Option<u64>,
-    /// Retry delay ceiling in ms (default 2000).
+    /// Retry delay ceiling in ms (default 2000: inside the timeout budget).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
-    /// Request timeout in ms (default 5000).
+    /// Request timeout in ms (default 5000: well above publish p99 so only
+    /// a stuck server trips it).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -640,6 +671,291 @@ impl GcpPubSubTransport for HttpGcpPubSubTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (`google-cloud-pubsub`).
+// ---------------------------------------------------------------------------
+
+/// Static Bearer credentials for raw OAuth2 access tokens.
+///
+/// The driver expects a `google-cloud-auth` credentials object; for a
+/// pre-minted token there is no refresh to perform, so `headers` returns
+/// `Authorization: Bearer <token>` verbatim (cached via the entity tag).
+#[derive(Debug, Clone)]
+struct StaticBearerCredentials {
+    token: String,
+    tag: google_cloud_auth::credentials::EntityTag,
+}
+
+impl StaticBearerCredentials {
+    fn new(token: String) -> Self {
+        Self {
+            token,
+            tag: google_cloud_auth::credentials::EntityTag::new(),
+        }
+    }
+}
+
+impl google_cloud_auth::credentials::CredentialsProvider for StaticBearerCredentials {
+    fn headers(
+        &self,
+        extensions: http::Extensions,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            google_cloud_auth::credentials::CacheableResource<http::HeaderMap>,
+            google_cloud_auth::errors::CredentialsError,
+        >,
+    > + Send {
+        let token = self.token.clone();
+        let tag = self.tag.clone();
+        async move {
+            if let Some(prev) = extensions.get::<google_cloud_auth::credentials::EntityTag>() {
+                if prev == &tag {
+                    return Ok(google_cloud_auth::credentials::CacheableResource::NotModified);
+                }
+            }
+            let mut map = http::HeaderMap::new();
+            let value = http::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| google_cloud_auth::errors::CredentialsError::from_source(false, e))?;
+            map.insert(http::header::AUTHORIZATION, value);
+            Ok(google_cloud_auth::credentials::CacheableResource::New {
+                entity_tag: tag,
+                data: map,
+            })
+        }
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Build driver credentials for `auth`.
+///
+/// Emulator endpoints (any explicit `endpoint` override) use anonymous
+/// credentials: the emulator ignores auth. Without an override, `None`
+/// uses Application Default Credentials, `AccessToken` uses the static
+/// bearer above, and `ServiceAccountKey` builds a service-account flow
+/// scoped to [`GCP_PUBSUB_SCOPE`].
+fn driver_credentials(
+    auth: &GcpAuth,
+    project_id: &str,
+    has_endpoint: bool,
+) -> Result<Option<google_cloud_auth::credentials::Credentials>> {
+    match auth {
+        GcpAuth::None => {
+            if has_endpoint {
+                Ok(Some(
+                    google_cloud_auth::credentials::anonymous::Builder::new().build(),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        GcpAuth::AccessToken { token } => {
+            if token.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "gcp access token must not be empty".to_string(),
+                ));
+            }
+            let creds: google_cloud_auth::credentials::Credentials =
+                StaticBearerCredentials::new(token.clone()).into();
+            Ok(Some(creds))
+        }
+        GcpAuth::ServiceAccountKey {
+            client_email,
+            private_key_pem,
+        } => {
+            if client_email.trim().is_empty() || private_key_pem.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "gcp service account needs email + private key".to_string(),
+                ));
+            }
+            // No `private_key_id`: the broker config carries only
+            // email + key, so the field is omitted (empty) rather than
+            // synthesised. The driver uses the empty `kid` as absent.
+            let key = serde_json::json!({
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key_id": "",
+                "private_key": private_key_pem,
+                "client_email": client_email,
+                "token_uri": GCP_TOKEN_URL,
+            });
+            let creds = google_cloud_auth::credentials::service_account::Builder::new(key)
+                .with_access_specifier(
+                    google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes(
+                        [GCP_PUBSUB_SCOPE],
+                    ),
+                )
+                .build()
+                .map_err(|e| {
+                    ConnectorError::Dispatch(format!("gcp service account rejected: {e}"))
+                })?;
+            Ok(Some(creds))
+        }
+    }
+}
+
+/// Convert one buffered wire message into a driver publish message.
+///
+/// Pure function: base64 `data_b64` decodes back to the raw payload
+/// bytes, the ordering key rides as-is, and the attribute map (already
+/// including `mqtt_topic` / `mqtt_qos`) becomes the driver attributes.
+pub fn driver_message_for(
+    message: &GcpPubSubMessage,
+) -> Result<google_cloud_pubsub::model::Message> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&message.data_b64)
+        .map_err(|e| ConnectorError::Dispatch(format!("gcp data not base64: {e}")))?;
+    let mut out = google_cloud_pubsub::model::Message::new()
+        .set_data(bytes::Bytes::from(raw))
+        .set_attributes(message.attributes.clone());
+    if let Some(key) = &message.ordering_key {
+        out = out.set_ordering_key(key.clone());
+    }
+    Ok(out)
+}
+
+/// Map a driver publish failure onto dispatch vs connection failures.
+///
+/// Transport outages, timeouts, throttles and the paused-ordering-key /
+///
+/// shutdown states retry in-loop; permission / argument / missing-topic
+/// style rejections are terminal. The match is string-based on the
+/// debug rendering so production code does not take a direct `gax`
+/// dependency (tests use `google-cloud-gax` via dev-dependencies):
+/// TODO(parity): is matching on the rendered `google-cloud-gax` status
+/// code strings the right granularity, or should the driver transport
+/// match `Code` directly?
+fn map_sdk_publish_error(error: google_cloud_pubsub::error::PublishError) -> ConnectorError {
+    use google_cloud_pubsub::error::PublishError as PubErr;
+    match error {
+        PubErr::OrderingKeyPaused | PubErr::Shutdown => {
+            ConnectorError::Connection(format!("gcp driver publish backpressured: {error}"))
+        }
+        PubErr::Rpc(source) => {
+            let rendered = format!("{source:?}");
+            let terminal = rendered.contains("PermissionDenied")
+                || rendered.contains("NotFound")
+                || rendered.contains("InvalidArgument")
+                || rendered.contains("AlreadyExists")
+                || rendered.contains("FailedPrecondition")
+                || rendered.contains("OutOfRange")
+                || rendered.contains("Unimplemented")
+                || rendered.contains("Unauthenticated");
+            if terminal {
+                ConnectorError::Dispatch(format!("gcp driver rejected: {source}"))
+            } else {
+                ConnectorError::Connection(format!("gcp driver publish failed: {source}"))
+            }
+        }
+        // Non-exhaustive future variants fail closed as retryable so a
+        // new driver error does not silently drop a batch.
+        _ => ConnectorError::Connection(format!("gcp driver publish failed: {error}")),
+    }
+}
+
+/// Production transport on the maintained `google-cloud-pubsub` driver.
+///
+/// Each `flush` batch publishes message-by-message through a shared
+/// gRPC `Publisher` (one per transport, pooled internally by the
+/// driver), awaiting each message id under the configured request
+/// timeout. Endpoint overrides target the emulator with anonymous
+/// credentials; without an override the auth mapping in
+/// [`driver_credentials`] applies.
+///
+/// Bound: one in-flight `flush` at a time (the batch itself is bounded
+/// by `batch_size`, default 1000, and `batch_bytes`, default 8 MiB);
+/// no background queue beyond the driver's own batching actor.
+pub struct SdkGcpPubSubTransport {
+    project: String,
+    topic: String,
+    endpoint: Option<String>,
+    auth: GcpAuth,
+    timeout: Duration,
+    publisher: tokio::sync::OnceCell<google_cloud_pubsub::client::Publisher>,
+}
+
+impl SdkGcpPubSubTransport {
+    pub fn new(config: &GcpPubSubSinkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            project: config.project_id.clone(),
+            topic: config.topic_id.clone(),
+            endpoint: config.endpoint.clone(),
+            auth: config.auth.clone(),
+            timeout: config.timeout(),
+            publisher: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    /// Fully qualified topic name for the driver builder.
+    pub fn topic_name(&self) -> String {
+        format!("projects/{}/topics/{}", self.project, self.topic)
+    }
+
+    /// Test hook proving `new` stores the configured timeout; the
+    /// production path applies `self.timeout` per publish in `publish`.
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    async fn publisher_client(&self) -> Result<google_cloud_pubsub::client::Publisher> {
+        let topic = self.topic_name();
+        let endpoint = self.endpoint.clone();
+        let auth = self.auth.clone();
+        let project = self.project.clone();
+        let has_endpoint = endpoint.is_some();
+        self.publisher
+            .get_or_try_init(|| async move {
+                let mut builder = google_cloud_pubsub::client::Publisher::builder(topic);
+                if let Some(endpoint) = endpoint {
+                    builder = builder.with_endpoint(endpoint);
+                }
+                if let Some(creds) = driver_credentials(&auth, &project, has_endpoint)? {
+                    builder = builder.with_credentials(creds);
+                }
+                builder.build().await.map_err(|e| {
+                    ConnectorError::Connection(format!("gcp driver build failed: {e}"))
+                })
+            })
+            .await
+            .cloned()
+            .map_err(|e: ConnectorError| e)
+    }
+}
+
+#[async_trait]
+impl GcpPubSubTransport for SdkGcpPubSubTransport {
+    async fn publish(
+        &self,
+        _project: &str,
+        _topic: &str,
+        messages: Vec<GcpPubSubMessage>,
+        _auth: Option<String>,
+    ) -> Result<Vec<String>> {
+        let publisher = self.publisher_client().await?;
+        let timeout = self.timeout;
+        let mut ids = Vec::with_capacity(messages.len());
+        for message in &messages {
+            let driver_message = driver_message_for(message)?;
+            let waiter = publisher.publish(driver_message);
+            let id = tokio::time::timeout(timeout, waiter)
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "gcp driver timed out after {}ms",
+                        timeout.as_millis()
+                    ))
+                })?
+                .map_err(map_sdk_publish_error)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -891,6 +1207,9 @@ mod tests {
     use super::*;
     use crate::test_rsa_keys::{PRIVATE_PEM as TEST_PRIVATE_PEM, PUBLIC_PEM as TEST_PUBLIC_PEM};
     use crate::Sink;
+
+    /// One pulled qualification message: raw payload, attributes, ordering key.
+    type QualSeenEntry = (Vec<u8>, HashMap<String, String>, String);
 
     fn test_config() -> GcpPubSubSinkConfig {
         GcpPubSubSinkConfig {
@@ -1196,5 +1515,391 @@ mod tests {
         );
         assert!(parse_publish_response(br#"{}"#).is_err());
         assert!(parse_publish_response(b"nope").is_err());
+    }
+
+    #[test]
+    fn test_sdk_transport_builds_offline() {
+        let config = test_config();
+        let transport = SdkGcpPubSubTransport::new(&config).expect("sdk builds");
+        assert_eq!(transport.timeout(), config.timeout());
+        assert_eq!(
+            transport.topic_name(),
+            "projects/my-iot-project/topics/telemetry-events"
+        );
+
+        let mut bad = test_config();
+        bad.project_id = "UPPER SPACE".to_string();
+        assert!(SdkGcpPubSubTransport::new(&bad).is_err());
+
+        // Endpoint override (emulator shape) builds without a server;
+        // the driver client itself is lazy and needs no connection.
+        let mut emu = test_config();
+        emu.endpoint = Some("http://127.0.0.1:1".to_string());
+        let emu_transport = SdkGcpPubSubTransport::new(&emu).expect("emulator builds");
+        assert_eq!(emu_transport.timeout(), emu.timeout());
+    }
+
+    #[test]
+    fn test_driver_message_framing() {
+        let message = GcpPubSubMessage {
+            data_b64: base64::engine::general_purpose::STANDARD
+                .encode(br#"{"client_id":"device-001"}"#),
+            ordering_key: Some("device-001".to_string()),
+            attributes: HashMap::from([
+                ("mqtt_topic".to_string(), "factory/line1/temp".to_string()),
+                ("mqtt_qos".to_string(), "1".to_string()),
+                ("source".to_string(), "indramqtt".to_string()),
+            ]),
+        };
+        let driver_message = driver_message_for(&message).expect("driver message builds");
+        assert_eq!(
+            driver_message.data.as_ref(),
+            br#"{"client_id":"device-001"}"#
+        );
+        assert_eq!(driver_message.ordering_key, "device-001");
+        assert_eq!(
+            driver_message
+                .attributes
+                .get("mqtt_topic")
+                .map(String::as_str),
+            Some("factory/line1/temp")
+        );
+        assert_eq!(
+            driver_message.attributes.get("source").map(String::as_str),
+            Some("indramqtt")
+        );
+
+        // Absent ordering key stays empty (ordering disabled).
+        let mut no_key = message.clone();
+        no_key.ordering_key = None;
+        let driver_no_key = driver_message_for(&no_key).expect("builds");
+        assert!(driver_no_key.ordering_key.is_empty());
+
+        // Corrupt base64 fails closed as dispatch, never panics.
+        let mut corrupt = message;
+        corrupt.data_b64 = "!!!not-base64!!!".to_string();
+        assert!(driver_message_for(&corrupt).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_driver_credentials_mapping() {
+        // Emulator endpoint maps None onto anonymous credentials.
+        let creds = driver_credentials(&GcpAuth::None, "p", true)
+            .expect("emulator creds")
+            .expect("some");
+        let _ = creds;
+        // Without an endpoint, None defers to ADC (no override).
+        assert!(driver_credentials(&GcpAuth::None, "p", false)
+            .expect("adc")
+            .is_none());
+        // Raw tokens map onto a static bearer.
+        assert!(driver_credentials(
+            &GcpAuth::AccessToken {
+                token: "tok".to_string()
+            },
+            "p",
+            false
+        )
+        .expect("bearer")
+        .is_some());
+        assert!(driver_credentials(
+            &GcpAuth::AccessToken {
+                token: "  ".to_string()
+            },
+            "p",
+            false
+        )
+        .is_err());
+        // Service-account keys build a scoped flow; empty halves fail closed.
+        assert!(driver_credentials(
+            &GcpAuth::ServiceAccountKey {
+                client_email: "a@b.iam.gserviceaccount.com".to_string(),
+                private_key_pem: "pem".to_string(),
+            },
+            "my-iot-project",
+            false
+        )
+        .is_ok());
+        assert!(driver_credentials(
+            &GcpAuth::ServiceAccountKey {
+                client_email: String::new(),
+                private_key_pem: String::new(),
+            },
+            "my-iot-project",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_sdk_error_mapping() {
+        use google_cloud_pubsub::error::PublishError;
+        // Backpressure states retry in-loop.
+        assert!(matches!(
+            map_sdk_publish_error(PublishError::OrderingKeyPaused),
+            ConnectorError::Connection(_)
+        ));
+        assert!(matches!(
+            map_sdk_publish_error(PublishError::Shutdown),
+            ConnectorError::Connection(_)
+        ));
+        // RPC permission-style rejections are terminal.
+        let denied = PublishError::Rpc(std::sync::Arc::new(
+            google_cloud_gax::error::Error::service(
+                google_cloud_gax::error::rpc::Status::default()
+                    .set_code(google_cloud_gax::error::rpc::Code::PermissionDenied)
+                    .set_message("denied"),
+            ),
+        ));
+        assert!(matches!(
+            map_sdk_publish_error(denied),
+            ConnectorError::Dispatch(_)
+        ));
+        // RPC unavailable-style outages retry.
+        let down = PublishError::Rpc(std::sync::Arc::new(
+            google_cloud_gax::error::Error::service(
+                google_cloud_gax::error::rpc::Status::default()
+                    .set_code(google_cloud_gax::error::rpc::Code::Unavailable)
+                    .set_message("down"),
+            ),
+        ));
+        assert!(matches!(
+            map_sdk_publish_error(down),
+            ConnectorError::Connection(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sink_flush_through_manager() {
+        // Broker path: rule actions deliver through the shared connector
+        // manager, so this sends through it rather than the sink directly.
+        use crate::ConnectorManager;
+        let mut config = test_config();
+        config.batch_size = Some(10);
+        config.initial_backoff_ms = Some(1);
+        config.max_backoff_ms = Some(2);
+        let transport = Arc::new(MockGcpPubSubTransport::new());
+        let sink = Arc::new(GcpPubSubSink::new(config, transport.clone()).expect("sink"));
+        assert_eq!(sink.kind(), "gcp_pubsub");
+        let manager = ConnectorManager::new();
+        manager.register("qual-pubsub", sink.clone());
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..10 {
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"dev-{seq:04}","device_id":"dev-{seq:04}","seq":{seq}}}"#
+            ));
+            manager
+                .send("qual-pubsub", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("manager send");
+        }
+        sink.flush().await.expect("flush");
+        assert_eq!(sink.sent_records(), 10);
+        assert_eq!(transport.captured().len(), 1);
+        assert_eq!(transport.captured()[0].messages.len(), 10);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against the official Pub/Sub emulator via the
+    /// maintained `google-cloud-pubsub` driver.
+    ///
+    /// Run with e.g.:
+    /// `PUBSUB_EMULATOR_HOST=127.0.0.1:8085 PUBSUB_PROJECT=qual-project
+    ///  PUBSUB_TOPIC=qual-topic PUBSUB_SUBSCRIPTION=qual-sub \
+    ///  cargo test -p broker-connectors --lib gcp_pubsub::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// The topic and subscription exist already (created by the pipeline
+    /// setup). Streams 500 messages with attributes and an ordering key
+    /// through the broker ([`crate::ConnectorManager`] ->
+    /// [`GcpPubSubSink`] on [`SdkGcpPubSubTransport`]), pulls them back
+    /// from the subscription and asserts exactly 500 distinct messages
+    /// with the attributes intact. No tolerance.
+    #[tokio::test]
+    #[ignore = "needs a real Pub/Sub server (see PUBSUB_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+        use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+
+        // CTO ruling B3-19: the emulator host comes from
+        // PUBSUB_EMULATOR_HOST (bare `host:port` as the pipeline sets
+        // it); production (no endpoint override) stays on the real
+        // service with real credentials. Missing env fails closed:
+        // a qualification that passes without a server proves nothing.
+        let emulator_host = qual_env("PUBSUB_EMULATOR_HOST").unwrap_or_else(|| {
+            panic!(
+                "PUBSUB_EMULATOR_HOST must point at a real Pub/Sub server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. PUBSUB_EMULATOR_HOST=127.0.0.1:8085)"
+            )
+        });
+        let project = qual_env("PUBSUB_PROJECT").unwrap_or_else(|| {
+            panic!("PUBSUB_PROJECT must name the pre-created qual project; failing closed")
+        });
+        let topic_id = qual_env("PUBSUB_TOPIC").unwrap_or_else(|| {
+            panic!("PUBSUB_TOPIC must name the pre-created qual topic; failing closed")
+        });
+        let sub_id = qual_env("PUBSUB_SUBSCRIPTION").unwrap_or_else(|| {
+            panic!(
+                "PUBSUB_SUBSCRIPTION must name the pre-created qual subscription; failing closed"
+            )
+        });
+        // TODO(parity): the emulator exposes no server-version API, so the
+        // report carries the endpoint plus topic/subscription names instead
+        // of a version string; is that an acceptable "server version"?
+        let endpoint = if emulator_host.contains("://") {
+            emulator_host.trim_end_matches('/').to_string()
+        } else {
+            format!("http://{}", emulator_host.trim_end_matches('/'))
+        };
+        let topic_name = format!("projects/{project}/topics/{topic_id}");
+        let sub_name = format!("projects/{project}/subscriptions/{sub_id}");
+        eprintln!(
+            "qual server: endpoint={endpoint} project={project} topic={topic_id} sub={sub_id}"
+        );
+
+        let anon = || Anonymous::new().build();
+
+        // The topic and subscription exist already per the ruling: the
+        // pipeline setup created them (with message ordering enabled), so
+        // the test neither creates nor deletes them.
+
+        let config = GcpPubSubSinkConfig {
+            project_id: project.clone(),
+            topic_id: topic_id.clone(),
+            endpoint: Some(endpoint.clone()),
+            auth: GcpAuth::None,
+            ordering_key_template: Some("${client_id}".to_string()),
+            attributes: HashMap::from([
+                ("source".to_string(), "indramqtt".to_string()),
+                ("device".to_string(), "${payload.device_id}".to_string()),
+            ]),
+            batch_size: Some(100),
+            batch_bytes: Some(8_388_608),
+            linger_ms: Some(10),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(15_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(SdkGcpPubSubTransport::new(&config).expect("qual transport"));
+        assert_eq!(
+            transport.topic_name(),
+            topic_name,
+            "driver topic must match the pre-created topic"
+        );
+        let sink = Arc::new(GcpPubSubSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "gcp_pubsub");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it, never
+        // `sink.send` directly.
+        let manager = ConnectorManager::new();
+        manager.register("qual-pubsub", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..500 {
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"dev-{seq:04}","device_id":"dev-{seq:04}","seq":{seq},"v":{:.1}}}"#,
+                20.0 + f64::from(seq) * 0.01
+            ));
+            manager
+                .send("qual-pubsub", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        while sink.buffered_rows() > 0 {
+            sink.flush().await.expect("qual flush");
+        }
+        assert_eq!(sink.sent_records(), 500);
+        eprintln!("qual rows sent: records=500 topic={topic_id}");
+
+        // Pull back through the driver subscriber and assert delivery with
+        // attributes and ordering keys.
+        let subscriber = google_cloud_pubsub::client::Subscriber::builder()
+            .with_endpoint(endpoint.clone())
+            .with_credentials(anon())
+            .build()
+            .await
+            .expect("qual subscriber");
+        let mut stream = subscriber
+            .subscribe(sub_name.clone())
+            .set_max_outstanding_messages(500)
+            .build();
+        let mut seen: HashMap<String, QualSeenEntry> = HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        while seen.len() < 500 {
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "qual pull timed out with {}/500 messages; failing closed",
+                    seen.len()
+                );
+            }
+            let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("qual pull must yield")
+                .unwrap_or_else(|| panic!("qual stream ended with {}/500", seen.len()))
+                .expect("qual pull item");
+            let (message, handler) = next;
+            let payload = message.data.to_vec();
+            let doc: serde_json::Value =
+                serde_json::from_slice(&payload).expect("qual payload is JSON");
+            let seq = doc
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .expect("qual payload has seq") as usize;
+            let key = format!("seq-{seq:04}");
+            seen.insert(
+                key,
+                (
+                    payload,
+                    message.attributes.clone(),
+                    message.ordering_key.clone(),
+                ),
+            );
+            handler.ack();
+        }
+        assert_eq!(seen.len(), 500);
+        for seq in 0..500 {
+            let key = format!("seq-{seq:04}");
+            let (payload, attributes, ordering_key) =
+                seen.get(&key).unwrap_or_else(|| panic!("missing {key}"));
+            let doc: serde_json::Value = serde_json::from_slice(payload).expect("JSON");
+            assert_eq!(
+                doc.get("device_id").and_then(|v| v.as_str()),
+                Some(format!("dev-{seq:04}").as_str()),
+                "device_id for {key}"
+            );
+            assert_eq!(
+                attributes.get("mqtt_topic").map(String::as_str),
+                Some("sensors/qual"),
+                "mqtt_topic for {key}"
+            );
+            assert_eq!(
+                attributes.get("mqtt_qos").map(String::as_str),
+                Some("1"),
+                "mqtt_qos for {key}"
+            );
+            assert_eq!(
+                attributes.get("source").map(String::as_str),
+                Some("indramqtt"),
+                "source for {key}"
+            );
+            assert_eq!(
+                attributes.get("device").map(String::as_str),
+                Some(format!("dev-{seq:04}").as_str()),
+                "device for {key}"
+            );
+            assert_eq!(
+                ordering_key,
+                &format!("dev-{seq:04}"),
+                "ordering key for {key}"
+            );
+        }
+        eprintln!("qual rows asserted: count=500 sub={sub_id}");
+        // No cleanup: the topic and subscription are owned by the pipeline
+        // setup, not by this test; pulled messages were acked above.
     }
 }

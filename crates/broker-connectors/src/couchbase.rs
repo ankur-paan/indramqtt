@@ -1,17 +1,19 @@
 //! Couchbase Server / Capella sink (INDRA-168).
 //!
 //! Buffers MQTT events as JSON documents (payload fields merged with
-//! an injected `_mqtt` metadata object) and writes them with the KV
-//! binary protocol: `Upsert` → SET (0x01), `Insert` → ADD (0x02,
-//! fails when the key exists), `Replace` → REPLACE (0x03, fails when
-//! the key is missing). Batches pipeline all requests and match
-//! responses by opaque. SASL PLAIN authenticates the connection.
+//! an injected `_mqtt` metadata object) and writes them with the
+//! maintained official `couchbase` driver
+//! ([`DriverCouchbaseTransport`] below): `Upsert` → upsert,
+//! `Insert` → insert (fails when the key exists), `Replace` →
+//! replace (fails when the key is missing), with scope/collection
+//! targeting and per-document expiry. The hand-written KV binary
+//! path ([`NativeCouchbaseTransport`]: SET/ADD/REPLACE opcodes +
+//! SASL PLAIN, pipelined by opaque) is retained for offline unit
+//! tests only; production wiring uses the driver.
 //!
-//! TemporaryFailure/Busy and transport errors retry with backoff;
-//! Exists (on insert) and NotFound (on replace) are terminal.
-//! Scope/collection select the logical target asserted end to end in
-//! mocks; the native KV path addresses bucket keys (server-side
-//! collection IDs need a live cluster dictionary).
+//! Driver errors that are backpressure or transport failures retry
+//! with backoff; document-exists (on insert) and document-missing
+//! (on replace) are terminal.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -79,32 +81,50 @@ fn default_collection() -> Option<String> {
     None
 }
 
+// Finite defaults with reasons (RULEBOOK §2: every bound has a finite
+// default and its reason next to it; the sink's send path runs behind
+// the rule engine's bounded queue, so no benchmark numbers are needed).
+// `None` remains an explicit operator opt-in to unbounded; the code
+// never chooses it.
 fn default_batch_size() -> Option<usize> {
+    // 100 docs: one KV batch stays well under the 16 MiB response cap
+    // with typical sub-KB telemetry documents.
     Some(100)
 }
 
 fn default_batch_bytes() -> Option<usize> {
+    // 2 MiB: matches the bulk sinks and keeps one batch far below the
+    // driver's per-request limits.
     Some(2_097_152)
 }
 
 fn default_linger_ms() -> Option<u64> {
+    // 10 ms: flushes interactive telemetry promptly without turning
+    // every message into its own round trip.
     Some(10)
 }
 
 fn default_max_retries() -> Option<usize> {
+    // 3 retries: absorbs transient backpressure without wedging the
+    // rule worker behind a wedged cluster.
     Some(3)
 }
 
 fn default_initial_backoff_ms() -> Option<u64> {
+    // 100 ms first delay: longer than a single scheduler quanta so a
+    // hot server gets breathing room.
     Some(100)
 }
 
 fn default_max_backoff_ms() -> Option<u64> {
+    // 2 s ceiling: bounds the worst-case stall per batch while still
+    // backing off across a short node restart.
     Some(2_000)
 }
 
-/// Couchbase sink configuration. All depths are optional (`None` =
-/// unbounded) with zero clamped ceilings.
+/// Couchbase sink configuration. All depths are optional: `None` is
+/// an explicit operator opt-in to unbounded, never the code's choice;
+/// zero clamps the ceiling. Finite defaults above carry their reasons.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouchbaseSinkConfig {
     /// Bootstrap string (`couchbase://host`, `couchbases://...`).
@@ -465,16 +485,28 @@ async fn read_response(
 
 /// Build a success response (fakes + tests).
 pub fn encode_success_response(opcode: u8, opaque: u32) -> Vec<u8> {
+    encode_status_response(opcode, opaque, status::SUCCESS)
+}
+
+/// Build an error response with an explicit status (fakes + tests):
+/// the loopback fake answers SASL PLAIN failures this way so the
+/// transport fails closed instead of panicking on a bad credential.
+pub fn encode_status_response(opcode: u8, opaque: u32, status: u16) -> Vec<u8> {
     let mut out = vec![0x81, opcode];
     out.extend_from_slice(&0u16.to_be_bytes());
     out.push(0x00);
     out.push(0x00);
-    out.extend_from_slice(&status::SUCCESS.to_be_bytes());
+    out.extend_from_slice(&status.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
     out.extend_from_slice(&opaque.to_be_bytes());
     out.extend_from_slice(&0u64.to_be_bytes());
     out
 }
+
+/// SASL AUTH failure status answered for bad credentials (0x20,
+/// the memcached AUTH_ERROR value): any non-zero status makes
+/// [`NativeCouchbaseTransport::connect`] fail closed.
+pub const SASL_AUTH_ERROR: u16 = 0x20;
 
 /// Classify a status: retryable backpressure, terminal conflicts, or
 /// success. Returns `Ok(true)` to retry, `Ok(false)` when done.
@@ -724,6 +756,186 @@ impl CouchbaseTransport for NativeCouchbaseTransport {
                     reply.status, item.key
                 )));
             }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Official driver transport (production).
+// ---------------------------------------------------------------------------
+
+/// Map a driver error onto the sink's retry contract: document-exists
+/// (insert) and document-missing (replace) are terminal dispatch
+/// errors; everything else (transport loss, backpressure, timeouts,
+/// failover) is a connection error so the sink retries with backoff.
+fn map_driver_error(
+    operation: CouchbaseOperation,
+    error: couchbase::error::Error,
+) -> ConnectorError {
+    use couchbase::error::ErrorKind as Kind;
+    match error.kind() {
+        Kind::DocumentExists if operation == CouchbaseOperation::Insert => {
+            ConnectorError::Dispatch(format!("couchbase insert: document exists: {error}"))
+        }
+        Kind::DocumentNotFound if operation == CouchbaseOperation::Replace => {
+            ConnectorError::Dispatch(format!("couchbase replace: document missing: {error}"))
+        }
+        // Upserts never hit these, but if they do the write did not
+        // happen: still terminal rather than silently retried forever.
+        Kind::DocumentExists | Kind::DocumentNotFound => {
+            ConnectorError::Dispatch(format!("couchbase driver conflict: {error}"))
+        }
+        _ => ConnectorError::Connection(format!("couchbase driver: {error}")),
+    }
+}
+
+/// Production transport on the maintained official `couchbase` driver.
+///
+/// Holds the validated config and lazily connects: `new` is sync (so
+/// management wiring stays sync like the other driver transports)
+/// and the first batch opens the `Cluster`, waits for the bucket,
+/// and caches it. Later batches reuse the cluster and derive the
+/// target collection from the call's bucket/scope/collection, so the
+/// sink's configured target is honoured per batch.
+pub struct DriverCouchbaseTransport {
+    config: CouchbaseSinkConfig,
+    cluster: tokio::sync::RwLock<Option<couchbase::cluster::Cluster>>,
+    timeout: Duration,
+}
+
+impl DriverCouchbaseTransport {
+    pub fn new(config: &CouchbaseSinkConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            cluster: tokio::sync::RwLock::new(None),
+            timeout: config.timeout(),
+        })
+    }
+
+    async fn cluster_handle(&self) -> Result<couchbase::cluster::Cluster> {
+        if let Some(cluster) = self.cluster.read().await.clone() {
+            return Ok(cluster);
+        }
+        let mut guard = self.cluster.write().await;
+        if let Some(cluster) = guard.clone() {
+            return Ok(cluster);
+        }
+        let authenticator = couchbase::authenticator::PasswordAuthenticator::new(
+            self.config.auth.username.clone(),
+            self.config.auth.password.clone(),
+        );
+        let options =
+            couchbase::options::cluster_options::ClusterOptions::new(authenticator.into());
+        let connection_string = self.config.connection_string.clone();
+        let timeout = self.timeout;
+        let cluster = tokio::time::timeout(
+            timeout,
+            couchbase::cluster::Cluster::connect(connection_string.clone(), options),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "couchbase driver connect timed out: {connection_string}"
+            ))
+        })?
+        .map_err(|e| ConnectorError::Connection(format!("couchbase driver connect: {e}")))?;
+        let bucket = cluster.bucket(self.config.bucket.clone());
+        tokio::time::timeout(timeout, bucket.wait_until_ready(None))
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "couchbase bucket timed out: {}",
+                    self.config.bucket
+                ))
+            })?
+            .map_err(|e| ConnectorError::Connection(format!("couchbase bucket ready: {e}")))?;
+        *guard = Some(cluster.clone());
+        Ok(cluster)
+    }
+
+    async fn write_one(
+        collection: &couchbase::collection::Collection,
+        operation: CouchbaseOperation,
+        item: &CouchbaseDocItem,
+        timeout: Duration,
+    ) -> Result<()> {
+        let document: serde_json::Value = serde_json::from_slice(&item.body).map_err(|e| {
+            ConnectorError::Dispatch(format!("couchbase document must be JSON: {e}"))
+        })?;
+        let expiry = if item.expiry_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(u64::from(item.expiry_secs)))
+        };
+        let outcome = match operation {
+            CouchbaseOperation::Upsert => {
+                let options = expiry.map(|expiry| {
+                    couchbase::options::kv_options::UpsertOptions::new().expiry(expiry)
+                });
+                tokio::time::timeout(timeout, collection.upsert(&item.key, document, options))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::Connection(format!(
+                            "couchbase driver timed out on {:?}",
+                            item.key
+                        ))
+                    })?
+                    .map(|_| ())
+                    .map_err(|e| map_driver_error(operation, e))
+            }
+            CouchbaseOperation::Insert => {
+                let options = expiry.map(|expiry| {
+                    couchbase::options::kv_options::InsertOptions::new().expiry(expiry)
+                });
+                tokio::time::timeout(timeout, collection.insert(&item.key, document, options))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::Connection(format!(
+                            "couchbase driver timed out on {:?}",
+                            item.key
+                        ))
+                    })?
+                    .map(|_| ())
+                    .map_err(|e| map_driver_error(operation, e))
+            }
+            CouchbaseOperation::Replace => {
+                let options = expiry.map(|expiry| {
+                    couchbase::options::kv_options::ReplaceOptions::new().expiry(expiry)
+                });
+                tokio::time::timeout(timeout, collection.replace(&item.key, document, options))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::Connection(format!(
+                            "couchbase driver timed out on {:?}",
+                            item.key
+                        ))
+                    })?
+                    .map(|_| ())
+                    .map_err(|e| map_driver_error(operation, e))
+            }
+        };
+        outcome
+    }
+}
+
+#[async_trait]
+impl CouchbaseTransport for DriverCouchbaseTransport {
+    async fn execute_batch(
+        &self,
+        bucket: &str,
+        scope: &str,
+        coll: &str,
+        items: Vec<CouchbaseDocItem>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let cluster = self.cluster_handle().await?;
+        let collection = cluster.bucket(bucket).scope(scope).collection(coll);
+        for item in &items {
+            Self::write_one(&collection, self.config.operation, item, self.timeout).await?;
         }
         Ok(())
     }
@@ -1244,11 +1456,23 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            // SASL PLAIN auth first.
+            // SASL PLAIN auth first. The fake verifies the credential it
+            // receives and fails closed: a bad token gets AUTH_ERROR
+            // instead of an anonymous pass.
             let (opcode, _, key, value, opaque) = read_request(&mut stream).await;
             assert_eq!(opcode, opcode::SASL_AUTH);
             assert_eq!(key, b"PLAIN");
-            assert_eq!(value, b"\0Administrator\0secret");
+            if value != b"\0Administrator\0secret" {
+                stream
+                    .write_all(&encode_status_response(
+                        opcode::SASL_AUTH,
+                        opaque,
+                        SASL_AUTH_ERROR,
+                    ))
+                    .await
+                    .expect("auth fail");
+                return;
+            }
             stream
                 .write_all(&encode_success_response(opcode::SASL_AUTH, opaque))
                 .await
@@ -1292,5 +1516,371 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+
+        // Wrong password fails closed at connect: a second fake with
+        // the same verifier answers AUTH_ERROR and the transport
+        // surfaces a connection error.
+        let bad_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bad_port = bad_listener.local_addr().expect("addr").port();
+        let bad_server = tokio::spawn(async move {
+            let (mut stream, _) = bad_listener.accept().await.expect("accept");
+            let (opcode, _, key, value, opaque) = read_request(&mut stream).await;
+            assert_eq!(opcode, opcode::SASL_AUTH);
+            assert_eq!(key, b"PLAIN");
+            if value != b"\0Administrator\0secret" {
+                stream
+                    .write_all(&encode_status_response(
+                        opcode::SASL_AUTH,
+                        opaque,
+                        SASL_AUTH_ERROR,
+                    ))
+                    .await
+                    .expect("auth fail");
+                return;
+            }
+            stream
+                .write_all(&encode_success_response(opcode::SASL_AUTH, opaque))
+                .await
+                .expect("auth ok");
+        });
+        let mut bad_config = test_config();
+        bad_config.connection_string = format!("couchbase://127.0.0.1:{bad_port}");
+        bad_config.auth.password = "wrong".to_string();
+        let bad_transport = NativeCouchbaseTransport::new(&bad_config).unwrap();
+        let err = bad_transport
+            .connect()
+            .await
+            .expect_err("bad password must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "bad credential must fail closed, got {err:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), bad_server)
+            .await
+            .expect("bad server done")
+            .expect("bad server task");
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Qualification against a real Couchbase Server via the official
+    /// `couchbase` driver.
+    ///
+    /// Run with e.g.:
+    /// `COUCHBASE_URL=couchbase://127.0.0.1 COUCHBASE_USERNAME=qual \
+    ///  COUCHBASE_PASSWORD=qualpass1 COUCHBASE_BUCKET=qual \
+    ///  cargo test -p broker-connectors --lib couchbase::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// The bucket is created by the qualification setup; the test
+    /// creates the scope and collection itself through the driver's
+    /// management API. 1000 messages drive through the broker's rule
+    /// path (`ConnectorManager::register` the way `register_live_sink`
+    /// does, then `manager.send`, which is exactly what the rule
+    /// engine's `ForwardConnector` action calls; never `sink.send`
+    /// directly), then every document is read back by key with a
+    /// non-zero CAS. A 2 s expiry probe is gone after 5 s. After the
+    /// first 300 messages the test requests a server restart by
+    /// creating `$QUAL_FAULT_FILE` and waits for the host to delete
+    /// it, proving the sink retries until every document lands.
+    /// Cleans up the scope it created.
+    #[tokio::test]
+    #[ignore = "needs a real Couchbase server (see COUCHBASE_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use crate::ConnectorManager;
+
+        let url = qual_env("COUCHBASE_URL").unwrap_or_else(|| {
+            panic!(
+                "COUCHBASE_URL must point at a real Couchbase server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. COUCHBASE_URL=couchbase://127.0.0.1)"
+            )
+        });
+        let username = qual_env("COUCHBASE_USERNAME").unwrap_or_else(|| {
+            panic!("COUCHBASE_USERNAME must be set for qualification; failing closed")
+        });
+        let password = qual_env("COUCHBASE_PASSWORD").unwrap_or_else(|| {
+            panic!("COUCHBASE_PASSWORD must be set for qualification; failing closed")
+        });
+        let bucket_name = qual_env("COUCHBASE_BUCKET").unwrap_or_else(|| {
+            panic!("COUCHBASE_BUCKET must be set for qualification; failing closed")
+        });
+        let scope_name =
+            qual_env("COUCHBASE_SCOPE").unwrap_or_else(|| "qual_b311_scope".to_string());
+        let collection_name =
+            qual_env("COUCHBASE_COLLECTION").unwrap_or_else(|| "qual_b311_docs".to_string());
+
+        let authenticator = couchbase::authenticator::PasswordAuthenticator::new(
+            username.clone(),
+            password.clone(),
+        );
+        let options =
+            couchbase::options::cluster_options::ClusterOptions::new(authenticator.into());
+        let cluster = tokio::time::timeout(
+            Duration::from_secs(60),
+            couchbase::cluster::Cluster::connect(url.clone(), options),
+        )
+        .await
+        .expect("qual connect timed out")
+        .expect("qual connect");
+        let bucket = cluster.bucket(bucket_name.clone());
+        tokio::time::timeout(Duration::from_secs(60), bucket.wait_until_ready(None))
+            .await
+            .expect("qual bucket timed out")
+            .expect("qual bucket ready");
+
+        // Server version for the report: pools endpoint first, driver
+        // diagnostics second; if neither gives it, omit it (never a
+        // constant standing in for a measurement).
+        let mut version_printed = String::new();
+        {
+            let mgmt_host = url
+                .split("://")
+                .last()
+                .unwrap_or(url.as_str())
+                .split(',')
+                .next()
+                .unwrap_or(url.as_str())
+                .split('/')
+                .next()
+                .unwrap_or(url.as_str())
+                .rsplit_once(':')
+                .map(|(host, port)| {
+                    if port.chars().all(|c| c.is_ascii_digit()) {
+                        host.to_string()
+                    } else {
+                        format!("{host}:{port}")
+                    }
+                })
+                .unwrap_or_else(|| url.clone());
+            let pools_url = format!("http://{mgmt_host}:8091/pools");
+            match reqwest::Client::new()
+                .get(pools_url.clone())
+                .basic_auth(username.clone(), Some(password.clone()))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(response) => match response.json::<serde_json::Value>().await {
+                    Ok(pools) => {
+                        if let Some(version) =
+                            pools.get("implementationVersion").and_then(|v| v.as_str())
+                        {
+                            version_printed = version.to_string();
+                            eprintln!(
+                                "qual server: version={version} url={url} bucket={bucket_name}"
+                            );
+                        } else {
+                            eprintln!("qual server: pools={pools} url={url}");
+                        }
+                    }
+                    Err(e) => eprintln!("qual server: pools parse failed: {e} url={url}"),
+                },
+                Err(e) => eprintln!("qual server: pools unreachable ({pools_url}): {e}"),
+            }
+        }
+        match cluster.diagnostics(None).await {
+            Ok(diagnostics) => {
+                eprintln!("qual diagnostics: {diagnostics:?}");
+                if version_printed.is_empty() {
+                    eprintln!("qual server: version unavailable (pools gave none)");
+                }
+            }
+            Err(e) => eprintln!("qual diagnostics unavailable: {e}"),
+        }
+
+        // Fresh scope/collection through the driver's management API
+        // (drop stale, then create; exists-races are fine).
+        let collections = bucket.collections();
+        let _ = collections.drop_scope(&scope_name, None).await;
+        match collections.create_scope(&scope_name, None).await {
+            Ok(()) => {}
+            Err(e) => match e.kind() {
+                couchbase::error::ErrorKind::ScopeExists => {}
+                _ => panic!("qual create scope: {e}"),
+            },
+        }
+        let collection_settings =
+            couchbase::management::collections::collection_settings::CreateCollectionSettings::new(
+            );
+        match collections
+            .create_collection(&scope_name, &collection_name, collection_settings, None)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => match e.kind() {
+                couchbase::error::ErrorKind::CollectionExists => {}
+                couchbase::error::ErrorKind::ScopeNotFound => {
+                    panic!("qual create collection: scope missing: {e}")
+                }
+                _ => panic!("qual create collection: {e}"),
+            },
+        }
+        let collection = cluster
+            .bucket(bucket_name.clone())
+            .scope(scope_name.clone())
+            .collection(collection_name.clone());
+        // Wait for the collection to accept writes.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match collection
+                    .upsert(
+                        "qual-b311-ready-probe",
+                        serde_json::json!({"probe": true}),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
+        })
+        .await
+        .expect("qual collection never became writable");
+        let _ = collection.remove("qual-b311-ready-probe", None).await;
+
+        let config = CouchbaseSinkConfig {
+            connection_string: url.clone(),
+            bucket: bucket_name.clone(),
+            scope: Some(scope_name.clone()),
+            collection: Some(collection_name.clone()),
+            auth: CouchbaseAuth {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            doc_id_template: "${client_id}".to_string(),
+            operation: CouchbaseOperation::Upsert,
+            expiry_secs: None,
+            batch_size: Some(100),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            // High enough to ride out the mid-batch server restart
+            // below without wedging the rule worker.
+            max_retries: Some(200),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(1_000),
+            timeout_ms: Some(15_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(DriverCouchbaseTransport::new(&config).expect("qual transport"));
+        let sink = Arc::new(CouchbaseSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "couchbase");
+        // The broker's path: rule actions deliver through the shared
+        // connector manager (this is what `register_live_sink` fills
+        // and what `ForwardConnector` sends through), so the
+        // qualification sends through it and never `sink.send`.
+        let manager = ConnectorManager::new();
+        manager.register("qual-cb", sink.clone());
+        manager.register("couchbase:qual-cb", sink.clone());
+
+        // TODO(parity): multi-node failover qualification.
+        let fault_file = qual_env("QUAL_FAULT_FILE");
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..1000u32 {
+            let device = format!("qual-{seq:06}");
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","seq":{seq},"temperature":{:.2}}}"#,
+                20.0 + f64::from(seq) * 0.01
+            ));
+            manager
+                .send("qual-cb", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+            if seq == 300 {
+                if let Some(path) = fault_file.clone() {
+                    eprintln!("qual fault: requesting server restart via {path}");
+                    std::fs::write(&path, b"restart").expect("qual fault file write");
+                    tokio::time::timeout(Duration::from_secs(600), async {
+                        while std::path::Path::new(&path).exists() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .await
+                    .expect("qual server never came back after restart");
+                    eprintln!("qual fault: server back, continuing writes");
+                }
+            }
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1000);
+        eprintln!("qual rows sent: records=1000 scope={scope_name}");
+
+        // Exactly 1000 documents asserted back by key (upserts by key
+        // are idempotent, so a retry cannot create extras and any loss
+        // is a defect): every key present, every CAS non-zero.
+        for seq in 0..1000u32 {
+            let device = format!("qual-{seq:06}");
+            let got = collection
+                .get(&device, None)
+                .await
+                .unwrap_or_else(|e| panic!("qual missing {device}: {e}"));
+            assert_ne!(got.cas(), 0, "qual CAS must be non-zero for {device}");
+        }
+        eprintln!("qual rows asserted: count=1000 each with non-zero CAS");
+
+        // Expiry through the sink path: one document with a 2 s TTL,
+        // present immediately, gone after 5 s.
+        let expiry_config = CouchbaseSinkConfig {
+            connection_string: url.clone(),
+            bucket: bucket_name.clone(),
+            scope: Some(scope_name.clone()),
+            collection: Some(collection_name.clone()),
+            auth: CouchbaseAuth {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            doc_id_template: "${client_id}".to_string(),
+            operation: CouchbaseOperation::Upsert,
+            expiry_secs: Some(2),
+            batch_size: Some(1),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            max_retries: Some(200),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(1_000),
+            timeout_ms: Some(15_000),
+        };
+        expiry_config.validate().expect("qual expiry config");
+        let expiry_transport =
+            Arc::new(DriverCouchbaseTransport::new(&expiry_config).expect("qual expiry transport"));
+        let expiry_sink = Arc::new(
+            CouchbaseSink::new(expiry_config, expiry_transport).expect("qual expiry sink"),
+        );
+        manager.register("qual-cb-expiry", expiry_sink.clone());
+        manager
+            .send(
+                "qual-cb-expiry",
+                &topic,
+                &Bytes::from_static(br#"{"client_id":"qual-expiry-probe","seq":-1}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual expiry send");
+        expiry_sink.flush().await.expect("qual expiry flush");
+        let probe = collection
+            .get("qual-expiry-probe", None)
+            .await
+            .expect("qual expiry doc must exist immediately");
+        assert_ne!(probe.cas(), 0);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match collection.get("qual-expiry-probe", None).await {
+            Ok(_) => panic!("qual expiry doc must be gone after 5 s"),
+            Err(e) => match e.kind() {
+                couchbase::error::ErrorKind::DocumentNotFound => {}
+                _ => panic!("qual expiry get must be NotFound, got {e}"),
+            },
+        }
+        eprintln!("qual expiry asserted: 2 s TTL gone after 5 s");
+
+        // Cleanup the scope created for this run (collections go with
+        // it); a failure is fatal so a stale scope never leaks into
+        // the next run silently.
+        collections
+            .drop_scope(&scope_name, None)
+            .await
+            .expect("qual cleanup scope");
+        eprintln!("qual cleanup: dropped scope {scope_name} in bucket {bucket_name}");
     }
 }

@@ -786,34 +786,49 @@ mod tests {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
 
+    /// Require a non-empty qualification variable; panics (fail closed)
+    /// when it is missing instead of passing vacuously.
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must be set for qualification; \
+                 failing closed instead of passing vacuously"
+            )
+        })
+    }
+
+    /// One `GROUP BY topic` row for the per-key count assertion.
+    #[derive(Debug, clickhouse::Row, Deserialize)]
+    struct QualTopicCount {
+        topic: String,
+        count: u64,
+    }
+
     /// Qualification against a real ClickHouse server via the official
     /// `clickhouse` driver.
     ///
     /// Run with e.g.:
-    /// `CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DATABASE=indra_qual \
-    ///  CLICKHOUSE_TABLE=qual_rows \
-    ///  cargo test -p broker-connectors --lib clickhouse::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    /// `CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DATABASE=indra_qual_b308 \
+    ///  CLICKHOUSE_TABLE=qual_rows CLICKHOUSE_USER=default \
+    ///  cargo test -p broker-connectors --lib clickhouse::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
     ///
-    /// Creates the table, streams 5000 rows through [`ClickHouseSink`]
-    /// on [`DriverClickHouseTransport`] (Basic auth when
-    /// `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` are set), runs
-    /// `OPTIMIZE ... FINAL` so parts merge, asserts `SELECT count()`
-    /// returns 5000, asserts the injection whitelist rejects bad DDL,
-    /// then drops the table it created.
+    /// Creates the table, streams 5000 rows (10 keys x 500 rows) through
+    /// the broker's rule path ([`crate::ConnectorManager`] ->
+    /// [`ClickHouseSink`] on [`DriverClickHouseTransport`], which is
+    /// exactly what the rule engine's `ForwardConnector` action calls;
+    /// never `sink.send` directly), runs `OPTIMIZE ... FINAL` so parts
+    /// merge, asserts `SELECT count()` returns 5000 and `GROUP BY topic`
+    /// returns exactly 500 per key, asserts the injection whitelist
+    /// rejects bad DDL, then drops the table it created.
     #[tokio::test]
     #[ignore = "needs a real ClickHouse server (see CLICKHOUSE_* env)"]
     async fn test_qualify_driver_write_path() {
-        let Some(url) = qual_env("CLICKHOUSE_URL") else {
-            panic!(
-                "CLICKHOUSE_URL must point at a real ClickHouse server for qualification; \
-                 failing closed instead of passing vacuously \
-                 (e.g. CLICKHOUSE_URL=http://127.0.0.1:8123)"
-            );
-        };
-        let database =
-            qual_env("CLICKHOUSE_DATABASE").unwrap_or_else(|| "indra_qual_b308".to_string());
-        let table = qual_env("CLICKHOUSE_TABLE").unwrap_or_else(|| "qual_rows".to_string());
-        let username = qual_env("CLICKHOUSE_USER").unwrap_or_else(|| "default".to_string());
+        use crate::ConnectorManager;
+
+        let url = qual_require("CLICKHOUSE_URL");
+        let database = qual_require("CLICKHOUSE_DATABASE");
+        let table = qual_require("CLICKHOUSE_TABLE");
+        let username = qual_require("CLICKHOUSE_USER");
         let password = qual_env("CLICKHOUSE_PASSWORD").unwrap_or_default();
 
         // Whitelist rejects bad DDL before any server round-trip.
@@ -849,13 +864,17 @@ mod tests {
 
         // Direct driver client for DDL and assertions.
         let client = config.driver_client().expect("qual driver client");
-        let version_sql = "SELECT version()".to_string();
-        let version: String = client
-            .query(&version_sql)
-            .fetch_one::<String>()
-            .await
-            .expect("qual version query");
-        eprintln!("qual server: version={version} url={url} table={qualified}");
+        // Server version for the report when the server reports one;
+        // otherwise it is omitted (never a constant standing in for a
+        // measurement).
+        match client.query("SELECT version()").fetch_one::<String>().await {
+            Ok(version) => {
+                eprintln!("qual server: version={version} url={url} table={qualified}");
+            }
+            Err(err) => {
+                eprintln!("qual server: version unavailable ({err}) url={url} table={qualified}");
+            }
+        }
 
         let ddl = config.create_table_ddl().expect("qual ddl");
         client
@@ -872,18 +891,29 @@ mod tests {
 
         let transport: Arc<dyn ClickHouseTransport> =
             Arc::new(DriverClickHouseTransport::new(&config).expect("qual transport"));
-        let sink = ClickHouseSink::new(config, transport).expect("qual sink");
+        let sink = Arc::new(ClickHouseSink::new(config, transport).expect("qual sink"));
         assert_eq!(sink.kind(), "clickhouse");
 
-        let topic = Topic::new("sensors/qual").unwrap();
-        for seq in 0..5000 {
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it and
+        // never `sink.send` directly.
+        const KEYS: u64 = 10;
+        const ROWS_PER_KEY: u64 = 500;
+        const ROWS_TOTAL: u64 = KEYS * ROWS_PER_KEY;
+        let manager = ConnectorManager::new();
+        manager.register("qual-ch", sink.clone());
+        for seq in 0..ROWS_TOTAL {
+            let key = seq % KEYS;
+            let topic = Topic::new(format!("qual/ch/{key:02}")).expect("qual topic");
             let payload = Bytes::from(format!(r#"{{"seq":{seq}}}"#));
-            sink.send(&topic, &payload, QoS::AtLeastOnce)
+            manager
+                .send("qual-ch", &topic, &payload, QoS::AtLeastOnce)
                 .await
                 .expect("qual send");
         }
         sink.flush().await.expect("qual flush");
-        assert_eq!(sink.sent_rows(), 5000);
+        assert_eq!(sink.sent_rows(), ROWS_TOTAL);
+        eprintln!("qual rows sent: records={ROWS_TOTAL} keys={KEYS} table={qualified}");
 
         // Parts merge: force it, then assert one active part set and the
         // full row count.
@@ -899,7 +929,33 @@ mod tests {
             .fetch_one::<u64>()
             .await
             .expect("qual count");
-        assert_eq!(count, 5000);
+        assert_eq!(count, ROWS_TOTAL);
+
+        // Exact counts by key: every key present with exactly its share.
+        // At-least-once permits duplicates, never loss, and the driver
+        // insert path is synchronous, so each key must read back whole.
+        let grouped_sql = format!("SELECT topic, count() AS count FROM {qualified} GROUP BY topic");
+        let grouped: Vec<QualTopicCount> = client
+            .query(&grouped_sql)
+            .fetch_all::<QualTopicCount>()
+            .await
+            .expect("qual grouped count");
+        assert_eq!(grouped.len(), KEYS as usize, "qual keys: {grouped:?}");
+        for row in &grouped {
+            assert_eq!(
+                row.count, ROWS_PER_KEY,
+                "qual key {:?} count mismatch: {grouped:?}",
+                row.topic
+            );
+        }
+        for key in 0..KEYS {
+            let expected = format!("qual/ch/{key:02}");
+            assert!(
+                grouped.iter().any(|row| row.topic == expected),
+                "qual key {expected:?} missing: {grouped:?}"
+            );
+        }
+        eprintln!("qual rows asserted: count={ROWS_TOTAL} each of {KEYS} keys={ROWS_PER_KEY}");
 
         // System table proves the merge happened (bounded active parts).
         let parts_sql = format!(
@@ -926,5 +982,6 @@ mod tests {
 
         let drop_sql = format!("DROP TABLE IF EXISTS {qualified}");
         client.query(&drop_sql).execute().await.expect("qual drop");
+        eprintln!("qual cleanup: dropped table {qualified}");
     }
 }
