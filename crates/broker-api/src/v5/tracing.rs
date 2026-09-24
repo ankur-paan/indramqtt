@@ -1,9 +1,11 @@
 //! Packet-tracing enable flag for the v5 management API.
 //!
 //! Covers `GET /tracing` (read the flag) and `PUT /tracing` (flip the
-//! flag). Single-node, management-plane only: nothing here runs on the
-//! per-message path, so reads and writes never take a delivery lock and
-//! no new buffering is added to fan-out or fan-in.
+//! flag). Reads and writes are management-plane only: handlers do one
+//! atomic operation plus one tiny JSON clone per request with no delivery
+//! locks and no new buffering. The kernel publish event reads the flag
+//! first as its cheap off-state check (F1-04, T-74): one relaxed atomic
+//! load, no lock, no allocation when disabled.
 //!
 //! Store bounds (both stated here and enforced by construction):
 //! - the flag is exactly one atomic bool; reads are one relaxed load and
@@ -25,8 +27,10 @@ use crate::ApiState;
 
 /// Boolean packet-tracing flag behind one atomic bool.
 ///
-/// Disabled by default. Constant-time reads and writes; never touched on
-/// the per-message path, so management reads never block delivery.
+/// Disabled by default; the trace-session lifecycle raises it while a
+/// session exists and lowers it when none remains. Constant-time reads and
+/// writes; the kernel publish event does one relaxed load per publish as
+/// its cheap off-state check.
 #[derive(Debug, Default)]
 pub struct TracingFlagStore {
     inner: AtomicBool,
@@ -70,7 +74,10 @@ pub async fn get_tracing(State(state): State<ApiState>) -> Response {
 /// `enable` field. Unknown fields are ignored so newer clients degrade
 /// to the known subset instead of a 400. Anything else is rejected with
 /// the documented `UPDATE_FAILED` shape and leaves the stored flag
-/// untouched.
+/// untouched. A manual flip is honoured by the kernel publish hook until
+/// the trace-session lifecycle changes it (creating a session raises the
+/// flag; clearing, deleting or stopping the last enabled session lowers
+/// it).
 pub async fn put_tracing(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,

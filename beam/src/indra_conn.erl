@@ -72,15 +72,17 @@
 -define(SUBSCRIBE_IN, 16#0030).
 -define(SUBACK_OUT, 16#0031).
 -define(CONN_CLOSE, 16#0041).
+-define(DISCONNECT_IN, 16#0040).
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 10000).
 %% Max client bytes buffered while the core is down; beyond this the
 %% connection fails closed instead of ballooning the edge.
 -define(MAX_HOLD_BUFFER_BYTES, 1048576).
 
 -type conn_opt() :: {broker, pid() | [pid()]}
-                  | {conn_id, non_neg_integer()}
-                  | {connect_timeout_ms, pos_integer()}
-                  | {transport, tcp | ssl}.
+                   | {conn_id, non_neg_integer()}
+                   | {connect_timeout_ms, pos_integer()}
+                   | {psk_identity, binary()}
+                   | {transport, tcp | ssl}.
 
 %%====================================================================
 %% API
@@ -98,6 +100,12 @@
 %% fresh positive unique integer.</li>
 %% <li>{@code {connect_timeout_ms, Ms}} — first-packet deadline,
 %% default 10000.</li>
+%% <li>{@code {psk_identity, Id}} — TLS PSK identity the listener
+%% negotiated for this socket (B5-05). The conn maps it onto the bind
+%% username so the kernel authenticates and authorizes it like any
+%% other CONNECT identity; a CONNECT username that is neither absent
+%% nor identical fails the connection closed with no bind sent. Absent
+%% on plaintext and certificate connections (unchanged path).</li>
 %% <li>{@code {transport, tcp | ssl}} — socket driver; default
 %% {@code tcp}. Must match how the socket was accepted.</li>
 %% </ul>
@@ -162,8 +170,23 @@ init_shard(Sock, Opts, Shards) ->
     ConnId = proplists:get_value(conn_id, Opts,
                                  erlang:unique_integer([positive, monotonic])),
     Timeout = proplists:get_value(connect_timeout_ms, Opts,
-                                  ?DEFAULT_CONNECT_TIMEOUT_MS),
+                                   ?DEFAULT_CONNECT_TIMEOUT_MS),
     Transport = proplists:get_value(transport, Opts, tcp),
+    PskIdentity = proplists:get_value(psk_identity, Opts, undefined),
+    case PskIdentity of
+        undefined ->
+            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, undefined);
+        PskIdentity when is_binary(PskIdentity) ->
+            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity);
+        _ ->
+            {stop, {invalid_option, psk_identity}}
+    end.
+
+%% @private Build the initial connection state. `psk_identity' is the
+%% TLS PSK identity the listener negotiated (`undefined' on plaintext
+%% and certificate sockets); it is consulted at CONNECT time to map
+%% the bind username (see handle_connect_packet/3).
+init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity) ->
     SockMod = case Transport of ssl -> ssl; _ -> gen_tcp end,
     Broker = pick_shard(ConnId, Shards),
     Data = #{sock => Sock,
@@ -172,12 +195,31 @@ init_shard(Sock, Opts, Shards) ->
              brokers => Shards,
              shard => shard_index(ConnId, length(Shards)),
              conn_id => ConnId,
-             connect_timeout_ms => Timeout,
-             buffer => <<>>,
-             seq => 0,
-             pending => undefined,
-             client_id => undefined,
-             keepalive => 0,
+              connect_timeout_ms => Timeout,
+              buffer => <<>>,
+              seq => 0,
+              %% B5-05 TLS PSK identity negotiated for this socket
+              %% (`undefined' on plaintext and certificate sockets).
+              %% Mapped onto the bind username at CONNECT time; the
+              %% kernel then authenticates and authorizes it like any
+              %% other CONNECT identity.
+              psk_identity => PskIdentity,
+               pending => undefined,
+               client_id => undefined,
+               keepalive => 0,
+               %% F1-01 last will captured from CONNECT (undefined when
+               %% the client registered none). Forwarded in every bind
+               %% (including rebinds after a core restart) and reported
+               %% via DisconnectIn on ungraceful close; the kernel owns
+               %% the session and the publish decision.
+               will => undefined,
+               %% B4-05 negotiated protocol level (4 or 5) and the
+               %% CONNECT Topic Alias Maximum (client receive limit).
+               %% Level gates the CONNACK shape and PUBLISH decoding;
+               %% the maximum rides every (re)bind so the kernel
+               %% outbound table survives core restarts.
+               proto_level => 4,
+               client_alias_max => 0,
              session_id => undefined,
              subs_pending => #{},
              pubs_pending => #{},
@@ -624,6 +666,35 @@ arm_socket(#{sock := Sock, sockmod := Mod}) ->
 %% the stop-cause aggregates). Every `{stop, ...}' site in this module
 %% goes through here; stuffing the cause into any other return shape
 %% would leave deaths unattributed.
+%%
+%% F1-01: any stop that is not a clean client DISCONNECT
+%% (`client_disconnect', which already sent Unbind) nor a kernel-ordered
+%% close (`kernel_close', where the kernel already detached) reports an
+%% ungraceful close to the kernel via DisconnectIn first, so the stored
+%% last will fires. The guard needs only a binary client id (a session
+%% exists); handshake states have `undefined' and send nothing. The send
+%% is asynchronous (spawned): the socket closes without waiting for the
+%% kernel, so a slow or dead kernel never delays the stop (the 5 s
+%% subscribe call-timeout kill must stay a 5 s kill, not 5 s plus another
+%% 5 s for the notice). A dead kernel simply drops the notice.
+stop_with(#{client_id := ClientId, broker := Broker,
+            conn_id := ConnId, seq := Seq} = Data, Cause)
+  when is_binary(ClientId),
+       Cause =/= client_disconnect, Cause =/= kernel_close ->
+    case (catch indra_brokerlink:encode_disconnect_meta(ClientId)) of
+        <<_/binary>> = Meta ->
+            SpawnBroker = Broker,
+            SpawnConn = ConnId,
+            SpawnSeq = Seq + 1,
+            spawn(fun() ->
+                catch indra_brokerlink:send(SpawnBroker, ?DISCONNECT_IN,
+                                            SpawnConn, SpawnSeq, Meta, <<>>)
+            end),
+            ok;
+        _ ->
+            ok
+    end,
+    {stop, normal, Data#{stop_cause => Cause}};
 stop_with(Data, Cause) ->
     {stop, normal, Data#{stop_cause => Cause}}.
 
@@ -694,38 +765,154 @@ handle_connect_bytes(Buf, Data) ->
 handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq := Seq} = Data) ->
     case indra_mqtt_codec:decode_connect(Payload) of
         {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive,
-               username := User, password := Pass}} ->
+               username := User, password := Pass, will_flag := WillFlag,
+               will_qos := WillQos, will_retain := WillRetain,
+               will_topic := WillTopic, will_payload := WillPayload} = Conn} ->
             %% The peer address rides the bind so the kernel can refuse
             %% address-banned clients (B1-03); a bind without it simply
-            %% matches no address ban, never fails.
-            Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive,
-                                                     {User, Pass},
-                                                     peer_ip_opt(Data)),
-            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-                ok ->
-                    Pending = #{client_id => ClientId, keepalive => Keepalive},
-                    %% Stash bytes pipelined behind CONNECT; they drain once
-                    %% the handshake completes (see `drain_buffer`).
-                    {keep_state, Data#{seq => Seq + 1,
-                                       pending => Pending,
-                                       buffer => Rest}};
-                Other ->
-                    stop_with(Data, classify_send_error(Other))
+            %% matches no address ban, never fails. B4-05: the CONNECT
+            %% Topic Alias Maximum rides the bind alias section (the
+            %% client's receive limit bounding the kernel outbound
+            %% table); 3.1.1 CONNECTs carry none, so the bound stays 0
+            %% and deliveries toward them always carry the full topic.
+            %% The negotiated level is stashed for CONNACK gating and
+            %% PUBLISH decoding below. Table ownership: kernel holds both
+            %% tables. F1-01: the CONNECT last will rides the bind when
+            %% present; the kernel stores it on the session and publishes
+            %% it on an ungraceful close only. A will topic carrying
+            %% wildcards (or an empty one) can never route, so the
+            %% CONNECT fails closed here instead of registering half
+            %% a will.
+            %%
+            %% B5-05: on a PSK socket the mapped identity is the bind
+            %% username, so the kernel authenticates and authorizes it
+            %% like any other CONNECT identity (bans, users, quotas all
+            %% apply unchanged; the CONNECT password still rides along
+            %% for the kernel to verify). A CONNECT username that is
+            %% neither absent nor identical fails closed here with no
+            %% bind sent.
+            %% TODO(parity): the spec does not decide whether a
+            %% mismatched CONNECT username should close (current,
+            %% conservative) or be ignored in favour of the PSK
+            %% identity; confirm the intended policy.
+            ProtoLevel = maps:get(protocol_level, Conn, 4),
+            ClientAliasMax = maps:get(alias_max, Conn, 0),
+            case psk_username(maps:get(psk_identity, Data, undefined), User) of
+                {error, _} ->
+                    stop_with(Data, protocol_error);
+                {ok, MappedUser} ->
+                    case make_will(WillFlag, WillTopic, WillPayload, WillQos, WillRetain) of
+                        {error, _} ->
+                            stop_with(Data, protocol_error);
+                        {ok, Will} ->
+                            %% No will rides the /6 encoding byte-for-byte;
+                            %% a will rides the /7 encoding (both carry the
+                            %% CONNECT alias maximum).
+                            Meta = case Will of
+                                undefined ->
+                                    (catch indra_brokerlink:encode_bind_meta(
+                                             ClientId, CleanStart, Keepalive,
+                                             {MappedUser, Pass},
+                                             peer_ip_opt(Data), ClientAliasMax));
+                                _ ->
+                                    (catch indra_brokerlink:encode_bind_meta(
+                                             ClientId, CleanStart, Keepalive,
+                                             {MappedUser, Pass},
+                                             peer_ip_opt(Data), ClientAliasMax, Will))
+                            end,
+                            case Meta of
+                                <<_/binary>> ->
+                                    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
+                                                                      ConnId, Seq + 1, Meta, <<>>) of
+                                        ok ->
+                                            Pending = #{client_id => ClientId,
+                                                        keepalive => Keepalive,
+                                                        will => Will,
+                                                        proto_level => ProtoLevel,
+                                                        client_alias_max => ClientAliasMax,
+                                                        username => MappedUser,
+                                                        password => Pass},
+                                            %% Stash bytes pipelined behind CONNECT; they drain once
+                                            %% the handshake completes (see `drain_buffer`).
+                                            {keep_state, Data#{seq => Seq + 1,
+                                                               pending => Pending,
+                                                               buffer => Rest}};
+                                        Other ->
+                                            stop_with(Data, classify_send_error(Other))
+                                    end;
+                                _ ->
+                                    %% Will too large for the bind meta (or another
+                                    %% encoding refusal): fail closed, no half bind.
+                                    stop_with(Data, protocol_error)
+                            end
+                    end
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)
     end.
 
+%% @private Map the TLS PSK identity onto the bind username (B5-05).
+%% Plaintext and certificate sockets carry `undefined' and keep the
+%% CONNECT username untouched. On a PSK socket an absent CONNECT
+%% username defaults to the identity and an identical one is accepted;
+%% anything else fails closed (no bind is sent, the socket closes).
+-spec psk_username(binary() | undefined, binary() | undefined) ->
+    {ok, binary() | undefined} | {error, psk_identity_mismatch}.
+psk_username(undefined, User) ->
+    {ok, User};
+psk_username(PskId, undefined) ->
+    {ok, PskId};
+psk_username(PskId, PskId) ->
+    {ok, PskId};
+psk_username(_, _) ->
+    {error, psk_identity_mismatch}.
+
+%% @private Build the bind will from decoded CONNECT fields. `undefined'
+%% when the will flag is clear; otherwise the topic must be routable
+%% (non-empty, no wildcards) and the payload a binary (empty allowed).
+make_will(false, _, _, _, _) ->
+    {ok, undefined};
+make_will(true, Topic, Payload, QoS, Retain)
+  when is_binary(Topic), is_binary(Payload),
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       (Retain =:= true orelse Retain =:= false),
+       byte_size(Topic) >= 1 ->
+    case binary:match(Topic, [<<"+">>, <<"#">>]) of
+        nomatch ->
+            {ok, #{topic => Topic, payload => Payload,
+                   qos => QoS, retain => Retain}};
+        _ ->
+            {error, invalid_will_topic}
+    end;
+make_will(_, _, _, _, _) ->
+    {error, invalid_will_topic}.
+
 %% @private Re-send the pending bind to a replacement broker (core flap
 %% mid-handshake). Drops back to waiting on failure.
 resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
-              pending := #{client_id := ClientId, keepalive := Keepalive}} = Data) ->
-    Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined},
-                                             peer_ip_opt(Data)),
-    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-        ok ->
-            {keep_state, Data#{seq => Seq + 1}};
+               pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
+    Will = maps:get(will, Pending, undefined),
+    ClientAliasMax = maps:get(client_alias_max, Pending, 0),
+    Username = maps:get(username, Pending, undefined),
+    Password = maps:get(password, Pending, undefined),
+    Meta = case Will of
+        undefined ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {Username, Password},
+                                                     peer_ip_opt(Data), ClientAliasMax));
+        _ ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {Username, Password},
+                                                     peer_ip_opt(Data), ClientAliasMax, Will))
+    end,
+    case Meta of
+        <<_/binary>> ->
+            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
+                ok ->
+                    {keep_state, Data#{seq => Seq + 1}};
+                _ ->
+                    {keep_state, Data}
+            end;
         _ ->
             {keep_state, Data}
     end;
@@ -761,18 +948,39 @@ peer_ip(_, _) ->
 
 handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_session_binding_meta(Meta) of
+        %% B4-05: the binding carries the kernel inbound alias maximum for
+        %% CONNACK negotiation. MQTT 5 peers learn it through the CONNACK
+        %% property (34) via encode_connack/3; 3.1.1 peers always get the
+        %% 4-byte encode_connack/2 shape (a property section would break
+        %% their framing), so alias_max 0 and every level-4 socket encode
+        %% with no property. Fail closed: a client never sends aliases it
+        %% was never told about. Table ownership: kernel holds both
+        %% tables; the edge only frames the wire values.
         {ok, #{session_id := SessionId,
                session_present := Present,
-               return_code := RC}} ->
-            Connack = indra_mqtt_codec:encode_connack(
-                        Present, indra_mqtt_codec:connack_return_code(RC)),
+               return_code := RC} = Binding} ->
+            AliasMax = maps:get(alias_max, Binding, 0),
+            Pending0 = maps:get(pending, Data, #{client_id => <<>>,
+                                                 keepalive => 0}),
+            ProtoLevel = maps:get(proto_level, Pending0, 4),
+            Connack = case ProtoLevel =:= 5 andalso AliasMax > 0 of
+                true ->
+                    indra_mqtt_codec:encode_connack(
+                      Present, indra_mqtt_codec:connack_return_code(RC), AliasMax);
+                false ->
+                    indra_mqtt_codec:encode_connack(
+                      Present, indra_mqtt_codec:connack_return_code(RC))
+            end,
             case sock_send(Mod, Sock, Connack) of
                 ok when RC =:= 0 ->
-                    Pending = maps:get(pending, Data, #{client_id => <<>>,
-                                                        keepalive => 0}),
+                    Pending = Pending0,
                     Data1 = Data#{session_id => SessionId,
                                   client_id => maps:get(client_id, Pending, <<>>),
-                                  keepalive => maps:get(keepalive, Pending, 0)},
+                                  keepalive => maps:get(keepalive, Pending, 0),
+                                  will => maps:get(will, Pending, undefined),
+                                  proto_level => ProtoLevel,
+                                  client_alias_max =>
+                                      maps:get(client_alias_max, Pending, 0)},
                     {next_state, connected, Data1,
                      [keepalive_action(Data1), {next_event, internal, drain_buffer}]};
                 ok ->
@@ -795,23 +1003,38 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
 %% @private Begin recovery: re-bind the session, always non-clean so a
 %% surviving core resumes (present=true, offline replay follows) while a
 %% fresh core simply recreates. Core-side tracking resets; the client
-%% buffer is preserved for the post-rebind drain.
+%% buffer is preserved for the post-rebind drain. The stored last will
+%% re-rides the rebind so a fresh core re-registers it.
 start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                client_id := ClientId, keepalive := Keepalive} = Data)
   when is_binary(ClientId) ->
-    Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined},
-                                             peer_ip_opt(Data)),
-    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-        ok ->
-            {next_state, await_core, Data#{seq => Seq + 1,
-                                           subs_pending => #{},
-                                           pubs_pending => #{},
-                                           qos2_pending => #{},
-                                           quiet_subs => #{},
-                                           rebinding => true}};
+    Will = maps:get(will, Data, undefined),
+    ClientAliasMax = maps:get(client_alias_max, Data, 0),
+    Meta = case Will of
+        undefined ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data), ClientAliasMax));
         _ ->
-            %% Replacement core already gone: hold for the next sweep.
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data), ClientAliasMax, Will))
+    end,
+    case Meta of
+        <<_/binary>> ->
+            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
+                ok ->
+                    {next_state, await_core, Data#{seq => Seq + 1,
+                                                   subs_pending => #{},
+                                                   pubs_pending => #{},
+                                                   qos2_pending => #{},
+                                                   quiet_subs => #{},
+                                                   rebinding => true}};
+                _ ->
+                    %% Replacement core already gone: hold for the next sweep.
+                    {next_state, await_core, Data#{rebinding => false}}
+            end;
+        _ ->
             {next_state, await_core, Data#{rebinding => false}}
     end;
 start_rebind(Data) ->
@@ -978,12 +1201,29 @@ handle_subscribe_packet(Payload, Data) ->
     end.
 
 handle_publish_packet(Payload, Flags, Data) ->
-    case indra_mqtt_codec:decode_publish(Payload, Flags) of
+    ProtoLevel = maps:get(proto_level, Data, 4),
+    case indra_mqtt_codec:decode_publish(Payload, Flags, ProtoLevel) of
         {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-               retain := Retain, dup := Dup, payload := AppPayload}} ->
+               retain := Retain, dup := Dup, payload := AppPayload,
+               alias := Alias, alias_present := AliasPresent}} ->
             #{broker := Broker, conn_id := ConnId, seq := Seq,
               pubs_pending := Pending, qos2_pending := Qos2Pending} = Data,
-            Meta = indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup),
+            %% B4-05: the alias rides the PUBLISH alias property on v5
+            %% sockets (absent on 3.1.1, where the codec always reports
+            %% it absent). Forward absent via the /5 form, never an
+            %% explicit alias 0 section: absent means "no alias carried"
+            %% while an explicit 0 is a protocol error the kernel
+            %% rejects with DISCONNECT 0x94, and the two must stay
+            %% distinguishable on the wire. The kernel checks the alias
+            %% against the CONNACK-negotiated maximum on the PUBLISH
+            %% event, where the inbound table is written.
+            Meta = case AliasPresent of
+                false ->
+                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup);
+                true ->
+                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup,
+                                                         Alias)
+            end,
             case catch indra_brokerlink:send(Broker, ?PUBLISH_IN, ConnId, Seq + 1, Meta, AppPayload) of
                 ok when QoS =:= 1 ->
                     {ok, Data#{seq => Seq + 1,
@@ -1197,9 +1437,14 @@ emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
         ?PUBLISH_OUT ->
             case indra_brokerlink:decode_publish_meta(Meta) of
                 {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-                       retain := Retain, dup := Dup}} ->
+                       retain := Retain, dup := Dup, alias := Alias}} ->
+                    %% B4-05: the kernel-assigned alias rides the PUBLISH
+                    %% alias property toward v5 subscribers (0 means full
+                    %% topic, no alias). The meta value is already the
+                    %% wire value, framed directly with no round-trip.
                     Packet = indra_mqtt_codec:encode_publish(Topic, PacketId, QoS,
-                                                             Retain, Dup, Payload),
+                                                             Retain, Dup, Payload,
+                                                             Alias),
                     emit_frames(Rest, Data, [Packet | Pending], N + 1,
                                 B + byte_size(Meta) + byte_size(Payload));
                 {error, _} ->
@@ -1402,13 +1647,17 @@ handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending}
     end.
 
 %% @private Forward one kernel PUBREC to the publishing client (D1-01
-%% inbound first phase). The pending entry stays until PUBCOMP so a
-%% duplicate PUBLISH still matches; unsolicited PUBRECs are still
-%% forwarded (the kernel only sends them for publishes it stored).
+%% inbound first phase, B4-05 alias rejects carry reason 0x94). The
+%% pending entry stays until PUBCOMP so a duplicate PUBLISH still
+%% matches; unsolicited PUBRECs are still forwarded (the kernel only
+%% sends them for publishes it stored). A nonzero reason code rides the
+%% MQTT 5 PUBREC reason field via encode_pubrec/2 so the publisher
+%% observes the 0x94 rejection instead of a bare PUBREC.
 handle_pubrec_out(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_pubrec_meta(Meta) of
-        {ok, #{packet_id := PacketId}} ->
-            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrec(PacketId)) of
+        {ok, #{packet_id := PacketId} = Dec} ->
+            RC = maps:get(reason_code, Dec, 0),
+            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrec(PacketId, RC)) of
                 ok ->
                     {keep_state, Data};
                 {error, _} ->

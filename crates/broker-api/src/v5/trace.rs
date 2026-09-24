@@ -9,10 +9,15 @@
 //! file download), `GET /trace/{name}/log` (paged inline read over the
 //! same bounded capture buffer) and `GET /trace/{name}/log_detail`
 //! (single-entry detail read over the same buffer by `position`).
-//! Single-node, management-plane only:
+//! Single-node, management-plane only for reads and writes:
 //! nothing here runs on the per-message path, so reads, creates, clears,
 //! single deletes, stops, downloads, log reads and detail reads never take a
 //! delivery lock and no new buffering is added to fan-out or fan-in.
+//! The packet path appends through [`TraceStore::capture_publish`], driven
+//! by the kernel publish event (`ingress_pipeline_with_publisher` in
+//! `crates/broker-node/src/main.rs`): one global-flag atomic load plus one
+//! short read lock when no session matches, small bounded line clones only
+//! for matching sessions (see [`MAX_TRACE_PAYLOAD_BYTES`]).
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_TRACES`] sessions are kept; creates past the cap are
@@ -27,8 +32,12 @@
 //!   (256 KiB); appends past the cap drop the oldest bytes and keep the
 //!   newest (newest-wins truncation, no rotation files). With at most
 //!   [`MAX_TRACES`] sessions the whole capture buffer stays under 7.5 MiB.
-//!   Capture is management-plane only: appends happen off the delivery
-//!   hot path and downloads clone at most one capped buffer per request.
+//!   Appends from the packet path format one line per matching session
+//!   (see [`MAX_TRACE_PAYLOAD_BYTES`]); downloads clone at most one capped
+//!   buffer per request.
+//! - a session starts empty: creation seeds no bytes, and reads serve only
+//!   what the packet path captured (an empty session downloads as an empty
+//!   body and lists as an empty page, never a synthesised header).
 //! - log reads split the same capped buffer into newline-delimited entries
 //!   and render only the requested W0 page (`page`/`limit` plus
 //!   `meta { page, limit, count, hasnext }`), so one read cannot grow
@@ -59,6 +68,14 @@ pub const MAX_TRACES: usize = 30;
 /// without limit. At [`MAX_TRACES`] sessions the whole buffer stays
 /// under 7.5 MiB.
 pub const MAX_TRACE_LOG_BYTES: usize = 256 * 1024;
+/// Cap on the payload bytes rendered into one captured line.
+/// Payloads on the wire can be megabytes; rendering all of one into every
+/// matching session would put unbounded formatting work on the publish path.
+/// Truncating to 1 KiB keeps one capture under ~1 KiB plus the small topic
+/// and client-id fields, so a publish fanning into all [`MAX_TRACES`]
+/// sessions formats at most ~30 KiB. The line notes truncation so a reader
+/// never mistakes a clipped payload for the full one.
+pub const MAX_TRACE_PAYLOAD_BYTES: usize = 1024;
 /// Download content type served by `GET /trace/{name}/download`.
 pub const TRACE_DOWNLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 /// Longest accepted session `name`.
@@ -246,13 +263,90 @@ impl TraceStore {
         true
     }
 
+    /// True when no session is stored. One short read lock; the packet
+    /// path uses this (via [`TraceStore::capture_publish`]) as its cheap
+    /// no-tracing check with no allocation.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .expect("trace store lock")
+            .sessions
+            .is_empty()
+    }
+
+    /// True when at least one stored session still has capture enabled.
+    /// Management-plane only (session lifecycle bookkeeping for the global
+    /// tracing flag); the packet path checks per-session state while
+    /// matching instead of calling this.
+    pub fn has_enabled(&self) -> bool {
+        self.inner
+            .read()
+            .expect("trace store lock")
+            .sessions
+            .values()
+            .any(|s| s.enable)
+    }
+
+    /// Append one publish to every running session whose filter matches.
+    ///
+    /// Driven by the kernel publish event with the publishing client id,
+    /// its last-known peer address, the concrete topic and the raw payload.
+    /// A session matches only while running (`enable` and `now` inside
+    /// `[start_at, end_at)`): `clientid` compares the publisher id exactly,
+    /// `topic` matches the concrete topic against the session filter with
+    /// MQTT wildcards, `ip_address` compares the publisher peer address
+    /// exactly. `ruleid` sessions never match here: rule identity is not
+    /// carried on the publish path.
+    /// TODO(parity): should `ruleid` sessions capture rule-engine input or
+    /// output for their rule? Neither this rulebook nor the task spec
+    /// decides; current choice is the conservative one (no capture) so a
+    /// rule trace never invents packets.
+    ///
+    /// Cost: one short read lock plus a bounded scan (at most [`MAX_TRACES`]
+    /// small comparisons, no allocation) when nothing matches; one small
+    /// bounded line clone per matching session otherwise (see
+    /// [`MAX_TRACE_PAYLOAD_BYTES`]). Appends reuse [`TraceStore::append_log`]
+    /// so the per-session [`MAX_TRACE_LOG_BYTES`] cap always applies.
+    pub fn capture_publish(
+        &self,
+        client_id: &str,
+        peerhost: Option<&str>,
+        topic: &str,
+        payload: &[u8],
+    ) {
+        let now = now_epoch_secs();
+        let lines: Vec<(String, Vec<u8>)> = {
+            let data = self.inner.read().expect("trace store lock");
+            if data.sessions.is_empty() {
+                return;
+            }
+            let mut out = Vec::new();
+            for session in data.sessions.values() {
+                if !session.enable || now < session.start_at || now >= session.end_at {
+                    continue;
+                }
+                if !session_matches(session, client_id, peerhost, topic) {
+                    continue;
+                }
+                out.push((
+                    session.name.clone(),
+                    format_capture_line(session, topic, client_id, payload),
+                ));
+            }
+            out
+        };
+        for (name, line) in &lines {
+            self.append_log(name, line);
+        }
+    }
+
     /// Insert one session. Fails cleanly when `name` already exists
     /// (caller maps to `ALREADY_EXISTS`), when another session already
     /// captures the same type plus filter (caller maps to
     /// `DUPLICATE_CONDITION`), or when the store holds [`MAX_TRACES`]
-    /// sessions (caller maps to `INVALID_PARAMS`). On success a short
-    /// header line is seeded into the session's capture buffer so a
-    /// download is never an empty file.
+    /// sessions (caller maps to `INVALID_PARAMS`). On success the session
+    /// starts with an empty capture buffer: reads serve only what the
+    /// packet path appends, never a synthesised header.
     pub fn insert(&self, session: TraceSession) -> Result<TraceSession, TraceInsertError> {
         let mut data = self.inner.write().expect("trace store lock");
         if data.sessions.contains_key(&session.name) {
@@ -268,15 +362,7 @@ impl TraceStore {
         if data.sessions.len() >= MAX_TRACES {
             return Err(TraceInsertError::Full);
         }
-        let header = format!(
-            "trace {} started type={} {}={}\n",
-            session.name, session.trace_type, session.trace_type, session.filter
-        );
-        let mut bytes = header.into_bytes();
-        if bytes.len() > MAX_TRACE_LOG_BYTES {
-            bytes = bytes[bytes.len() - MAX_TRACE_LOG_BYTES..].to_vec();
-        }
-        data.logs.insert(session.name.clone(), bytes);
+        data.logs.insert(session.name.clone(), Vec::new());
         data.sessions.insert(session.name.clone(), session.clone());
         Ok(session)
     }
@@ -314,6 +400,119 @@ impl TraceStore {
         entry.enable = false;
         Some(entry.clone())
     }
+}
+
+/// True when one publish belongs in `session`: the publisher id for
+/// `clientid`, MQTT filter match for `topic`, the publisher peer address
+/// for `ip_address`. Unknown kinds and unparseable filters never match
+/// (fail closed, never a guessed capture).
+fn session_matches(
+    session: &TraceSession,
+    client_id: &str,
+    peerhost: Option<&str>,
+    topic: &str,
+) -> bool {
+    match session.trace_type.as_str() {
+        "clientid" => session.filter == client_id,
+        "topic" => {
+            let Ok(filter) = broker_protocol::TopicFilter::new(session.filter.clone()) else {
+                return false;
+            };
+            let Ok(concrete) = broker_protocol::Topic::new(topic.to_string()) else {
+                return false;
+            };
+            filter.matches(&concrete)
+        }
+        "ip_address" => peerhost.is_some_and(|peer| peer == session.filter),
+        _ => false,
+    }
+}
+
+/// Render one captured publish line for `session`, honouring its payload
+/// encoding and formatter. `text` lines read
+/// `publish topic=<topic> clientid=<client> payload=<text>`; `json` lines
+/// carry the same fields as a JSON object. `hidden` omits the payload so a
+/// sensitive payload is never written into the capture buffer. Payloads
+/// past [`MAX_TRACE_PAYLOAD_BYTES`] are truncated with a marker (see the
+/// constant for why). Every line ends with `\n` so the log and detail
+/// readers split entries the same way.
+fn format_capture_line(
+    session: &TraceSession,
+    topic: &str,
+    client_id: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let hidden = session.payload_encode == "hidden";
+    let rendered: Option<String> = if hidden {
+        None
+    } else if session.payload_encode == "hex" {
+        Some(render_hex_capped(payload))
+    } else {
+        Some(render_text_capped(payload))
+    };
+    if session.formatter == "json" {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "topic".to_string(),
+            serde_json::Value::String(topic.to_string()),
+        );
+        obj.insert(
+            "clientid".to_string(),
+            serde_json::Value::String(client_id.to_string()),
+        );
+        if let Some(text) = rendered {
+            obj.insert("payload".to_string(), serde_json::Value::String(text));
+        }
+        let mut line = serde_json::Value::Object(obj).to_string();
+        line.push('\n');
+        line.into_bytes()
+    } else {
+        let mut line = format!("publish topic={topic} clientid={client_id}");
+        if let Some(text) = rendered {
+            line.push_str(" payload=");
+            line.push_str(&text);
+        }
+        line.push('\n');
+        line.into_bytes()
+    }
+}
+
+/// Render at most [`MAX_TRACE_PAYLOAD_BYTES`] payload bytes as lossy text,
+/// appending `...[truncated]` when clipped so a reader never mistakes a
+/// clipped payload for the full one.
+fn render_text_capped(payload: &[u8]) -> String {
+    if payload.len() <= MAX_TRACE_PAYLOAD_BYTES {
+        return String::from_utf8_lossy(payload).into_owned();
+    }
+    let mut end = MAX_TRACE_PAYLOAD_BYTES.min(payload.len());
+    while end > 0 && end < payload.len() && (payload[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&payload[..end]).into_owned();
+    text.push_str("...[truncated]");
+    text
+}
+
+/// Render at most [`MAX_TRACE_PAYLOAD_BYTES`] payload bytes as lowercase
+/// hex, appending `...[truncated]` when clipped (same marker as text so
+/// readers learn one convention).
+fn render_hex_capped(payload: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let clipped = payload.len() > MAX_TRACE_PAYLOAD_BYTES;
+    let slice = if clipped {
+        &payload[..MAX_TRACE_PAYLOAD_BYTES]
+    } else {
+        payload
+    };
+    let mut out = String::with_capacity(slice.len() * 2 + 14);
+    for byte in slice {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    if clipped {
+        out.push_str("...[truncated]");
+    }
+    out
 }
 
 impl Default for TraceStore {
@@ -370,6 +569,12 @@ pub async fn create_trace(State(state): State<ApiState>, body: Bytes) -> Respons
     };
     match state.traces.insert(session) {
         Ok(stored) => {
+            // A stored session means capture is active: raise the global
+            // packet-tracing flag so the kernel publish hook (which checks
+            // the flag first) observes it without a restart. One atomic
+            // store on the management plane; the per-message path pays one
+            // atomic load.
+            state.tracing.set_enabled(true);
             let now = now_epoch_secs();
             let size = state.traces.log_len(&stored.name);
             (StatusCode::OK, Json(stored.to_json(now, size))).into_response()
@@ -398,9 +603,12 @@ pub async fn create_trace(State(state): State<ApiState>, body: Bytes) -> Respons
 }
 
 /// `DELETE /trace`: drop every session and report success with 204.
-/// Always succeeds, even when nothing is stored.
+/// Always succeeds, even when nothing is stored. Clearing the last session
+/// lowers the global packet-tracing flag so the kernel publish hook
+/// returns to its single-load off state.
 pub async fn clear_traces(State(state): State<ApiState>) -> Response {
     state.traces.clear();
+    state.tracing.set_enabled(false);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -412,6 +620,11 @@ pub async fn clear_traces(State(state): State<ApiState>) -> Response {
 pub async fn delete_trace(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
     if !state.traces.remove(&name) {
         return ApiError::NotFound("trace not found".to_string()).into_response();
+    }
+    // Dropping the last enabled session lowers the global flag so the
+    // kernel publish hook returns to its single-load off state.
+    if !state.traces.has_enabled() {
+        state.tracing.set_enabled(false);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -427,6 +640,12 @@ pub async fn stop_trace(State(state): State<ApiState>, Path(name): Path<String>)
     let Some(stopped) = state.traces.stop(&name) else {
         return ApiError::NotFound("trace not found".to_string()).into_response();
     };
+    // Stopping the last enabled session lowers the global flag so the
+    // kernel publish hook returns to its single-load off state. Time-window
+    // expiry is checked per packet, not here.
+    if !state.traces.has_enabled() {
+        state.tracing.set_enabled(false);
+    }
     let now = now_epoch_secs();
     let size = state.traces.log_len(&stopped.name);
     (StatusCode::OK, Json(stopped.to_json(now, size))).into_response()
@@ -435,8 +654,9 @@ pub async fn stop_trace(State(state): State<ApiState>, Path(name): Path<String>)
 /// `GET /trace/{name}/download`: serve one session's captured log as a
 /// file download.
 ///
-/// Returns the bounded per-session buffer (`text` lines seeded at
-/// creation plus any appended capture bytes) with
+/// Returns exactly the bounded per-session buffer the packet path appended
+/// (possibly empty: an uncaptured session downloads as an empty body, never
+/// a synthesised header) with
 /// `application/octet-stream` and a `content-disposition` attachment
 /// filename of `<name>.log`. Unknown sessions fail with `NOT_FOUND`.
 /// Management-plane only: one capped clone per request (at most
@@ -446,14 +666,7 @@ pub async fn download_trace(State(state): State<ApiState>, Path(name): Path<Stri
     let Some(session) = state.traces.get(&name) else {
         return ApiError::NotFound("trace not found".to_string()).into_response();
     };
-    let mut bytes = state.traces.read_log(&session.name).unwrap_or_default();
-    if bytes.is_empty() {
-        let header = format!(
-            "trace {} started type={} {}={}\n",
-            session.name, session.trace_type, session.trace_type, session.filter
-        );
-        bytes = header.into_bytes();
-    }
+    let bytes = state.traces.read_log(&session.name).unwrap_or_default();
     let filename = format!("attachment; filename=\"{}.log\"", session.name);
     (
         StatusCode::OK,
@@ -469,8 +682,9 @@ pub async fn download_trace(State(state): State<ApiState>, Path(name): Path<Stri
 /// `GET /trace/{name}/log`: paged inline read over one session's captured
 /// log.
 ///
-/// Splits the same bounded per-session buffer the download serves
-/// (`text` lines seeded at creation plus any appended capture bytes) into
+/// Splits the same bounded per-session buffer the download serves (only
+/// packet-path appended lines; an uncaptured session reads as an empty page,
+/// never a synthesised header) into
 /// newline-delimited entries and renders only the requested W0 page as
 /// `data` plus `meta { page, limit, count, hasnext }`. Each entry is
 /// `{ position, content }` where `position` is the zero-based line index
@@ -487,14 +701,7 @@ pub async fn get_trace_log(
     let Some(session) = state.traces.get(&name) else {
         return ApiError::NotFound("trace not found".to_string()).into_response();
     };
-    let mut bytes = state.traces.read_log(&session.name).unwrap_or_default();
-    if bytes.is_empty() {
-        let header = format!(
-            "trace {} started type={} {}={}\n",
-            session.name, session.trace_type, session.trace_type, session.filter
-        );
-        bytes = header.into_bytes();
-    }
+    let bytes = state.traces.read_log(&session.name).unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let total = lines.len();
@@ -552,14 +759,7 @@ pub async fn get_trace_log_detail(
     let Some(session) = state.traces.get(&name) else {
         return ApiError::NotFound("trace not found".to_string()).into_response();
     };
-    let mut bytes = state.traces.read_log(&session.name).unwrap_or_default();
-    if bytes.is_empty() {
-        let header = format!(
-            "trace {} started type={} {}={}\n",
-            session.name, session.trace_type, session.trace_type, session.filter
-        );
-        bytes = header.into_bytes();
-    }
+    let bytes = state.traces.read_log(&session.name).unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let Some(content) = lines.get(position).cloned() else {
@@ -1210,11 +1410,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_serves_seeded_bytes_and_misses_unknown() {
+    async fn download_serves_captured_bytes_and_misses_unknown() {
         let state = standalone_state();
         let (status, _) =
             response_parts(create_trace(State(state.clone()), valid_body("trace-dl")).await).await;
         assert_eq!(status, StatusCode::OK);
+
+        // An uncaptured session downloads as an empty body, never a
+        // synthesised header.
+        let response = download_trace(State(state.clone()), Path("trace-dl".to_string())).await;
+        let (status, _, bytes) = download_parts(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(bytes.is_empty(), "empty session must download empty");
 
         // Simulated captured traffic lands in the same bounded buffer the
         // download serves.
@@ -1238,10 +1445,6 @@ mod tests {
         );
         assert!(!bytes.is_empty(), "download must carry log bytes");
         let text = String::from_utf8(bytes).expect("download is text");
-        assert!(
-            text.contains("sensors/#"),
-            "download must carry the session filter"
-        );
         assert!(
             text.contains("publish sensors/temp"),
             "download must carry appended traffic"
@@ -1290,7 +1493,9 @@ mod tests {
                 end_at: now + 600,
             })
             .expect("insert works");
-        assert!(store.log_len("cap-me") > 0);
+        // A fresh session starts empty: reads serve only what the packet
+        // path appends, never a synthesised header.
+        assert_eq!(store.log_len("cap-me"), 0);
 
         // One over-long append keeps only its tail.
         let big = vec![b'x'; MAX_TRACE_LOG_BYTES + 1024];
@@ -1321,10 +1526,13 @@ mod tests {
             response_parts(create_trace(State(state.clone()), valid_body("trace-size")).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
-        let seeded = created["log_size"]["indramqtt@127.0.0.1"]
+        let initial = created["log_size"]["indramqtt@127.0.0.1"]
             .as_u64()
             .expect("log_size renders a byte count");
-        assert!(seeded > 0, "fresh sessions seed a header line");
+        assert_eq!(
+            initial, 0,
+            "fresh sessions start empty (no synthesised header)"
+        );
 
         assert!(state.traces.append_log("trace-size", b"extra line\n"));
         let (status, listed) = response_parts(list_traces(State(state.clone())).await).await;
@@ -1335,7 +1543,7 @@ mod tests {
             .as_u64()
             .expect("list renders a byte count");
         assert_eq!(reported, state.traces.log_len("trace-size") as u64);
-        assert!(reported > seeded);
+        assert!(reported > initial);
     }
 
     #[tokio::test]
@@ -1345,6 +1553,11 @@ mod tests {
             response_parts(create_trace(State(state.clone()), valid_body("trace-clear-dl")).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
+        // A fresh session starts empty; the first append makes it non-empty.
+        assert_eq!(state.traces.log_len("trace-clear-dl"), 0);
+        assert!(state
+            .traces
+            .append_log("trace-clear-dl", b"publish a/b x\n"));
         assert!(state.traces.log_len("trace-clear-dl") > 0);
 
         let (status, _) = response_parts(clear_traces(State(state.clone())).await).await;
@@ -1370,6 +1583,21 @@ mod tests {
             response_parts(create_trace(State(state.clone()), valid_body("trace-log")).await).await;
         assert_eq!(status, StatusCode::OK);
 
+        // An uncaptured session reads as an empty page, never a
+        // synthesised header.
+        let (status, empty) = response_parts(
+            get_trace_log(
+                State(state.clone()),
+                Path("trace-log".to_string()),
+                log_page_params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty["data"], serde_json::json!([]));
+        assert_eq!(empty["meta"]["count"], serde_json::json!(0));
+
         // Simulated captured traffic lands in the same bounded buffer the
         // inline log read serves.
         assert!(state
@@ -1390,19 +1618,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let entries = body["data"].as_array().expect("log has data");
-        assert!(
-            entries.len() >= 3,
-            "log must carry seeded header plus appended traffic, got {entries:?}"
+        assert_eq!(
+            entries.len(),
+            2,
+            "log must carry exactly the appended traffic, got {entries:?}"
         );
         let joined = entries
             .iter()
             .map(|entry| entry["content"].as_str().unwrap_or_default())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            joined.contains("sensors/#"),
-            "log must carry the session filter"
-        );
         assert!(
             joined.contains("publish sensors/temp"),
             "log must carry appended traffic"
@@ -1458,7 +1683,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(first["data"].as_array().expect("data").len(), 2);
-        assert_eq!(first["meta"]["count"], serde_json::json!(4));
+        assert_eq!(first["meta"]["count"], serde_json::json!(3));
         assert_eq!(first["meta"]["hasnext"], serde_json::json!(true));
         assert_eq!(first["data"][0]["position"], serde_json::json!(0));
         assert_eq!(first["data"][1]["position"], serde_json::json!(1));
@@ -1473,10 +1698,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(second["data"].as_array().expect("data").len(), 2);
+        assert_eq!(second["data"].as_array().expect("data").len(), 1);
         assert_eq!(second["meta"]["hasnext"], serde_json::json!(false));
         assert_eq!(second["data"][0]["position"], serde_json::json!(2));
-        assert_eq!(second["data"][1]["position"], serde_json::json!(3));
         assert_ne!(first["data"][0]["content"], second["data"][0]["content"]);
 
         let (status, empty) = response_parts(
@@ -1490,7 +1714,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(empty["data"], serde_json::json!([]));
-        assert_eq!(empty["meta"]["count"], serde_json::json!(4));
+        assert_eq!(empty["meta"]["count"], serde_json::json!(3));
         assert_eq!(empty["meta"]["hasnext"], serde_json::json!(false));
     }
 
@@ -1541,6 +1765,9 @@ mod tests {
         assert!(state
             .traces
             .append_log("trace-detail", b"publish sensors/temp {\"t\": 21}\n"));
+        assert!(state
+            .traces
+            .append_log("trace-detail", b"publish sensors/hum {\"h\": 55}\n"));
 
         let (status, first) = response_parts(
             get_trace_log_detail(
@@ -1557,8 +1784,8 @@ mod tests {
             first["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("sensors/#"),
-            "detail at 0 must carry the seeded header, got {first:?}"
+                .contains("publish sensors/temp"),
+            "detail at 0 must carry appended traffic, got {first:?}"
         );
 
         let (status, second) = response_parts(
@@ -1576,7 +1803,7 @@ mod tests {
             second["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("publish sensors/temp"),
+                .contains("publish sensors/hum"),
             "detail at 1 must carry appended traffic, got {second:?}"
         );
 
@@ -1654,6 +1881,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
+        // Capture one line first: an uncaptured session has no position 0.
+        assert!(state
+            .traces
+            .append_log("trace-detail-gone", b"publish sensors/temp x\n"));
         let (status, detail) = response_parts(
             get_trace_log_detail(
                 State(state.clone()),
@@ -1681,5 +1912,197 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    fn insert_running(
+        store: &TraceStore,
+        name: &str,
+        trace_type: &str,
+        filter: &str,
+    ) -> TraceSession {
+        let now = now_epoch_secs();
+        let session = TraceSession {
+            name: name.to_string(),
+            trace_type: trace_type.to_string(),
+            filter: filter.to_string(),
+            enable: true,
+            payload_encode: "text".to_string(),
+            formatter: "text".to_string(),
+            start_at: now,
+            end_at: now + 600,
+        };
+        store.insert(session.clone()).expect("insert works");
+        session
+    }
+
+    #[test]
+    fn capture_publish_matches_topic_clientid_and_peerhost() {
+        let store = TraceStore::new();
+        insert_running(&store, "cap-topic", "topic", "sensors/#");
+        insert_running(&store, "cap-client", "clientid", "device-1");
+        insert_running(&store, "cap-ip", "ip_address", "10.0.0.9");
+
+        store.capture_publish("device-1", Some("10.0.0.9"), "sensors/temp", b"hello");
+
+        let topic_log = store.read_log("cap-topic").expect("log exists");
+        let topic_text = String::from_utf8(topic_log).expect("text");
+        assert!(
+            topic_text.contains("sensors/temp") && topic_text.contains("hello"),
+            "topic session must capture matching publish, got {topic_text:?}"
+        );
+        let client_log = store.read_log("cap-client").expect("log exists");
+        let client_text = String::from_utf8(client_log).expect("text");
+        assert!(
+            client_text.contains("sensors/temp") && client_text.contains("device-1"),
+            "clientid session must capture its publisher, got {client_text:?}"
+        );
+        let ip_log = store.read_log("cap-ip").expect("log exists");
+        assert!(
+            String::from_utf8(ip_log)
+                .expect("text")
+                .contains("sensors/temp"),
+            "ip session must capture its peer address"
+        );
+
+        // Non-matching publishes capture nothing new.
+        let before = store.log_len("cap-client");
+        store.capture_publish("other-device", Some("10.0.0.10"), "other/topic", b"hello");
+        assert_eq!(store.log_len("cap-client"), before);
+        let topic_before = store.log_len("cap-topic");
+        store.capture_publish("device-1", Some("10.0.0.9"), "other/topic", b"hello");
+        assert_eq!(store.log_len("cap-topic"), topic_before);
+    }
+
+    #[test]
+    fn capture_publish_skips_stopped_expired_and_ruleid() {
+        let store = TraceStore::new();
+        let now = now_epoch_secs();
+        store
+            .insert(TraceSession {
+                name: "cap-stopped".to_string(),
+                trace_type: "topic".to_string(),
+                filter: "sensors/#".to_string(),
+                enable: false,
+                payload_encode: "text".to_string(),
+                formatter: "text".to_string(),
+                start_at: now,
+                end_at: now + 600,
+            })
+            .expect("insert works");
+        store
+            .insert(TraceSession {
+                name: "cap-expired".to_string(),
+                trace_type: "topic".to_string(),
+                filter: "expired/#".to_string(),
+                enable: true,
+                payload_encode: "text".to_string(),
+                formatter: "text".to_string(),
+                start_at: now.saturating_sub(1200),
+                end_at: now.saturating_sub(600),
+            })
+            .expect("insert works");
+        store
+            .insert(TraceSession {
+                name: "cap-rule".to_string(),
+                trace_type: "ruleid".to_string(),
+                filter: "rule-1".to_string(),
+                enable: true,
+                payload_encode: "text".to_string(),
+                formatter: "text".to_string(),
+                start_at: now,
+                end_at: now + 600,
+            })
+            .expect("insert works");
+
+        store.capture_publish("any", Some("10.0.0.1"), "sensors/temp", b"hello");
+        store.capture_publish("any", Some("10.0.0.1"), "expired/x", b"hello");
+        assert_eq!(store.log_len("cap-stopped"), 0);
+        assert_eq!(store.log_len("cap-expired"), 0);
+        assert_eq!(store.log_len("cap-rule"), 0);
+    }
+
+    #[test]
+    fn capture_publish_respects_encoding_and_payload_bound() {
+        let store = TraceStore::new();
+        let now = now_epoch_secs();
+        store
+            .insert(TraceSession {
+                name: "cap-hidden".to_string(),
+                trace_type: "topic".to_string(),
+                filter: "hidden/#".to_string(),
+                enable: true,
+                payload_encode: "hidden".to_string(),
+                formatter: "text".to_string(),
+                start_at: now,
+                end_at: now + 600,
+            })
+            .expect("insert works");
+        store
+            .insert(TraceSession {
+                name: "cap-hex".to_string(),
+                trace_type: "topic".to_string(),
+                filter: "hexed/#".to_string(),
+                enable: true,
+                payload_encode: "hex".to_string(),
+                formatter: "text".to_string(),
+                start_at: now,
+                end_at: now + 600,
+            })
+            .expect("insert works");
+        store
+            .insert(TraceSession {
+                name: "cap-big".to_string(),
+                trace_type: "topic".to_string(),
+                filter: "big/#".to_string(),
+                enable: true,
+                payload_encode: "text".to_string(),
+                formatter: "text".to_string(),
+                start_at: now,
+                end_at: now + 600,
+            })
+            .expect("insert works");
+
+        store.capture_publish("dev", None, "hidden/x", b"secret-bytes");
+        let hidden = String::from_utf8(store.read_log("cap-hidden").expect("log")).expect("text");
+        assert!(
+            hidden.contains("hidden/x") && !hidden.contains("secret-bytes"),
+            "hidden encoding must omit the payload, got {hidden:?}"
+        );
+
+        store.capture_publish("dev", None, "hexed/x", b"AB");
+        let hexed = String::from_utf8(store.read_log("cap-hex").expect("log")).expect("text");
+        assert!(
+            hexed.contains("hexed/x") && hexed.contains("4142"),
+            "hex encoding must render payload hex, got {hexed:?}"
+        );
+
+        let big = vec![b'z'; MAX_TRACE_PAYLOAD_BYTES + 64];
+        store.capture_publish("dev", None, "big/x", &big);
+        let kept = store.read_log("cap-big").expect("log");
+        assert!(
+            kept.len() < big.len() + 128,
+            "one capture must stay near the payload cap, got {} bytes",
+            kept.len()
+        );
+        assert!(
+            String::from_utf8_lossy(&kept).contains("truncated"),
+            "clipped payloads must say so"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_lifecycle_drives_the_global_flag() {
+        let state = standalone_state();
+        assert!(!state.tracing.is_enabled());
+        let (status, _) =
+            response_parts(create_trace(State(state.clone()), valid_body("trace-flag")).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.tracing.is_enabled());
+        let (status, _) =
+            response_parts(stop_trace(State(state.clone()), Path("trace-flag".to_string())).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!state.tracing.is_enabled());
     }
 }

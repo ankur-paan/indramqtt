@@ -95,6 +95,13 @@ window_channel_depth = 65536
 # Options: Block, DropNewest, DropOldest, SpillToDisk, RejectPublisher
 backpressure_policy = "DropOldest"
 
+# On-disk spill directory for the SpillToDisk backpressure policy
+# (kernel flag --rule-spill-dir). Empty (the default) keeps the memory-only
+# input: overflow is refused. Set to a dedicated directory to append
+# overflow rule-ingress events to a bounded on-disk buffer (1 MiB
+# segments, 64 MiB total) that replays in order and survives a restart.
+# spill_dir = ""
+
 # =============================================================================
 # Authentication & Authorization (ACL)
 # =============================================================================

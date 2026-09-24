@@ -9,12 +9,22 @@ repository.workspace = true
 broker-protocol = { workspace = true }
 broker-config = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
-sha2 = { workspace = true }
+arc-swap = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+argon2 = { workspace = true }
+bcrypt = { workspace = true }
+pbkdf2 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
 ldap3 = "0.12"
 native-tls = "0.2"
 kerberos-parser = "0.9"
@@ -25,8 +35,38 @@ picky-krb = "0.12"
 picky-asn1 = { version = "0.10", features = ["time_conversion"] }
 picky-asn1-der = "0.5"
 time = "0.3"
+tokio-postgres = { version = "0.7" }
+mysql_async = { version = "0.35" }
+redis = { version = "0.27", features = ["tokio-comp"] }
+mongodb = { version = "3", default-features = false, features = ["bson-3", "compat-3-3-0", "openssl-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+axum = { workspace = true }
 yamldap = "0.2"
 tempfile = "3"
+# Test-only (B5-02 JWKS fixtures and `jwks_connect_bench` HTTPS server):
+# the shared `jwks_test_support` module is `#[cfg(test)]`, and the bench
+# file mirrors it inline, so these never ship in production binaries. All
+# are maintained crates on permissive licences already used in the workspace.
+rsa = { workspace = true }
+rustls = { version = "0.23.45" }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "1" }
+
+[features]
+default = ["jwks-bench", "webhook-bench"]
+# Bench selector for `tests/jwks_connect_bench.rs` (B5-02): the gates run
+# that file on the task's base commit (with only the file copied in, where
+# the JWKS types do not exist) and on the tree. The JWKS legs compile under
+# this feature; without it the file falls back to the base CONNECT
+# credential check under the same `BENCH` metric names. Empty: library code
+# is unconditional, this only selects the benchmark body.
+jwks-bench = []
+# Bench selector for `tests/webhook_publish_bench.rs` (B5-04): the gates
+# run that file on the task's base commit (with only the file copied in,
+# where the webhook types do not exist) and on the tree. The webhook leg
+# compiles under this feature; without it the file measures the base
+# publish path under the same `BENCH` metric names. Empty: library code is
+# unconditional, this only selects the benchmark body.
+webhook-bench = []

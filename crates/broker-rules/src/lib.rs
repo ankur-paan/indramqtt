@@ -5,16 +5,25 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 
+/// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
+pub mod spill;
+
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
 pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
+
+use spill::SpillLog;
+pub use spill::{
+    SpillConfig, SpillOutcome, SpillStats, DEFAULT_SPILL_MAX_BYTES, DEFAULT_SPILL_SEGMENT_MAX_BYTES,
+};
 
 #[derive(Error, Debug)]
 pub enum RuleEngineError {
@@ -101,12 +110,48 @@ pub trait BrokerSink: Send + Sync {
 ///
 /// `Block` waits for capacity inside `push`; `DropNewest` discards the
 /// incoming event when full; `DropOldest` evicts the oldest queued event
-/// to make room. `SpillToDisk` (not yet implemented) and
-/// `RejectPublisher` report overflow as an error instead of queueing.
+/// to make room. `RejectPublisher` reports overflow as an error instead
+/// of queueing. `SpillToDisk` appends overflow events to the bounded
+/// on-disk spill buffer ([`spill::SpillLog`]) instead of erroring, and
+/// the consumer replays them in order once the pressure eases; without
+/// a spill directory configured (plain [`BoundedEventInput::new`]) it
+/// refuses loudly like `RejectPublisher` and counts the drop, failing
+/// closed rather than pretending to be durable.
 pub struct BoundedEventInput {
     tx: mpsc::Sender<StreamEvent>,
     rx: Mutex<mpsc::Receiver<StreamEvent>>,
     policy: BackpressurePolicy,
+    /// Disk behind `SpillToDisk`, if one was configured. `None` for the
+    /// other four policies and for directory-less `SpillToDisk` inputs.
+    /// Held across the check-send-spill sequence so concurrent pushes
+    /// keep one global order (memory first, then disk, sticky while a
+    /// backlog exists). Steady-state `SpillToDisk` pushes pay one
+    /// uncontended mutex; the other policies never touch it.
+    spill: parking_lot::Mutex<Option<SpillLog>>,
+    /// Lock-free spill-enabled flag for the live publish path: set once
+    /// when a spill directory opens, never flipped back. `dispatch_ingress`
+    /// checks this single relaxed load (no mutex) so the default
+    /// memory-only engine pays no new lock on publish; only spill-backed
+    /// engines take the push path below.
+    spill_enabled: AtomicU64,
+    /// Lock-free mirror of the on-disk backlog for tests and for the
+    /// sticky-spill fast check. Maintained under the spill mutex
+    /// wherever the log mutates (mirrors `inflight_spill.len()` the way
+    /// the session spill count does).
+    spill_backlog: AtomicU64,
+    /// Outcome counters for the spill backend. Bumped on every spill,
+    /// replay, refusal and recovery outcome so the behaviour is visible
+    /// and never silent; mirrored into the node metrics when attached.
+    spilled: AtomicU64,
+    replayed: AtomicU64,
+    spill_dropped: AtomicU64,
+    torn_discarded: AtomicU64,
+    spill_recovered: AtomicU64,
+    /// Node metrics mirror for the counters above (`None` in unit
+    /// tests and standalone state). Attached once via
+    /// [`BoundedEventInput::set_metrics`]; the first attach also
+    /// carries the counts accumulated so far.
+    metrics: OnceLock<Arc<broker_observability::Metrics>>,
 }
 
 impl BoundedEventInput {
@@ -116,12 +161,144 @@ impl BoundedEventInput {
             tx,
             rx: Mutex::new(rx),
             policy,
+            spill: parking_lot::Mutex::new(None),
+            spill_enabled: AtomicU64::new(0),
+            spill_backlog: AtomicU64::new(0),
+            spilled: AtomicU64::new(0),
+            replayed: AtomicU64::new(0),
+            spill_dropped: AtomicU64::new(0),
+            torn_discarded: AtomicU64::new(0),
+            spill_recovered: AtomicU64::new(0),
+            metrics: OnceLock::new(),
         })
+    }
+
+    /// Spill-backed input: `SpillToDisk` policy with a bounded on-disk
+    /// buffer behind the push path. Opening recovers the directory
+    /// (replaying whatever a previous engine left), so recreating the
+    /// input on the same directory survives a restart. A bad directory
+    /// or config fails here, loudly, before anything can pretend to be
+    /// durable.
+    pub fn with_spill(capacity: usize, config: SpillConfig) -> io::Result<Arc<Self>> {
+        let input = Self::new(capacity, BackpressurePolicy::SpillToDisk);
+        let (log, outcome) = SpillLog::open(&config)?;
+        input
+            .spill_recovered
+            .fetch_add(outcome.recovered, Ordering::Relaxed);
+        input
+            .torn_discarded
+            .fetch_add(outcome.torn, Ordering::Relaxed);
+        input.spill_backlog.store(log.backlog(), Ordering::Relaxed);
+        input.spill_enabled.store(1, Ordering::Relaxed);
+        *input.spill.lock() = Some(log);
+        Ok(input)
+    }
+
+    /// Attach the node metrics mirror for the spill counters. The first
+    /// attach wins and also carries the counts accumulated so far, so
+    /// recovery outcomes (counted at open, before any attach) still
+    /// reach the existing observability path exactly once.
+    pub fn set_metrics(&self, metrics: &Arc<broker_observability::Metrics>) {
+        if self.metrics.set(Arc::clone(metrics)).is_ok() {
+            metrics.inc_rule_spill_spilled_by(self.spilled.load(Ordering::Relaxed));
+            metrics.inc_rule_spill_replayed_by(self.replayed.load(Ordering::Relaxed));
+            metrics.inc_rule_spill_dropped_by(self.spill_dropped.load(Ordering::Relaxed));
+            metrics.inc_rule_spill_torn_by(self.torn_discarded.load(Ordering::Relaxed));
+            metrics.inc_rule_spill_recovered_by(self.spill_recovered.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Current spill outcome counts (zeros when no spill backend is
+    /// configured, apart from refusals, which are always counted).
+    pub fn spill_stats(&self) -> SpillStats {
+        SpillStats {
+            spilled: self.spilled.load(Ordering::Relaxed),
+            replayed: self.replayed.load(Ordering::Relaxed),
+            dropped: self.spill_dropped.load(Ordering::Relaxed),
+            torn_discarded: self.torn_discarded.load(Ordering::Relaxed),
+            recovered: self.spill_recovered.load(Ordering::Relaxed),
+        }
+    }
+
+    /// True while a spill directory is configured behind this input.
+    pub fn has_spill(&self) -> bool {
+        self.spill.lock().is_some()
+    }
+
+    /// Lock-free spill check for the live publish path: one relaxed
+    /// atomic load, no mutex. The publish path (`dispatch_ingress`)
+    /// uses this, never [`BoundedEventInput::has_spill`].
+    pub fn spill_enabled(&self) -> bool {
+        self.spill_enabled.load(Ordering::Relaxed) != 0
+    }
+
+    /// Events currently awaiting replay on disk.
+    pub fn spill_backlog_len(&self) -> u64 {
+        self.spill_backlog.load(Ordering::Relaxed)
+    }
+
+    /// Force the active spill segment to stable storage. The spill
+    /// path itself never syncs (see [`spill`]); call this before an
+    /// orderly shutdown or a restart handoff. No backend is a no-op.
+    pub fn sync_spill(&self) -> io::Result<()> {
+        let guard = self.spill.lock();
+        if let Some(log) = guard.as_ref() {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
+    fn count_spilled(&self) {
+        self.spilled.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.inc_rule_spill_spilled();
+        }
+    }
+
+    fn count_replayed(&self) {
+        self.replayed.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.inc_rule_spill_replayed();
+        }
+    }
+
+    fn count_dropped(&self) {
+        self.spill_dropped.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.inc_rule_spill_dropped();
+        }
+    }
+
+    fn count_torn_by(&self, n: u64) {
+        self.torn_discarded.fetch_add(n, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.inc_rule_spill_torn_by(n);
+        }
     }
 
     /// Non-blocking enqueue attempt. `Block` never blocks here: a full
     /// buffer reports `WouldBlock`-style success value... see below.
+    ///
+    /// Publish-path cost (B4-07, measured by
+    /// `test_spill_workload_timings`, which prints both rates into the
+    /// gate log): steady-state (no pressure, no disk backlog) pays two
+    /// relaxed atomic loads plus one `try_send` — no spill mutex, no
+    /// allocation, no file I/O, identical to the other four policies.
+    /// Only overflow (full memory, or a disk backlog while sticky) takes
+    /// the spill mutex plus one page-cache `write + flush` (encode `Vec`
+    /// allocs bounded by the event size and capped by
+    /// `MAX_FRAME_BODY_BYTES`, never an `fsync`); refusals (cap, oversize,
+    /// I/O error) fail closed and counted.
     pub fn try_push(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
+        // Sticky-spill order: while a disk backlog exists every arrival
+        // joins the disk (memory always predates it), so replay stays
+        // memory-then-disk, oldest first. The backlog mirror is lock-free;
+        // steady-state (`0`) skips the mutex entirely.
+        if self.policy == BackpressurePolicy::SpillToDisk
+            && self.spill_backlog.load(Ordering::Relaxed) != 0
+        {
+            return self.spill_or_refuse(event);
+        }
         match self.tx.try_send(event) {
             Ok(()) => Ok(PushOutcome::Enqueued),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -152,15 +329,128 @@ impl BoundedEventInput {
                     Ok(PushOutcome::Dropped(OverflowReason::DroppedNewest))
                 }
             }
-            BackpressurePolicy::SpillToDisk | BackpressurePolicy::RejectPublisher => {
+            BackpressurePolicy::SpillToDisk => self.spill_or_refuse(event),
+            BackpressurePolicy::RejectPublisher => {
+                self.count_dropped();
                 Err(RuleEngineError::Overflow(OverflowReason::BufferFull))
             }
         }
     }
 
-    /// Take the next queued event (consumer side).
+    /// Overflow path for `SpillToDisk`: memory first, disk behind it,
+    /// refusal only when there is nowhere to put the event. The spill
+    /// mutex is held across the check-send-spill sequence so concurrent
+    /// pushes keep one global order: while a disk backlog exists every
+    /// arrival joins it (sticky spill), so replay order is always
+    /// memory-then-disk, oldest first. The disk write is `write +
+    /// flush` to the page cache, never an `fsync`: the live event path
+    /// never blocks on stable storage.
+    fn spill_or_refuse(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
+        let mut spill = self.spill.lock();
+        let Some(log) = spill.as_mut() else {
+            // No disk behind the variant: refuse loudly and count the
+            // drop. Fail closed rather than pretending to be durable.
+            self.count_dropped();
+            tracing::warn!(
+                "rule input SpillToDisk overflow refused: no spill directory configured"
+            );
+            return Err(RuleEngineError::Overflow(OverflowReason::BufferFull));
+        };
+        let event = if log.backlog() == 0 {
+            match self.tx.try_send(event) {
+                Ok(()) => return Ok(PushOutcome::Enqueued),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.count_dropped();
+                    return Err(RuleEngineError::Overflow(OverflowReason::BufferFull));
+                }
+                Err(mpsc::error::TrySendError::Full(event)) => event,
+            }
+        } else {
+            event
+        };
+        match log.spill(&event) {
+            Ok(seq) => {
+                self.spill_backlog.store(log.backlog(), Ordering::Relaxed);
+                self.count_spilled();
+                Ok(PushOutcome::SpilledToDisk(seq))
+            }
+            Err(e) => {
+                self.spill_backlog.store(log.backlog(), Ordering::Relaxed);
+                self.count_dropped();
+                tracing::warn!(error = %e, "rule input spill refused: failing closed");
+                Err(RuleEngineError::Overflow(OverflowReason::BufferFull))
+            }
+        }
+    }
+
+    /// Replay one spilled event under the spill mutex. Counters stay in
+    /// sync with the log: the backlog mirror follows every mutation,
+    /// replays and torn repairs are counted and mirrored.
+    fn replay_one_locked(&self) -> Option<StreamEvent> {
+        let mut spill = self.spill.lock();
+        let log = spill.as_mut()?;
+        let (event, torn) = log.replay_one();
+        self.spill_backlog.store(log.backlog(), Ordering::Relaxed);
+        if torn > 0 {
+            self.count_torn_by(torn);
+        }
+        if event.is_some() {
+            self.count_replayed();
+        }
+        event
+    }
+
+    /// Take the next queued event (consumer side): memory first (it
+    /// always predates the disk backlog under sticky spill), then one
+    /// disk replay, then pend for the next memory arrival. A pending
+    /// consumer cannot miss spilled events: pushes join the disk while
+    /// a backlog exists, and every wake re-checks memory before disk.
+    ///
+    /// Locking: the async channel mutex is held only for the
+    /// non-blocking `try_recv` and for the final pending `recv`; it is
+    /// never held across disk I/O (`replay_one_locked` takes only the
+    /// short sync spill mutex for a page-cache read plus at most one
+    /// repair truncation). Steady-state consumers pay no disk work at
+    /// all.
     pub async fn next_event(&self) -> Option<StreamEvent> {
-        self.rx.lock().await.recv().await
+        // Fast path: one short channel lock, released before any disk.
+        {
+            let mut rx = self.rx.lock().await;
+            match rx.try_recv() {
+                Ok(event) => return Some(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    drop(rx);
+                    return self.replay_one_locked();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        // Memory empty: one disk replay with no channel lock held.
+        if let Some(event) = self.replay_one_locked() {
+            return Some(event);
+        }
+        // Nothing anywhere: pend for the next memory arrival (channel
+        // lock only across the sleep). A spill that lands while pending
+        // wakes via the channel only when it also enqueued to memory;
+        // sticky disk-only arrivals are picked up on the next wake by
+        // re-checking memory before disk.
+        let mut rx = self.rx.lock().await;
+        // Re-check memory first: an arrival between the replay above and
+        // this lock must not be overtaken by disk.
+        match rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                drop(rx);
+                self.replay_one_locked()
+            }
+            Err(mpsc::error::TryRecvError::Empty) => match rx.recv().await {
+                Some(event) => Some(event),
+                None => {
+                    drop(rx);
+                    self.replay_one_locked()
+                }
+            },
+        }
     }
 }
 
@@ -417,6 +707,50 @@ impl RuleEngine {
         Self::new_with_window_depth(queue_capacity, policy, DEFAULT_WINDOW_CHANNEL_DEPTH)
     }
 
+    /// Create an engine whose ingress queue spills to disk under
+    /// pressure (`SpillToDisk` policy with a bounded buffer in `dir`).
+    /// Opening recovers the directory, so a previous engine's spilled
+    /// events survive the restart. Window worker channels use
+    /// [`DEFAULT_WINDOW_CHANNEL_DEPTH`]. A bad directory fails loudly.
+    pub fn new_with_spill(
+        queue_capacity: usize,
+        spill_dir: impl Into<std::path::PathBuf>,
+    ) -> io::Result<Self> {
+        Self::new_with_spill_config(queue_capacity, SpillConfig::new(spill_dir))
+    }
+
+    /// Create a spill-backed engine with an explicit disk policy
+    /// (segment and total caps, for tests and tuned deployments).
+    pub fn new_with_spill_config(
+        queue_capacity: usize,
+        spill_config: SpillConfig,
+    ) -> io::Result<Self> {
+        let input = BoundedEventInput::with_spill(queue_capacity, spill_config)?;
+        Ok(Self::with_input(input, DEFAULT_WINDOW_CHANNEL_DEPTH))
+    }
+
+    /// Shared construction from a ready ingress queue.
+    fn with_input(input: Arc<BoundedEventInput>, window_channel_depth: usize) -> Self {
+        let connectors = Arc::new(ConnectorManager::new());
+        let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        Self {
+            rules: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            input,
+            connectors: connectors.clone(),
+            flush_ctx: Arc::new(FlushContext {
+                connectors,
+                broker_sink: RwLock::new(None),
+                forward_throttle: forward_throttle.clone(),
+            }),
+            window_workers: RwLock::new(HashMap::new()),
+            window_channel_depth: window_channel_depth.max(1),
+            forward_throttle,
+            registry: RwLock::new(None),
+            save_lock: parking_lot::Mutex::new(()),
+        }
+    }
+
     /// Create an engine with an explicit per-rule window worker channel
     /// depth (`depth` floors at 1, no ceiling). Use 65,536+ for
     /// high-scale bursts.
@@ -460,6 +794,20 @@ impl RuleEngine {
     /// Bounded ingress queue for flood protection at outer boundaries.
     pub fn input(&self) -> &Arc<BoundedEventInput> {
         &self.input
+    }
+
+    /// Spill outcome counts for the ingress queue (zeros when no spill
+    /// directory is configured, apart from refusals, which count).
+    pub fn spill_stats(&self) -> SpillStats {
+        self.input.spill_stats()
+    }
+
+    /// Attach the node metrics mirror for the ingress spill counters.
+    /// Called once by the node after the shared metrics exist; the
+    /// first attach wins and carries the counts so far (including
+    /// recovery outcomes from open).
+    pub fn set_metrics(&self, metrics: &Arc<broker_observability::Metrics>) {
+        self.input.set_metrics(metrics);
     }
 
     /// Live outbound connectors addressable by `ForwardConnector` actions.
@@ -910,6 +1258,7 @@ impl RuleEngine {
     ) -> usize {
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
+        // B4-07 live wiring (durability push after match, see below).
         let matched: Vec<Rule> = {
             let rules = self.rules.read();
             rules
@@ -946,6 +1295,34 @@ impl RuleEngine {
                 &self.forward_throttle,
             )
             .await;
+        }
+        // B4-07 live wiring: every broker ingress (see
+        // `crates/broker-node/src/main.rs:ingress_pipeline_with_publisher`,
+        // the single prod caller of `push`/`try_push` via this method)
+        // mirrors a durability copy through the bounded input queue after
+        // inline matching. Memory-only engines skip this with one
+        // lock-free load, so the other four policies are unchanged.
+        // Spill-backed engines append overflow to disk instead of erroring
+        // (`SpillLog::spill` at `spill.rs:580`, page-cache `write + flush`,
+        // never `fsync` on this path); the copy carries topic/payload for
+        // order verification and crash durability, while live matching
+        // above still uses the original `qos` inline, so delivery
+        // guarantees never change. Pushed after the match so a crash
+        // between match and push leaves an already-executed event without
+        // a copy (safe to discard after restart); a crash before the match
+        // leaves nothing (QoS 1 retries via MQTT, QoS 0 loss is
+        // best-effort). The broker spill drain task (`broker-node`)
+        // replays via `next_event` after the pressure eases; restart
+        // recovery reopens the same directory (`SpillLog::open` at
+        // `spill.rs:491`). Driven by the rule-ingress event; disk writes
+        // consult `crates/broker-rules/src/spill.rs:580`
+        // (`SpillLog::spill`) and replays consult
+        // `crates/broker-rules/src/spill.rs:637` (`SpillLog::replay_one`).
+        if self.input.spill_enabled() {
+            let durability = StreamEvent::new(topic.clone(), payload.clone());
+            // Counted (spilled/dropped) inside `try_push`; overflow
+            // refuses fail-closed without blocking publish.
+            let _ = self.input.try_push(durability);
         }
         matched.len()
     }
@@ -1941,6 +2318,352 @@ mod tests {
                 Err(RuleEngineError::Overflow(OverflowReason::BufferFull))
             ));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // B4-07: SpillToDisk is a real bounded disk buffer, not a silent
+    // alias for rejection. The tests below are buffer units through the
+    // broker's rule engine input (never a bare store); the Done-when
+    // broker-path coverage (fill via publish/deliver through
+    // `ingress_pipeline`, spill, replay in order) lives in
+    // `crates/broker-node/src/main.rs:rule_spill_broker_path_spills_and_replays_in_order`.
+    // Every test cleans up its scratch directory.
+    // ------------------------------------------------------------------
+
+    static SPILL_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique scratch directory for one spill test (no new crates:
+    /// process id plus a counter). Callers remove it when done.
+    fn spill_test_dir(tag: &str) -> std::path::PathBuf {
+        let seq = SPILL_TEST_SEQ.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "indra-rule-spill-{tag}-{}-{seq}",
+            std::process::id()
+        ))
+    }
+
+    fn remove_spill_dir(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Fill the in-memory queue through the broker input path, push
+    /// past it, and drain: overflow spills to disk instead of erroring
+    /// and replays oldest-first after the memory events.
+    #[tokio::test]
+    async fn test_spill_to_disk_spills_and_replays_in_order() {
+        let dir = spill_test_dir("order");
+        remove_spill_dir(&dir);
+        let engine = RuleEngine::new_with_spill(2, dir.clone()).expect("spill engine opens");
+        let metrics = Arc::new(broker_observability::Metrics::new());
+        engine.set_metrics(&metrics);
+        let input = engine.input();
+        assert!(input.has_spill());
+
+        assert_eq!(
+            input.push(test_event("t", b"one")).await.unwrap(),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            input.push(test_event("t", b"two")).await.unwrap(),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            input.push(test_event("t", b"three")).await.unwrap(),
+            PushOutcome::SpilledToDisk(0)
+        );
+        assert_eq!(
+            input.push(test_event("t", b"four")).await.unwrap(),
+            PushOutcome::SpilledToDisk(1)
+        );
+
+        // Rule matching is unchanged on a spill-backed engine, and live
+        // ingress now mirrors a durability copy through the input queue
+        // (`dispatch_ingress` pushes when spill-backed): with a disk
+        // backlog present the copy joins the disk (sticky spill), so it
+        // replays last after the four events below.
+        engine
+            .create_rule(
+                "spill-probe".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Log],
+            )
+            .expect("rule creates");
+        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        assert_eq!(
+            engine
+                .dispatch_ingress(
+                    &Topic::new("sensors/kitchen").unwrap(),
+                    &Bytes::from_static(b"21.5C"),
+                    QoS::AtMostOnce,
+                    &sink,
+                )
+                .await,
+            1
+        );
+
+        // Drain: memory events first in order, then spilled in order,
+        // then the live-ingress durability copy (`21.5C`) last.
+        for want in [
+            b"one".as_slice(),
+            b"two".as_slice(),
+            b"three".as_slice(),
+            b"four".as_slice(),
+            b"21.5C".as_slice(),
+        ] {
+            let event = input.next_event().await.expect("replay delivers");
+            assert_eq!(event.payload, Bytes::from_static(want));
+        }
+        let stats = engine.spill_stats();
+        assert_eq!(stats.spilled, 3);
+        assert_eq!(stats.replayed, 3);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.recovered, 0);
+        assert_eq!(input.spill_backlog_len(), 0);
+        // The existing observability path mirrors every outcome.
+        assert_eq!(metrics.rule_spill_spilled(), 3);
+        assert_eq!(metrics.rule_spill_replayed(), 3);
+        assert_eq!(metrics.rule_spill_dropped(), 0);
+
+        input.sync_spill().expect("sync");
+        remove_spill_dir(&dir);
+    }
+
+    /// Spilled events survive an engine rebuild from the same spill
+    /// directory (restart). Memory-queued events do not: only overflow
+    /// is durable, which the test asserts explicitly.
+    #[tokio::test]
+    async fn test_spill_survives_engine_rebuild() {
+        let dir = spill_test_dir("restart");
+        remove_spill_dir(&dir);
+        {
+            let engine = RuleEngine::new_with_spill(1, dir.clone()).expect("spill engine opens");
+            let input = engine.input();
+            assert_eq!(
+                input.push(test_event("t", b"memory-only")).await.unwrap(),
+                PushOutcome::Enqueued
+            );
+            assert_eq!(
+                input.push(test_event("t", b"spilled-a")).await.unwrap(),
+                PushOutcome::SpilledToDisk(0)
+            );
+            assert_eq!(
+                input.push(test_event("t", b"spilled-b")).await.unwrap(),
+                PushOutcome::SpilledToDisk(1)
+            );
+            input.sync_spill().expect("sync before restart");
+        }
+        // Recreate from the same directory: the two spilled events are
+        // recovered, the memory event is gone by design.
+        let engine = RuleEngine::new_with_spill(1, dir.clone()).expect("spill engine reopens");
+        let metrics = Arc::new(broker_observability::Metrics::new());
+        // Attaching after open still mirrors the recovery counts: the
+        // first attach carries everything accumulated so far.
+        engine.set_metrics(&metrics);
+        assert_eq!(engine.spill_stats().recovered, 2);
+        assert_eq!(metrics.rule_spill_recovered(), 2);
+        let input = engine.input();
+        assert_eq!(
+            input.next_event().await.expect("first replay").payload,
+            Bytes::from_static(b"spilled-a")
+        );
+        assert_eq!(
+            input.next_event().await.expect("second replay").payload,
+            Bytes::from_static(b"spilled-b")
+        );
+        assert_eq!(engine.spill_stats().replayed, 2);
+        // Nothing left anywhere: the consumer pends instead of
+        // inventing an event.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.next_event())
+                .await
+                .is_err(),
+            "drained spill must pend, not invent"
+        );
+        remove_spill_dir(&dir);
+    }
+
+    /// A spill file truncated mid-record recovers everything before
+    /// the tear, discards the torn tail, and counts it.
+    #[tokio::test]
+    async fn test_spill_torn_tail_discarded_and_counted() {
+        use std::fs::OpenOptions;
+
+        let dir = spill_test_dir("torn");
+        remove_spill_dir(&dir);
+        {
+            let engine = RuleEngine::new_with_spill(1, dir.clone()).expect("spill engine opens");
+            let input = engine.input();
+            assert_eq!(
+                input.push(test_event("t", b"pad")).await.unwrap(),
+                PushOutcome::Enqueued
+            );
+            for (seq, payload) in [b"keep-a", b"keep-b", b"torn-c"].into_iter().enumerate() {
+                assert_eq!(
+                    input.push(test_event("t", payload)).await.unwrap(),
+                    PushOutcome::SpilledToDisk(seq as u64)
+                );
+            }
+            input.sync_spill().expect("sync");
+        }
+        // Truncate the single segment three bytes into the second
+        // spilled frame: parse the first frame header to land strictly
+        // inside a later frame rather than on a boundary.
+        let seg = std::fs::read_dir(&dir)
+            .expect("spill dir lists")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("spill-") && n.ends_with(".log"))
+            })
+            .expect("one segment file");
+        let data = std::fs::read(&seg).expect("segment reads");
+        assert!(data.len() > 16, "segment must hold frames");
+        let first_len = u32::from_be_bytes(data[4..8].try_into().expect("header")) as usize;
+        let cut = 8 + first_len + 4 + 3;
+        assert!(cut < data.len(), "cut must land inside a later frame");
+        drop(data);
+        OpenOptions::new()
+            .write(true)
+            .open(&seg)
+            .expect("segment opens")
+            .set_len(cut as u64)
+            .expect("truncate");
+
+        let engine = RuleEngine::new_with_spill(1, dir.clone()).expect("spill engine reopens");
+        let stats = engine.spill_stats();
+        assert_eq!(stats.torn_discarded, 1, "one torn tail counted");
+        assert_eq!(
+            stats.recovered, 1,
+            "everything before the tear survives, got {stats:?}"
+        );
+        // The intact first frame replays; nothing follows it.
+        let input = engine.input();
+        let first = input.next_event().await.expect("first frame replays");
+        assert_eq!(first.payload, Bytes::from_static(b"keep-a"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.next_event())
+                .await
+                .is_err(),
+            "torn tail must not replay"
+        );
+        remove_spill_dir(&dir);
+    }
+
+    /// SpillToDisk without a directory refuses loudly and counts the
+    /// drop: fail closed, never silently memory-only.
+    #[tokio::test]
+    async fn test_spill_without_directory_refuses_and_counts() {
+        let engine = RuleEngine::new(1, BackpressurePolicy::SpillToDisk);
+        let input = engine.input();
+        assert!(!input.has_spill());
+        assert!(input.push(test_event("t", b"one")).await.is_ok());
+        assert!(matches!(
+            input.push(test_event("t", b"two")).await,
+            Err(RuleEngineError::Overflow(OverflowReason::BufferFull))
+        ));
+        assert_eq!(engine.spill_stats().dropped, 1);
+    }
+
+    /// Publish-path cost, before and after (B4-07): time the
+    /// steady-state push loop (no pressure, no disk, no spill mutex) and
+    /// the overflow spill-append loop (page-cache writes, no fsync) plus
+    /// the replay loop, printing msgs/sec for the gate log.
+    /// Steady-state pushes (no pressure) never touch disk; only overflow
+    /// pays the spill mutex plus one page-cache `write + flush`.
+    #[tokio::test]
+    async fn test_spill_workload_timings() {
+        // BEFORE: steady-state pushes with room — no pressure, no disk.
+        // One relaxed load for the sticky check plus one `try_send`; no
+        // spill mutex, no `Vec` alloc, no file I/O.
+        let dir_base = spill_test_dir("timings-base");
+        remove_spill_dir(&dir_base);
+        let engine_base =
+            RuleEngine::new_with_spill(4096, dir_base.clone()).expect("spill engine opens");
+        let input_base = engine_base.input();
+        let total = 2_000usize;
+        let start = std::time::Instant::now();
+        for i in 0..total {
+            let payload = format!("event-{i:05}");
+            let event = StreamEvent {
+                topic: Topic::new("t").unwrap(),
+                payload: Bytes::from(payload.into_bytes()),
+                timestamp_millis: 1700000000,
+                client_id: None,
+            };
+            assert_eq!(
+                input_base.push(event).await.expect("memory admits"),
+                PushOutcome::Enqueued,
+                "baseline must never touch disk"
+            );
+        }
+        let elapsed = start.elapsed();
+        let rate = total as f64 / elapsed.as_secs_f64();
+        println!(
+            "rule spill steady-state workload: {total} enqueued pushes in {elapsed:?} \
+             ({rate:.0} msgs/sec, avg {:.1} ns/msg, no disk, no spill mutex)",
+            elapsed.as_nanos() as f64 / total as f64
+        );
+        assert_eq!(engine_base.spill_stats().spilled, 0);
+        // Drain the baseline so the scratch dir check stays clean.
+        for _ in 0..total {
+            input_base.next_event().await.expect("baseline drains");
+        }
+        remove_spill_dir(&dir_base);
+        // AFTER: overflow pushes spill to disk (one spill mutex plus one
+        // page-cache write+flush each, never fsync) and replay reads back.
+        let dir = spill_test_dir("timings");
+        remove_spill_dir(&dir);
+        let engine = RuleEngine::new_with_spill(128, dir.clone()).expect("spill engine opens");
+        let input = engine.input();
+        let total = 2_000usize;
+        let start = std::time::Instant::now();
+        let mut spilled = 0usize;
+        for i in 0..total {
+            let payload = format!("event-{i:05}");
+            let event = StreamEvent {
+                topic: Topic::new("t").unwrap(),
+                payload: Bytes::from(payload.into_bytes()),
+                timestamp_millis: 1700000000,
+                client_id: None,
+            };
+            match input.push(event).await.expect("spill admits") {
+                PushOutcome::Enqueued => {}
+                PushOutcome::SpilledToDisk(_) => spilled += 1,
+                PushOutcome::Dropped(reason) => panic!("spill must not drop: {reason:?}"),
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(spilled > 0, "the run must actually exercise the disk path");
+        let rate = total as f64 / elapsed.as_secs_f64();
+        println!(
+            "rule spill workload: {total} pushes ({spilled} spilled) in {elapsed:?} \
+             ({rate:.0} msgs/sec, avg {:.1} ns/msg)",
+            elapsed.as_nanos() as f64 / total as f64
+        );
+        let start = std::time::Instant::now();
+        for i in 0..total {
+            let event = input.next_event().await.expect("replay delivers");
+            assert_eq!(
+                event.payload,
+                Bytes::from(format!("event-{i:05}").into_bytes()),
+                "replay keeps global order"
+            );
+        }
+        let elapsed = start.elapsed();
+        let rate = total as f64 / elapsed.as_secs_f64();
+        println!(
+            "rule spill replay workload: {total} replays in {elapsed:?} \
+             ({rate:.0} msgs/sec, avg {:.1} ns/msg)",
+            elapsed.as_nanos() as f64 / total as f64
+        );
+        let stats = engine.spill_stats();
+        assert_eq!(stats.spilled as usize, spilled);
+        assert_eq!(stats.replayed as usize, spilled);
+        assert_eq!(stats.dropped, 0);
+        remove_spill_dir(&dir);
     }
 
     fn sql_rule(

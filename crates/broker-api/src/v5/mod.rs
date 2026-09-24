@@ -2,6 +2,9 @@
 
 pub mod alarms;
 pub mod auth;
+pub mod authn_cache;
+pub mod authn_chain;
+pub mod authn_settings;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -49,7 +52,46 @@ pub fn protected_router() -> Router<ApiState> {
             "/users/:username/change_pwd",
             put(auth::change_user_password).post(auth::change_user_password),
         )
-        // Authentication (AuthN) built-in-database users
+        // Authentication (AuthN) chain: ordered list plus append, plus
+        // whole-order replacement. Management-plane only; the CONNECT
+        // path reads a lock-free snapshot and publish/deliver never
+        // touch this store.
+        .route(
+            "/authentication",
+            get(authn_chain::list_authn_chain).post(authn_chain::create_authn_chain),
+        )
+        .route(
+            "/authentication/order",
+            put(authn_chain::replace_authn_order),
+        )
+        .route(
+            "/authentication/:id",
+            get(authn_chain::get_authn_entry)
+                .put(authn_chain::put_authn_entry)
+                .delete(authn_chain::delete_authn_entry),
+        )
+        // Authentication (AuthN) node cache: status read plus reset that
+        // actually evicts entries. Management-plane only; the CONNECT
+        // path records successes, publish and deliver never touch it.
+        .route(
+            "/authentication/node_cache/status",
+            get(authn_cache::node_cache_status),
+        )
+        .route(
+            "/authentication/node_cache/reset",
+            post(authn_cache::node_cache_reset),
+        )
+        // Global authentication settings: validated full replace over
+        // the registry-backed store. Management-plane only; the CONNECT
+        // path reads a lock-free snapshot and publish/deliver never
+        // touch this store.
+        .route(
+            "/authentication/settings",
+            get(authn_settings::get_authn_settings).put(authn_settings::put_authn_settings),
+        )
+        // Authentication (AuthN) built-in-database users plus bulk
+        // import. Management-plane only; CONNECT reads the live user map
+        // under short read locks and publish/deliver never touch it.
         .route(
             "/authentication/:id/users",
             get(auth::list_authn_users).post(auth::create_authn_user),
@@ -57,6 +99,10 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authentication/:id/users/:user_id",
             put(auth::update_authn_user).delete(auth::delete_authn_user),
+        )
+        .route(
+            "/authentication/:id/import_users",
+            post(auth::import_authn_users),
         )
         // Authorization (AuthZ / ACL) rules
         .route(
@@ -159,6 +205,10 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/clients/:clientid/mqueue_messages",
             get(clients::get_client_mqueue),
+        )
+        .route(
+            "/clients/:clientid/authorization/cache",
+            get(clients::get_client_authz_cache).delete(clients::clear_client_authz_cache),
         )
         .route(
             "/clients/:clientid/inflight_messages",

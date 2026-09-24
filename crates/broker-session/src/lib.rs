@@ -1,4 +1,6 @@
+use broker_protocol::v5 as protocol_v5;
 use broker_protocol::{QoS, Topic, TopicFilter};
+use broker_storage::{OfflineQueueStore, OfflineRecord};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,23 @@ impl From<QoS> for SubscriptionOptions {
     }
 }
 
+/// One client's last will (F1-01): published by the kernel when the
+/// edge reports an ungraceful close (`DisconnectIn`), suppressed on a
+/// clean `DISCONNECT` (unbind). Stored on the session because the session
+/// is where the decision lives; the edge only detects the close.
+///
+/// Bound: one will per session; the topic is an MQTT string (<= 65535
+/// bytes) and the payload rides the BrokerLink bind meta (<= 65535 bytes
+/// of meta incl. topic and payload). Per-session will memory is therefore
+/// bounded near 128 KiB by the wire limit, with no new config needed.
+#[derive(Debug, Clone)]
+pub struct StoredWill {
+    pub topic: Topic,
+    pub qos: QoS,
+    pub retain: bool,
+    pub payload: Bytes,
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub id: SessionId,
@@ -48,6 +67,25 @@ pub struct Session {
     pub conn_id: RwLock<Option<u64>>,
     pub subscriptions: RwLock<HashMap<TopicFilter, SubscriptionOptions>>,
     pub offline_queue: RwLock<VecDeque<QueuedMessage>>,
+    /// Durable backing for the offline queue (B4-06, T-93). `None` (unit
+    /// tests, stores never installed) keeps the previous memory-only
+    /// behaviour exactly. `Some` (kernel boot with a data directory)
+    /// write-throughs every buffered message to the per-client queue file
+    /// before it enters the memory queue, truncates the file on drain,
+    /// and rewrites it from the surviving snapshot on eviction. Cloned
+    /// from the manager at session creation and on
+    /// [`SessionManager::set_offline_store`]; read once per buffer/drain
+    /// (one short lock, never held across file I/O or the queue lock).
+    offline_store: RwLock<Option<Arc<OfflineQueueStore>>>,
+    /// Serializes this session's durable queue file mutations (append,
+    /// eviction rewrite, drain delete, confirm rewrite). Held across the
+    /// file append, the memory push and any eviction rewrite so concurrent
+    /// buffers for the same detached client keep file order equal to queue
+    /// order; the queue lock itself is taken only for the memory section
+    /// in between, never across file I/O, so queue readers never wait for
+    /// an fsync. One mutex per session, detached-buffer path only; live
+    /// deliveries to connected sessions never touch it or a file.
+    offline_persist: std::sync::Mutex<()>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -114,9 +152,51 @@ pub struct Session {
     /// (packet id retained, payload dropped). Bounded by
     /// [`MAX_QOS2_INFLIGHT`]; the kernel owns this state.
     pub qos2_outbound: RwLock<VecDeque<Qos2OutboundEntry>>,
+    /// Inbound topic-alias table (B4-05, T-92): `alias -> topic` for
+    /// publishes the client sends with an alias. Index 0 is always
+    /// `None` (alias 0 is never valid); once an alias-carrying publish
+    /// arrives the vector is sized to `max + 1`, so lookup is a bounded
+    /// index with no per-message allocation on the hot path (alias 0
+    /// returns before taking any lock, and publishes carrying no alias
+    /// never touch this table). Until the first such publish the table
+    /// stays empty, so connections that never use aliases pay no alias
+    /// allocation. Owned by the kernel (this session); written on the
+    /// PUBLISH event, bounded by [`Session::inbound_alias_max`]. The edge
+    /// decodes the MQTT 5 alias properties (34/35) on the socket and
+    /// forwards them in the BrokerLink publish meta; the kernel owns
+    /// this table and writes it on the PUBLISH event.
+    pub inbound_aliases: RwLock<Vec<Option<Topic>>>,
+    /// Maximum alias the client may use (B4-05). Advertised in CONNACK;
+    /// written on the CONNECT event from the manager default.
+    inbound_alias_max: AtomicU16,
+    /// Outbound topic-alias table (B4-05, T-92): `alias -> topic` for
+    /// deliveries the kernel sends with an alias. Same layout and cost
+    /// as the inbound table; reuse is a bounded linear scan
+    /// (<= max entries, no map, no per-message allocation) so the table
+    /// is reused rather than grown per message. Owned by the kernel
+    /// (this session); written on the delivery event, bounded by
+    /// [`Session::outbound_alias_max`].
+    pub outbound_aliases: RwLock<Vec<Option<Topic>>>,
+    /// Maximum alias the kernel may use toward the client (B4-05).
+    /// Received in CONNECT; written on the CONNECT event. Zero means the
+    /// client sent no maximum and the kernel never assigns an alias.
+    outbound_alias_max: AtomicU16,
     /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
     /// the edge at bind time; surfaced read-only for observability.
     pub keepalive_secs: RwLock<u16>,
+    /// Last will from CONNECT, if the client registered one. Written on
+    /// the CONNECT (bind) event, consumed exactly once on disconnect:
+    /// `DisconnectIn` takes and publishes it, `UnbindConnection` takes
+    /// and drops it (clean `DISCONNECT` suppresses the will). The take is
+    /// atomic, so an edge notice racing a kernel notice publishes once.
+    /// Disconnect-path only (bind/disconnect events); the publish and
+    /// delivery hot paths never touch this lock.
+    /// TODO(parity): a transport-death detach preserves the will for a
+    /// later rebind but never fires it, so a will is lost when the edge
+    /// itself dies without sending `DisconnectIn`. The rulebook does not
+    /// decide the transport-death policy; current choice avoids spurious
+    /// publishes while the edge may still hold the socket.
+    pub last_will: RwLock<Option<StoredWill>>,
     /// Authenticated username that owns this session, if any. Maintained
     /// by the edge at bind time; drives per-user quota accounting.
     pub username: RwLock<Option<String>>,
@@ -131,6 +211,12 @@ pub struct Session {
     /// `None` means the session predates timestamp recording; API reads
     /// must omit the field rather than substituting anything.
     pub connected_at_ms: RwLock<Option<u64>>,
+    /// Per-client authorization decision cache for the management read
+    /// (W2-01). Written on the publish/subscribe authorization event,
+    /// read and cleared from the management plane only. The delivery
+    /// fan-out path never touches this lock. Bounded by
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
+    pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
     next_packet_id: AtomicU16,
 }
 
@@ -159,6 +245,27 @@ pub struct QueuedMessage {
     pub publish_at_ms: Option<u64>,
 }
 
+/// One cached authorization decision for the per-client decision-cache
+/// read (W2-01). `action` is `publish` or `subscribe`; `topic` is the
+/// concrete publish topic or the subscription filter as requested;
+/// `qos` is the publish QoS (or the granted QoS for subscribes);
+/// `retain` is the publish retain flag (always false for subscribes);
+/// `allow` is the decision; `updated_ms` is millis since the Unix epoch
+/// recorded where the decision is written.
+// TODO(parity): should subscribe decisions be cached at all, and if so
+// with which `qos`/`retain` semantics? The rulebook does not decide the
+// subscribe-cache shape; current choice records both with the granted QoS
+// and `retain = false` so management reads observe every grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthzDecision {
+    pub action: String,
+    pub topic: String,
+    pub qos: u8,
+    pub retain: bool,
+    pub allow: bool,
+    pub updated_ms: u64,
+}
+
 /// One QoS 1 downlink held from the moment it is written toward a
 /// subscriber until its PUBACK arrives (T-31). The packet id is the
 /// downlink id on the wire; replay reuses it with DUP set, so resume
@@ -170,6 +277,13 @@ pub struct InflightMessage {
     pub qos: QoS,
     pub retain: bool,
     pub payload: Bytes,
+    /// Delivery instant for slow-subscriber ack latency (FX-02). Stamped
+    /// once when the downlink is built; read once on PUBACK to compute
+    /// `timespan`. One `Instant` per tracked entry, bounded by the
+    /// existing window (`max_inflight`) plus spill (`max_spill`) caps, so
+    /// no new unbounded state. Reason for `Instant` (monotonic) over
+    /// wall-clock: ack latency must not jump on clock adjustments.
+    pub enqueued_at: Instant,
 }
 
 /// Maximum unacknowledged QoS 1 downlinks held in the per-session
@@ -215,6 +329,32 @@ pub enum InflightTrackOutcome {
     Dropped,
 }
 
+/// Default per-connection topic-alias bound in each direction (B4-05,
+/// T-92): 10 aliases. Rationale: covers typical small-device use (a
+/// handful of telemetry topics aliased to 1-byte handles) while capping
+/// per-connection alias memory near 10 topic strings plus one small
+/// index vector, so one peer cannot balloon the node. Configurable per
+/// manager via [`SessionManager::set_max_topic_alias`] and per session
+/// via [`Session::set_inbound_alias_max`] /
+/// [`Session::set_outbound_alias_max`]. A maximum of 0 disables aliases
+/// in that direction (fail closed: alias-carrying publishes are rejected
+/// and no alias is ever assigned on delivery).
+pub const DEFAULT_TOPIC_ALIAS_MAXIMUM: u16 = 10;
+
+/// Maximum alias value the tables can ever index (wire `u16` range).
+pub const MAX_TOPIC_ALIAS_VALUE: u16 = u16::MAX;
+
+/// Rejection cause for one inbound alias use. Both map to reason code
+/// `0x94` (Topic Alias Invalid) on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasReject {
+    /// Alias 0 is never valid on the wire.
+    Zero,
+    /// Alias above the negotiated maximum (or any alias while the
+    /// maximum is 0 / disabled).
+    OverMaximum,
+}
+
 /// Maximum QoS 2 inbound publishes held per session between PUBLISH and
 /// PUBREL (D1-01). At the limit a new packet id is refused (the kernel
 /// sends no PUBREC, so the publisher retries); duplicates of held ids
@@ -251,6 +391,15 @@ pub struct Qos2OutboundEntry {
     pub payload: Bytes,
     pub rec_received: bool,
 }
+
+/// Maximum cached authorization decisions per client for the
+/// per-client decision-cache read (W2-01). Rationale: caps per-client
+/// cache memory near 1024 small entries (topic string plus a few bytes)
+/// so one chatty client cannot balloon the node, while holding a working
+/// set of recent publish topics; the oldest entry is evicted past the cap
+/// (LRU). The cache is enabled by default as a bounded map, never an
+/// unbounded list.
+pub const MAX_AUTHZ_DECISIONS_PER_CLIENT: usize = 1024;
 
 /// Maximum buffered messages per detached session; beyond this the
 /// oldest entry drops so one dead client cannot balloon the node.
@@ -305,6 +454,8 @@ impl Session {
             conn_id: RwLock::new(None),
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
+            offline_store: RwLock::new(None),
+            offline_persist: std::sync::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -312,10 +463,21 @@ impl Session {
             max_spill: AtomicUsize::new(DEFAULT_MAX_QOS1_SPILL),
             qos2_inbound: RwLock::new(HashMap::new()),
             qos2_outbound: RwLock::new(VecDeque::new()),
+            // Inbound alias table starts empty (B4-05 hot path): sized to
+            // `max + 1` on the first alias-carrying PUBLISH, so the
+            // common no-alias connection pays no alias allocation here.
+            // The bound is enforced by the `inbound_alias_max` range
+            // check, never by the vector length.
+            inbound_aliases: RwLock::new(Vec::new()),
+            inbound_alias_max: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
+            outbound_aliases: RwLock::new(Vec::new()),
+            outbound_alias_max: AtomicU16::new(0),
             keepalive_secs: RwLock::new(0),
+            last_will: RwLock::new(None),
             username: RwLock::new(None),
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
+            authz_cache: RwLock::new(VecDeque::new()),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -436,9 +598,17 @@ impl Session {
     /// oldest unacked downlinks and replay stays oldest-first. Ack path
     /// only: the publish fast path never takes both locks.
     pub fn ack_inflight(&self, packet_id: u16) -> bool {
+        self.ack_inflight_timed(packet_id).is_some()
+    }
+
+    /// Release one downlink on its PUBACK and return the held entry so the
+    /// caller can measure delivery-to-ack latency (FX-02). Same promotion
+    /// and lock order as [`Session::ack_inflight`]; `None` for stale ids.
+    /// Ack path only: the publish fast path never calls this.
+    pub fn ack_inflight_timed(&self, packet_id: u16) -> Option<InflightMessage> {
         let mut inflight = self.inflight.write();
         if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
-            inflight.remove(pos);
+            let entry = inflight.remove(pos).expect("position checked");
             // Promote the oldest spill so the window stays the oldest
             // entries. Nested `inflight` -> `inflight_spill` order matches
             // the documented lock order; no other path nests in reverse.
@@ -451,23 +621,23 @@ impl Session {
             // spill push only defers promotion to the next ack; replay
             // still covers window then spill oldest-first.
             if self.spill_count.load(Ordering::Relaxed) == 0 {
-                return true;
+                return Some(entry);
             }
             let promoted = self.inflight_spill.write().pop_front();
-            if let Some(entry) = promoted {
+            if let Some(promoted_entry) = promoted {
                 self.spill_count.fetch_sub(1, Ordering::Relaxed);
-                inflight.push_back(entry);
+                inflight.push_back(promoted_entry);
             }
-            return true;
+            return Some(entry);
         }
         drop(inflight);
         let mut spill = self.inflight_spill.write();
         if let Some(pos) = spill.iter().position(|m| m.packet_id == packet_id) {
-            spill.remove(pos);
+            let entry = spill.remove(pos).expect("position checked");
             self.spill_count.fetch_sub(1, Ordering::Relaxed);
-            return true;
+            return Some(entry);
         }
-        false
+        None
     }
 
     /// Ordered snapshot of unacked window downlinks for reconnect replay.
@@ -607,10 +777,222 @@ impl Session {
         self.qos2_outbound.write().clear();
     }
 
+    /// Negotiated inbound alias maximum (aliases the client may send).
+    /// One relaxed atomic load; the publish fast path checks `alias == 0`
+    /// first and returns without a lock, so alias-disabled publishes pay
+    /// one branch and nothing else.
+    pub fn inbound_alias_max(&self) -> u16 {
+        self.inbound_alias_max.load(Ordering::Relaxed)
+    }
+
+    /// Set the inbound alias maximum, resizing the table to `max + 1`
+    /// (index 0 stays unused) when it already holds entries. A fresh
+    /// (empty) table is left empty and sized on the first alias-carrying
+    /// PUBLISH instead, so connections that never use aliases pay no
+    /// alias allocation; the bound is enforced by the `max` range check,
+    /// never by the vector length. Shrinking drops mappings above the new
+    /// maximum (fail closed on next use). CONNECT event only; never per
+    /// message.
+    pub fn set_inbound_alias_max(&self, max: u16) {
+        self.inbound_alias_max.store(max, Ordering::Relaxed);
+        let mut table = self.inbound_aliases.write();
+        if table.is_empty() {
+            return;
+        }
+        let want = max as usize + 1;
+        table.resize_with(want, || None);
+        if table.len() > want {
+            table.truncate(want);
+        }
+    }
+
+    /// Negotiated outbound alias maximum (aliases the kernel may send).
+    /// One relaxed atomic load; deliveries with max 0 skip the table
+    /// without a lock.
+    pub fn outbound_alias_max(&self) -> u16 {
+        self.outbound_alias_max.load(Ordering::Relaxed)
+    }
+
+    /// Set the outbound alias maximum, resizing the table to `max + 1`.
+    /// CONNECT event only; never per message.
+    pub fn set_outbound_alias_max(&self, max: u16) {
+        self.outbound_alias_max.store(max, Ordering::Relaxed);
+        let mut table = self.outbound_aliases.write();
+        let want = if max == 0 { 0 } else { max as usize + 1 };
+        table.clear();
+        table.resize_with(want, || None);
+    }
+
+    /// Register `alias -> topic` from a client publish carrying both.
+    /// Overwrites the previous mapping for a valid alias (the documented
+    /// behaviour). PUBLISH event only.
+    pub fn register_inbound_alias(&self, alias: u16, topic: Topic) -> Result<(), AliasReject> {
+        if alias == protocol_v5::NO_TOPIC_ALIAS {
+            return Err(AliasReject::Zero);
+        }
+        let max = self.inbound_alias_max();
+        if !protocol_v5::alias_in_range(alias, max) {
+            return Err(AliasReject::OverMaximum);
+        }
+        let mut table = self.inbound_aliases.write();
+        let want = max as usize + 1;
+        if table.len() != want {
+            table.resize_with(want, || None);
+        }
+        table[alias as usize] = Some(topic);
+        Ok(())
+    }
+
+    /// Resolve one inbound alias to its topic. Hot path: alias 0 returns
+    /// `None` with no lock; otherwise one read lock plus a bounded index,
+    /// cloning the stored topic only on a hit.
+    pub fn resolve_inbound_alias(&self, alias: u16) -> Option<Topic> {
+        if alias == protocol_v5::NO_TOPIC_ALIAS {
+            return None;
+        }
+        let max = self.inbound_alias_max.load(Ordering::Relaxed);
+        if !protocol_v5::alias_in_range(alias, max) {
+            return None;
+        }
+        self.inbound_aliases
+            .read()
+            .get(alias as usize)
+            .cloned()
+            .flatten()
+    }
+
+    /// Number of inbound alias mappings currently held (for boundedness
+    /// assertions; management-plane only).
+    pub fn inbound_alias_len(&self) -> usize {
+        self.inbound_aliases.read().iter().flatten().count()
+    }
+
+    /// Outbound alias already assigned to `topic`, if any. Hot path:
+    /// max 0 returns `None` with no lock; otherwise one read lock plus a
+    /// bounded linear scan (<= max entries), no allocation.
+    pub fn outbound_alias_for(&self, topic_str: &str) -> Option<u16> {
+        let max = self.outbound_alias_max.load(Ordering::Relaxed);
+        if max == protocol_v5::NO_TOPIC_ALIAS {
+            return None;
+        }
+        let table = self.outbound_aliases.read();
+        let end = (max as usize + 1).min(table.len());
+        for (alias, slot) in table.iter().enumerate().take(end).skip(1) {
+            if let Some(topic) = slot {
+                if topic.as_str() == topic_str {
+                    return Some(alias as u16);
+                }
+            }
+        }
+        None
+    }
+
+    /// Assign (or reuse) one outbound alias for `topic` on the delivery
+    /// event. Reuses the existing alias when present; otherwise claims
+    /// the smallest free alias <= max. `None` means no maximum negotiated
+    /// or the table is full (the caller sends the full topic with alias
+    /// 0, so the table never grows per message).
+    pub fn assign_outbound_alias(&self, topic: &Topic) -> Option<u16> {
+        let max = self.outbound_alias_max.load(Ordering::Relaxed);
+        if max == protocol_v5::NO_TOPIC_ALIAS {
+            return None;
+        }
+        let mut table = self.outbound_aliases.write();
+        let want = max as usize + 1;
+        if table.len() != want {
+            table.resize_with(want, || None);
+        }
+        for (alias, slot) in table.iter().enumerate().skip(1) {
+            if let Some(held) = slot {
+                if held == topic {
+                    return Some(alias as u16);
+                }
+            }
+        }
+        for (alias, slot) in table.iter_mut().enumerate().skip(1) {
+            if slot.is_none() {
+                *slot = Some(topic.clone());
+                return Some(alias as u16);
+            }
+        }
+        None
+    }
+
+    /// Number of outbound alias mappings currently held.
+    pub fn outbound_alias_len(&self) -> usize {
+        self.outbound_aliases.read().iter().flatten().count()
+    }
+
+    /// Drop both alias tables (per-connection state dies with the
+    /// connection). Called on bind (new connection renegotiates) and on
+    /// verified unbind.
+    pub fn clear_aliases(&self) {
+        for slot in self.inbound_aliases.write().iter_mut() {
+            *slot = None;
+        }
+        for slot in self.outbound_aliases.write().iter_mut() {
+            *slot = None;
+        }
+    }
+
+    /// Record one authorization decision for the per-client decision-cache
+    /// read (W2-01). `action` is `publish` or `subscribe`; `topic` is the
+    /// concrete topic or filter; `qos`/`retain` ride with the entry so the
+    /// management read can render them without consulting the hot path.
+    /// A repeat of the same `(action, topic, qos, retain)` refreshes the
+    /// decision and recency instead of duplicating; past
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is evicted.
+    /// Called on the publish/subscribe authorization event only; the
+    /// delivery fan-out path never touches this lock, and management
+    /// reads take only this per-session lock.
+    pub fn record_authz_decision(
+        &self,
+        action: &str,
+        topic: &str,
+        qos: u8,
+        retain: bool,
+        allow: bool,
+    ) {
+        let mut cache = self.authz_cache.write();
+        if let Some(pos) = cache.iter().position(|e| {
+            e.action == action && e.topic == topic && e.qos == qos && e.retain == retain
+        }) {
+            cache.remove(pos);
+        }
+        cache.push_back(AuthzDecision {
+            action: action.to_string(),
+            topic: topic.to_string(),
+            qos,
+            retain,
+            allow,
+            updated_ms: now_ms(),
+        });
+        while cache.len() > MAX_AUTHZ_DECISIONS_PER_CLIENT {
+            cache.pop_front();
+        }
+    }
+
+    /// Ordered snapshot of cached authorization decisions, oldest first.
+    /// Management-plane read only; clones at most
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] small entries under one short
+    /// lock and never touches the delivery path.
+    pub fn authz_cache_snapshot(&self) -> Vec<AuthzDecision> {
+        self.authz_cache.read().iter().cloned().collect()
+    }
+
+    /// Evict every cached authorization decision for this client.
+    /// Management-plane only (the clear route); a background map removal
+    /// that never runs on the publish or deliver path.
+    pub fn clear_authz_cache(&self) {
+        self.authz_cache.write().clear();
+    }
+
     /// Buffer one message for later replay, evicting the oldest entry
-    /// past [`MAX_OFFLINE_QUEUE`].
-    pub fn push_offline(&self, message: QueuedMessage) {
-        self.push_offline_with_limit(message, Some(MAX_OFFLINE_QUEUE));
+    /// past [`MAX_OFFLINE_QUEUE`]. Returns whether the entry was queued
+    /// (false only when durable persist failed; see
+    /// [`Session::push_offline_with_limit`]).
+    pub fn push_offline(&self, message: QueuedMessage) -> bool {
+        self.push_offline_with_limit(message, Some(MAX_OFFLINE_QUEUE))
     }
 
     /// Buffer one message with an explicit cap: `Some(n)` evicts the
@@ -619,28 +1001,265 @@ impl Session {
     /// recorded here where the message is already being written: an entry
     /// arriving without one is stamped once, so the delivery hot path
     /// never takes a clock.
-    pub fn push_offline_with_limit(&self, message: QueuedMessage, limit: Option<usize>) {
+    ///
+    /// Durable backing (B4-06): when an offline store is installed, the
+    /// entry is appended to the per-client queue file (flushed, plus
+    /// `sync_data` under the default fsync policy) before it enters the
+    /// memory queue, so an acknowledged publish that buffered here has
+    /// already reached stable storage. Evictions past the cap rewrite the
+    /// file from the surviving snapshot (`O(cap)`, bounded by the cap,
+    /// detached path only). The per-session persist mutex (not the queue
+    /// lock) is held across the file append, the memory push and any
+    /// eviction rewrite so concurrent buffers for the same detached client
+    /// keep file order equal to queue order; the queue lock itself is taken
+    /// only for the memory section in between, never across file I/O, so
+    /// queue readers never wait for an fsync. Cross-client publishes never
+    /// share either lock, and live deliveries to connected sessions never
+    /// touch a file. A failed append queues nothing (fail closed): it is
+    /// counted in the store and logged, the memory copy is dropped, and
+    /// `false` is returned so the kernel publish path withholds the QoS 1
+    /// ack and the publisher retries; a failed eviction rewrite is likewise
+    /// counted, logged and reported as `false` (the capped memory queue is
+    /// kept, the next restore re-caps the file).
+    /// Returns `true` when the entry was queued, `false` when a durable
+    /// write failed and nothing was queued (or the rewrite failed).
+    pub fn push_offline_with_limit(&self, message: QueuedMessage, limit: Option<usize>) -> bool {
         let mut message = message;
         if message.publish_at_ms.is_none() {
             message.publish_at_ms = Some(now_ms());
         }
-        let mut queue = self.offline_queue.write();
-        if let Some(limit) = limit {
-            let limit = limit.max(1);
-            while queue.len() >= limit {
-                queue.pop_front();
+        let store = self.offline_store.read().clone();
+        let Some(store) = store else {
+            let mut queue = self.offline_queue.write();
+            if let Some(limit) = limit {
+                let limit = limit.max(1);
+                while queue.len() >= limit {
+                    queue.pop_front();
+                }
+            }
+            queue.push_back(message);
+            return true;
+        };
+        let record = OfflineRecord {
+            topic: message.topic.clone(),
+            qos: message.qos,
+            retain: message.retain,
+            payload: message.payload.clone(),
+            publish_at_ms: message.publish_at_ms,
+        };
+        // One writer per client queue: the persist mutex stays held across
+        // the file append, the memory push and any eviction rewrite, so a
+        // concurrent buffer for the same client cannot append between the
+        // snapshot and the file replace and be clobbered, matching
+        // `confirm_offline_consumed`. The queue lock is taken only for the
+        // memory section in between, never across file I/O.
+        // Detached-buffer path only; live deliveries never touch either
+        // lock or a file.
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = store.append(&self.client_id, &record) {
+            tracing::warn!("Offline queue persist failed for {}: {e}", self.client_id);
+            return false;
+        }
+        let snapshot: Option<Vec<OfflineRecord>> = {
+            let mut queue = self.offline_queue.write();
+            let mut evicted = false;
+            if let Some(limit) = limit {
+                let limit = limit.max(1);
+                while queue.len() >= limit {
+                    queue.pop_front();
+                    evicted = true;
+                }
+            }
+            queue.push_back(message);
+            if evicted {
+                Some(
+                    queue
+                        .iter()
+                        .map(|queued| OfflineRecord {
+                            topic: queued.topic.clone(),
+                            qos: queued.qos,
+                            retain: queued.retain,
+                            payload: queued.payload.clone(),
+                            publish_at_ms: queued.publish_at_ms,
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
+                tracing::warn!("Offline queue rewrite failed for {}: {e}", self.client_id);
+                return false;
             }
         }
-        queue.push_back(message);
+        true
     }
 
-    /// Take every buffered message, leaving the queue empty.
+    /// Refill the memory queue from already-persisted records without
+    /// writing them back (restart reload path). Enforces `limit` exactly
+    /// like [`Session::push_offline_with_limit`] (oldest dropped past the
+    /// cap) but never touches the store: the file already holds these
+    /// entries in order. Preserves `publish_at_ms` as stored (`None` stays
+    /// `None`): the reload must not invent history. Returns the number of
+    /// entries dropped by the cap.
+    pub fn push_restored_with_limit(
+        &self,
+        messages: Vec<QueuedMessage>,
+        limit: Option<usize>,
+    ) -> usize {
+        let mut dropped = 0usize;
+        let mut queue = self.offline_queue.write();
+        for message in messages {
+            if let Some(limit) = limit {
+                let limit = limit.max(1);
+                while queue.len() >= limit {
+                    queue.pop_front();
+                    dropped += 1;
+                }
+            }
+            queue.push_back(message);
+        }
+        dropped
+    }
+
+    /// Point the session at the durable offline backing (`None` returns
+    /// to memory-only buffering). Called by the manager for new sessions
+    /// and when the kernel installs the store at boot; never per message.
+    pub fn set_offline_store(&self, store: Option<Arc<OfflineQueueStore>>) {
+        *self.offline_store.write() = store;
+    }
+
+    /// Take every buffered message, leaving the queue empty. When a
+    /// durable store is installed the queue file is deleted alongside, so
+    /// a restart after the handoff replays nothing (replay hands each
+    /// entry to the new connection exactly once per drain, matching the
+    /// previous memory-only semantics). The persist mutex is held across
+    /// the memory drain and the file delete so a concurrent buffer cannot
+    /// append between them and be lost; the queue lock itself is taken
+    /// only for the drain.
+    ///
+    /// Only for paths where the handoff is already complete (tests,
+    /// management drains). The reconnect-replay path must use
+    /// [`Session::take_offline_retained`] plus
+    /// [`Session::confirm_offline_consumed`] so the file survives until
+    /// each entry has reached the new mailbox.
     pub fn drain_offline(&self) -> Vec<QueuedMessage> {
+        let store = self.offline_store.read().clone();
+        let Some(store) = store else {
+            return self.offline_queue.write().drain(..).collect();
+        };
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let drained: Vec<QueuedMessage> = self.offline_queue.write().drain(..).collect();
+        if !drained.is_empty() {
+            store.remove(&self.client_id);
+        }
+        drained
+    }
+
+    /// Drain the memory queue but retain the durable queue file (B4-06
+    /// SLOP-1 fix). The reconnect-replay caller routes the returned
+    /// entries first and then calls
+    /// [`Session::confirm_offline_consumed`]: a crash between this drain
+    /// and the confirm still finds the file on disk and replays
+    /// at-least-once instead of losing the backlog (fail closed). Takes
+    /// the persist mutex for the drain so the drain pairs with the
+    /// confirm's rewrite under the same serialization as concurrent
+    /// buffers; no file I/O happens here.
+    pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
+        if self.offline_store.read().is_some() {
+            let _persist = self
+                .offline_persist
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            return self.offline_queue.write().drain(..).collect();
+        }
         self.offline_queue.write().drain(..).collect()
+    }
+
+    /// Complete a retained drain after routing (B4-06 SLOP-1 fix). Entries
+    /// the caller could not route are passed back in `unrouted` (in drain
+    /// order): they are prepended to the memory queue ahead of any
+    /// concurrent arrivals and the file is rewritten from the resulting
+    /// queue, so unrouted entries survive for the next replay. Entries
+    /// that reached the new mailbox are dropped from both memory (already
+    /// drained) and disk (the rewrite omits them). An empty queue
+    /// rewrites to no file (delete), preserving the previous
+    /// drain-deletes-the-file behaviour on the success path while keeping
+    /// concurrent arrivals that buffered after the drain. Unroutable
+    /// frames are already counted inside `ConnTable::route`
+    /// (`unknown_conn_dropped` / `dead_mailbox_dropped`); this method only
+    /// guarantees they are retained, never silently dropped.
+    pub fn confirm_offline_consumed(&self, unrouted: Vec<QueuedMessage>) {
+        let Some(store) = self.offline_store.read().clone() else {
+            if !unrouted.is_empty() {
+                let mut queue = self.offline_queue.write();
+                let arrivals: Vec<QueuedMessage> = queue.drain(..).collect();
+                queue.extend(unrouted);
+                queue.extend(arrivals);
+            }
+            return;
+        };
+        // The persist mutex stays held across the merge and the file
+        // rewrite so a concurrent `push_offline_with_limit` append cannot
+        // slip between the snapshot and the file replace and be
+        // clobbered. The queue lock is taken only for the merge and
+        // snapshot, never across the rewrite. Detached-buffer path only;
+        // live deliveries never touch either lock or a file.
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snapshot: Vec<OfflineRecord> = {
+            let mut queue = self.offline_queue.write();
+            if !unrouted.is_empty() {
+                let arrivals: Vec<QueuedMessage> = queue.drain(..).collect();
+                queue.extend(unrouted);
+                queue.extend(arrivals);
+            }
+            queue
+                .iter()
+                .map(|queued| OfflineRecord {
+                    topic: queued.topic.clone(),
+                    qos: queued.qos,
+                    retain: queued.retain,
+                    payload: queued.payload.clone(),
+                    publish_at_ms: queued.publish_at_ms,
+                })
+                .collect()
+        };
+        if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
+            tracing::warn!(
+                "Offline queue confirm rewrite failed for {}: {e}",
+                self.client_id
+            );
+        }
     }
 
     pub fn offline_len(&self) -> usize {
         self.offline_queue.read().len()
+    }
+
+    /// Record the CONNECT last will, replacing any previous one. `None`
+    /// (CONNECT without a will) clears the previous will: the will is
+    /// per-connection state, so a reconnect without one registers none.
+    /// CONNECT (bind) event only.
+    pub fn set_last_will(&self, will: Option<StoredWill>) {
+        *self.last_will.write() = will;
+    }
+
+    /// Take the stored will exactly once, leaving `None` behind. The
+    /// first taker publishes (ungraceful close); a racing second taker
+    /// observes `None` and publishes nothing. Disconnect events only.
+    pub fn take_last_will(&self) -> Option<StoredWill> {
+        self.last_will.write().take()
     }
 }
 
@@ -715,6 +1334,34 @@ pub struct SessionManager {
     /// last set (B4-01). Read only when a session is created or
     /// reconfigured, never per message.
     max_qos1_spill: AtomicUsize,
+    /// Default inbound topic-alias maximum applied to sessions created
+    /// after the last set (B4-05). One relaxed atomic load per new
+    /// session; never touched on the publish fast path.
+    max_topic_alias: AtomicU16,
+    /// Durable backing for every detached offline queue (B4-06, T-93).
+    /// `None` (the default) keeps memory-only queues exactly as before.
+    /// The kernel installs one store at boot (see
+    /// [`SessionManager::set_offline_store`]); sessions created
+    /// afterwards inherit it, and a restart rebuilds the memory queues
+    /// from it via [`SessionManager::restore_offline_queues`]. One `Arc`
+    /// clone at boot; the publish path never touches this lock (each
+    /// session holds its own clone).
+    offline_store: RwLock<Option<Arc<OfflineQueueStore>>>,
+}
+
+/// Outcome of [`SessionManager::restore_offline_queues`]: what the restart
+/// reload rebuilt into the in-memory index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineRestoreStats {
+    /// Queued messages rebuilt into detached persistent sessions.
+    pub messages: usize,
+    /// Client ids with a queue file that produced at least one message.
+    pub clients: usize,
+    /// Queue files whose torn tail was truncated and never served.
+    pub torn: u64,
+    /// Rebuilt entries dropped because the file held more than the
+    /// configured cap (oldest first, file rewritten to the survivors).
+    pub capped_dropped: usize,
 }
 
 impl Default for SessionManager {
@@ -763,7 +1410,113 @@ impl SessionManager {
             max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
             max_qos1_inflight: AtomicUsize::new(max_qos1_inflight.max(1)),
             max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
+            max_topic_alias: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
+            offline_store: RwLock::new(None),
         }
+    }
+
+    /// Durable offline backing installed by the kernel at boot (`None` =
+    /// memory-only, the default). Installs the handle on every existing
+    /// session as well as the manager, so sessions created before boot
+    /// wiring still persist. Boot-time only; never per message.
+    pub fn set_offline_store(&self, store: Arc<OfflineQueueStore>) {
+        *self.offline_store.write() = Some(store.clone());
+        let sessions: Vec<Arc<Session>> = self.sessions.read().values().cloned().collect();
+        for session in sessions {
+            session.set_offline_store(Some(store.clone()));
+        }
+    }
+
+    /// Installed durable offline backing, if any.
+    pub fn offline_store(&self) -> Option<Arc<OfflineQueueStore>> {
+        self.offline_store.read().clone()
+    }
+
+    /// Rebuild the in-memory offline index from the durable store after a
+    /// restart (B4-06). For every client id with a queue file, loads its
+    /// records in order (truncating a torn tail with a counter, never
+    /// served) and refills a detached persistent session: sessions that
+    /// do not exist yet are created detached (`clean_start = false`,
+    /// unconnected, invisible to the live-session count) and filled
+    /// without writing back. Files holding more than the configured cap
+    /// keep the newest entries and are rewritten to the survivors.
+    /// Sessions that already exist are left untouched and their files are
+    /// left for the next restart.
+    /// TODO(parity): should a reload merge into an already-live session
+    /// (e.g. a store installed after traffic started) instead of
+    /// skipping it? The rulebook does not decide the merge order; current
+    /// choice restores only unknown clients and keeps live state
+    /// authoritative.
+    pub fn restore_offline_queues(&self) -> OfflineRestoreStats {
+        let Some(store) = self.offline_store.read().clone() else {
+            return OfflineRestoreStats {
+                messages: 0,
+                clients: 0,
+                torn: 0,
+                capped_dropped: 0,
+            };
+        };
+        let mut stats = OfflineRestoreStats {
+            messages: 0,
+            clients: 0,
+            torn: 0,
+            capped_dropped: 0,
+        };
+        for client_id in store.client_ids() {
+            let (records, torn) = store.load(&client_id);
+            stats.torn += torn;
+            if records.is_empty() {
+                if torn > 0 {
+                    store.remove(&client_id);
+                }
+                continue;
+            }
+            if self.sessions.read().contains_key(&client_id) {
+                continue;
+            }
+            let messages: Vec<QueuedMessage> = records
+                .into_iter()
+                .map(|record| QueuedMessage {
+                    topic: record.topic,
+                    qos: record.qos,
+                    retain: record.retain,
+                    payload: record.payload,
+                    publish_at_ms: record.publish_at_ms,
+                })
+                .collect();
+            let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+            let session = Arc::new(Session::new(id, client_id.clone(), false));
+            self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(Some(store.clone()));
+            *session.connected.write() = false;
+            let dropped = session.push_restored_with_limit(messages, self.max_offline_queue);
+            stats.capped_dropped += dropped;
+            if dropped > 0 {
+                let snapshot: Vec<OfflineRecord> = session
+                    .offline_queue
+                    .read()
+                    .iter()
+                    .map(|queued| OfflineRecord {
+                        topic: queued.topic.clone(),
+                        qos: queued.qos,
+                        retain: queued.retain,
+                        payload: queued.payload.clone(),
+                        publish_at_ms: queued.publish_at_ms,
+                    })
+                    .collect();
+                if store.rewrite(&client_id, &snapshot).is_err() {
+                    tracing::warn!("Offline restore rewrite failed for {client_id}");
+                }
+            }
+            let restored = session.offline_len();
+            self.sessions.write().insert(client_id, session);
+            if restored > 0 {
+                stats.messages += restored;
+                stats.clients += 1;
+            }
+        }
+        stats
     }
 
     /// Configured offline queue cap (`None` = unbounded).
@@ -805,14 +1558,33 @@ impl SessionManager {
         session.set_max_spill(self.max_qos1_spill());
     }
 
+    /// Default inbound topic-alias maximum for sessions created after
+    /// the last set (default [`DEFAULT_TOPIC_ALIAS_MAXIMUM`]).
+    pub fn max_topic_alias(&self) -> u16 {
+        self.max_topic_alias.load(Ordering::Relaxed)
+    }
+
+    /// Override the default inbound topic-alias maximum for sessions
+    /// created afterwards. Existing sessions keep their own bound unless
+    /// reconfigured via [`Session::set_inbound_alias_max`].
+    pub fn set_max_topic_alias(&self, max: u16) {
+        self.max_topic_alias.store(max, Ordering::Relaxed);
+    }
+
+    /// Apply this manager's current topic-alias bound to one session
+    /// (new sessions at creation; reconfiguration callers may re-apply
+    /// explicitly). Sizes the inbound table; the outbound table stays
+    /// empty until CONNECT carries the client's maximum.
+    pub fn apply_topic_alias_limits(&self, session: &Arc<Session>) {
+        session.set_inbound_alias_max(self.max_topic_alias());
+    }
+
     /// Buffer one message for a detached session, applying this
-    /// manager's offline cap. False when the client has no session.
+    /// manager's offline cap. False when the client has no session or when
+    /// the durable persist failed and nothing was queued (fail closed).
     pub fn queue_offline(&self, client_id: &str, message: QueuedMessage) -> bool {
         match self.get(client_id) {
-            Some(session) => {
-                session.push_offline_with_limit(message, self.max_offline_queue);
-                true
-            }
+            Some(session) => session.push_offline_with_limit(message, self.max_offline_queue),
             None => false,
         }
     }
@@ -984,6 +1756,24 @@ impl SessionManager {
     }
 
     pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {
+        // Cloned up front so no branch nests the store lock inside the
+        // session-map guard (see `set_offline_store` for the other order,
+        // which runs only at boot before serving starts).
+        let store = self.offline_store.read().clone();
+
+        if clean_start {
+            // A clean start discards previous durable state by definition.
+            // The queue file goes before the replacement session is
+            // visible: the map is crash-volatile, so remove-first is the
+            // crash-consistent order (a crash between remove and insert
+            // restarts with neither file nor session, i.e. discarded; the
+            // old insert-first order revived the queue on the next
+            // restore). File I/O never runs under the map guard. A
+            // missing file is a no-op.
+            if let Some(store) = store.clone() {
+                store.remove(client_id);
+            }
+        }
         let mut map = self.sessions.write();
 
         if clean_start {
@@ -1001,6 +1791,8 @@ impl SessionManager {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
             self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store.clone());
             map.insert(client_id.to_string(), session.clone());
             drop(map);
             if !stale_connected {
@@ -1024,11 +1816,14 @@ impl SessionManager {
                 *existing.connected_at_ms.write() = Some(now_ms());
                 self.connected_count.fetch_add(1, Ordering::SeqCst);
             }
+            existing.set_offline_store(store);
             (existing.clone(), true)
         } else {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
             self.apply_qos1_limits(&session);
+            self.apply_topic_alias_limits(&session);
+            session.set_offline_store(store);
             map.insert(client_id.to_string(), session.clone());
             drop(map);
             self.connected_count.fetch_add(1, Ordering::SeqCst);
@@ -1093,6 +1888,9 @@ impl SessionManager {
                         // Clean sessions keep no inflight or QoS 2 state
                         // across a disconnect (T-31, D1-01); durable
                         // sessions keep theirs for reconnect replay.
+                        // Alias tables are per-connection either way
+                        // (B4-05): they die with the connection.
+                        session.clear_aliases();
                         if session.clean_start {
                             session.clear_inflight();
                             session.clear_qos2_inbound();
@@ -1191,6 +1989,219 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_offline_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let slot = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "indramqtt-session-offline-{label}-{}-{nanos}-{slot}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn test_offline_durable_buffer_drain_and_restore() {
+        let dir = unique_offline_dir("restore");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        // Buffer through the session entry point: the file follows.
+        let (session, _) = manager.get_or_create("durable-restore-1", false);
+        for i in 0..3u8 {
+            session.push_offline(QueuedMessage {
+                topic: Topic::new("job/queue").unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![i]),
+                publish_at_ms: None,
+            });
+        }
+        assert_eq!(session.offline_len(), 3);
+        assert_eq!(store.client_ids(), vec!["durable-restore-1".to_string()]);
+
+        // A fresh manager on the same directory rebuilds the queue detached.
+        let fresh = SessionManager::new();
+        fresh.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&dir).expect("reopen offline store"),
+        ));
+        let stats = fresh.restore_offline_queues();
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.clients, 1);
+        assert_eq!(stats.torn, 0);
+        let restored = fresh.get("durable-restore-1").expect("restored session");
+        assert!(!restored.clean_start);
+        assert!(!*restored.connected.read());
+        assert_eq!(restored.offline_len(), 3);
+        let drained = restored.drain_offline();
+        assert_eq!(drained[0].payload, Bytes::from(vec![0u8]));
+        assert_eq!(drained[2].payload, Bytes::from(vec![2u8]));
+        // Draining deletes the file: a second restart replays nothing.
+        let again = SessionManager::new();
+        again.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&dir).expect("reopen offline store"),
+        ));
+        let stats = again.restore_offline_queues();
+        assert_eq!(stats.messages, 0);
+
+        // A clean start discards the previous durable queue by definition.
+        manager.get_or_create("durable-restore-1", true);
+        assert!(store.client_ids().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_offline_concurrent_enqueue_evict_survives_restart() {
+        // Lost-update guard: concurrent enqueue plus eviction for one
+        // client, and for two clients at once, through the session API the
+        // broker calls on deliver to an offline session
+        // (`SessionManager::queue_offline` -> `push_offline_with_limit` on
+        // the disconnect-buffer event). After the join every message not
+        // deliberately evicted by the bound is present after a restart from
+        // disk, by id, with no tolerance.
+        use std::collections::HashSet;
+
+        fn payload_id(id: u32) -> Bytes {
+            Bytes::from(id.to_be_bytes().to_vec())
+        }
+
+        fn payload_to_id(payload: &Bytes) -> u32 {
+            let bytes: [u8; 4] = payload.as_ref().try_into().expect("4-byte id payload");
+            u32::from_be_bytes(bytes)
+        }
+
+        fn message(id: u32) -> QueuedMessage {
+            QueuedMessage {
+                topic: Topic::new("job/queue").unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: payload_id(id),
+                publish_at_ms: None,
+            }
+        }
+
+        let dir = unique_offline_dir("concurrent");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        // Finite cap with its reason: one dead client cannot balloon the
+        // node past `cap` entries (see DEFAULT_MAX_OFFLINE_QUEUE); the
+        // small test cap forces eviction rewrites on every push past it.
+        let cap = 100usize;
+        let manager = Arc::new(SessionManager::new_with_limits(Some(cap)));
+        manager.set_offline_store(store.clone());
+        for client in ["conc-a", "conc-b"] {
+            let (session, _) = manager.get_or_create(client, false);
+            *session.connected.write() = false;
+            *session.conn_id.write() = None;
+        }
+
+        // Distinct id spaces per client so a cross-client clobber is
+        // visible as a missing or foreign id. Four writers per client race
+        // appends and eviction rewrites for the same queue, while both
+        // clients' rewrites race each other for temp files.
+        let threads_per_client = 4usize;
+        let per_thread = 50usize;
+        std::thread::scope(|scope| {
+            for (client_index, client) in ["conc-a", "conc-b"].iter().enumerate() {
+                let base = (client_index as u32) * 100_000;
+                for writer in 0..threads_per_client {
+                    let manager = manager.clone();
+                    let client = client.to_string();
+                    scope.spawn(move || {
+                        let start = base + (writer as u32) * (per_thread as u32);
+                        for offset in 0..(per_thread as u32) {
+                            assert!(manager.queue_offline(&client, message(start + offset)));
+                        }
+                    });
+                }
+            }
+        });
+
+        for (client_index, client) in ["conc-a", "conc-b"].iter().enumerate() {
+            let base = (client_index as u32) * 100_000;
+            let pushed: HashSet<u32> = (0..(threads_per_client * per_thread) as u32)
+                .map(|offset| base + offset)
+                .collect();
+            let session = manager.get(client).expect("session known");
+            assert_eq!(session.offline_len(), cap);
+            let memory_ids: Vec<u32> = session
+                .take_offline_retained()
+                .iter()
+                .map(|queued| payload_to_id(&queued.payload))
+                .collect();
+            // Restore the memory queue: the snapshot above is ground truth
+            // for what the bound deliberately kept.
+            for id in &memory_ids {
+                session.push_restored_with_limit(vec![message(*id)], Some(cap));
+            }
+            assert_eq!(memory_ids.len(), cap);
+            let memory_set: HashSet<u32> = memory_ids.iter().copied().collect();
+            assert_eq!(memory_set.len(), cap, "survivors must be distinct");
+            for id in &memory_ids {
+                assert!(pushed.contains(id), "survivor {id} was never pushed");
+            }
+            // Restart from disk: the file must hold exactly the survivors
+            // in order, with no torn tail and no lost update.
+            let reopened = OfflineQueueStore::open(&dir).expect("reopen offline store");
+            let (loaded, torn) = reopened.load(client);
+            assert_eq!(torn, 0, "concurrent rewrites must not tear the file");
+            let disk_ids: Vec<u32> = loaded
+                .iter()
+                .map(|record| payload_to_id(&record.payload))
+                .collect();
+            assert_eq!(disk_ids, memory_ids, "disk must match memory exactly");
+        }
+
+        // The manager restore path rebuilds the same survivors detached.
+        let fresh = SessionManager::new_with_limits(Some(cap));
+        fresh.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&dir).expect("reopen offline store"),
+        ));
+        let stats = fresh.restore_offline_queues();
+        assert_eq!(stats.clients, 2);
+        assert_eq!(stats.messages, 2 * cap);
+        assert_eq!(stats.torn, 0);
+        for client in ["conc-a", "conc-b"] {
+            assert_eq!(fresh.get(client).expect("restored").offline_len(), cap);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_last_will_takes_exactly_once() {
+        use super::StoredWill;
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("will-1", true);
+        assert!(session.take_last_will().is_none());
+
+        session.set_last_will(Some(StoredWill {
+            topic: Topic::new("will/test").unwrap(),
+            qos: broker_protocol::QoS::AtLeastOnce,
+            retain: true,
+            payload: Bytes::from_static(b"gone"),
+        }));
+        let taken = session.take_last_will().expect("will stored");
+        assert_eq!(taken.topic.as_str(), "will/test");
+        assert_eq!(taken.payload, Bytes::from_static(b"gone"));
+        // Second take observes None: edge and kernel notices race safely.
+        assert!(session.take_last_will().is_none());
+
+        // Reconnect without a will clears the previous one.
+        session.set_last_will(Some(StoredWill {
+            topic: Topic::new("will/test").unwrap(),
+            qos: broker_protocol::QoS::AtMostOnce,
+            retain: false,
+            payload: Bytes::from_static(b"x"),
+        }));
+        session.set_last_will(None);
+        assert!(session.take_last_will().is_none());
+    }
 
     #[test]
     fn test_session_lifecycle() {
@@ -1353,6 +2364,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -1419,6 +2431,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -1494,6 +2507,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -1571,6 +2585,7 @@ mod tests {
             qos: broker_protocol::QoS::AtLeastOnce,
             retain: false,
             payload: payload.clone(),
+            enqueued_at: Instant::now(),
         };
 
         // BEFORE baseline (pre-B4-01 window-only entry point): the legacy
@@ -1983,5 +2998,117 @@ mod tests {
         let swept = manager.unbind_connection("tk04-durable", 999);
         assert!(swept.is_empty());
         assert_eq!(manager.subscription_filters("tk04-durable").len(), 1);
+    }
+
+    #[test]
+    fn topic_alias_inbound_register_resolve_reject() {
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("alias-in-1", true);
+        assert_eq!(session.inbound_alias_max(), DEFAULT_TOPIC_ALIAS_MAXIMUM);
+        // Alias 0 is never valid.
+        assert_eq!(
+            session.register_inbound_alias(0, Topic::new("a/b").unwrap()),
+            Err(AliasReject::Zero)
+        );
+        // Above the maximum is rejected.
+        assert_eq!(
+            session.register_inbound_alias(
+                DEFAULT_TOPIC_ALIAS_MAXIMUM + 1,
+                Topic::new("a/b").unwrap()
+            ),
+            Err(AliasReject::OverMaximum)
+        );
+        // Valid registration resolves.
+        session
+            .register_inbound_alias(1, Topic::new("sensors/temp").unwrap())
+            .expect("alias 1 registers");
+        assert_eq!(
+            session
+                .resolve_inbound_alias(1)
+                .expect("alias 1 resolves")
+                .as_str(),
+            "sensors/temp"
+        );
+        assert_eq!(session.inbound_alias_len(), 1);
+        // Re-registering the same alias overwrites (documented behaviour).
+        session
+            .register_inbound_alias(1, Topic::new("sensors/hum").unwrap())
+            .expect("alias 1 re-registers");
+        assert_eq!(
+            session
+                .resolve_inbound_alias(1)
+                .expect("alias 1 resolves")
+                .as_str(),
+            "sensors/hum"
+        );
+        assert_eq!(session.inbound_alias_len(), 1);
+        // Unknown aliases resolve to nothing (fail closed).
+        assert!(session.resolve_inbound_alias(2).is_none());
+        // Disabled maximum rejects everything.
+        session.set_inbound_alias_max(0);
+        assert_eq!(
+            session.register_inbound_alias(1, Topic::new("a/b").unwrap()),
+            Err(AliasReject::OverMaximum)
+        );
+        assert!(session.resolve_inbound_alias(1).is_none());
+    }
+
+    #[test]
+    fn topic_alias_outbound_assign_reuses_and_bounds() {
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("alias-out-1", true);
+        // No client maximum yet: nothing is ever assigned.
+        assert_eq!(session.outbound_alias_max(), 0);
+        assert_eq!(
+            session.assign_outbound_alias(&Topic::new("a/b").unwrap()),
+            None
+        );
+        session.set_outbound_alias_max(2);
+        // First assignment claims alias 1, repeat reuses it.
+        let first = session
+            .assign_outbound_alias(&Topic::new("sensors/temp").unwrap())
+            .expect("alias assigned");
+        assert_eq!(first, 1);
+        assert_eq!(session.outbound_alias_for("sensors/temp"), Some(1));
+        assert_eq!(
+            session.assign_outbound_alias(&Topic::new("sensors/temp").unwrap()),
+            Some(1)
+        );
+        assert_eq!(session.outbound_alias_len(), 1);
+        // Second topic claims alias 2; the table is now full.
+        assert_eq!(
+            session.assign_outbound_alias(&Topic::new("sensors/hum").unwrap()),
+            Some(2)
+        );
+        assert_eq!(session.outbound_alias_len(), 2);
+        // Past the bound nothing is assigned (full topic is sent instead).
+        assert_eq!(
+            session.assign_outbound_alias(&Topic::new("sensors/x").unwrap()),
+            None
+        );
+        assert_eq!(session.outbound_alias_len(), 2);
+    }
+
+    #[test]
+    fn topic_alias_state_is_per_connection_and_bounded() {
+        let manager = SessionManager::new();
+        manager.set_max_topic_alias(3);
+        assert_eq!(manager.max_topic_alias(), 3);
+        let (a, _) = manager.get_or_create("alias-iso-a", true);
+        let (b, _) = manager.get_or_create("alias-iso-b", true);
+        assert_eq!(a.inbound_alias_max(), 3);
+        assert_eq!(b.inbound_alias_max(), 3);
+        a.register_inbound_alias(1, Topic::new("a/one").unwrap())
+            .expect("a registers");
+        b.register_inbound_alias(1, Topic::new("b/one").unwrap())
+            .expect("b registers");
+        assert_eq!(a.resolve_inbound_alias(1).unwrap().as_str(), "a/one");
+        assert_eq!(b.resolve_inbound_alias(1).unwrap().as_str(), "b/one");
+        // Verified unbind drops per-connection alias state.
+        manager.bind_session(&a, 4101);
+        manager.unbind_connection("alias-iso-a", 4101);
+        assert!(a.resolve_inbound_alias(1).is_none());
+        assert_eq!(a.inbound_alias_len(), 0);
+        assert_eq!(b.resolve_inbound_alias(1).unwrap().as_str(), "b/one");
     }
 }

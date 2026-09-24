@@ -1036,11 +1036,30 @@ fn shard_encode_bind(client_id: &str, clean_start: bool, keepalive: u16) -> byte
     bytes::Bytes::from(meta)
 }
 
-/// Decode `SessionBinding` metadata into `(session_id, present, rc)`.
-fn shard_decode_binding(meta: &[u8]) -> (u64, bool, u8) {
-    assert_eq!(meta.len(), 10, "SessionBinding meta must be 10 bytes");
+/// Decode `SessionBinding` metadata into `(session_id, present, rc,
+/// alias_max)`. Accepts 10-byte (pre-alias, alias maximum 0) and 12-byte
+/// (B4-05 with trailing Topic Alias Maximum) encodings; the trailing
+/// maximum is asserted by the alias negotiation test below.
+fn shard_decode_binding(meta: &[u8]) -> (u64, bool, u8, u16) {
+    assert!(
+        meta.len() == 10 || meta.len() == 12,
+        "SessionBinding meta must be 10 or 12 bytes, got {}",
+        meta.len()
+    );
     let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
-    (session_id, meta[8] != 0, meta[9])
+    let alias_max = if meta.len() == 12 {
+        u16::from_be_bytes([meta[10], meta[11]])
+    } else {
+        0
+    };
+    (session_id, meta[8] != 0, meta[9], alias_max)
+}
+
+/// Decode `SessionBinding` metadata into `(session_id, present, rc)`,
+/// ignoring the trailing alias maximum (legacy callers).
+fn shard_decode_binding_legacy(meta: &[u8]) -> (u64, bool, u8) {
+    let (session_id, present, rc, _) = shard_decode_binding(meta);
+    (session_id, present, rc)
 }
 
 /// Encode `SubscribeMeta` (`PacketId:16be | IdLen:16be | ClientId |
@@ -1080,6 +1099,53 @@ fn shard_encode_publish(
         bytes::Bytes::from(meta),
         bytes::Bytes::from(payload.to_vec()),
     )
+}
+
+/// Encode `PublishMeta` with the trailing B4-05 alias section
+/// (`Alias:16be`). An empty topic with a nonzero alias encodes
+/// alias-by-reference; absent-alias callers use
+/// [`shard_encode_publish`].
+fn shard_encode_publish_with_alias(
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    alias: u16,
+    payload: &[u8],
+) -> (bytes::Bytes, bytes::Bytes) {
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(0u8);
+    meta.extend_from_slice(&alias.to_be_bytes());
+    (
+        bytes::Bytes::from(meta),
+        bytes::Bytes::from(payload.to_vec()),
+    )
+}
+
+/// Decode `PublishOut` metadata into `(topic, packet_id, qos, alias)`.
+/// The kernel always appends the B4-05 alias section, so the meta is
+/// `TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8 |
+/// Alias:16be`.
+fn shard_decode_publish_out(meta: &[u8]) -> (String, u16, u8, u16) {
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    let base = 2 + topic_len;
+    assert!(
+        meta.len() == base + 2 + 3 + 2,
+        "PublishOut meta must carry the trailing alias section, got {} bytes",
+        meta.len()
+    );
+    let topic = std::str::from_utf8(&meta[2..base])
+        .expect("topic UTF-8")
+        .to_string();
+    let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
+    let qos = meta[base + 2];
+    let alias = u16::from_be_bytes([meta[base + 5], meta[base + 6]]);
+    (topic, packet_id, qos, alias)
 }
 
 /// Locate the real kernel binary for the sharded-transports test.
@@ -1145,10 +1211,160 @@ async fn shard_bind(
         .expect("bind reply");
     assert_eq!(reply.header.opcode, OpCode::SessionBinding);
     assert_eq!(reply.header.conn_id, conn_id);
-    let (session_id, present, rc) = shard_decode_binding(&reply.metadata);
+    let (session_id, present, rc) = shard_decode_binding_legacy(&reply.metadata);
     assert_eq!(rc, 0, "bind of {client_id} must be accepted");
     assert_ne!(session_id, 0);
     (session_id, present)
+}
+
+/// B4-05 end-to-end alias assertion through the broker: CONNACK carries
+/// the configured Topic Alias Maximum, an alias publish delivers the
+/// correct topic, and the alias value itself rides the downlink frame.
+#[tokio::test]
+async fn sharded_topic_alias_negotiation_and_delivery() {
+    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+    let scratch = std::env::temp_dir().join(format!(
+        "indramqtt-alias-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let bl_port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        probe.local_addr().expect("port").port()
+    };
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--brokerlink-bind")
+        .arg(format!("127.0.0.1:{bl_port}"))
+        .arg("--api-bind")
+        .arg("")
+        .arg("--data-dir")
+        .arg(&scratch)
+        .arg("--allow-anonymous")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
+    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("kernel did not listen in time");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let transport = FramedTransport::new(stream);
+    // Bind asserts CONNACK carries the configured maximum (12-byte form).
+    let bind = BrokerFrame::new(
+        OpCode::BindConnection,
+        201,
+        1,
+        shard_encode_bind("alias-e2e-1", false, 60),
+        bytes::Bytes::new(),
+    )
+    .expect("valid bind");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(bind))
+        .await
+        .expect("send in time")
+        .expect("send");
+    let reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("reply in time")
+        .expect("reply");
+    let (_, _, rc, alias_max) = shard_decode_binding(&reply.metadata);
+    assert_eq!(rc, 0);
+    assert!(
+        alias_max > 0,
+        "CONNACK carries the configured alias maximum"
+    );
+    // An alias publish through the broker delivers the correct topic,
+    // and the alias value itself rides the downlink frame (outbound
+    // direction). The subscriber binds on the same transport.
+    let pub_conn = 201u64;
+    let sub_conn = 202u64;
+    let sub_bind = BrokerFrame::new(
+        OpCode::BindConnection,
+        sub_conn,
+        2,
+        shard_encode_bind("alias-e2e-2", false, 60),
+        bytes::Bytes::new(),
+    )
+    .expect("valid bind");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(sub_bind))
+        .await
+        .expect("send in time")
+        .expect("send");
+    let sub_reply = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("reply in time")
+        .expect("reply");
+    assert_eq!(sub_reply.header.opcode, OpCode::SessionBinding);
+    let sub = BrokerFrame::new(
+        OpCode::SubscribeIn,
+        sub_conn,
+        3,
+        shard_encode_subscribe(1, "alias-e2e-2", &[("alias/e2e", 0)]),
+        bytes::Bytes::new(),
+    )
+    .expect("valid subscribe frame");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(sub))
+        .await
+        .expect("send in time")
+        .expect("send");
+    let suback = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("suback in time")
+        .expect("suback");
+    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+    // First publish carries topic + alias 3: registers the mapping and
+    // delivers the full topic with the assigned downlink alias.
+    let (meta, body) = shard_encode_publish_with_alias("alias/e2e", 0, 0, false, 3, b"21.5");
+    let publish =
+        BrokerFrame::new(OpCode::PublishIn, pub_conn, 4, meta, body).expect("valid publish frame");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(publish))
+        .await
+        .expect("send in time")
+        .expect("send");
+    let downlink = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
+    assert_eq!(downlink.header.conn_id, sub_conn);
+    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
+    assert_eq!(topic, "alias/e2e");
+    assert_eq!(downlink.payload, bytes::Bytes::from_static(b"21.5"));
+    // Second publish carries the empty topic + alias 3: the broker
+    // resolves the alias and the subscriber still sees the topic.
+    let (meta2, body2) = shard_encode_publish_with_alias("", 0, 0, false, 3, b"22.5");
+    let publish2 = BrokerFrame::new(OpCode::PublishIn, pub_conn, 5, meta2, body2)
+        .expect("valid publish frame");
+    tokio::time::timeout(SHARD_E2E_STEP, transport.send(publish2))
+        .await
+        .expect("send in time")
+        .expect("send");
+    let downlink2 = tokio::time::timeout(SHARD_E2E_STEP, transport.recv())
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(downlink2.header.opcode, OpCode::PublishOut);
+    assert_eq!(downlink2.header.conn_id, sub_conn);
+    let (topic2, _, _, _) = shard_decode_publish_out(&downlink2.metadata);
+    assert_eq!(topic2, "alias/e2e", "alias resolves to the correct topic");
+    assert_eq!(downlink2.payload, bytes::Bytes::from_static(b"22.5"));
+    let _ = child.kill().await;
 }
 
 /// K parallel BrokerLink transports against one real kernel are

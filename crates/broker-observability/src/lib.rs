@@ -62,6 +62,15 @@ pub struct Metrics {
     // left untracked. Each also bumps `inflight_dropped` so the old
     // untracked-delivery alert keeps firing.
     inflight_spill_evicted: AtomicU64,
+    // Rule ingress queue spill-to-disk outcomes (B4-07). Each bumps
+    // where its event is already being spilled, replayed, refused or
+    // recovered; overflows that happened before still happen, they are
+    // now counted instead of silent.
+    rule_spill_spilled: AtomicU64,
+    rule_spill_replayed: AtomicU64,
+    rule_spill_dropped: AtomicU64,
+    rule_spill_torn: AtomicU64,
+    rule_spill_recovered: AtomicU64,
     // Kernel-to-edge delivery accounting (egress redesign, stage 0).
     // `messages_forwarded` counts admission into the shard transport
     // mailbox at `route()` time; `transport_sent` counts frames actually
@@ -126,6 +135,11 @@ pub struct MetricsSnapshot {
     pub inflight_spilled: u64,
     pub inflight_spill_replayed: u64,
     pub inflight_spill_evicted: u64,
+    pub rule_spill_spilled: u64,
+    pub rule_spill_replayed: u64,
+    pub rule_spill_dropped: u64,
+    pub rule_spill_torn: u64,
+    pub rule_spill_recovered: u64,
     pub transport_sent: u64,
     pub transport_send_failed: u64,
     pub egress_qos0_shed: u64,
@@ -436,6 +450,53 @@ impl Metrics {
         self.inflight_spill_evicted.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// One rule-ingress event appended to the on-disk spill buffer
+    /// instead of erroring (B4-07).
+    pub fn inc_rule_spill_spilled(&self) -> u64 {
+        self.inc_rule_spill_spilled_by(1)
+    }
+
+    pub fn inc_rule_spill_spilled_by(&self, n: u64) -> u64 {
+        self.rule_spill_spilled.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One spilled rule-ingress event replayed to the consumer in order
+    /// (B4-07).
+    pub fn inc_rule_spill_replayed(&self) -> u64 {
+        self.inc_rule_spill_replayed_by(1)
+    }
+
+    pub fn inc_rule_spill_replayed_by(&self, n: u64) -> u64 {
+        self.rule_spill_replayed.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One rule-ingress overflow event refused: no spill directory, an
+    /// oversize event, the disk cap, or an I/O error (B4-07, fail
+    /// closed and counted).
+    pub fn inc_rule_spill_dropped(&self) -> u64 {
+        self.inc_rule_spill_dropped_by(1)
+    }
+
+    pub fn inc_rule_spill_dropped_by(&self, n: u64) -> u64 {
+        self.rule_spill_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// One torn spill tail truncated (plus later segments discarded)
+    /// on recovery or replay (B4-07).
+    pub fn inc_rule_spill_torn(&self) -> u64 {
+        self.inc_rule_spill_torn_by(1)
+    }
+
+    pub fn inc_rule_spill_torn_by(&self, n: u64) -> u64 {
+        self.rule_spill_torn.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Rule-ingress events found on disk when a spill directory opened
+    /// (B4-07 restart survival).
+    pub fn inc_rule_spill_recovered_by(&self, n: u64) -> u64 {
+        self.rule_spill_recovered.fetch_add(n, Ordering::Relaxed) + n
+    }
+
     /// Frames actually written toward the edge by a successful transport
     /// batch write (compare with `messages_forwarded`, which counts
     /// admission into the transport mailbox).
@@ -610,6 +671,26 @@ impl Metrics {
         self.inflight_spill_evicted.load(Ordering::Relaxed)
     }
 
+    pub fn rule_spill_spilled(&self) -> u64 {
+        self.rule_spill_spilled.load(Ordering::Relaxed)
+    }
+
+    pub fn rule_spill_replayed(&self) -> u64 {
+        self.rule_spill_replayed.load(Ordering::Relaxed)
+    }
+
+    pub fn rule_spill_dropped(&self) -> u64 {
+        self.rule_spill_dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn rule_spill_torn(&self) -> u64 {
+        self.rule_spill_torn.load(Ordering::Relaxed)
+    }
+
+    pub fn rule_spill_recovered(&self) -> u64 {
+        self.rule_spill_recovered.load(Ordering::Relaxed)
+    }
+
     pub fn transport_sent(&self) -> u64 {
         self.transport_sent.load(Ordering::Relaxed)
     }
@@ -674,6 +755,11 @@ impl Metrics {
             inflight_spilled: self.inflight_spilled(),
             inflight_spill_replayed: self.inflight_spill_replayed(),
             inflight_spill_evicted: self.inflight_spill_evicted(),
+            rule_spill_spilled: self.rule_spill_spilled(),
+            rule_spill_replayed: self.rule_spill_replayed(),
+            rule_spill_dropped: self.rule_spill_dropped(),
+            rule_spill_torn: self.rule_spill_torn(),
+            rule_spill_recovered: self.rule_spill_recovered(),
             transport_sent: self.transport_sent(),
             transport_send_failed: self.transport_send_failed(),
             egress_qos0_shed: self.egress_qos0_shed(),
@@ -727,6 +813,21 @@ impl Metrics {
               # HELP indramqtt_inflight_spill_evicted_total Live QoS 1 deliveries past both window and spill bounds, left untracked.\n\
               # TYPE indramqtt_inflight_spill_evicted_total counter\n\
               indramqtt_inflight_spill_evicted_total {}\n\
+              # HELP indramqtt_rule_spill_spilled_total Rule-ingress events appended to the on-disk spill buffer instead of erroring.\n\
+              # TYPE indramqtt_rule_spill_spilled_total counter\n\
+              indramqtt_rule_spill_spilled_total {}\n\
+              # HELP indramqtt_rule_spill_replayed_total Spilled rule-ingress events replayed to the consumer in order.\n\
+              # TYPE indramqtt_rule_spill_replayed_total counter\n\
+              indramqtt_rule_spill_replayed_total {}\n\
+              # HELP indramqtt_rule_spill_dropped_total Rule-ingress overflow events refused (no spill directory, oversize event, disk cap, I/O error).\n\
+              # TYPE indramqtt_rule_spill_dropped_total counter\n\
+              indramqtt_rule_spill_dropped_total {}\n\
+              # HELP indramqtt_rule_spill_torn_total Torn spill tails truncated (plus later segments discarded) on recovery or replay.\n\
+              # TYPE indramqtt_rule_spill_torn_total counter\n\
+              indramqtt_rule_spill_torn_total {}\n\
+              # HELP indramqtt_rule_spill_recovered_total Rule-ingress events found on disk when a spill directory opened.\n\
+              # TYPE indramqtt_rule_spill_recovered_total counter\n\
+              indramqtt_rule_spill_recovered_total {}\n\
               # HELP indramqtt_transport_sent_total Frames actually written toward the edge by successful transport batch writes.\n\
               # TYPE indramqtt_transport_sent_total counter\n\
               indramqtt_transport_sent_total {}\n\
@@ -764,6 +865,11 @@ impl Metrics {
             self.inflight_spilled(),
             self.inflight_spill_replayed(),
             self.inflight_spill_evicted(),
+            self.rule_spill_spilled(),
+            self.rule_spill_replayed(),
+            self.rule_spill_dropped(),
+            self.rule_spill_torn(),
+            self.rule_spill_recovered(),
             self.transport_sent(),
             self.transport_send_failed(),
             self.egress_qos0_shed(),
@@ -1155,6 +1261,36 @@ mod tests {
         assert!(text.contains("indramqtt_inflight_spill_replayed_total 1\n"));
         assert!(text.contains("indramqtt_inflight_spill_evicted_total 1\n"));
         assert!(text.contains("indramqtt_inflight_dropped_total 1\n"));
+    }
+
+    #[test]
+    fn test_rule_spill_counters_increment_and_render() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.rule_spill_spilled(), 0);
+        assert_eq!(metrics.rule_spill_replayed(), 0);
+        assert_eq!(metrics.rule_spill_dropped(), 0);
+        assert_eq!(metrics.rule_spill_torn(), 0);
+        assert_eq!(metrics.rule_spill_recovered(), 0);
+
+        assert_eq!(metrics.inc_rule_spill_spilled_by(3), 3);
+        assert_eq!(metrics.inc_rule_spill_replayed(), 1);
+        assert_eq!(metrics.inc_rule_spill_dropped(), 1);
+        assert_eq!(metrics.inc_rule_spill_torn_by(2), 2);
+        assert_eq!(metrics.inc_rule_spill_recovered_by(3), 3);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.rule_spill_spilled, 3);
+        assert_eq!(snap.rule_spill_replayed, 1);
+        assert_eq!(snap.rule_spill_dropped, 1);
+        assert_eq!(snap.rule_spill_torn, 2);
+        assert_eq!(snap.rule_spill_recovered, 3);
+
+        let text = metrics.render_prometheus_metrics();
+        assert!(text.contains("indramqtt_rule_spill_spilled_total 3\n"));
+        assert!(text.contains("indramqtt_rule_spill_replayed_total 1\n"));
+        assert!(text.contains("indramqtt_rule_spill_dropped_total 1\n"));
+        assert!(text.contains("indramqtt_rule_spill_torn_total 2\n"));
+        assert!(text.contains("indramqtt_rule_spill_recovered_total 3\n"));
     }
 
     #[test]

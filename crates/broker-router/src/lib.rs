@@ -1,4 +1,5 @@
 use ahash::{AHashMap, AHashSet};
+use arc_swap::ArcSwap;
 use broker_observability::Metrics;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use brokerlink::{BrokerFrame, OpCode};
@@ -373,17 +374,40 @@ struct StickyEntry {
     fingerprint: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TrieNode {
-    // Exact child path segments (shared, never cloned on match)
-    children: AHashMap<Arc<str>, TrieNode>,
-    // Single-level wildcard '+' child
-    single_wildcard: Option<Box<TrieNode>>,
+    // Exact child path segments. Children are `Arc`-shared so a writer's
+    // shallow `clone()` of a node shares every unchanged subtree and only
+    // the nodes on the mutated filter path are replaced (B4-08 path
+    // copy). Readers never clone here: the match walk borrows.
+    children: AHashMap<Arc<str>, Arc<TrieNode>>,
+    // Single-level wildcard '+' child, shared the same way.
+    single_wildcard: Option<Arc<TrieNode>>,
     // Multi-level wildcard '#' subscriptions at this level
     multi_wildcard_subs: SubscriptionSet,
     // Exact subscriptions attached at this terminal node
     exact_subs: SubscriptionSet,
 }
+
+/// Maximum live subscription entries held by one router trie (B4-08).
+///
+/// Each entry is one `Subscription` set slot (client id and group are
+/// shared `Arc<str>` pointers, so tens of bytes plus the set overhead),
+/// and each distinct filter path costs one node per level. At the cap the
+/// steady trie costs low tens of MB, and a writer's path copy clones only
+/// the nodes on one filter path (depth bounded by the filter byte length,
+/// one map clone per level sharing every unchanged child `Arc`), so the
+/// transient is one extra path, never a second whole trie.
+///
+/// Rationale: 100 000 matches [`MAX_KNOWN_TOPICS`] so the subscription
+/// trie shares one memory story with the existing topic index; the B4-08
+/// storm settles 10 000 subscriptions, so the cap leaves 10x headroom for
+/// that workload while keeping a subscribe storm from growing the trie
+/// without limit. Past the cap a new `(filter, client)` entry is denied
+/// (fail closed, delivery of existing subscriptions proceeds); a
+/// re-subscribe that replaces the same client's entry always succeeds and
+/// an unsubscribe always succeeds.
+pub const MAX_SUBSCRIPTIONS: usize = 100_000;
 
 /// Maximum concrete topics remembered by the topic index (W1-15).
 /// The list read snapshots at most this many names under a short lock,
@@ -416,7 +440,8 @@ pub const DEFAULT_QOS0_BACKLOG: usize = 1_000;
 
 /// True when `frame` is a QoS 0 `PublishOut` (the only sheddable shape).
 /// Parses the `PublishOut` meta `TopicLen:16be | Topic | PacketId:16be |
-/// QoS:8 | Retain:8 | Dup:8`; anything unparseable is not QoS 0 so a
+/// QoS:8 | Retain:8 | Dup:8`, optionally followed by the B4-05 alias
+/// section `Alias:16be`; anything unparseable is not QoS 0 so a
 /// malformed frame can never trigger a shed of guaranteed traffic.
 pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     if frame.header.opcode != OpCode::PublishOut {
@@ -427,33 +452,114 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
         return false;
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() != 2 + topic_len + 5 {
+    let old_len = 2 + topic_len + 5;
+    if meta.len() != old_len && meta.len() != old_len + 2 {
         return false;
     }
     meta[2 + topic_len + 2] == 0
 }
 
+/// Shards for per-group shared-subscription delivery state (B4-08).
+/// One group maps to exactly one shard, so deliveries for different
+/// groups never contend on the same lock. Each shard is bounded
+/// independently (see [`MAX_SHARED_GROUPS_PER_SHARD`]); the global table
+/// stays within [`MAX_SHARED_GROUPS`] by construction.
+///
+/// Rationale for 32: the pipeline runs the B4-08 storm on an 8-core host
+/// with 8 concurrent match threads (`NUM_READERS = 8` in
+/// `crates/broker-router/tests/contention_bench.rs`), so 32 shards is 4x
+/// the observed delivery parallelism and distinct groups rarely share a
+/// shard; a power of two keeps the FNV-1a modulo on the match path to one
+/// multiply-free mask-style remainder, and 32 shard headers cost only a
+/// few KB while each shard caps at 32 groups (1024 / 32) so per-shard
+/// eviction scans stay short.
+const NUM_GROUP_SHARDS: usize = 32;
+
+/// Per-shard cap implied by [`MAX_SHARED_GROUPS`] over
+/// [`NUM_GROUP_SHARDS`] shards (1024 / 32 = 32). A shard that is full
+/// evicts one arbitrary entry in that same shard to make room; the
+/// evicted group's next delivery re-creates its entry from scratch, so
+/// eviction costs at most one rotation step, never a drop.
+const MAX_SHARED_GROUPS_PER_SHARD: usize = MAX_SHARED_GROUPS / NUM_GROUP_SHARDS;
+
+/// Sharded round-robin cursors: one atomic counter per group, striped so
+/// the match path never takes a global lock. Reads hit one shard's read
+/// lock to fetch the counter; only a missing group takes that shard's
+/// write lock. Increments are lock-free relaxed `fetch_add`s.
+struct ShardedCursors {
+    shards: [RwLock<AHashMap<Arc<str>, AtomicUsize>>; NUM_GROUP_SHARDS],
+}
+
+impl Default for ShardedCursors {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::new(AHashMap::new())),
+        }
+    }
+}
+
+/// Sharded sticky affinity: one [`StickyEntry`] per group, striped the
+/// same way as the cursors. A delivery locks only its own group's shard
+/// (read first, write only on a miss or membership change).
+struct ShardedSticky {
+    shards: [RwLock<AHashMap<Arc<str>, StickyEntry>>; NUM_GROUP_SHARDS],
+}
+
+impl Default for ShardedSticky {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::new(AHashMap::new())),
+        }
+    }
+}
+
+/// Shard owning `group`: FNV-1a of the name modulo the shard count.
+/// Deterministic, allocation-free, stable across calls.
+fn group_shard(group: &str) -> usize {
+    (fnv1a64(group) as usize) % NUM_GROUP_SHARDS
+}
+
 pub struct Router {
-    root: RwLock<TrieNode>,
-    /// Round-robin cursors per shared-subscription group. Mutated under
-    /// `matches`, hence behind the lock; keyed by group name alone so one
-    /// group balances across all its filters. Bounded by
-    /// [`MAX_SHARED_GROUPS`] with the arbitrary-evict rule documented
-    /// there.
-    rr_cursors: RwLock<AHashMap<Arc<str>, usize>>,
-    /// Per-group dispatch strategy (B4-02). Written by
-    /// [`Router::set_shared_strategy`], read on every shared delivery by
-    /// `balance_shared_groups`. Keyed by group name; unconfigured groups
-    /// read as [`SharedStrategy::RoundRobin`]. Bounded by
-    /// [`MAX_SHARED_GROUPS`]: new groups past the cap are rejected with
+    /// Copy-on-write subscription trie (B4-08) with structural sharing.
+    /// Readers load a snapshot with one lock-free `ArcSwap` load and
+    /// match without holding any trie lock, so a subscribe storm never
+    /// blocks the fan-out path; the worst reader wait is a single pointer
+    /// load plus a refcount bump. Writers serialize on `trie_write`,
+    /// shallow-clone the snapshot (child subtrees stay shared `Arc`s),
+    /// copy only the nodes on the mutated filter path, and store the new
+    /// root atomically. Steady state holds one trie; transiently (inside
+    /// one writer critical section) the old root plus one new path whose
+    /// depth is bounded by the filter byte length. Live entries are
+    /// bounded by [`MAX_SUBSCRIPTIONS`].
+    root: ArcSwap<TrieNode>,
+    /// Serializes copy-on-write trie writers. Readers never take it.
+    trie_write: Mutex<()>,
+    /// Live subscription entries in the trie, bounded by
+    /// [`MAX_SUBSCRIPTIONS`]. Updated only under `trie_write`, read
+    /// lock-free. A re-subscribe that replaces the same client's entry
+    /// does not change the count.
+    subscription_count: AtomicUsize,
+    /// Round-robin cursors per shared-subscription group, sharded (B4-08).
+    /// Keyed by group name alone so one group balances across all its
+    /// filters. No global lock on the match path: each delivery touches
+    /// only its group's shard.
+    rr_cursors: ShardedCursors,
+    /// Per-group dispatch strategy (B4-02), copy-on-write (B4-08).
+    /// Written by [`Router::set_shared_strategy`] under `strategy_write`
+    /// (clone, mutate, swap); read on every shared delivery by
+    /// `balance_shared_groups` with one lock-free `ArcSwap` load. Keyed
+    /// by group name; unconfigured groups read as
+    /// [`SharedStrategy::RoundRobin`]. Bounded by [`MAX_SHARED_GROUPS`]:
+    /// new groups past the cap are rejected with
     /// [`SharedStrategyError::TooManyGroups`] (fail closed, never an
     /// unbounded config map).
-    strategies: RwLock<AHashMap<Arc<str>, SharedStrategy>>,
-    /// Sticky affinity per shared-subscription group (B4-02). Keyed by
-    /// group name alone so the table stays bounded by
-    /// [`MAX_SHARED_GROUPS`] with the same arbitrary-evict rule as the
-    /// cursors. See [`StickyEntry`] for the pin/re-pick rule.
-    sticky: RwLock<AHashMap<Arc<str>, StickyEntry>>,
+    strategies: ArcSwap<AHashMap<Arc<str>, SharedStrategy>>,
+    /// Serializes strategy-table writers. Readers never take it.
+    strategy_write: Mutex<()>,
+    /// Sticky affinity per shared-subscription group (B4-02), sharded
+    /// (B4-08). Keyed by group name alone. See [`StickyEntry`] for the
+    /// pin/re-pick rule.
+    sticky: ShardedSticky,
     /// Xorshift random seed for the `random` strategy. One relaxed atomic
     /// add per random delivery; no lock, no allocation, no per-message
     /// map. Seeded once from the wall clock (fallback constant when the
@@ -498,10 +604,13 @@ impl Router {
             .wrapping_add(0x2545F4914F6CDD1D)
             | 1;
         Self {
-            root: RwLock::new(TrieNode::default()),
-            rr_cursors: RwLock::new(AHashMap::new()),
-            strategies: RwLock::new(AHashMap::new()),
-            sticky: RwLock::new(AHashMap::new()),
+            root: ArcSwap::from(Arc::new(TrieNode::default())),
+            trie_write: Mutex::new(()),
+            subscription_count: AtomicUsize::new(0),
+            rr_cursors: ShardedCursors::default(),
+            strategies: ArcSwap::from(Arc::new(AHashMap::new())),
+            strategy_write: Mutex::new(()),
+            sticky: ShardedSticky::default(),
             random_seed: std::sync::atomic::AtomicU64::new(seed),
             known_topics: RwLock::new(AHashSet::new()),
             rewrite_rules: RwLock::new(Vec::new()),
@@ -528,21 +637,23 @@ impl Router {
             return Err(SharedStrategyError::EmptyGroup);
         }
         let strategy = SharedStrategy::parse(strategy_name)?;
-        let mut strategies = self.strategies.write();
-        if !strategies.contains_key(group) && strategies.len() >= MAX_SHARED_GROUPS {
+        let _guard = self.strategy_write.lock();
+        let current = self.strategies.load_full();
+        if !current.contains_key(group) && current.len() >= MAX_SHARED_GROUPS {
             return Err(SharedStrategyError::TooManyGroups(MAX_SHARED_GROUPS));
         }
-        strategies.insert(group.into(), strategy);
+        let mut next = (*current).clone();
+        next.insert(group.into(), strategy);
+        self.strategies.store(Arc::new(next));
         Ok(())
     }
 
     /// Dispatch strategy for `group`: the configured value, or
     /// [`SharedStrategy::RoundRobin`] when the group has no entry. One
-    /// short read lock; no allocation on the hit path beyond the lock
-    /// guard.
+    /// lock-free snapshot load; no lock, no allocation on the hit path.
     pub fn shared_strategy(&self, group: &str) -> SharedStrategy {
         self.strategies
-            .read()
+            .load_full()
             .get(group)
             .copied()
             .unwrap_or_default()
@@ -552,13 +663,49 @@ impl Router {
     /// The group falls back to round-robin. Returns true when an entry
     /// existed.
     pub fn clear_shared_strategy(&self, group: &str) -> bool {
-        self.strategies.write().remove(group).is_some()
+        let _guard = self.strategy_write.lock();
+        let current = self.strategies.load_full();
+        if !current.contains_key(group) {
+            return false;
+        }
+        let mut next = (*current).clone();
+        next.remove(group);
+        self.strategies.store(Arc::new(next));
+        true
     }
 
     /// Number of groups with an explicit strategy entry (config-plane
     /// hook for tests and operators).
     pub fn shared_strategy_count(&self) -> usize {
-        self.strategies.read().len()
+        self.strategies.load_full().len()
+    }
+
+    /// Number of live round-robin cursor entries across all shards
+    /// (operator/test hook for the B4-08 bound check).
+    pub fn rr_cursor_count(&self) -> usize {
+        self.rr_cursors
+            .shards
+            .iter()
+            .map(|shard| shard.read().len())
+            .sum()
+    }
+
+    /// Number of live sticky affinity entries across all shards
+    /// (operator/test hook for the B4-08 bound check).
+    pub fn sticky_count(&self) -> usize {
+        self.sticky
+            .shards
+            .iter()
+            .map(|shard| shard.read().len())
+            .sum()
+    }
+
+    /// Number of live subscription entries in the trie (operator/test
+    /// hook for the B4-08 bound check). Never exceeds
+    /// [`MAX_SUBSCRIPTIONS`]: new entries past the cap are denied while
+    /// replacements and removals always proceed.
+    pub fn subscription_count(&self) -> usize {
+        self.subscription_count.load(Ordering::Relaxed)
     }
 
     /// Install the ordered rewrite table (B4-04, config plane). Every
@@ -742,64 +889,300 @@ impl Router {
         self.known_topics.read().contains(topic)
     }
 
-    pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) {
-        let mut root = self.root.write();
-        let mut curr = &mut *root;
-        // Peekable so the terminal level is known without collecting.
-        let mut levels = filter.as_str().split('/').peekable();
+    /// Subscribe event: insert `sub` at `filter` with copy-on-write
+    /// isolation and structural sharing (B4-08). The writer shallow-clones
+    /// the snapshot root under `trie_write` (unchanged subtrees stay shared
+    /// `Arc`s), copies only the nodes on the filter path, and swaps the new
+    /// root into view; readers holding the old snapshot finish against it
+    /// without waiting. Match semantics are unchanged (B4-02 strategies
+    /// untouched). Mutation-path cost only (never on the match path): one
+    /// shallow root clone plus one new node per filter level, each cloning
+    /// only its level's sibling map while sharing every unchanged child
+    /// `Arc`, so steady state holds one trie bounded by
+    /// [`MAX_SUBSCRIPTIONS`] and transiently the old root plus one new
+    /// path; per-subscribe latency is measured by
+    /// `subscribe_storm_alongside_matches_keeps_semantics` (before and
+    /// after min/median/max) and stays off the publish/deliver path. New
+    /// entries past [`MAX_SUBSCRIPTIONS`] are denied (fail closed, existing
+    /// delivery proceeds, returns `false` so the caller never reports
+    /// success); replacing the same client's entry always succeeds and
+    /// returns `true`.
+    pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) -> bool {
+        let _guard = self.trie_write.lock();
+        let current = self.root.load_full();
+        if !Self::terminal_contains(&current, filter, sub.client_id.as_ref())
+            && self.subscription_count.load(Ordering::Relaxed) >= MAX_SUBSCRIPTIONS
+        {
+            return false;
+        }
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        let root_owned = (*current).clone();
+        let (next, added) = Self::insert_owned(root_owned, &levels, 0, sub);
+        if added {
+            self.subscription_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.root.store(Arc::new(next));
+        true
+    }
 
-        while let Some(level) = levels.next() {
-            if level == "#" {
-                // Re-subscribing from a new connection replaces the old copy.
-                curr.multi_wildcard_subs
-                    .retain(|s| s.client_id != sub.client_id);
-                curr.multi_wildcard_subs.insert(sub);
-                return;
-            } else if level == "+" {
-                if curr.single_wildcard.is_none() {
-                    curr.single_wildcard = Some(Box::new(TrieNode::default()));
+    /// Insert helper with path copying on a shallow-cloned root. Only the
+    /// nodes on the filter path are replaced; every other child `Arc` is
+    /// shared with the previous snapshot. Same traversal as before: `#`
+    /// attaches at the current level, `+` descends the single-wildcard
+    /// child, other levels descend exact children, and a re-subscribe from
+    /// a new connection replaces the old copy. Returns the new node plus
+    /// whether a new `(filter, client)` entry was added (false for a
+    /// same-client replacement).
+    fn insert_owned(
+        mut node: TrieNode,
+        levels: &[&str],
+        pos: usize,
+        sub: Subscription,
+    ) -> (TrieNode, bool) {
+        let level = levels[pos];
+        let is_last = pos + 1 == levels.len();
+        if level == "#" {
+            let existed = node
+                .multi_wildcard_subs
+                .iter()
+                .any(|s| s.client_id == sub.client_id);
+            node.multi_wildcard_subs
+                .retain(|s| s.client_id != sub.client_id);
+            node.multi_wildcard_subs.insert(sub);
+            return (node, !existed);
+        }
+        if level == "+" {
+            if is_last {
+                let mut child = match node.single_wildcard.take() {
+                    Some(child) => (*child).clone(),
+                    None => TrieNode::default(),
+                };
+                let existed = child
+                    .exact_subs
+                    .iter()
+                    .any(|s| s.client_id == sub.client_id);
+                child.exact_subs.retain(|s| s.client_id != sub.client_id);
+                child.exact_subs.insert(sub);
+                node.single_wildcard = Some(Arc::new(child));
+                return (node, !existed);
+            }
+            let mut child = match node.single_wildcard.take() {
+                Some(child) => (*child).clone(),
+                None => TrieNode::default(),
+            };
+            let (next_child, added) = Self::insert_owned(child, levels, pos + 1, sub);
+            child = next_child;
+            node.single_wildcard = Some(Arc::new(child));
+            return (node, added);
+        }
+        if is_last {
+            let mut child = match node.children.remove(level) {
+                Some(child) => (*child).clone(),
+                None => TrieNode::default(),
+            };
+            let existed = child
+                .exact_subs
+                .iter()
+                .any(|s| s.client_id == sub.client_id);
+            child.exact_subs.retain(|s| s.client_id != sub.client_id);
+            child.exact_subs.insert(sub);
+            node.children.insert(level.into(), Arc::new(child));
+            return (node, !existed);
+        }
+        let child = match node.children.remove(level) {
+            Some(child) => (*child).clone(),
+            None => TrieNode::default(),
+        };
+        let (next_child, added) = Self::insert_owned(child, levels, pos + 1, sub);
+        node.children.insert(level.into(), Arc::new(next_child));
+        (node, added)
+    }
+
+    /// Probe the snapshot for a live `(filter, client)` entry: true when
+    /// the filter path exists and its terminal set already holds
+    /// `client_id`. Used to tell a same-client replacement (always
+    /// allowed) from a new entry (counted against [`MAX_SUBSCRIPTIONS`]),
+    /// and to skip no-op unsubscribes without copying.
+    fn terminal_contains(node: &TrieNode, filter: &TopicFilter, client_id: &str) -> bool {
+        let mut curr = node;
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        for (pos, level) in levels.iter().enumerate() {
+            if *level == "#" {
+                return curr
+                    .multi_wildcard_subs
+                    .iter()
+                    .any(|s| s.client_id.as_ref() == client_id);
+            }
+            let is_last = pos + 1 == levels.len();
+            if *level == "+" {
+                match curr.single_wildcard.as_ref() {
+                    Some(child) => {
+                        if is_last {
+                            return child
+                                .exact_subs
+                                .iter()
+                                .any(|s| s.client_id.as_ref() == client_id);
+                        }
+                        curr = &**child;
+                    }
+                    None => return false,
                 }
-                curr = curr.single_wildcard.as_mut().unwrap();
             } else {
-                curr = curr.children.entry(level.into()).or_default();
+                match curr.children.get(*level) {
+                    Some(child) => {
+                        if is_last {
+                            return child
+                                .exact_subs
+                                .iter()
+                                .any(|s| s.client_id.as_ref() == client_id);
+                        }
+                        curr = &**child;
+                    }
+                    None => return false,
+                }
             }
+        }
+        false
+    }
 
-            if levels.peek().is_none() {
-                curr.exact_subs.retain(|s| s.client_id != sub.client_id);
-                curr.exact_subs.insert(sub);
-                return;
-            }
+    /// Unsubscribe event: remove `client_id` at `filter` with the same
+    /// path-copying discipline as [`Router::subscribe`]. A filter path
+    /// without a live entry for `client_id` returns after one lock-free
+    /// snapshot load and one probe, with no copy and no store, so no-op
+    /// unsubscribes pay no allocation. A real removal copies only the
+    /// filter path, prunes nodes left empty, and decrements the
+    /// [`MAX_SUBSCRIPTIONS`] count.
+    pub fn unsubscribe(&self, filter: &TopicFilter, client_id: &str) {
+        let _guard = self.trie_write.lock();
+        let current = self.root.load_full();
+        if !Self::path_exists(&current, filter) {
+            return;
+        }
+        if !Self::terminal_contains(&current, filter, client_id) {
+            return;
+        }
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        let root_owned = (*current).clone();
+        let (next, changed) = Self::remove_owned(root_owned, &levels, 0, client_id);
+        if changed {
+            self.subscription_count.fetch_sub(1, Ordering::Relaxed);
+            self.root.store(Arc::new(next));
         }
     }
 
-    pub fn unsubscribe(&self, filter: &TopicFilter, client_id: &str) {
-        let mut root = self.root.write();
-        let mut curr = &mut *root;
-        let mut levels = filter.as_str().split('/').peekable();
-
-        while let Some(level) = levels.next() {
+    /// Read-only probe: true when every level of `filter` exists in
+    /// `node` (so a removal could change something). `#` always counts
+    /// as present at its level; missing exact or `+` children mean no
+    /// unsubscribe work is needed.
+    fn path_exists(node: &TrieNode, filter: &TopicFilter) -> bool {
+        let mut curr = node;
+        for level in filter.as_str().split('/') {
             if level == "#" {
-                curr.multi_wildcard_subs
-                    .retain(|s| s.client_id.as_ref() != client_id);
-                return;
+                return true;
             } else if level == "+" {
-                if let Some(ref mut child) = curr.single_wildcard {
-                    curr = child;
-                } else {
-                    return;
+                match curr.single_wildcard.as_ref() {
+                    Some(child) => curr = child.as_ref(),
+                    None => return false,
                 }
-            } else if let Some(child) = curr.children.get_mut(level) {
-                curr = child;
             } else {
-                return;
-            }
-
-            if levels.peek().is_none() {
-                curr.exact_subs
-                    .retain(|s| s.client_id.as_ref() != client_id);
-                return;
+                match curr.children.get(level) {
+                    Some(child) => curr = child.as_ref(),
+                    None => return false,
+                }
             }
         }
+        true
+    }
+
+    /// True when a node holds no subscriptions and no children, so its
+    /// parent can drop the entry instead of keeping an empty branch. Keeps
+    /// trie memory bounded by live entries under [`MAX_SUBSCRIPTIONS`]
+    /// rather than by churn history.
+    fn is_empty_node(node: &TrieNode) -> bool {
+        node.exact_subs.is_empty()
+            && node.multi_wildcard_subs.is_empty()
+            && node.children.is_empty()
+            && node.single_wildcard.is_none()
+    }
+
+    /// Removal helper with path copying on a shallow-cloned root. Returns
+    /// the new node plus whether an entry was actually removed (the caller
+    /// stores the clone only then). Empty branches are pruned so
+    /// subscribe/unsubscribe churn over rotating filters cannot grow the
+    /// trie without limit. Traversal mirrors [`Router::insert_owned`].
+    fn remove_owned(
+        mut node: TrieNode,
+        levels: &[&str],
+        pos: usize,
+        client_id: &str,
+    ) -> (TrieNode, bool) {
+        let level = levels[pos];
+        let is_last = pos + 1 == levels.len();
+        if level == "#" {
+            let before = node.multi_wildcard_subs.len();
+            node.multi_wildcard_subs
+                .retain(|s| s.client_id.as_ref() != client_id);
+            let changed = node.multi_wildcard_subs.len() != before;
+            return (node, changed);
+        }
+        if level == "+" {
+            let child = match node.single_wildcard.take() {
+                Some(child) => (*child).clone(),
+                None => return (node, false),
+            };
+            if is_last {
+                let before = child.exact_subs.len();
+                let mut child = child;
+                child
+                    .exact_subs
+                    .retain(|s| s.client_id.as_ref() != client_id);
+                if child.exact_subs.len() == before {
+                    node.single_wildcard = Some(Arc::new(child));
+                    return (node, false);
+                }
+                if !Self::is_empty_node(&child) {
+                    node.single_wildcard = Some(Arc::new(child));
+                }
+                return (node, true);
+            }
+            let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+            if !changed {
+                node.single_wildcard = Some(Arc::new(next_child));
+                return (node, false);
+            }
+            if !Self::is_empty_node(&next_child) {
+                node.single_wildcard = Some(Arc::new(next_child));
+            }
+            return (node, true);
+        }
+        let child = match node.children.remove(level) {
+            Some(child) => (*child).clone(),
+            None => return (node, false),
+        };
+        if is_last {
+            let before = child.exact_subs.len();
+            let mut child = child;
+            child
+                .exact_subs
+                .retain(|s| s.client_id.as_ref() != client_id);
+            if child.exact_subs.len() == before {
+                node.children.insert(level.into(), Arc::new(child));
+                return (node, false);
+            }
+            if !Self::is_empty_node(&child) {
+                node.children.insert(level.into(), Arc::new(child));
+            }
+            return (node, true);
+        }
+        let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+        if !changed {
+            node.children.insert(level.into(), Arc::new(next_child));
+            return (node, false);
+        }
+        if !Self::is_empty_node(&next_child) {
+            node.children.insert(level.into(), Arc::new(next_child));
+        }
+        (node, true)
     }
 
     pub fn matches(&self, topic: &Topic) -> SubscriptionSet {
@@ -808,6 +1191,17 @@ impl Router {
 
     /// Match plus shared-group reduction with publisher context (B4-02).
     ///
+    /// Locking (B4-08, `crates/broker-router/src/lib.rs`): the match path
+    /// loads one `ArcSwap` snapshot (`Router::root` via `load_full`) and
+    /// walks it with no trie lock held, then releases the snapshot before
+    /// `balance_shared_groups`, which touches only its group's shard
+    /// (`ShardedCursors` / `ShardedSticky`) plus lock-free strategy and
+    /// random state. Readers never wait on writers longer than one
+    /// pointer load plus a refcount bump; writers never wait on readers.
+    /// Driven by the publish delivery event (`matches` /
+    /// `matches_with_publisher` on every publish fan-out) and by the
+    /// subscribe/unsubscribe events for the mutation path.
+    ///
     /// The delivery path calls this with the publishing client id so the
     /// `hash_clientid` strategy hashes a real key; callers without a
     /// publisher (management reads, rule republishes, retained replays)
@@ -815,17 +1209,29 @@ impl Router {
     /// empty string deterministically (stable, still one member); see
     /// the open-question note at the call site for what key those paths
     /// should hash.
+    ///
+    /// Per-match cost: one lock-free snapshot load, one trie walk that
+    /// clones only the matched subscriptions (pointer clones, no heap
+    /// strings), plus the per-group reduction cost documented on
+    /// `balance_shared_groups`. No allocation, lock, or unbounded work
+    /// beyond the matched set itself. Measured by
+    /// `subscribe_storm_alongside_matches_keeps_semantics` (storm
+    /// matches/s, run with `-- --nocapture`) and
+    /// `router_match_cost_reports_min_median_max` (settled single-thread
+    /// ns/match with min/median/max across repeats).
     pub fn matches_with_publisher(
         &self,
         topic: &Topic,
         publisher: Option<&str>,
     ) -> SubscriptionSet {
-        let root = self.root.read();
+        let snapshot = self.root.load_full();
         let mut matched = SubscriptionSet::default();
-        Self::match_recursive(&root, topic.as_str(), &mut matched);
-        // The trie read guard is held across balancing (as before): the
-        // balance step takes only short per-group state locks, never the
-        // trie write lock, so subscribers never block deliveries.
+        Self::match_recursive(&snapshot, topic.as_str(), &mut matched);
+        drop(snapshot);
+        // No trie lock is held across balancing: the balance step takes
+        // only short per-group shard locks (or no lock for hash/random),
+        // never a global critical section, so subscribers never block
+        // deliveries.
         self.balance_shared_groups(&mut matched, topic, publisher);
         matched
     }
@@ -844,11 +1250,17 @@ impl Router {
     /// count, the dominant term for large groups), then O(members) or
     /// better selection with no allocation beyond the existing group
     /// buckets and the single picked clone: round-robin is one short
-    /// cursor-lock increment, random is one relaxed atomic scramble, the
-    /// hashes are one FNV pass over the key, and sticky is one FNV
-    /// fingerprint pass plus at most one short affinity-lock update when
-    /// the membership changed. No per-message map grows without bound:
-    /// cursors and affinity entries stay within [`MAX_SHARED_GROUPS`].
+    /// shard read plus one lock-free atomic increment, random is one
+    /// relaxed atomic scramble, the hashes are one FNV pass over the key,
+    /// and sticky is one FNV fingerprint pass plus at most one short
+    /// shard write when the membership changed. No per-message map grows
+    /// without bound: cursors and affinity entries stay within
+    /// [`MAX_SHARED_GROUPS`] (`MAX_SHARED_GROUPS_PER_SHARD` per shard).
+    /// No global lock is taken here: each group touches only its own
+    /// shard (`crates/broker-router/src/lib.rs`, `ShardedCursors` /
+    /// `ShardedSticky`), and strategies load lock-free. Measured by
+    /// `router_match_cost_reports_min_median_max` (run with
+    /// `-- --nocapture` for the ns/match min/median/max report).
     fn balance_shared_groups(
         &self,
         matched: &mut SubscriptionSet,
@@ -869,9 +1281,9 @@ impl Router {
         if groups.is_empty() {
             return;
         }
-        // Read all strategies under one short lock so the per-group loop
-        // below pays no lock per group on the hot path.
-        let strategies = self.strategies.read();
+        // Lock-free strategy snapshot: one `ArcSwap` load for the whole
+        // delivery, then no lock per group on the hot path.
+        let strategies = self.strategies.load_full();
         for (group, mut members) in groups {
             members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
             let strategy = strategies.get(&group).copied().unwrap_or_default();
@@ -896,20 +1308,37 @@ impl Router {
     }
 
     /// Round-robin pick: cursor per group, deterministic client-id order.
-    /// Bounded: a missing group past [`MAX_SHARED_GROUPS`] evicts one
-    /// arbitrary entry first (documented on the constant).
+    /// Locking (`crates/broker-router/src/lib.rs`, `ShardedCursors`):
+    /// exactly one shard is touched. The fast path takes that shard's
+    /// read lock to fetch the atomic counter and bumps it lock-free with
+    /// `fetch_add`; only a missing group takes the shard's write lock to
+    /// insert. Bounded per shard by [`MAX_SHARED_GROUPS_PER_SHARD`]: a
+    /// missing group in a full shard evicts one arbitrary entry of that
+    /// same shard first (documented on the constant).
     fn pick_round_robin(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
         debug_assert!(!members.is_empty());
-        let mut cursors = self.rr_cursors.write();
-        if !cursors.contains_key(group) && cursors.len() >= MAX_SHARED_GROUPS {
+        let shard = &self.rr_cursors.shards[group_shard(group)];
+        // Fast path: the group already has a cursor.
+        {
+            let cursors = shard.read();
+            if let Some(cursor) = cursors.get(group) {
+                let prev = cursor.fetch_add(1, Ordering::Relaxed);
+                return members[prev % members.len()].clone();
+            }
+        }
+        // Slow path: install the cursor (at most one shard write).
+        let mut cursors = shard.write();
+        if let Some(cursor) = cursors.get(group) {
+            let prev = cursor.fetch_add(1, Ordering::Relaxed);
+            return members[prev % members.len()].clone();
+        }
+        if cursors.len() >= MAX_SHARED_GROUPS_PER_SHARD {
             if let Some(victim) = cursors.keys().next().cloned() {
                 cursors.remove(&victim);
             }
         }
-        let cursor = cursors.entry(group.clone()).or_insert(0);
-        let pick = members[*cursor % members.len()].clone();
-        *cursor = cursor.wrapping_add(1);
-        pick
+        cursors.insert(group.clone(), AtomicUsize::new(1));
+        members[0].clone()
     }
 
     /// Uniform random pick. One relaxed atomic add plus an xorshift
@@ -946,13 +1375,17 @@ impl Router {
     /// re-pick at the new `fnv1a64(group) % members`. Pinning is by
     /// client id (not connection), so a re-subscribe from a new
     /// connection keeps the pin and delivers to the freshest member
-    /// object. Bounded like the cursors with the same arbitrary-evict
-    /// rule.
+    /// object. Locking (`crates/broker-router/src/lib.rs`,
+    /// `ShardedSticky`): exactly one shard is touched (read first, write
+    /// only on a miss or membership change). Bounded per shard by
+    /// [`MAX_SHARED_GROUPS_PER_SHARD`] with the same arbitrary-evict
+    /// rule as the cursors.
     fn pick_sticky(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
         debug_assert!(!members.is_empty());
         let fingerprint = fingerprint_members(members);
+        let shard = &self.sticky.shards[group_shard(group)];
         {
-            let sticky = self.sticky.read();
+            let sticky = shard.read();
             if let Some(entry) = sticky.get(group) {
                 if entry.fingerprint == fingerprint {
                     if let Some(pinned) = members.iter().find(|m| m.client_id == entry.pinned) {
@@ -963,8 +1396,17 @@ impl Router {
         }
         let index = (fnv1a64(group.as_ref()) as usize) % members.len();
         let pick = members[index].clone();
-        let mut sticky = self.sticky.write();
-        if !sticky.contains_key(group) && sticky.len() >= MAX_SHARED_GROUPS {
+        let mut sticky = shard.write();
+        // Re-check under the write lock: another delivery may have
+        // installed the current membership while we were unlocked.
+        if let Some(entry) = sticky.get(group) {
+            if entry.fingerprint == fingerprint {
+                if let Some(pinned) = members.iter().find(|m| m.client_id == entry.pinned) {
+                    return pinned.clone();
+                }
+            }
+        }
+        if !sticky.contains_key(group) && sticky.len() >= MAX_SHARED_GROUPS_PER_SHARD {
             if let Some(victim) = sticky.keys().next().cloned() {
                 sticky.remove(&victim);
             }
@@ -1014,6 +1456,47 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reconstructed pre-B4-08 single-lock discipline (B4-08 before
+    /// numbers). Wraps the current trie behind one global `RwLock`:
+    /// subscribes take it for writing, matches take it for reading, so
+    /// readers block on writers exactly as the old
+    /// `RwLock<TrieNode>` root did. Same traversal as the CoW writer plus
+    /// the global lock (not conservative: the true old writer mutated
+    /// in place without a clone, so this baseline pays a path copy the
+    /// old code never paid and any measured match-throughput gain
+    /// overstates the contention removed by the cutover).
+    /// Driven by the same subscribe/unsubscribe and publish delivery
+    /// events as [`Router`]; the before side of the B4-08 storm
+    /// comparison (spec B4-08:53-60), reported through the gates log.
+    struct SingleLockBaseline {
+        inner: Router,
+        lock: parking_lot::RwLock<()>,
+    }
+
+    impl SingleLockBaseline {
+        fn new() -> Self {
+            Self {
+                inner: Router::new(),
+                lock: parking_lot::RwLock::new(()),
+            }
+        }
+
+        fn subscribe(&self, filter: &TopicFilter, sub: Subscription) {
+            let _guard = self.lock.write();
+            self.inner.subscribe(filter, sub);
+        }
+
+        fn matches(&self, topic: &Topic) -> SubscriptionSet {
+            let _guard = self.lock.read();
+            self.inner.matches(topic)
+        }
+
+        fn unsubscribe(&self, filter: &TopicFilter, client_id: &str) {
+            let _guard = self.lock.write();
+            self.inner.unsubscribe(filter, client_id);
+        }
+    }
 
     #[test]
     fn test_router_wildcard_fanout() {
@@ -1379,8 +1862,407 @@ mod tests {
             let topic = Topic::new("t").unwrap();
             assert_eq!(router.matches(&topic).len(), 1);
         }
-        assert!(router.rr_cursors.read().len() <= MAX_SHARED_GROUPS);
-        assert!(router.sticky.read().len() <= MAX_SHARED_GROUPS);
+        assert!(router.rr_cursor_count() <= MAX_SHARED_GROUPS);
+        assert!(router.sticky_count() <= MAX_SHARED_GROUPS);
+    }
+
+    #[test]
+    fn subscribe_storm_alongside_matches_keeps_semantics() {
+        // B4-08 contention harness: the same subscribe storm + steady
+        // match workload runs against the reconstructed single-lock
+        // baseline (before numbers) and the CoW router (after numbers).
+        // Writer threads churn distinct filters while reader threads
+        // match a steady topic; readers must always see the steady
+        // subscriber and the final snapshot must equal the sequential
+        // expectation. Throughputs report min/median/max across repeats
+        // (spec B4-08:53-60); settled subscribe latency reports
+        // min/median/max per subscribe. Asserts exact delivery counts
+        // plus correctness, never an absolute time threshold, so the
+        // test is stable on loaded runners.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+
+        const WRITERS: usize = 4;
+        const FILTERS_PER_WRITER: usize = 25;
+        const READERS: usize = 4;
+        const MATCHES_PER_READER: usize = 200;
+        const REPEATS: usize = 5;
+        const SUB_LATENCY_OPS: usize = 200;
+
+        fn storm_once(
+            subscribe: &(dyn Fn(usize, usize) + Sync),
+            matches: &(dyn Fn() -> usize + Sync),
+            steady_visible: &(dyn Fn() -> bool + Sync),
+        ) -> (f64, f64) {
+            let matched_total = Arc::new(AtomicU64::new(0));
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    scope.spawn(move || {
+                        for i in 0..FILTERS_PER_WRITER {
+                            subscribe(writer, i);
+                        }
+                    });
+                }
+                for _ in 0..READERS {
+                    let matched_total = matched_total.clone();
+                    scope.spawn(move || {
+                        for _ in 0..MATCHES_PER_READER {
+                            let n = matches();
+                            assert!(steady_visible(), "steady subscriber visible under storm");
+                            matched_total.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            let elapsed_secs = start.elapsed().as_secs_f64().max(f64::EPSILON);
+            let total = matched_total.load(Ordering::Relaxed);
+            assert_eq!(total, (READERS * MATCHES_PER_READER) as u64);
+            let subscribes = (WRITERS * FILTERS_PER_WRITER) as u64;
+            (
+                total as f64 / elapsed_secs,
+                subscribes as f64 / elapsed_secs,
+            )
+        }
+
+        fn settled_sub_latency_ns(subscribe_one: &dyn Fn(usize)) -> (f64, f64, f64) {
+            let mut per_op_ns = Vec::with_capacity(SUB_LATENCY_OPS);
+            for i in 0..SUB_LATENCY_OPS {
+                let start = Instant::now();
+                subscribe_one(i);
+                per_op_ns.push(start.elapsed().as_secs_f64() * 1e9);
+            }
+            per_op_ns.sort_by(|a, b| a.total_cmp(b));
+            (
+                per_op_ns[0],
+                per_op_ns[SUB_LATENCY_OPS / 2],
+                per_op_ns[SUB_LATENCY_OPS - 1],
+            )
+        }
+
+        // Before numbers: single-lock baseline, same workload family.
+        let mut base_match = Vec::with_capacity(REPEATS);
+        let mut base_sub = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let baseline = Arc::new(SingleLockBaseline::new());
+            baseline.subscribe(
+                &TopicFilter::new("storm/steady").unwrap(),
+                Subscription::new("steady", 1, QoS::AtMostOnce),
+            );
+            let steady_topic = Topic::new("storm/steady").unwrap();
+            let b = baseline.clone();
+            let (m, s) = storm_once(
+                &|writer, i| {
+                    let filter = TopicFilter::new(format!("storm/w{writer}/t{i}"))
+                        .expect("valid test filter");
+                    b.subscribe(
+                        &filter,
+                        Subscription::new(
+                            format!("storm-w{writer}-{i}"),
+                            writer as u64 * 1000 + i as u64,
+                            QoS::AtMostOnce,
+                        ),
+                    );
+                },
+                &|| b.matches(&steady_topic).len(),
+                &|| {
+                    b.matches(&steady_topic)
+                        .iter()
+                        .any(|s| s.client_id.as_ref() == "steady")
+                },
+            );
+            base_match.push(m);
+            base_sub.push(s);
+            // Baseline correctness: every storm filter resolves exactly.
+            for writer in 0..WRITERS {
+                for i in 0..FILTERS_PER_WRITER {
+                    let topic =
+                        Topic::new(format!("storm/w{writer}/t{i}")).expect("valid test topic");
+                    let matched = baseline.matches(&topic);
+                    assert_eq!(
+                        matched.len(),
+                        1,
+                        "baseline storm filter {writer}/{i} matches once"
+                    );
+                    assert_eq!(
+                        matched.iter().next().unwrap().client_id.as_ref(),
+                        format!("storm-w{writer}-{i}")
+                    );
+                }
+            }
+            // Baseline unsubscribe path (same events as `Router`): remove
+            // one storm filter and confirm it no longer resolves, then
+            // restore it so the baseline keeps full coverage.
+            {
+                let filter = TopicFilter::new("storm/w0/t0").expect("valid test filter");
+                let probe = Topic::new("storm/w0/t0").expect("valid test topic");
+                baseline.unsubscribe(&filter, "storm-w0-0");
+                assert!(
+                    baseline.matches(&probe).is_empty(),
+                    "baseline unsubscribe removes the filter"
+                );
+                baseline.subscribe(&filter, Subscription::new("storm-w0-0", 0, QoS::AtMostOnce));
+                assert_eq!(baseline.matches(&probe).len(), 1);
+            }
+        }
+        base_match.sort_by(|a, b| a.total_cmp(b));
+        base_sub.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "B4-08 baseline storm: matches/s min={:.0} median={:.0} max={:.0}; \
+            subscribes/s min={:.0} median={:.0} max={:.0} \
+            ({} matches + {} subscribes x {REPEATS} repeats)",
+            base_match[0],
+            base_match[REPEATS / 2],
+            base_match[REPEATS - 1],
+            base_sub[0],
+            base_sub[REPEATS / 2],
+            base_sub[REPEATS - 1],
+            READERS * MATCHES_PER_READER,
+            WRITERS * FILTERS_PER_WRITER,
+        );
+        assert!(
+            base_match[0] > 0.0 && base_match[0].is_finite() && base_match[REPEATS - 1].is_finite()
+        );
+        // Baseline settled subscribe latency (before number for SLOP2/SLOP3).
+        let probe = SingleLockBaseline::new();
+        let (bmin, bmed, bmax) = settled_sub_latency_ns(&|i| {
+            let filter = TopicFilter::new(format!("storm/lat/{i}")).expect("valid test filter");
+            probe.subscribe(
+                &filter,
+                Subscription::new(format!("lat-{i}"), 5000 + i as u64, QoS::AtMostOnce),
+            );
+        });
+        eprintln!(
+            "B4-08 baseline subscribe latency: min={bmin:.1}ns median={bmed:.1}ns max={bmax:.1}ns \
+            ({SUB_LATENCY_OPS} subscribes)"
+        );
+        assert!(bmin > 0.0 && bmin.is_finite() && bmax.is_finite());
+
+        // After numbers: CoW router, identical workload.
+        let mut after_match = Vec::with_capacity(REPEATS);
+        let mut after_sub = Vec::with_capacity(REPEATS);
+        let mut last_router: Option<Arc<Router>> = None;
+        let mut last_steady = Topic::new("storm/steady").unwrap();
+        for _ in 0..REPEATS {
+            let router = Arc::new(Router::new());
+            router.subscribe(
+                &TopicFilter::new("storm/steady").unwrap(),
+                Subscription::new("steady", 1, QoS::AtMostOnce),
+            );
+            let steady_topic = Topic::new("storm/steady").unwrap();
+            let r = router.clone();
+            let (m, s) = storm_once(
+                &|writer, i| {
+                    let filter = TopicFilter::new(format!("storm/w{writer}/t{i}"))
+                        .expect("valid test filter");
+                    r.subscribe(
+                        &filter,
+                        Subscription::new(
+                            format!("storm-w{writer}-{i}"),
+                            writer as u64 * 1000 + i as u64,
+                            QoS::AtMostOnce,
+                        ),
+                    );
+                },
+                &|| r.matches(&steady_topic).len(),
+                &|| {
+                    r.matches(&steady_topic)
+                        .iter()
+                        .any(|s| s.client_id.as_ref() == "steady")
+                },
+            );
+            after_match.push(m);
+            after_sub.push(s);
+            last_router = Some(router);
+            last_steady = steady_topic;
+        }
+        after_match.sort_by(|a, b| a.total_cmp(b));
+        after_sub.sort_by(|a, b| a.total_cmp(b));
+        let total = (READERS * MATCHES_PER_READER) as u64;
+        let subscribes = (WRITERS * FILTERS_PER_WRITER) as u64;
+        eprintln!(
+            "B4-08 storm: {total} matches + {subscribes} subscribes per repeat; \
+            matches/s min={:.0} median={:.0} max={:.0}; \
+            subscribes/s min={:.0} median={:.0} max={:.0} \
+            (x {REPEATS} repeats)",
+            after_match[0],
+            after_match[REPEATS / 2],
+            after_match[REPEATS - 1],
+            after_sub[0],
+            after_sub[REPEATS / 2],
+            after_sub[REPEATS - 1],
+        );
+        assert!(
+            after_match[0] > 0.0
+                && after_match[0].is_finite()
+                && after_match[REPEATS - 1].is_finite()
+        );
+        assert!(
+            after_sub[0] > 0.0 && after_sub[0].is_finite() && after_sub[REPEATS - 1].is_finite()
+        );
+        // Settled subscribe latency on the CoW path (writer clone cost).
+        let probe = Router::new();
+        let (amin, amed, amax) = settled_sub_latency_ns(&|i| {
+            let filter = TopicFilter::new(format!("storm/lat/{i}")).expect("valid test filter");
+            probe.subscribe(
+                &filter,
+                Subscription::new(format!("lat-{i}"), 6000 + i as u64, QoS::AtMostOnce),
+            );
+        });
+        eprintln!(
+            "B4-08 subscribe latency: min={amin:.1}ns median={amed:.1}ns max={amax:.1}ns \
+            ({SUB_LATENCY_OPS} subscribes)"
+        );
+        assert!(amin > 0.0 && amin.is_finite() && amax.is_finite());
+
+        // Final snapshot agrees with the sequential expectation on the
+        // last CoW router: every storm filter matches exactly once, plus
+        // wildcard levels and shared-group reduction.
+        let router = last_router.expect("at least one repeat");
+        let steady = router.matches(&last_steady);
+        assert!(steady.iter().any(|s| s.client_id.as_ref() == "steady"));
+        assert_eq!(steady.len(), 1);
+        for writer in 0..WRITERS {
+            for i in 0..FILTERS_PER_WRITER {
+                let topic = Topic::new(format!("storm/w{writer}/t{i}")).expect("valid test topic");
+                let matched = router.matches(&topic);
+                assert_eq!(matched.len(), 1, "storm filter {writer}/{i} matches once");
+                assert_eq!(
+                    matched.iter().next().unwrap().client_id.as_ref(),
+                    format!("storm-w{writer}-{i}")
+                );
+            }
+        }
+        router.subscribe(
+            &TopicFilter::new("storm/+").unwrap(),
+            Subscription::new("wild", 999, QoS::AtMostOnce),
+        );
+        let wild = router.matches(&last_steady);
+        assert_eq!(wild.len(), 2);
+        assert!(wild.iter().any(|s| s.client_id.as_ref() == "wild"));
+        assert!(wild.iter().any(|s| s.client_id.as_ref() == "steady"));
+        router.unsubscribe(&TopicFilter::new("storm/+").unwrap(), "wild");
+        let after = router.matches(&last_steady);
+        assert_eq!(after.len(), 1);
+        assert!(!after.iter().any(|s| s.client_id.as_ref() == "wild"));
+        assert!(after.iter().any(|s| s.client_id.as_ref() == "steady"));
+        // Shared-group reduction still agrees after the storm.
+        router.subscribe(
+            &TopicFilter::new("storm/shared").unwrap(),
+            Subscription::shared("sg-a", 1001, QoS::AtMostOnce, "storm-sg"),
+        );
+        router.subscribe(
+            &TopicFilter::new("storm/shared").unwrap(),
+            Subscription::shared("sg-b", 1002, QoS::AtMostOnce, "storm-sg"),
+        );
+        let shared_topic = Topic::new("storm/shared").unwrap();
+        let reduced = router.matches(&shared_topic);
+        assert_eq!(reduced.len(), 1, "shared group reduces to one member");
+        assert!(router.rr_cursor_count() <= MAX_SHARED_GROUPS);
+        assert!(router.sticky_count() <= MAX_SHARED_GROUPS);
+    }
+
+    #[test]
+    fn router_match_cost_reports_min_median_max() {
+        // B4-08 per-match cost harness (RULEBOOK hot-path row): settled
+        // single-thread matches on one topic, repeated so the gate log
+        // carries min/median/max for the single-lock baseline (before)
+        // and the CoW + sharded-cursor router (after). The match path
+        // under test is `Router::root` snapshot load
+        // (`crates/broker-router/src/lib.rs`, `matches_with_publisher`)
+        // plus the trie walk; shared-group reduction is plain
+        // subscriptions here so the comparison isolates the trie-lock
+        // removal. Asserts only positivity and correctness, never an
+        // absolute time threshold, so it is stable on loaded runners.
+        use std::time::Instant;
+
+        const REPEATS: usize = 5;
+        const MATCHES_PER_REPEAT: usize = 5_000;
+
+        fn settled_cost(matches: &dyn Fn() -> usize, expected: usize) -> (f64, f64, f64, f64) {
+            let mut per_match_ns = Vec::with_capacity(REPEATS);
+            for _ in 0..REPEATS {
+                let start = Instant::now();
+                let mut sink = 0usize;
+                for _ in 0..MATCHES_PER_REPEAT {
+                    sink += matches();
+                }
+                std::hint::black_box(sink);
+                assert_eq!(sink, expected * MATCHES_PER_REPEAT);
+                let ns = start.elapsed().as_secs_f64() * 1e9 / MATCHES_PER_REPEAT as f64;
+                per_match_ns.push(ns);
+            }
+            per_match_ns.sort_by(|a, b| a.total_cmp(b));
+            let min = per_match_ns[0];
+            let median = per_match_ns[REPEATS / 2];
+            let max = per_match_ns[REPEATS - 1];
+            let mean = per_match_ns.iter().sum::<f64>() / REPEATS as f64;
+            (min, median, max, mean)
+        }
+
+        // Before: single global read lock per match.
+        let baseline = SingleLockBaseline::new();
+        baseline.subscribe(
+            &TopicFilter::new("cost/steady").unwrap(),
+            Subscription::new("steady", 1, QoS::AtMostOnce),
+        );
+        baseline.subscribe(
+            &TopicFilter::new("cost/+").unwrap(),
+            Subscription::new("wild", 2, QoS::AtMostOnce),
+        );
+        let btopic = Topic::new("cost/steady").unwrap();
+        assert_eq!(baseline.matches(&btopic).len(), 2);
+        let (bmin, bmed, bmax, bmean) = settled_cost(&|| baseline.matches(&btopic).len(), 2);
+        eprintln!(
+            "B4-08 baseline per-match cost: min={bmin:.1}ns median={bmed:.1}ns max={bmax:.1}ns mean={bmean:.1}ns \
+            ({MATCHES_PER_REPEAT} matches x {REPEATS} repeats)"
+        );
+        assert!(
+            bmin > 0.0 && bmin.is_finite() && bmax.is_finite(),
+            "baseline per-match cost must report positive finite ns/match"
+        );
+
+        let router = Router::new();
+        router.subscribe(
+            &TopicFilter::new("cost/steady").unwrap(),
+            Subscription::new("steady", 1, QoS::AtMostOnce),
+        );
+        router.subscribe(
+            &TopicFilter::new("cost/+").unwrap(),
+            Subscription::new("wild", 2, QoS::AtMostOnce),
+        );
+        let topic = Topic::new("cost/steady").unwrap();
+        assert_eq!(router.matches(&topic).len(), 2);
+
+        let mut per_match_ns = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..MATCHES_PER_REPEAT {
+                sink += router.matches(&topic).len();
+            }
+            std::hint::black_box(sink);
+            assert_eq!(sink, 2 * MATCHES_PER_REPEAT);
+            let ns = start.elapsed().as_secs_f64() * 1e9 / MATCHES_PER_REPEAT as f64;
+            per_match_ns.push(ns);
+        }
+        per_match_ns.sort_by(|a, b| a.total_cmp(b));
+        let min = per_match_ns[0];
+        let median = per_match_ns[REPEATS / 2];
+        let max = per_match_ns[REPEATS - 1];
+        let mean = per_match_ns.iter().sum::<f64>() / REPEATS as f64;
+        eprintln!(
+            "B4-08 per-match cost: min={min:.1}ns median={median:.1}ns max={max:.1}ns mean={mean:.1}ns \
+            ({MATCHES_PER_REPEAT} matches x {REPEATS} repeats)"
+        );
+        assert!(
+            min > 0.0 && min.is_finite() && max.is_finite(),
+            "per-match cost must report positive finite ns/match"
+        );
+        assert!(
+            (mean - median).abs() <= median.max(1.0) * 10.0,
+            "per-match repeats must be broadly consistent"
+        );
     }
 
     #[test]
