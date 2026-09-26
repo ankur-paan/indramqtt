@@ -52,7 +52,7 @@ rsa = { workspace = true }
 jsonwebtoken = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+rustls-pemfile = { version = "2" }
 ring = "0.17"
 picky-krb = "0.12"
 picky-asn1 = { version = "0.10", features = ["time_conversion"] }
