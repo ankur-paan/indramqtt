@@ -31,7 +31,7 @@ tokio-rustls = { version = "0.26" }
 rustls-pemfile = { version = "1" }
 rustls-pki-types = { version = "1" }
 rustls-native-certs = { version = "0.8" }
-webpki-roots = { version = "0.25" }
+webpki-roots = { version = "1.0" }
 tokio-postgres = { version = "0.7" }
 tokio-postgres-rustls = { version = "0.14", features = ["native-certs"] }
 google-cloud-auth = { version = "1" }
