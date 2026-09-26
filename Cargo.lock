@@ -1167,7 +1167,7 @@ dependencies = [
  "mongodb",
  "mysql_async 0.35.1",
  "native-tls",
- "nom 7.1.3",
+ "nom 8.0.0",
  "parking_lot",
  "pbkdf2 0.12.2",
  "picky-asn1",
