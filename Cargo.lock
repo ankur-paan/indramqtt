@@ -953,8 +953,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e65938ed058ef47d92cf8b346cc76ef48984572ade631927e9937b5ffc7662c7"
 dependencies = [
  "base64 0.22.1",
- "blowfish",
+ "blowfish 0.9.1",
  "getrandom 0.2.17",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "bcrypt"
+version = "0.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0cd0bd35a28836d528d2b58ad499bc3c5641d59379421b1be9eeb0c2f2b912a"
+dependencies = [
+ "base64 0.23.1",
+ "blowfish 0.10.0",
+ "getrandom 0.4.3",
  "subtle",
  "zeroize",
 ]
@@ -1081,6 +1094,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blowfish"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62ce3946557b35e71d1bbe07ec385073ce9eda05043f95de134eb578fcf1a298"
+dependencies = [
+ "byteorder",
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "bnum"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1156,7 +1179,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "bcrypt",
+ "bcrypt 0.19.3",
  "broker-config",
  "broker-protocol",
  "der-parser",
@@ -8847,7 +8870,7 @@ checksum = "22802bd283f96eae8146592f211dde0bf5387372ebe8f2469f4e4a15d8ee5799"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "bcrypt",
+ "bcrypt 0.15.1",
  "bytes",
  "chrono",
  "clap",
