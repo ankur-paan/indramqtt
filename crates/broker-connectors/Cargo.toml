@@ -102,4 +102,4 @@ redis = { version = "0.25", default-features = false, features = ["tokio-comp"] 
 
 [dev-dependencies]
 axum = { workspace = true }
-apache-avro = { version = "0.15" }
+apache-avro = { version = "0.21" }
