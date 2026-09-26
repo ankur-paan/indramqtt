@@ -1243,7 +1243,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-pubsub",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "http",
  "jsonwebtoken",
  "lapin",
