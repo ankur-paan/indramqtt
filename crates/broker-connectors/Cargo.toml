@@ -98,7 +98,7 @@ lapin = { version = "4", default-features = false, features = ["tokio", "rustls"
 # Pinned to the 0.25 line: redis 1.x pulls `xxhash-rust` (BSL-1.0)
 # unconditionally, which the licence gate rejects, while 0.25 exposes
 # the same RESP/AUTH/SELECT/multiplexed API without it.
-redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
 axum = { workspace = true }
