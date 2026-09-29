@@ -52,6 +52,7 @@ async fn test_e2e_router_and_rules_pipeline() {
             conn_id: 101,
             qos: QoS::AtLeastOnce,
             group: None,
+            tenant: broker_router::DEFAULT_TENANT_ID.into(),
         },
     );
 
@@ -210,7 +211,8 @@ type E2eBind = (String, bool, u16, Option<String>, Option<Vec<u8>>);
 /// Decode a `BindConnection` metadata body into [`E2eBind`], mirroring
 /// the kernel's `decode_bind_meta` contract (`ClientIdLen:16be |
 /// ClientId | Flags:8 | Keepalive:16be`, plus the optional trailing
-/// `UserLen | Username | PassLen | Password` credentials section).
+/// `UserLen | Username | PassLen | Password` credentials section and the
+/// optional trailing `PeerLen:16be | PeerIp` peer-address section).
 fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
     if meta.len() < 5 {
         return None;
@@ -231,19 +233,46 @@ fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
         }
         let user_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
         if rest.len() < 2 + user_len + 2 {
-            return None;
+            // Too short for credentials: only a peer-only anonymous bind
+            // (peer-aware edge appends `PeerLen | PeerIp`) decodes here.
+            e2e_decode_peer_section(rest)?;
+            (None, None)
+        } else {
+            let username = std::str::from_utf8(&rest[2..2 + user_len])
+                .ok()?
+                .to_string();
+            let base = 2 + user_len;
+            let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
+            if rest.len() < base + 2 + pass_len {
+                return None;
+            }
+            let password = rest[base + 2..base + 2 + pass_len].to_vec();
+            let tail = &rest[base + 2 + pass_len..];
+            if !tail.is_empty() {
+                // Optional trailing peer-address section; anything else
+                // is malformed trailing garbage.
+                e2e_decode_peer_section(tail)?;
+            }
+            (Some(username), Some(password))
         }
-        let username = std::str::from_utf8(&rest[2..2 + user_len])
-            .ok()?
-            .to_string();
-        let pass_len = u16::from_be_bytes([rest[2 + user_len], rest[3 + user_len]]) as usize;
-        if rest.len() != 4 + user_len + pass_len {
-            return None;
-        }
-        let password = rest[4 + user_len..].to_vec();
-        (Some(username), Some(password))
     };
     Some((client_id, flags & 0x01 != 0, keepalive, username, password))
+}
+
+/// Decode one peer-address section `PeerLen:16be | PeerIp`: exactly those
+/// bytes and an IP literal, otherwise `None`. Mirrors the kernel's
+/// `decode_peer_section`.
+fn e2e_decode_peer_section(section: &[u8]) -> Option<String> {
+    if section.len() < 2 {
+        return None;
+    }
+    let peer_len = u16::from_be_bytes([section[0], section[1]]) as usize;
+    if section.len() != 2 + peer_len {
+        return None;
+    }
+    let literal = std::str::from_utf8(&section[2..]).ok()?;
+    literal.parse::<std::net::IpAddr>().ok()?;
+    Some(literal.to_string())
 }
 
 /// Decode an `UnbindConnection` metadata body (`ClientIdLen:16be |
@@ -512,7 +541,7 @@ async fn e2e_command_output(
 /// free on Windows may be taken in WSL). Returns `None` with a logged
 /// reason when no runtime exists, in which case the caller skips instead
 /// of failing.
-async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
+async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ebin = manifest.join("../../beam/ebin");
     let ebin = ebin.canonicalize().unwrap_or(ebin);
@@ -530,6 +559,12 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral MQTT port");
             probe.local_addr().expect("MQTT port").port()
         };
+        // The plaintext WebSocket listener rides beside MQTT on its own
+        // ephemeral port so parallel tests never share 8083.
+        let ws_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral WS port");
+            probe.local_addr().expect("WS port").port()
+        };
         let args = vec![
             "-noshell".to_string(),
             "-pa".to_string(),
@@ -537,6 +572,9 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
             "-indra_edge".to_string(),
             "mqtt_port".to_string(),
             mqtt_port.to_string(),
+            "-indra_edge".to_string(),
+            "ws_port".to_string(),
+            ws_port.to_string(),
             "-indra_edge".to_string(),
             "kernel_host".to_string(),
             "\"127.0.0.1\"".to_string(),
@@ -556,6 +594,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
                 proxy: None,
             },
             mqtt_port,
+            ws_port,
         ));
     }
     // Windows fallback: Erlang lives in WSL (this repo's edge toolchain).
@@ -612,6 +651,26 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
             return None;
         }
         let mqtt_port: u16 = String::from_utf8_lossy(&probe.stdout).trim().parse().ok()?;
+        // The plaintext WebSocket listener gets its own guest-side
+        // ephemeral port beside MQTT for the same reason.
+        let ws_probe = e2e_command_output(
+            "wsl.exe",
+            &[
+                "-e",
+                "bash",
+                "-lc",
+                "python3 -c 'import socket; s = socket.socket(); s.bind((\"0.0.0.0\", 0)); print(s.getsockname()[1])'",
+            ],
+            KICK_E2E_PROBE,
+        )
+        .await?;
+        if !ws_probe.status.success() {
+            return None;
+        }
+        let ws_port: u16 = String::from_utf8_lossy(&ws_probe.stdout)
+            .trim()
+            .parse()
+            .ok()?;
         // Firewall proxy (see `E2E_PROXY_SCRIPT`): the edge dials the
         // proxy through the gateway; the proxy forwards to `bl_port`
         // on loopback. Without it the edge's SYNs never reach this
@@ -659,6 +718,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
         let script = format!(
             "cd /tmp && erl -noshell -pa '{wsl_ebin}' \
              -indra_edge mqtt_port {mqtt_port} \
+             -indra_edge ws_port {ws_port} \
              -indra_edge kernel_host '\"{gateway}\"' \
              -indra_edge kernel_port {proxy_port} \
              -eval '{{ok,_}} = application:ensure_all_started(indra_edge), timer:sleep(infinity).'"
@@ -686,6 +746,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16)> {
                 proxy: Some(proxy),
             },
             mqtt_port,
+            ws_port,
         ));
     }
     eprintln!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH");
@@ -768,7 +829,7 @@ async fn kicked_mqtt_client_sees_disconnect() {
         .expect("bind BrokerLink listener in time")
         .expect("bind BrokerLink listener");
     let bl_port = bl_listener.local_addr().expect("BrokerLink addr").port();
-    let (edge, mqtt_port) = match e2e_edge_target(bl_port).await {
+    let (edge, mqtt_port, _ws_port) = match e2e_edge_target(bl_port).await {
         // SKIP already logged when no runtime exists.
         Some(target) => target,
         None => return,
@@ -1034,6 +1095,115 @@ fn shard_encode_bind(client_id: &str, clean_start: bool, keepalive: u16) -> byte
     meta.push(u8::from(clean_start));
     meta.extend_from_slice(&keepalive.to_be_bytes());
     bytes::Bytes::from(meta)
+}
+
+/// Will-carrying bind parameters for [`shard_encode_bind_with_will_and_alias`].
+/// Grouped in one struct so the helper stays under the argument-count lint.
+struct ShardWillBind<'a> {
+    client_id: &'a str,
+    clean_start: bool,
+    keepalive: u16,
+    will_topic: &'a str,
+    will_payload: &'a [u8],
+    will_qos: u8,
+    will_retain: bool,
+    client_alias_max: u16,
+}
+
+/// Encode `BindConnection` metadata with an F1-01 last-will section plus
+/// the B4-05 trailing `ClientAliasMax:16be` (the canonical encoding the
+/// edge sends for a WebSocket connection carrying PSK identity, will and
+/// alias state together): will-bit head, then
+/// `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
+/// PayloadLen:32be | Payload`, then the alias maximum.
+fn shard_encode_bind_with_will_and_alias(params: ShardWillBind<'_>) -> bytes::Bytes {
+    let id = params.client_id.as_bytes();
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.push(u8::from(params.clean_start) | 0x02);
+    meta.extend_from_slice(&params.keepalive.to_be_bytes());
+    meta.push(params.will_qos);
+    meta.push(u8::from(params.will_retain));
+    meta.extend_from_slice(&(params.will_topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(params.will_topic.as_bytes());
+    meta.extend_from_slice(&(params.will_payload.len() as u32).to_be_bytes());
+    meta.extend_from_slice(params.will_payload);
+    meta.extend_from_slice(&params.client_alias_max.to_be_bytes());
+    bytes::Bytes::from(meta)
+}
+
+/// Encode `PubAckIn` metadata (`PacketId:16be | RC:8`) for one downlink ack.
+fn shard_encode_puback(packet_id: u16) -> bytes::Bytes {
+    let mut meta = Vec::with_capacity(3);
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(0u8);
+    bytes::Bytes::from(meta)
+}
+
+/// Encode `DisconnectIn`/`UnbindConnection` metadata (`IdLen:16be | ClientId`).
+fn shard_encode_client_id(client_id: &str) -> bytes::Bytes {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::with_capacity(2 + id.len());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    bytes::Bytes::from(meta)
+}
+
+/// One ephemeral loopback port for a test kernel's BrokerLink listener.
+fn shard_ephemeral_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    probe.local_addr().expect("port").port()
+}
+
+/// Spawn one real kernel with the given extra argv (after the standard
+/// `--brokerlink-bind/--api-bind/--data-dir/--allow-anonymous` prefix),
+/// wait for its BrokerLink listener, and return the child plus address.
+/// The caller owns `child.kill()` (plus scratch cleanup where relevant).
+async fn shard_spawn_kernel(
+    extra_argv: &[&str],
+    scratch: &std::path::Path,
+    bl_port: u16,
+) -> (tokio::process::Child, std::net::SocketAddr) {
+    let mut child = tokio::process::Command::new(shard_kernel_binary());
+    child
+        .arg("--brokerlink-bind")
+        .arg(format!("127.0.0.1:{bl_port}"))
+        .arg("--api-bind")
+        .arg("")
+        .arg("--data-dir")
+        .arg(scratch)
+        .arg("--allow-anonymous");
+    for arg in extra_argv {
+        child.arg(arg);
+    }
+    let mut child = child
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bl_port}").parse().expect("addr");
+    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill().await;
+                    panic!("kernel never opened BrokerLink {bl_port}: {error}");
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("kernel exited during boot: {status}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    (child, addr)
 }
 
 /// Decode `SessionBinding` metadata into `(session_id, present, rc,
@@ -1523,14 +1693,11 @@ async fn sharded_transports_do_not_serialize() {
                 // published while detached. No assertion below changes.
                 let pid = shard_downlink_packet_id(&frame.metadata);
                 assert_ne!(pid, 0, "QoS 1 downlink carries a packet id");
-                let mut ack_meta = Vec::with_capacity(3);
-                ack_meta.extend_from_slice(&pid.to_be_bytes());
-                ack_meta.push(0u8);
                 let ack = BrokerFrame::new(
                     OpCode::PubAckIn,
                     11,
                     400 + seen.len() as u64,
-                    bytes::Bytes::from(ack_meta),
+                    shard_encode_puback(pid),
                     bytes::Bytes::new(),
                 )
                 .expect("valid puback frame");
@@ -1603,4 +1770,1404 @@ async fn sharded_transports_do_not_serialize() {
 
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// SY-02 edge harness: a spawned kernel plus the shipped Erlang edge.
+///
+/// The three SY-02 tests speak real MQTT through the edge (TCP and
+/// WebSocket) the way production clients do, never `SessionManager` or
+/// `Router` directly. Returns `None` (with a logged SKIP reason, like
+/// [`e2e_edge_target`]) when the edge cannot run here; a spawned edge
+/// that never opens its ports is a loud failure, never a skip.
+struct Sy02Edge {
+    child: tokio::process::Child,
+    edge: EdgeTarget,
+    log: std::path::PathBuf,
+    mqtt_port: u16,
+    ws_port: u16,
+}
+
+async fn sy02_spawn_edge(bl_port: u16) -> Option<Sy02Edge> {
+    use std::time::{Duration, Instant};
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ebin = manifest.join("../../beam/ebin");
+    // The WebSocket listener beams must exist; without them the edge
+    // supervisor cannot start and no port ever opens.
+    if !ebin.join("indra_ws_listener.beam").is_file() {
+        eprintln!(
+            "SKIP sy02 edge test: no WS edge beams at {} (build beam/ first)",
+            ebin.display()
+        );
+        return None;
+    }
+    let (edge, mqtt_port, ws_port) = e2e_edge_target(bl_port).await?;
+    let log = std::env::temp_dir().join(format!(
+        "indramqtt-sy02-edge-{}-{mqtt_port}.log",
+        std::process::id()
+    ));
+    let edge_stderr = std::fs::File::create(&log).expect("edge log file");
+    let mut child = tokio::process::Command::new(&edge.program)
+        .args(&edge.args)
+        .stdout(std::process::Stdio::null())
+        .stderr(edge_stderr)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn shipped edge");
+    // Both listeners must open: the TCP MQTT port and the WebSocket
+    // port. Fail fast when the VM dies instead of polling dead ports.
+    let deadline = Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        let mqtt_open = tokio::net::TcpStream::connect((edge.mqtt_host.as_str(), mqtt_port))
+            .await
+            .is_ok();
+        let ws_open = tokio::net::TcpStream::connect((edge.mqtt_host.as_str(), ws_port))
+            .await
+            .is_ok();
+        if mqtt_open && ws_open {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            let tail = &log_text[log_text.len().saturating_sub(2000)..];
+            panic!("shipped edge exited during boot: {status}\nedge log tail:\n{tail}");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill().await;
+            panic!("shipped edge never opened MQTT {mqtt_port} and WS {ws_port}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Some(Sy02Edge {
+        child,
+        edge,
+        log,
+        mqtt_port,
+        ws_port,
+    })
+}
+
+impl Sy02Edge {
+    fn host(&self) -> &str {
+        &self.edge.mqtt_host
+    }
+
+    async fn finish(mut self) {
+        let _ = self.child.kill().await;
+        if let Some((program, args)) = self.edge.cleanup {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = e2e_command_output(&program, &refs, KICK_E2E_STEP).await;
+        }
+        if let Some(mut proxy) = self.edge.proxy {
+            let _ = proxy.kill().await;
+        }
+        let _ = std::fs::remove_file(&self.log);
+    }
+}
+
+/// Encode an MQTT remaining length (variable-byte integer).
+fn sy02_mqtt_rl(mut len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (len % 128) as u8;
+        len /= 128;
+        if len > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Encode an MQTT UTF-8 string (`len:16be | bytes`).
+fn sy02_mqtt_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + s.len());
+    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+/// Minimal MQTT 3.1.1 CONNECT with optional credentials.
+fn sy02_connect311(
+    client_id: &str,
+    clean_start: bool,
+    keepalive: u16,
+    creds: Option<(&str, &[u8])>,
+) -> Vec<u8> {
+    let mut rest = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04];
+    let mut flags = 0u8;
+    if clean_start {
+        flags |= 0x02;
+    }
+    if let Some((_, pass)) = creds {
+        flags |= 0x80;
+        if !pass.is_empty() {
+            flags |= 0x40;
+        }
+    }
+    rest.push(flags);
+    rest.extend_from_slice(&keepalive.to_be_bytes());
+    rest.extend_from_slice(&sy02_mqtt_str(client_id));
+    if let Some((user, pass)) = creds {
+        rest.extend_from_slice(&sy02_mqtt_str(user));
+        rest.extend_from_slice(&(pass.len() as u16).to_be_bytes());
+        rest.extend_from_slice(pass);
+    }
+    let mut packet = vec![0x10];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// MQTT 5 CONNECT with optional credentials, an optional last will and
+/// the client's Topic Alias Maximum (property 34, the kernel outbound
+/// bound; 0 sends an empty property section).
+fn sy02_connect5(
+    client_id: &str,
+    clean_start: bool,
+    keepalive: u16,
+    creds: Option<(&str, &[u8])>,
+    will: Option<(&str, &[u8])>,
+    alias_max: u16,
+) -> Vec<u8> {
+    let mut rest = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05];
+    let mut flags = 0u8;
+    if let Some((_, pass)) = creds {
+        flags |= 0x80;
+        if !pass.is_empty() {
+            flags |= 0x40;
+        }
+    }
+    if will.is_some() {
+        flags |= 0x04;
+    }
+    if clean_start {
+        flags |= 0x02;
+    }
+    rest.push(flags);
+    rest.extend_from_slice(&keepalive.to_be_bytes());
+    if alias_max == 0 {
+        rest.push(0x00);
+    } else {
+        rest.push(0x03);
+        rest.push(34);
+        rest.extend_from_slice(&alias_max.to_be_bytes());
+    }
+    rest.extend_from_slice(&sy02_mqtt_str(client_id));
+    if will.is_some() {
+        // Empty will-property section, then topic and payload.
+        rest.push(0x00);
+    }
+    if let Some((will_topic, will_payload)) = will {
+        rest.extend_from_slice(&sy02_mqtt_str(will_topic));
+        rest.extend_from_slice(&(will_payload.len() as u16).to_be_bytes());
+        rest.extend_from_slice(will_payload);
+    }
+    if let Some((user, pass)) = creds {
+        rest.extend_from_slice(&sy02_mqtt_str(user));
+        rest.extend_from_slice(&(pass.len() as u16).to_be_bytes());
+        rest.extend_from_slice(pass);
+    }
+    let mut packet = vec![0x10];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// Classic SUBSCRIBE (`packet id | filter | qos ...`): the shape the
+/// edge decodes on every session, 3.1.1 and 5 alike.
+fn sy02_subscribe(packet_id: u16, subs: &[(&str, u8)]) -> Vec<u8> {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&packet_id.to_be_bytes());
+    for (filter, qos) in subs {
+        rest.extend_from_slice(&sy02_mqtt_str(filter));
+        rest.push(*qos);
+    }
+    let mut packet = vec![0x82];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// MQTT 3.1.1 PUBLISH (client to edge).
+fn sy02_publish311(topic: &str, packet_id: u16, qos: u8, retain: bool, payload: &[u8]) -> Vec<u8> {
+    let mut rest = sy02_mqtt_str(topic);
+    if qos > 0 {
+        rest.extend_from_slice(&packet_id.to_be_bytes());
+    }
+    rest.extend_from_slice(payload);
+    let mut flags = qos << 1;
+    if retain {
+        flags |= 0x01;
+    }
+    let mut packet = vec![0x30 | flags];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// MQTT 5 PUBLISH (client to edge): `topic | packet id | properties |
+/// payload`. `Some(alias)` registers the alias (property 35);
+/// `None` sends an empty property section.
+fn sy02_publish5(
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    alias: Option<u16>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut rest = sy02_mqtt_str(topic);
+    if qos > 0 {
+        rest.extend_from_slice(&packet_id.to_be_bytes());
+    }
+    match alias {
+        Some(value) => {
+            rest.push(0x03);
+            rest.push(35);
+            rest.extend_from_slice(&value.to_be_bytes());
+        }
+        None => rest.push(0x00),
+    }
+    rest.extend_from_slice(payload);
+    let mut flags = qos << 1;
+    if retain {
+        flags |= 0x01;
+    }
+    let mut packet = vec![0x30 | flags];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// Two-byte PUBACK (packet id only): the shape the edge forwards to the
+/// kernel on every session, 3.1.1 and 5 alike.
+fn sy02_puback(packet_id: u16) -> Vec<u8> {
+    vec![0x40, 0x02, (packet_id >> 8) as u8, (packet_id & 0xff) as u8]
+}
+
+/// Decode one variable-byte integer, returning `(value, bytes used)`.
+fn sy02_varint(mut bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    let mut used = 0usize;
+    loop {
+        let byte = *bytes.first()?;
+        bytes = &bytes[1..];
+        used += 1;
+        value += ((byte & 0x7F) as usize) * (128usize.pow(used as u32 - 1));
+        if byte & 0x80 == 0 {
+            return Some((value, used));
+        }
+        if used == 4 {
+            return None;
+        }
+    }
+}
+
+/// Parse a 3.1.1 CONNACK body into `(session_present, return_code)`.
+fn sy02_parse_connack311(body: &[u8]) -> (bool, u8) {
+    assert_eq!(body.len(), 2, "3.1.1 CONNACK body is two bytes");
+    (body[0] & 0x01 != 0, body[1])
+}
+
+/// Parse an MQTT 5 CONNACK body into `(session_present, reason, alias_max)`.
+/// Scans the property section for the Topic Alias Maximum (34).
+fn sy02_parse_connack5(body: &[u8]) -> (bool, u8, u16) {
+    assert!(
+        body.len() >= 3,
+        "MQTT 5 CONNACK carries flags, reason and properties"
+    );
+    let present = body[0] & 0x01 != 0;
+    let reason = body[1];
+    let (prop_len, used) = sy02_varint(&body[2..]).expect("CONNACK property length");
+    let mut props = &body[2 + used..];
+    assert!(props.len() >= prop_len, "CONNACK properties fit the body");
+    props = &props[..prop_len];
+    let mut alias_max = 0u16;
+    while !props.is_empty() {
+        let (id, used) = sy02_varint(props).expect("CONNACK property id");
+        props = &props[used..];
+        match id {
+            34 => {
+                assert!(props.len() >= 2, "alias-maximum property carries a u16");
+                alias_max = u16::from_be_bytes([props[0], props[1]]);
+                props = &props[2..];
+            }
+            _ => panic!("unexpected CONNACK property {id}"),
+        }
+    }
+    (present, reason, alias_max)
+}
+
+/// Parse a classic SUBACK body into `(packet_id, granted codes)`.
+fn sy02_parse_suback(body: &[u8]) -> (u16, Vec<u8>) {
+    assert!(body.len() >= 3, "SUBACK carries a packet id plus codes");
+    (u16::from_be_bytes([body[0], body[1]]), body[2..].to_vec())
+}
+
+/// One PUBLISH as the edge delivers it to a subscribing client.
+struct Sy02Publish {
+    topic: String,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    dup: bool,
+    alias: u16,
+    payload: Vec<u8>,
+}
+
+/// Parse a classic-shape PUBLISH (no property section): live retained
+/// replays, offline replays and every delivery toward a client that
+/// negotiated no outbound alias.
+fn sy02_parse_publish_classic(header: u8, body: &[u8]) -> Sy02Publish {
+    let dup = header & 0x08 != 0;
+    let qos = (header >> 1) & 0x03;
+    let retain = header & 0x01 != 0;
+    assert!(body.len() >= 2, "PUBLISH carries a topic");
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert!(body.len() >= 2 + topic_len, "PUBLISH topic fits the body");
+    let topic = std::str::from_utf8(&body[2..2 + topic_len])
+        .expect("PUBLISH topic UTF-8")
+        .to_string();
+    let mut rest = &body[2 + topic_len..];
+    let packet_id = if qos > 0 {
+        assert!(rest.len() >= 2, "PUBLISH carries a packet id");
+        let id = u16::from_be_bytes([rest[0], rest[1]]);
+        rest = &rest[2..];
+        id
+    } else {
+        0
+    };
+    Sy02Publish {
+        topic,
+        packet_id,
+        qos,
+        retain,
+        dup,
+        alias: 0,
+        payload: rest.to_vec(),
+    }
+}
+
+/// Parse an alias-carrying PUBLISH (the edge appends the alias property
+/// after a one-byte property length when the kernel assigned one):
+/// live deliveries toward a subscriber that negotiated a maximum.
+fn sy02_parse_publish_alias(header: u8, body: &[u8]) -> Sy02Publish {
+    let dup = header & 0x08 != 0;
+    let qos = (header >> 1) & 0x03;
+    let retain = header & 0x01 != 0;
+    assert!(body.len() >= 3, "PUBLISH carries a topic and properties");
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert!(body.len() > 2 + topic_len, "PUBLISH topic fits the body");
+    let topic = std::str::from_utf8(&body[2..2 + topic_len])
+        .expect("PUBLISH topic UTF-8")
+        .to_string();
+    let mut rest = &body[2 + topic_len..];
+    let packet_id = if qos > 0 {
+        assert!(rest.len() >= 2, "PUBLISH carries a packet id");
+        let id = u16::from_be_bytes([rest[0], rest[1]]);
+        rest = &rest[2..];
+        id
+    } else {
+        0
+    };
+    let (prop_len, used) = sy02_varint(rest).expect("PUBLISH property length");
+    rest = &rest[used..];
+    assert!(rest.len() >= prop_len, "PUBLISH properties fit the body");
+    let mut props = &rest[..prop_len];
+    let mut alias = 0u16;
+    while !props.is_empty() {
+        let (id, used) = sy02_varint(props).expect("PUBLISH property id");
+        props = &props[used..];
+        match id {
+            35 => {
+                assert!(props.len() >= 2, "alias property carries a u16");
+                alias = u16::from_be_bytes([props[0], props[1]]);
+                props = &props[2..];
+            }
+            _ => panic!("unexpected PUBLISH property {id}"),
+        }
+    }
+    assert_ne!(alias, 0, "alias-carrying PUBLISH holds a nonzero alias");
+    Sy02Publish {
+        topic,
+        packet_id,
+        qos,
+        retain,
+        dup,
+        alias,
+        payload: rest[prop_len..].to_vec(),
+    }
+}
+
+/// Connect a TCP MQTT client and read its CONNACK, retrying through edge
+/// boot: the edge accepts the socket before its BrokerLink shard is up,
+/// and an early CONNECT can be dropped. Uses a throwaway clean session
+/// so retries leave no state behind.
+async fn sy02_mqtt_ready(host: &str, port: u16) {
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    let deadline = Instant::now() + SHARD_E2E_BOOT;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let dial =
+            tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
+                .await;
+        if let Ok(Ok(mut sock)) = dial {
+            let probe = sy02_connect311(&format!("sy02-probe-{attempt}"), true, 60, None);
+            let sent = tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&probe)).await;
+            if sent.as_ref().is_ok_and(|r| r.is_ok()) {
+                if let Ok(Ok((head, body))) =
+                    tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sock)).await
+                {
+                    if head == 0x20 && body == vec![0x00, 0x00] {
+                        return;
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("edge MQTT {port} never answered a CONNECT");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// RFC 6455 example key: the server cannot echo the right accept value
+/// without computing it, so asserting the known answer verifies the
+/// handshake.
+const SY02_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+const SY02_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+/// Complete a WebSocket upgrade for MQTT against the edge and verify
+/// the 101 answer (accept key plus `mqtt` subprotocol).
+async fn sy02_ws_handshake(
+    sock: &mut tokio::net::TcpStream,
+    host: &str,
+    port: u16,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = format!(
+        "GET /mqtt HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {SY02_WS_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n"
+    );
+    sock.write_all(request.as_bytes()).await?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        sock.read_exact(&mut byte).await?;
+        head.push(byte[0]);
+        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+            break;
+        }
+        if head.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WS handshake head too long",
+            ));
+        }
+    }
+    let head_text = String::from_utf8_lossy(&head);
+    let mut lines = head_text.lines();
+    let status = lines.next().unwrap_or_default();
+    assert!(
+        status.starts_with("HTTP/1.1 101"),
+        "WS upgrade accepted, got: {status}"
+    );
+    let mut accept_ok = false;
+    let mut proto_ok = false;
+    for line in lines {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Sec-WebSocket-Accept:") {
+            accept_ok = value.trim() == SY02_WS_ACCEPT;
+        } else if let Some(value) = line.strip_prefix("Sec-WebSocket-Protocol:") {
+            proto_ok = value.split(',').any(|token| token.trim() == "mqtt");
+        }
+    }
+    assert!(accept_ok, "WS accept key matches the offered key");
+    assert!(proto_ok, "WS subprotocol negotiates mqtt");
+    Ok(())
+}
+
+/// Send one masked client-to-server binary frame.
+async fn sy02_ws_send(sock: &mut tokio::net::TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    // Fixed mask: RFC-compliant (present), deterministic for the harness.
+    const MASK: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+    let mut frame = vec![0x82];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() < 65536 {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&MASK);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ MASK[index % 4]);
+    }
+    sock.write_all(&frame).await
+}
+
+/// What one server-to-client frame read yields.
+enum Sy02WsMsg {
+    Binary(Vec<u8>),
+    Closed,
+}
+
+/// Read server frames until a binary message or a close arrives,
+/// answering pings on the way. Only used with a caller timeout.
+async fn sy02_ws_recv(sock: &mut tokio::net::TcpStream) -> std::io::Result<Sy02WsMsg> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let mut head = [0u8; 2];
+        sock.read_exact(&mut head).await?;
+        let opcode = head[0] & 0x0F;
+        let masked = head[1] & 0x80 != 0;
+        assert!(!masked, "server-to-client frames are unmasked");
+        let mut length = (head[1] & 0x7F) as u64;
+        if length == 126 {
+            let mut ext = [0u8; 2];
+            sock.read_exact(&mut ext).await?;
+            length = u16::from_be_bytes(ext) as u64;
+        } else if length == 127 {
+            let mut ext = [0u8; 8];
+            sock.read_exact(&mut ext).await?;
+            length = u64::from_be_bytes(ext);
+        }
+        assert!(length <= 16_777_216, "WS frame bounded");
+        let mut payload = vec![0u8; length as usize];
+        sock.read_exact(&mut payload).await?;
+        match opcode {
+            0x2 => return Ok(Sy02WsMsg::Binary(payload)),
+            0x8 => return Ok(Sy02WsMsg::Closed),
+            0x9 => {
+                // Answer pings so an idle peer is never dropped: one
+                // masked pong carrying the ping payload.
+                const MASK: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+                let mut frame = vec![0x8A];
+                if payload.len() < 126 {
+                    frame.push(0x80 | payload.len() as u8);
+                } else {
+                    frame.push(0x80 | 126);
+                    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                }
+                frame.extend_from_slice(&MASK);
+                for (index, byte) in payload.iter().enumerate() {
+                    frame.push(byte ^ MASK[index % 4]);
+                }
+                sock.write_all(&frame).await?;
+                continue;
+            }
+            0xA => continue,
+            other => panic!("unexpected WS opcode {other}"),
+        }
+    }
+}
+
+/// SY-02: a last will fires to a subscriber on ungraceful close, through
+/// the real broker, on both transports.
+///
+/// The edge sends one canonical bind for a WebSocket connection carrying
+/// PSK identity, will and alias state together; the kernel cannot tell WS
+/// binds from TCP binds past that. The first leg drives that exact
+/// encoding (will section plus trailing `ClientAliasMax`) over a real
+/// BrokerLink socket: the subscriber binds and subscribes, the publisher
+/// binds with a last will, drops with `DisconnectIn` (no
+/// `DISCONNECT`/unbind), and the subscriber's transport receives the
+/// will payload. The second leg connects a real MQTT 5 client over
+/// WebSocket through the shipped edge with a will, drops the socket with
+/// no DISCONNECT, and the same subscriber receives that will too. Bind,
+/// subscribe, disconnect and delivery all run through the broker, never
+/// the store.
+#[tokio::test]
+async fn sy02_ws_mqtt5_will_fires_to_subscriber() {
+    use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+    let scratch = std::env::temp_dir().join(format!(
+        "indramqtt-sy02-will-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let bl_port = shard_ephemeral_port();
+    let (mut child, addr) = shard_spawn_kernel(&[], &scratch, bl_port).await;
+
+    let sub_io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("subscriber dial in time")
+        .expect("subscriber dial");
+    let sub = FramedTransport::new(sub_io);
+    let pub_io = tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("publisher dial in time")
+        .expect("publisher dial");
+    let publisher = FramedTransport::new(pub_io);
+
+    // Subscriber binds durably and subscribes to the will topic.
+    let (_, present) = shard_bind(&sub, 7001, "sy02-ws-sub", false).await;
+    assert!(!present, "first durable bind reports session_present=false");
+    let sub_frame = BrokerFrame::new(
+        OpCode::SubscribeIn,
+        7001,
+        2,
+        shard_encode_subscribe(1, "sy02-ws-sub", &[("sy02/ws/will", 0)]),
+        bytes::Bytes::new(),
+    )
+    .expect("valid subscribe frame");
+    tokio::time::timeout(SHARD_E2E_STEP, sub.send(sub_frame))
+        .await
+        .expect("subscribe in time")
+        .expect("subscribe");
+    let suback = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
+        .await
+        .expect("suback in time")
+        .expect("suback");
+    assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+    assert_eq!(&suback.metadata[..], &[0x00, 0x01, 0x00]);
+
+    // Publisher binds with the WS-equivalent encoding: will section plus
+    // the client's alias maximum. CONNACK carries the kernel alias bound.
+    let pub_bind = BrokerFrame::new(
+        OpCode::BindConnection,
+        7002,
+        1,
+        shard_encode_bind_with_will_and_alias(ShardWillBind {
+            client_id: "sy02-ws-pub",
+            clean_start: true,
+            keepalive: 60,
+            will_topic: "sy02/ws/will",
+            will_payload: b"ws-will-bytes",
+            will_qos: 0,
+            will_retain: false,
+            client_alias_max: 10,
+        }),
+        bytes::Bytes::new(),
+    )
+    .expect("valid bind frame");
+    tokio::time::timeout(SHARD_E2E_STEP, publisher.send(pub_bind))
+        .await
+        .expect("pub bind in time")
+        .expect("pub bind send");
+    let pub_reply = tokio::time::timeout(SHARD_E2E_STEP, publisher.recv())
+        .await
+        .expect("pub bind reply in time")
+        .expect("pub bind reply");
+    assert_eq!(pub_reply.header.opcode, OpCode::SessionBinding);
+    let (_, _, rc, alias_max) = shard_decode_binding(&pub_reply.metadata);
+    assert_eq!(rc, 0, "will-carrying bind must be accepted");
+    assert!(alias_max > 0, "CONNACK carries the alias maximum");
+
+    // Ungraceful close: DisconnectIn with no preceding unbind (no clean
+    // DISCONNECT). The kernel fires the stored will once.
+    let drop_frame = BrokerFrame::new(
+        OpCode::DisconnectIn,
+        7002,
+        2,
+        shard_encode_client_id("sy02-ws-pub"),
+        bytes::Bytes::new(),
+    )
+    .expect("valid disconnect frame");
+    tokio::time::timeout(SHARD_E2E_STEP, publisher.send(drop_frame))
+        .await
+        .expect("disconnect in time")
+        .expect("disconnect send");
+
+    // The subscriber receives the will over its live transport.
+    let downlink = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
+        .await
+        .expect("will arrives in time")
+        .expect("will delivery");
+    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
+    assert_eq!(downlink.header.conn_id, 7001);
+    assert_eq!(
+        downlink.payload,
+        bytes::Bytes::from_static(b"ws-will-bytes")
+    );
+    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
+    assert_eq!(topic, "sy02/ws/will");
+
+    // Second leg: a real MQTT 5 client over WebSocket. The edge is
+    // spawned against the same kernel; the publisher completes the WS
+    // upgrade, connects with a will, and drops the socket with no
+    // DISCONNECT and no WS close frame. The same subscriber receives
+    // the will, proving the WS transport gets will handling exactly
+    // like the BrokerLink path above.
+    let edge = match sy02_spawn_edge(bl_port).await {
+        Some(edge) => edge,
+        None => {
+            // SKIP already logged: the kernel leg above still verified
+            // the will through the broker.
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+    };
+    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+    let ws_io = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.ws_port)),
+    )
+    .await
+    .expect("WS dial in time")
+    .expect("WS dial");
+    let mut ws = ws_io;
+    tokio::time::timeout(
+        SHARD_E2E_STEP,
+        sy02_ws_handshake(&mut ws, edge.host(), edge.ws_port),
+    )
+    .await
+    .expect("WS handshake in time")
+    .expect("WS handshake");
+    let connect = sy02_connect5(
+        "sy02-ws5-pub",
+        true,
+        60,
+        None,
+        Some(("sy02/ws/will", b"ws5-will-bytes")),
+        10,
+    );
+    tokio::time::timeout(SHARD_E2E_STEP, sy02_ws_send(&mut ws, &connect))
+        .await
+        .expect("WS CONNECT in time")
+        .expect("WS CONNECT send");
+    let connack = tokio::time::timeout(SHARD_E2E_STEP, sy02_ws_recv(&mut ws))
+        .await
+        .expect("WS CONNACK in time")
+        .expect("WS CONNACK");
+    let (present, reason, alias_max) = match connack {
+        Sy02WsMsg::Binary(frame) => {
+            assert_eq!(frame[0] & 0xF0, 0x20, "edge answers with CONNACK");
+            let body = &frame[2..];
+            sy02_parse_connack5(body)
+        }
+        Sy02WsMsg::Closed => panic!("edge closed the WS socket on CONNECT"),
+    };
+    assert!(!present, "first WS bind reports session_present=false");
+    assert_eq!(reason, 0, "will-carrying WS CONNECT must be accepted");
+    assert_eq!(alias_max, 10, "WS CONNACK carries the kernel alias maximum");
+    // Ungraceful close: drop the socket with no DISCONNECT. The edge
+    // reports the close and the kernel fires the stored will once.
+    drop(ws);
+    let downlink = tokio::time::timeout(SHARD_E2E_STEP, sub.recv())
+        .await
+        .expect("WS will arrives in time")
+        .expect("WS will delivery");
+    assert_eq!(downlink.header.opcode, OpCode::PublishOut);
+    assert_eq!(downlink.header.conn_id, 7001);
+    assert_eq!(
+        downlink.payload,
+        bytes::Bytes::from_static(b"ws5-will-bytes")
+    );
+    let (topic, _, _, _) = shard_decode_publish_out(&downlink.metadata);
+    assert_eq!(topic, "sy02/ws/will");
+
+    edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// SY-02: the QoS 1 inflight window set through `indra.toml` and its
+/// `INDRA_` variable is enforced on real MQTT connections.
+///
+/// The config file sets `session.max_qos1_inflight = 2` /
+/// `session.max_qos1_spill = 2`; the environment overrides both to 1.
+/// The kernel boots against that config dir with the environment set, so
+/// the resolved window is 1 and spill is 1, and the shipped edge serves
+/// real MQTT clients against it. A durable subscriber receives three
+/// live QoS 1 downlinks without acking; it then drops and reconnects.
+/// Only the two tracked downlinks (window oldest-first, then spill)
+/// replay with DUP set — the third, delivered live once but past
+/// window+spill, stays untracked and never replays. That replay count is
+/// the enforcement observed on real connections, and it matches the env
+/// override (1+1), not the file (2+2). Acking the replays then releases
+/// the hold: a fourth publish is tracked again and replays alone after
+/// the next drop, proving the broker holds the excess only until acks
+/// arrive.
+#[tokio::test]
+async fn sy02_qos1_window_from_toml_and_env_enforced() {
+    let tag = format!(
+        "sy02-qos1-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        "[session]\nmax_qos1_inflight = 2\nmax_qos1_spill = 2\n",
+    )
+    .expect("write indra.toml");
+
+    // The file layer alone resolves to 2/2 through the real loader.
+    {
+        use broker_config::layers::{load_layered_with_env, CliOverrides};
+        let layered =
+            load_layered_with_env(&config_dir, &[], &CliOverrides::default()).expect("load file");
+        assert_eq!(layered.config().session.max_qos1_inflight, 2);
+        assert_eq!(layered.config().session.max_qos1_spill, 2);
+    }
+
+    // The environment overrides the file for the booted kernel below.
+    let prev_window = std::env::var("INDRA_SESSION__MAX_QOS1_INFLIGHT").ok();
+    let prev_spill = std::env::var("INDRA_SESSION__MAX_QOS1_SPILL").ok();
+    std::env::set_var("INDRA_SESSION__MAX_QOS1_INFLIGHT", "1");
+    std::env::set_var("INDRA_SESSION__MAX_QOS1_SPILL", "1");
+
+    let bl_port = shard_ephemeral_port();
+    let config_arg = format!("--config-dir={}", config_dir.display());
+    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
+
+    std::env::remove_var("INDRA_SESSION__MAX_QOS1_INFLIGHT");
+    std::env::remove_var("INDRA_SESSION__MAX_QOS1_SPILL");
+    if let Some(v) = prev_window {
+        std::env::set_var("INDRA_SESSION__MAX_QOS1_INFLIGHT", v);
+    }
+    if let Some(v) = prev_spill {
+        std::env::set_var("INDRA_SESSION__MAX_QOS1_SPILL", v);
+    }
+
+    // Real MQTT clients through the shipped edge, served by the kernel
+    // above (same config dir, same env-resolved window).
+    let edge = match sy02_spawn_edge(bl_port).await {
+        Some(edge) => edge,
+        None => {
+            // SKIP already logged.
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return;
+        }
+    };
+    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+
+    use tokio::io::AsyncWriteExt;
+
+    // Durable subscriber over real MQTT: CONNECT (clean_start=false),
+    // then a QoS 1 subscribe.
+    let mut sub = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("subscriber dial in time")
+    .expect("subscriber dial");
+    let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
+    tokio::time::timeout(SHARD_E2E_STEP, sub.write_all(&connect))
+        .await
+        .expect("CONNECT in time")
+        .expect("CONNECT send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+        .await
+        .expect("CONNACK in time")
+        .expect("CONNACK");
+    assert_eq!(head, 0x20, "edge answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (false, 0),
+        "first durable CONNECT accepted with session_present=false"
+    );
+    let subscribe = sy02_subscribe(1, &[("sy02/qos1", 1)]);
+    tokio::time::timeout(SHARD_E2E_STEP, sub.write_all(&subscribe))
+        .await
+        .expect("SUBSCRIBE in time")
+        .expect("SUBSCRIBE send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+        .await
+        .expect("SUBACK in time")
+        .expect("SUBACK");
+    assert_eq!(head, 0x90, "edge answers with SUBACK");
+    assert_eq!(
+        sy02_parse_suback(&body),
+        (1, vec![1]),
+        "QoS 1 subscription granted"
+    );
+
+    // Publisher over real MQTT.
+    let mut publisher = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("publisher dial in time")
+    .expect("publisher dial");
+    let connect = sy02_connect311("sy02-qos1-pub", true, 60, None);
+    tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&connect))
+        .await
+        .expect("publisher CONNECT in time")
+        .expect("publisher CONNECT send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+        .await
+        .expect("publisher CONNACK in time")
+        .expect("publisher CONNACK");
+    assert_eq!(head, 0x20, "edge answers the publisher with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+
+    // Three QoS 1 publishes; the subscriber receives all three live (live
+    // delivery always goes out once) and acks nothing. The publisher
+    // drains its own PUBACKs to stay in sync.
+    for (seq, payload) in [(1u16, "qos1-1"), (2, "qos1-2"), (3, "qos1-3")] {
+        let publish = sy02_publish311("sy02/qos1", seq, 1, false, payload.as_bytes());
+        tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&publish))
+            .await
+            .expect("publish in time")
+            .expect("publish send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+            .await
+            .expect("PUBACK in time")
+            .expect("PUBACK");
+        assert_eq!(head, 0x40, "publisher sees PUBACK");
+        assert_eq!(
+            body,
+            vec![(seq >> 8) as u8, (seq & 0xff) as u8],
+            "PUBACK mirrors its packet id"
+        );
+    }
+    let mut live = Vec::new();
+    for _ in 0..3 {
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut sub))
+            .await
+            .expect("live downlink in time")
+            .expect("live downlink");
+        assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+        let downlink = sy02_parse_publish_classic(head, &body);
+        assert_eq!(downlink.qos, 1, "downlink keeps QoS 1");
+        assert!(!downlink.dup, "live delivery carries no DUP");
+        live.push(downlink.payload);
+    }
+    assert_eq!(
+        live,
+        vec![b"qos1-1".to_vec(), b"qos1-2".to_vec(), b"qos1-3".to_vec()],
+        "all three publish live exactly once"
+    );
+
+    // Ungraceful drop of the subscriber socket, then reconnect the
+    // durable session on a fresh socket.
+    drop(sub);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut re = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("reconnect in time")
+    .expect("reconnect");
+    let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
+    tokio::time::timeout(SHARD_E2E_STEP, re.write_all(&connect))
+        .await
+        .expect("reconnect CONNECT in time")
+        .expect("reconnect CONNECT send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+        .await
+        .expect("reconnect CONNACK in time")
+        .expect("reconnect CONNACK");
+    assert_eq!(head, 0x20, "edge answers the reconnect with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "resumed session reports session_present=true"
+    );
+
+    // Exactly window+spill (1+1 from the env override) replay with DUP,
+    // oldest-first; the third live-only delivery never replays.
+    let mut replayed = Vec::new();
+    let mut replay_ids = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+            .await
+            .expect("replay in time")
+            .expect("replay");
+        assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
+        let downlink = sy02_parse_publish_classic(head, &body);
+        assert!(downlink.dup, "replayed downlink carries DUP");
+        replay_ids.push(downlink.packet_id);
+        replayed.push(downlink.payload);
+    }
+    assert_eq!(
+        replayed,
+        vec![b"qos1-1".to_vec(), b"qos1-2".to_vec()],
+        "window oldest-first, then spill; live-only third never replays"
+    );
+    let nothing =
+        tokio::time::timeout(std::time::Duration::from_secs(2), read_mqtt_packet(&mut re)).await;
+    assert!(
+        nothing.is_err(),
+        "no third replay: window+spill bound enforced"
+    );
+
+    // Acking the replays releases the hold: a fourth publish is tracked
+    // again and replays alone after the next drop, proving the broker
+    // holds the excess only until acks arrive.
+    for packet_id in &replay_ids {
+        tokio::time::timeout(SHARD_E2E_STEP, re.write_all(&sy02_puback(*packet_id)))
+            .await
+            .expect("PUBACK in time")
+            .expect("PUBACK send");
+    }
+    // Let the PUBACKs land before the next publish races them.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let publish = sy02_publish311("sy02/qos1", 4, 1, false, b"qos1-4");
+    tokio::time::timeout(SHARD_E2E_STEP, publisher.write_all(&publish))
+        .await
+        .expect("fourth publish in time")
+        .expect("fourth publish send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut publisher))
+        .await
+        .expect("fourth PUBACK in time")
+        .expect("fourth PUBACK");
+    assert_eq!(head, 0x40, "publisher sees the fourth PUBACK");
+    assert_eq!(body, vec![0x00, 0x04]);
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re))
+        .await
+        .expect("fourth live downlink in time")
+        .expect("fourth live downlink");
+    assert_eq!(head & 0xF0, 0x30, "fourth downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert!(!downlink.dup, "live delivery carries no DUP");
+    assert_eq!(downlink.payload, b"qos1-4");
+    drop(re);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut re2 = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("second reconnect in time")
+    .expect("second reconnect");
+    let connect = sy02_connect311("sy02-qos1-sub", false, 60, None);
+    tokio::time::timeout(SHARD_E2E_STEP, re2.write_all(&connect))
+        .await
+        .expect("second reconnect CONNECT in time")
+        .expect("second reconnect CONNECT send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re2))
+        .await
+        .expect("second reconnect CONNACK in time")
+        .expect("second reconnect CONNACK");
+    assert_eq!(head, 0x20, "edge answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "resumed session reports session_present=true"
+    );
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut re2))
+        .await
+        .expect("fourth replay in time")
+        .expect("fourth replay");
+    assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert!(downlink.dup, "replayed downlink carries DUP");
+    assert_eq!(
+        downlink.payload, b"qos1-4",
+        "only the acked-after publish replays: acks released the hold"
+    );
+    let nothing = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut re2),
+    )
+    .await;
+    assert!(
+        nothing.is_err(),
+        "no second replay: acked entries stay released"
+    );
+
+    edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// SY-02: two tenants cannot see each other's messages while aliases,
+/// retained messages and offline queues work in each, over real MQTT.
+///
+/// The kernel boots with one tenant rule (`t-${username}`) installed from
+/// `indra.toml` via `TenantsConf -> TenantRegistry::replace`, and the
+/// shipped edge serves real MQTT 5 clients against it, so CONNECTs
+/// carrying username `user-a` land in one tenant and `user-b` in another.
+/// In each tenant: the subscriber connects durably with an alias maximum,
+/// a topic+alias publish registers the inbound alias and arrives with the
+/// full topic plus an outbound alias, an alias-by-reference publish
+/// resolves to the same topic, a retained publish is visible only inside
+/// its own tenant, then the subscriber drops and a publish while detached
+/// replays on reconnect (with the same username, so the same tenant).
+/// Every client receives exactly its own tenant's payloads — the spec's
+/// isolation, observed over real connections through the broker, never
+/// the store.
+#[tokio::test]
+async fn sy02_tenants_isolated_with_aliases_and_offline() {
+    let tag = format!(
+        "sy02-tenant-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        "[[tenants.rules]]\nexpression = \"t-${username}\"\n",
+    )
+    .expect("write indra.toml");
+
+    let bl_port = shard_ephemeral_port();
+    let config_arg = format!("--config-dir={}", config_dir.display());
+    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
+
+    // Real MQTT 5 clients through the shipped edge, served by the kernel
+    // above (same tenant config). One socket per client so every
+    // downlink is attributable.
+    let edge = match sy02_spawn_edge(bl_port).await {
+        Some(edge) => edge,
+        None => {
+            // SKIP already logged.
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return;
+        }
+    };
+    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+
+    // One socket per client so every downlink is attributable.
+    async fn dial(host: &str, port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    // CONNECT with the tenant username over MQTT 5 (alias maximum 10),
+    // returning session-present. The CONNECT is accepted (rc 0) with the
+    // kernel alias bound every time.
+    async fn connect_tenant(
+        sock: &mut tokio::net::TcpStream,
+        client_id: &str,
+        clean_start: bool,
+        username: &str,
+    ) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let connect = sy02_connect5(
+            client_id,
+            clean_start,
+            60,
+            Some((username, b"pw")),
+            None,
+            10,
+        );
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+            .await
+            .expect("CONNECT in time")
+            .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "edge answers {client_id} with CONNACK");
+        let (present, reason, alias_max) = sy02_parse_connack5(&body);
+        assert_eq!(reason, 0, "CONNECT of {client_id} must be accepted");
+        assert_eq!(alias_max, 10, "CONNACK carries the kernel alias maximum");
+        present
+    }
+    async fn subscribe_qos1(sock: &mut tokio::net::TcpStream, client_id: &str, filter: &str) {
+        use tokio::io::AsyncWriteExt;
+        let subscribe = sy02_subscribe(1, &[(filter, 1)]);
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&subscribe))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head, 0x90, "edge answers with SUBACK");
+        assert_eq!(
+            sy02_parse_suback(&body),
+            (1, vec![1]),
+            "QoS 1 subscription of {client_id} to {filter} must be granted"
+        );
+    }
+    async fn recv_packet(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("downlink in time")
+            .expect("downlink")
+    }
+    async fn publish_qos1(
+        sock: &mut tokio::net::TcpStream,
+        topic: &str,
+        packet_id: u16,
+        retain: bool,
+        alias: Option<u16>,
+        payload: &[u8],
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let publish = sy02_publish5(topic, packet_id, 1, retain, alias, payload);
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&publish))
+            .await
+            .expect("publish in time")
+            .expect("publish send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("PUBACK in time")
+            .expect("PUBACK");
+        assert_eq!(head, 0x40, "publisher sees PUBACK");
+        assert_eq!(
+            body,
+            vec![(packet_id >> 8) as u8, (packet_id & 0xff) as u8],
+            "PUBACK mirrors its packet id"
+        );
+    }
+    async fn ack(sock: &mut tokio::net::TcpStream, packet_id: u16) {
+        use tokio::io::AsyncWriteExt;
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&sy02_puback(packet_id)))
+            .await
+            .expect("PUBACK in time")
+            .expect("PUBACK send");
+    }
+    async fn expect_silence(sock: &mut tokio::net::TcpStream, what: &str) {
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_mqtt_packet(sock)).await;
+        assert!(extra.is_err(), "{what}");
+    }
+
+    let mut a_sub = dial(edge.host(), edge.mqtt_port).await;
+    let mut a_pub = dial(edge.host(), edge.mqtt_port).await;
+    let mut b_sub = dial(edge.host(), edge.mqtt_port).await;
+    let mut b_pub = dial(edge.host(), edge.mqtt_port).await;
+
+    assert!(
+        !connect_tenant(&mut a_sub, "sy02-a-sub", false, "user-a").await,
+        "tenant-a first CONNECT reports session_present=false"
+    );
+    assert!(
+        !connect_tenant(&mut b_sub, "sy02-b-sub", false, "user-b").await,
+        "tenant-b first CONNECT reports session_present=false"
+    );
+    subscribe_qos1(&mut a_sub, "sy02-a-sub", "sy02/iso").await;
+    subscribe_qos1(&mut b_sub, "sy02-b-sub", "sy02/iso").await;
+    connect_tenant(&mut a_pub, "sy02-a-pub", true, "user-a").await;
+    connect_tenant(&mut b_pub, "sy02-b-pub", true, "user-b").await;
+
+    // Alias leg per tenant: topic+alias registers, alias-by-reference
+    // resolves, downlink carries the full topic plus an outbound alias.
+    publish_qos1(&mut a_pub, "sy02/iso", 1, false, Some(3), b"a-1").await;
+    publish_qos1(&mut b_pub, "sy02/iso", 1, false, Some(5), b"b-1").await;
+    let (head, body) = recv_packet(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let a1 = sy02_parse_publish_alias(head, &body);
+    assert_eq!(a1.topic, "sy02/iso");
+    assert_eq!(a1.payload, b"a-1");
+    assert!(!a1.dup, "live delivery carries no DUP");
+    assert_ne!(a1.alias, 0, "downlink carries an outbound alias");
+    let (head, body) = recv_packet(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let b1 = sy02_parse_publish_alias(head, &body);
+    assert_eq!(b1.topic, "sy02/iso");
+    assert_eq!(b1.payload, b"b-1");
+    assert!(!b1.dup, "live delivery carries no DUP");
+    assert_ne!(b1.alias, 0, "downlink carries an outbound alias");
+    ack(&mut a_sub, a1.packet_id).await;
+    ack(&mut b_sub, b1.packet_id).await;
+
+    // Alias-by-reference in each tenant resolves to the same topic.
+    publish_qos1(&mut a_pub, "", 2, false, Some(3), b"a-2").await;
+    publish_qos1(&mut b_pub, "", 2, false, Some(5), b"b-2").await;
+    let (head, body) = recv_packet(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let a2 = sy02_parse_publish_alias(head, &body);
+    assert_eq!(a2.topic, "sy02/iso", "alias resolves in tenant-a");
+    assert_eq!(a2.payload, b"a-2");
+    assert_ne!(a2.alias, 0, "downlink carries an outbound alias");
+    let (head, body) = recv_packet(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let b2 = sy02_parse_publish_alias(head, &body);
+    assert_eq!(b2.topic, "sy02/iso", "alias resolves in tenant-b");
+    assert_eq!(b2.payload, b"b-2");
+    assert_ne!(b2.alias, 0, "downlink carries an outbound alias");
+    ack(&mut a_sub, a2.packet_id).await;
+    ack(&mut b_sub, b2.packet_id).await;
+
+    // Retained leg: the same topic string holds one retained message
+    // per tenant, and each tenant's new subscriber sees only its own.
+    publish_qos1(&mut a_pub, "sy02/retained", 3, true, None, b"a-ret").await;
+    publish_qos1(&mut b_pub, "sy02/retained", 3, true, None, b"b-ret").await;
+    let mut a_ret = dial(edge.host(), edge.mqtt_port).await;
+    assert!(
+        !connect_tenant(&mut a_ret, "sy02-a-ret", true, "user-a").await,
+        "tenant-a retained reader connects clean"
+    );
+    subscribe_qos1(&mut a_ret, "sy02-a-ret", "sy02/retained").await;
+    let (head, body) = recv_packet(&mut a_ret).await;
+    assert_eq!(head & 0xF0, 0x30, "retained downlink is PUBLISH");
+    let retained_a = sy02_parse_publish_classic(head, &body);
+    assert_eq!(retained_a.topic, "sy02/retained");
+    assert_eq!(
+        retained_a.payload, b"a-ret",
+        "tenant-a sees only its own retained message"
+    );
+    assert!(retained_a.retain, "retained replay carries retain");
+    expect_silence(&mut a_ret, "tenant-a holds only its own retained message").await;
+    let mut b_ret = dial(edge.host(), edge.mqtt_port).await;
+    assert!(
+        !connect_tenant(&mut b_ret, "sy02-b-ret", true, "user-b").await,
+        "tenant-b retained reader connects clean"
+    );
+    subscribe_qos1(&mut b_ret, "sy02-b-ret", "sy02/retained").await;
+    let (head, body) = recv_packet(&mut b_ret).await;
+    assert_eq!(head & 0xF0, 0x30, "retained downlink is PUBLISH");
+    let retained_b = sy02_parse_publish_classic(head, &body);
+    assert_eq!(retained_b.topic, "sy02/retained");
+    assert_eq!(
+        retained_b.payload, b"b-ret",
+        "tenant-b sees only its own retained message"
+    );
+    assert!(retained_b.retain, "retained replay carries retain");
+    expect_silence(&mut b_ret, "tenant-b holds only its own retained message").await;
+
+    // Offline leg: both subscribers drop; one publish per tenant while
+    // detached; each reconnect (same username, so the same tenant)
+    // replays exactly its own tenant's message.
+    drop(a_sub);
+    drop(b_sub);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    publish_qos1(&mut a_pub, "sy02/iso", 4, false, None, b"a-off").await;
+    publish_qos1(&mut b_pub, "sy02/iso", 4, false, None, b"b-off").await;
+    let mut a_re = dial(edge.host(), edge.mqtt_port).await;
+    let mut b_re = dial(edge.host(), edge.mqtt_port).await;
+    assert!(
+        connect_tenant(&mut a_re, "sy02-a-sub", false, "user-a").await,
+        "tenant-a resume reports session_present=true"
+    );
+    assert!(
+        connect_tenant(&mut b_re, "sy02-b-sub", false, "user-b").await,
+        "tenant-b resume reports session_present=true"
+    );
+    let (head, body) = recv_packet(&mut a_re).await;
+    assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
+    let off_a = sy02_parse_publish_classic(head, &body);
+    assert_eq!(off_a.topic, "sy02/iso");
+    assert_eq!(off_a.payload, b"a-off");
+    let (head, body) = recv_packet(&mut b_re).await;
+    assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
+    let off_b = sy02_parse_publish_classic(head, &body);
+    assert_eq!(off_b.topic, "sy02/iso");
+    assert_eq!(off_b.payload, b"b-off");
+    // Nothing crosses tenants: each reconnect holds exactly one frame.
+    expect_silence(&mut a_re, "tenant-a holds only its own replay").await;
+    expect_silence(&mut b_re, "tenant-b holds only its own replay").await;
+
+    edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
 }

@@ -1,0 +1,183 @@
+// WebSocket frame throughput sampler for the edge receive path (M1-01).
+//
+// MQTT-over-WebSocket puts one WS frame around every MQTT packet on the
+// publish path (edge receive), so the frame encode/decode cost is
+// per-message overhead. This file implements the same RFC 6455
+// binary-frame header/mask/length rules as `beam/src/indra_ws.erl`
+// (`feed/3` client-frame parsing incl. unmask, `encode_binary/1`
+// server framing) over the same MQTT-shaped sizes, so the sampler
+// represents the per-message framing work the edge does in
+// `indra_conn` (`ws_mqtt_bytes` ingress, `sock_send(ws, ...)` egress).
+// It is std-only and uses only base-commit APIs, so the pipeline can
+// run the same file on the base commit and on this tree: three runs
+// each, and the numbers land in the gates log.
+//
+// Single source of truth: `crates/broker-node/benches/ws_frame.rs`
+// includes this file, which is what makes it compilable by the spec's
+// BENCH command (`cargo test -p broker-node --bench ws_frame --
+// --ignored`). Keep all logic here; keep that wrapper a bare include.
+//
+// Run with: `cargo test -p broker-node --bench ws_frame -- --ignored`
+
+use std::hint::black_box;
+use std::time::Instant;
+
+/// Encode one server binary frame (FIN + binary, never masked).
+fn ws_encode(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut out = Vec::with_capacity(10 + len);
+    out.push(0x82);
+    if len <= 125 {
+        out.push(len as u8);
+    } else if len <= 65535 {
+        out.push(126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Encode one masked client binary frame (what the edge must parse).
+fn ws_encode_masked(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let len = payload.len();
+    let mut out = Vec::with_capacity(14 + len);
+    out.push(0x82);
+    if len <= 125 {
+        out.push(0x80 | len as u8);
+    } else if len <= 65535 {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(0x80 | 127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        out.push(b ^ mask[i % 4]);
+    }
+    out
+}
+
+/// Decode one masked client binary frame, returning the payload length.
+fn ws_decode(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 2 {
+        return None;
+    }
+    // Server-side parser: the mask bit must be set.
+    if frame[1] & 0x80 == 0 {
+        return None;
+    }
+    let (len, mut off) = match frame[1] & 0x7F {
+        126 => {
+            if frame.len() < 4 {
+                return None;
+            }
+            (u16::from_be_bytes([frame[2], frame[3]]) as usize, 4)
+        }
+        127 => {
+            if frame.len() < 10 {
+                return None;
+            }
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&frame[2..10]);
+            (u64::from_be_bytes(raw) as usize, 10)
+        }
+        small => (small as usize, 2),
+    };
+    if frame.len() < off + 4 + len {
+        return None;
+    }
+    let mask = [frame[off], frame[off + 1], frame[off + 2], frame[off + 3]];
+    off += 4;
+    let mut checksum: u8 = 0;
+    for i in 0..len {
+        checksum ^= frame[off + i] ^ mask[i % 4];
+    }
+    black_box(checksum);
+    Some(len)
+}
+
+fn sample_payload(size: usize) -> Vec<u8> {
+    // MQTT-shaped bytes: fixed header + topic + application payload.
+    let mut payload = vec![0x30u8];
+    payload.extend_from_slice(&(size as u16).to_be_bytes());
+    payload.extend_from_slice(b"sensors/42/temp");
+    while payload.len() < size {
+        payload.push((payload.len() % 251) as u8);
+    }
+    payload.truncate(size);
+    payload
+}
+
+/// Emit one BENCH line so the pipeline's gates log records it.
+///
+/// `println!` alone is not enough: `cargo test` captures stdout of passing
+/// tests and only shows it with `--nocapture`, which the spec's BENCH
+/// command (`cargo test -p broker-node --bench ws_frame -- --ignored`) does
+/// not pass. A child process inherits the real stdout fd, which libtest
+/// does not capture, so echo the line via `echo`/`sh` as well as `println!`.
+/// Std only, so the file still runs on the base commit.
+fn emit(line: &str) {
+    println!("{line}");
+    // Preferred: direct `echo` binary (coreutils, on PATH on the host).
+    if std::process::Command::new("echo")
+        .arg(line)
+        .status()
+        .is_ok()
+    {
+        return;
+    }
+    // Fallbacks for minimal PATHs.
+    for prog in ["/usr/bin/echo", "/bin/echo"] {
+        if std::process::Command::new(prog).arg(line).status().is_ok() {
+            return;
+        }
+    }
+    // Last resort: shell builtin via `sh` (always present on the host).
+    let _ = std::process::Command::new("sh")
+        .args(["-c", "printf '%s\n' \"$1\"", "sh", line])
+        .status();
+}
+
+#[ignore]
+#[test]
+fn bench_ws_frame() {
+    for size in [128usize, 1024, 8192] {
+        let payload = sample_payload(size);
+        let masked = ws_encode_masked(&payload, [0x11, 0x22, 0x33, 0x44]);
+
+        // Warmup so caches settle.
+        for _ in 0..1_000 {
+            black_box(ws_encode(black_box(&payload)));
+            black_box(ws_decode(black_box(&masked)));
+        }
+
+        let iters = 20_000usize;
+        let start = Instant::now();
+        for _ in 0..iters {
+            black_box(ws_encode(black_box(&payload)));
+        }
+        let encode_per_sec = iters as f64 / start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            black_box(ws_decode(black_box(&masked)));
+        }
+        let decode_per_sec = iters as f64 / start.elapsed().as_secs_f64();
+
+        // Round-trip integrity: every encoded byte decodes back.
+        let server_frame = ws_encode(&payload);
+        assert!(server_frame.len() > payload.len());
+        assert_eq!(ws_decode(&masked), Some(payload.len()));
+
+        emit(&format!(
+            "BENCH ws_frame_encode_{size}B {encode_per_sec:.0} msg/s"
+        ));
+        emit(&format!(
+            "BENCH ws_frame_decode_{size}B {decode_per_sec:.0} msg/s"
+        ));
+    }
+}

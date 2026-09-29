@@ -52,9 +52,12 @@
          encode_bind_meta/5,
          encode_bind_meta/6,
          encode_bind_meta/7,
+         encode_bind_meta/8,
+         encode_bind_meta/9,
          decode_bind_meta/1,
          encode_session_binding_meta/3,
          encode_session_binding_meta/4,
+         encode_session_binding_meta/5,
          decode_session_binding_meta/1]).
 
 %% BrokerLink metadata contracts (Sprint 3: messaging loop).
@@ -147,10 +150,8 @@
                    | {backoff_base_ms, pos_integer()}
                    | {backoff_max_ms, pos_integer()}.
 
-%%====================================================================
-%% Framing API
-%%====================================================================
-
+%%=============================================================%% Framing API
+%%=============================================================
 %% @doc Encode one BrokerLink frame.
 %%
 %% Opcode may be an atom (e.g. {@code ping}) or a raw 16-bit integer.
@@ -308,10 +309,8 @@ is_known_opcode(16#0041) -> true;
 is_known_opcode(16#0042) -> true;
 is_known_opcode(_) -> false.
 
-%%====================================================================
-%% BrokerLink metadata contracts (Sprint 2: CONNECT -> CONNACK)
-%%====================================================================
-%%
+%%=============================================================%% BrokerLink metadata contracts (Sprint 2: CONNECT -> CONNACK)
+%%=============================================================%%
 %% These binary layouts are the canonical cross-language contract between
 %% the BEAM edge (`indra_conn`) and the Rust core
 %% (`crates/broker-node/src/main.rs::reply_for_frame`). Both sides
@@ -324,7 +323,9 @@ is_known_opcode(_) -> false.
 %%   |                  |  (UTF-8)       |  :8   |  :16be     | (optional)|
 %%   +------------------+----------------+-------+------------+-----------+
 %% </pre>
-%% Flags bit 0 = clean_start. All other bits are reserved and must be 0.
+%% Flags bit 0 = clean_start, bit 1 = F1-01 will section present,
+%% bit 2 = X1-01 v5 section present. All other bits are reserved and
+%% must be 0.
 %% The optional trailing credentials section (present only for
 %% authenticated connects) is:
 %% {@code UserLen:16be | Username | PassLen:16be | Password}.
@@ -332,22 +333,64 @@ is_known_opcode(_) -> false.
 %% A peer-aware edge appends one trailing peer-address section
 %% {@code PeerLen:16be | PeerIp} carrying the client IP literal it saw on
 %% the socket (B1-03: drives the kernel `peerhost' / `peerhost_net'
-%% bans). Binds encoded before the peer section existed carry no trailing
-%% bytes and still decode with `peerhost' unset.
+%% bans). A TLS-terminating edge appends one further certificate section
+%% {@code CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
+%% SanCount:16be | (SanLen:16be | San)*} carrying the client-certificate
+%% fields it extracted (MT-01: expression inputs for tenant assignment;
+%% absent fields encode as zero length). An edge that parsed a CONNECT
+%% last will appends one final will section {@code WillLen:16be |
+%% WillTopicLen:16be | WillTopic | WillQos:8 | WillRetain:8 |
+%% WillPayloadLen:32be | WillPayload} (MT-05: registered at connect,
+%% fired once on unexpected disconnect). Binds encoded before a section
+%% existed carry no trailing bytes and still decode with the missing
+%% fields unset. An X1-01 v5 bind appends one final v5 section
+%% `AliasMax:16be | V5Payload | V5Len:16be' carrying the negotiated
+%% version plus the decoded CONNECT properties the kernel needs
+%% (session expiry, receive maximum, maximum packet size, client
+%% user-properties); version-4 binds carry no v5 section and stay
+%% byte-identical to before.
 %%
 %% SessionBinding meta (Opcode 16#0011, Rust -> BEAM):
 %% <pre>
-%%   +----------------+---------------+------------+
-%%   | SessionId:64be | Present:8     | RC:8       |
-%%   |                | (0 | 1)       | (0 = ok)   |
-%%   +----------------+---------------+------------+
+%%   +----------------+---------------+------------+----------------+
+%%   | SessionId:64be | Present:8     | RC:8       | AliasMax:16be  |
+%%   |                | (0 | 1)       | (0 = ok)   | (B4-05 inbound)|
+%%   +----------------+---------------+------------+----------------+
 %% </pre>
 %% RC carries the kernel bind outcome: 0 = accepted, 2 = identifier
 %% rejected, plus the MQTT 5 style reason codes the edge maps to a
 %% 3.1.1 CONNACK (16#86 bad username/password, 16#87 not authorized,
 %% 16#8A banned, 16#8B quota exceeded; see
-%% `indra_mqtt_codec:connack_return_code/1').
+%% `indra_mqtt_codec:connack_return_code/1'). A version-5 bind appends
+%% one trailing v5 section `V5Payload | V5Len:16be' carrying the
+%% granted session expiry, the server receive-maximum /
+%% maximum-packet-size limits, the server-side reason string and the
+%% echoed CONNECT user properties (X1-02); version-4 binds carry the
+%% 12-byte form only and stay byte-identical to before.
 
+%% Largest v5 bind section (bytes, including its length prefix).
+%% Reason: one bind section must leave room for the head, credentials,
+%% peer, certificate, will and alias sections inside the 65535-byte
+%% BrokerLink meta cap; 4 KiB covers realistic CONNECT properties.
+-define(MAX_V5_SECTION_LEN, 4096).
+%% Most client user properties carried per bind (count). Reason: bounds
+%% per-bind memory on the handshake path; mirrors the 16-SAN bound on
+%% the certificate section.
+-define(MAX_V5_BIND_USERS, 16).
+%% Largest single user-property key or value in a bind (bytes). Reason:
+%% bounds per-bind memory; mirrors the 1024-byte bound on certificate
+%% fields.
+-define(MAX_V5_BIND_STRING, 1024).
+%% Flags bit marking a trailing X1-01 v5 section (version plus the
+%% decoded CONNECT properties the kernel needs). Version-4 binds never
+%% set it and stay byte-identical to before.
+-define(BIND_FLAG_V5, 16#04).
+
+-type v5_bind_info() :: #{version := 4 | 5,
+                          session_expiry := 0..4294967295,
+                          receive_max := 0..65535,
+                          max_packet_size := 0..4294967295,
+                          user_properties := [{binary(), binary()}]}.
 -type bind_meta() :: #{client_id := binary(),
                        clean_start := boolean(),
                        keepalive := 0..65535,
@@ -355,14 +398,27 @@ is_known_opcode(_) -> false.
                        password := binary() | undefined,
                        peerhost := binary() | undefined,
                        client_alias_max := 0..65535,
+                       cert_cn := binary() | undefined,
+                       cert_subject := binary() | undefined,
+                       cert_sans := [binary()],
                        will_topic := binary() | undefined,
                        will_payload := binary() | undefined,
                        will_qos := 0..2,
-                       will_retain := boolean()}.
+                       will_retain := boolean(),
+                       protocol_version := 4 | 5,
+                       session_expiry := 0..4294967295,
+                       receive_maximum := 0..65535,
+                       max_packet_size := 0..4294967295,
+                       user_properties := [{binary(), binary()}]}.
 -type session_binding_meta() :: #{session_id := non_neg_integer(),
-                                  session_present := boolean(),
-                                  return_code := 0..255,
-                                  alias_max := 0..65535}.
+                                   session_present := boolean(),
+                                   return_code := 0..255,
+                                   alias_max := 0..65535,
+                                   server_recv_max => 0..65535,
+                                   server_max_pkt => 0..4294967295,
+                                   session_expiry => 0..4294967295,
+                                   reason_string => binary(),
+                                   user_properties => [{binary(), binary()}]}.
 
 %% @doc Encode BindConnection metadata for the given client parameters.
 -spec encode_bind_meta(binary(), boolean(), 0..65535) -> binary().
@@ -373,13 +429,19 @@ encode_bind_meta(ClientId, CleanStart, Keepalive)
 
 %% @private Encode the fixed bind head. Flags bit 0 is clean_start;
 %% Flags bit 1 marks a following F1-01 will section (see
-%% {@link encode_bind_meta/7}).
-encode_head(ClientId, CleanStart, Keepalive, WillPresent)
+%% {@link encode_bind_meta/7}); Flags bit 2 marks a trailing X1-01 v5
+%% section (see {@link encode_bind_meta/9}). Version-4 binds never set
+%% bit 2 and stay byte-identical to before.
+encode_head(ClientId, CleanStart, Keepalive, WillPresent) ->
+    encode_head(ClientId, CleanStart, Keepalive, WillPresent, false).
+
+encode_head(ClientId, CleanStart, Keepalive, WillPresent, V5Present)
   when is_binary(ClientId), is_boolean(CleanStart),
        is_integer(Keepalive), Keepalive >= 0, Keepalive =< 65535,
-       is_boolean(WillPresent) ->
+       is_boolean(WillPresent), is_boolean(V5Present) ->
     Flags = (case CleanStart of true -> 1; false -> 0 end)
-        bor (case WillPresent of true -> 2; false -> 0 end),
+        bor (case WillPresent of true -> 2; false -> 0 end)
+        bor (case V5Present of true -> ?BIND_FLAG_V5; false -> 0 end),
     IdLen = byte_size(ClientId),
     true = (IdLen =< 65535) orelse erlang:error(badarg),
     <<IdLen:16/big, ClientId/binary, Flags:8, Keepalive:16/big>>.
@@ -439,52 +501,9 @@ encode_peer_bin(PeerIp) when is_binary(PeerIp) ->
 encode_peer_bin(_) ->
     erlang:error(badarg).
 
-%% @doc Encode BindConnection metadata with credentials, peer address
-%% and the client's Topic Alias Maximum (B4-05). The alias maximum is
-%% the client's receive limit bounding the kernel outbound table; 0 (or
-%% the /5 encoding without it) means the kernel never assigns an alias
-%% toward the client.
--spec encode_bind_meta(binary(), boolean(), 0..65535,
-                       {binary() | undefined, binary() | undefined},
-                       binary() | undefined, 0..65535) -> binary().
-encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax)
-  when is_integer(ClientAliasMax),
-       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
-    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer),
-    <<Base/binary, ClientAliasMax:16/big>>.
-
-%% @doc Encode BindConnection metadata with credentials, peer address,
-%% alias maximum and the CONNECT last will (F1-01). `Will' is
-%% `undefined' (no will, encodes exactly like {@link encode_bind_meta/6})
-%% or `#{topic := binary(), payload := binary(), qos := 0..2,
-%% retain := boolean()}'. The will section rides immediately after the
-%% keepalive (Flags bit 1 set) and ahead of credentials/peer/alias, so
-%% the remainder parses exactly like a legacy bind. Bound: the will
-%% topic (1..65535 bytes) plus payload must fit the 65535-byte
-%% BrokerLink meta cap; larger wills are rejected at encode time (fail
-%% closed, the connection closes instead of registering half a will).
--spec encode_bind_meta(binary(), boolean(), 0..65535,
-                       {binary() | undefined, binary() | undefined},
-                       binary() | undefined, 0..65535,
-                       undefined | map()) -> binary().
-encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax, undefined)
-  when is_integer(ClientAliasMax),
-       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
-    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax);
-encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax,
-                 #{topic := Topic, payload := Payload, qos := QoS, retain := Retain})
-  when is_integer(ClientAliasMax),
-       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
-    <<(encode_head(ClientId, CleanStart, Keepalive, true))/binary,
-      (encode_will_bin(Topic, Payload, QoS, Retain))/binary,
-      (encode_creds_bin(Creds))/binary,
-      (encode_peer_bin(Peer))/binary,
-      ClientAliasMax:16/big>>;
-encode_bind_meta(_, _, _, _, _, _, _) ->
-    erlang:error(badarg).
-
-%% @private Encode one will section: `WillQos:8 | WillRetain:8 |
-%% TopicLen:16be | Topic | PayloadLen:32be | Payload'.
+%% @private Encode one head-will section: `WillQos:8 | WillRetain:8 |
+%% TopicLen:16be | Topic | PayloadLen:32be | Payload' (F1-01, rides
+%% immediately after the keepalive with Flags bit 1 set).
 encode_will_bin(Topic, Payload, QoS, Retain)
   when is_binary(Topic), is_binary(Payload),
        (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
@@ -500,6 +519,267 @@ encode_will_bin(Topic, Payload, QoS, Retain)
 encode_will_bin(_, _, _, _) ->
     erlang:error(badarg).
 
+%% @doc Encode BindConnection metadata with credentials, peer address
+%% and the client's Topic Alias Maximum (B4-05), or with the TLS
+%% client-certificate fields (MT-01). Clause-dispatched on the sixth
+%% argument: an integer is the alias maximum (the client's receive
+%% limit bounding the kernel outbound table; 0 or the /5 encoding
+%% without it means the kernel never assigns an alias toward the
+%% client); a map or `undefined' is the certificate (`cn'/`subject'
+%% binary or `undefined', `sans' list of binaries; absent fields encode
+%% as zero length, `undefined' encodes exactly like
+%% {@link encode_bind_meta/5}).
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined,
+                       0..65535 | map() | undefined) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax)
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer),
+    <<Base/binary, ClientAliasMax:16/big>>;
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, undefined) ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo)
+  when is_map(CertInfo) ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp),
+    Payload = encode_cert_payload(CertInfo),
+    true = (byte_size(Payload) =< 65535) orelse erlang:error(badarg),
+    <<Base/binary, (byte_size(Payload)):16/big, Payload/binary>>;
+encode_bind_meta(_, _, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @doc Encode BindConnection metadata with the CONNECT last will,
+%% clause-dispatched on the sixth argument. An integer sixth argument
+%% is the B4-05 alias maximum and the will rides the head section
+%% (F1-01: `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
+%% PayloadLen:32be | Payload' immediately after the keepalive with
+%% Flags bit 1 set, ahead of credentials/peer/alias, so the remainder
+%% parses exactly like a legacy bind); `undefined' encodes exactly like
+%% {@link encode_bind_meta/6}. A map or `undefined' sixth argument is
+%% the MT-01 certificate and the will rides the trailing section
+%% (MT-05: `WillLen:16be | WillPayload' after the certificate section);
+%% `undefined' encodes exactly like the /6 certificate form. Bound: the
+%% will topic (1..65535 bytes) plus payload must fit the 65535-byte
+%% BrokerLink meta cap; larger wills are rejected at encode time (fail
+%% closed, the connection closes instead of registering half a will).
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined,
+                       0..65535 | map() | undefined,
+                       undefined | map()) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax, undefined)
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax,
+                 #{topic := Topic, payload := Payload, qos := QoS, retain := Retain})
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    <<(encode_head(ClientId, CleanStart, Keepalive, true))/binary,
+      (encode_will_bin(Topic, Payload, QoS, Retain))/binary,
+      (encode_creds_bin(Creds))/binary,
+      (encode_peer_bin(Peer))/binary,
+      ClientAliasMax:16/big>>;
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo, undefined)
+  when CertInfo =:= undefined; is_map(CertInfo) ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo, WillInfo)
+  when is_map(WillInfo), (CertInfo =:= undefined orelse is_map(CertInfo)) ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo),
+    Payload = encode_will_payload(WillInfo),
+    true = (byte_size(Payload) =< 65535) orelse erlang:error(badarg),
+    <<Base/binary, (byte_size(Payload)):16/big, Payload/binary>>;
+encode_bind_meta(_, _, _, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @doc Encode BindConnection metadata with credentials, peer address,
+%% alias maximum, certificate fields and last will (canonical SY-02
+%% merge of the B4-05 /7 head-will form and the MT-05 /7 trailing-will
+%% form above). `ClientAliasMax' is the client's receive limit bounding
+%% the kernel outbound table; `CertInfo' is a map|undefined (MT-01
+%% tenant inputs: `cn'/`subject' binary|undefined, `sans' list of
+%% binaries); `WillInfo' is a map|undefined (F1-01 head-will section,
+%% Flags bit 1: `topic'/`payload' binary, `qos' 0..2, `retain'
+%% boolean). Emits the head-will section when `WillInfo' is present,
+%% then credentials, peer, the certificate section when present, then
+%% the alias maximum. The decoder accepts every prefix form, so absent
+%% sections decode with the missing fields unset.
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined, 0..65535,
+                       map() | undefined, map() | undefined) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInfo, WillInfo)
+  when is_integer(AliasMax), AliasMax >= 0, AliasMax =< 65535 ->
+    WillPresent = WillInfo =/= undefined,
+    Base0 = encode_head(ClientId, CleanStart, Keepalive, WillPresent),
+    WillBin = case WillInfo of
+        undefined -> <<>>;
+        #{topic := Topic, payload := Payload, qos := QoS, retain := Retain} ->
+            encode_will_bin(Topic, Payload, QoS, Retain)
+    end,
+    CredsBin = encode_creds_bin(Creds),
+    PeerBin = encode_peer_bin(Peer),
+    CertBin = case CertInfo of
+        undefined -> <<>>;
+        _ when is_map(CertInfo) ->
+            Payload0 = encode_cert_payload(CertInfo),
+            true = (byte_size(Payload0) =< 65535) orelse erlang:error(badarg),
+            <<(byte_size(Payload0)):16/big, Payload0/binary>>;
+        _ -> erlang:error(badarg)
+    end,
+    <<Base0/binary, WillBin/binary, CredsBin/binary, PeerBin/binary, CertBin/binary, AliasMax:16/big>>.
+
+%% @doc Encode BindConnection metadata with the X1-01 v5 section
+%% (canonical v5 form). `V5Info' is `undefined' or a map with
+%% `version' (4 | 5, the negotiated protocol level) plus the decoded
+%% CONNECT properties the kernel needs: `session_expiry' (u32),
+%% `receive_max' (u16), `max_packet_size' (u32) and `user_properties'
+%% ([{Key, Value}]). `undefined' encodes exactly like
+%% {@link encode_bind_meta/8}, so version-4 binds stay byte-identical
+%% to today. A present section sets Flags bit 2 and appends
+%% `AliasMax:16be | V5Payload | V5Len:16be' (the section length rides
+%% last so the decoder strips it deterministically from the end; the
+%% remainder then parses exactly like a legacy alias-carrying bind);
+%% `V5Payload' is `Version:8 | SessionExpiry:32be | RecvMax:16be |
+%% MaxPacketSize:32be | UserCount:16be |
+%% (KeyLen:16be | Key | ValLen:16be | Val)*'.
+%% Bounds (fail closed at encode time): at most `MAX_V5_BIND_USERS'
+%% user properties, each key/value at most `MAX_V5_BIND_STRING' bytes,
+%% whole section at most `MAX_V5_SECTION_LEN' bytes.
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined, 0..65535,
+                       map() | undefined, map() | undefined,
+                       v5_bind_info() | undefined) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInfo, WillInfo,
+                 undefined) ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInfo, WillInfo);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInfo, WillInfo,
+                 #{version := Version, session_expiry := Expiry, receive_max := RecvMax,
+                   max_packet_size := MaxPkt, user_properties := Users} = V5Info)
+  when is_integer(AliasMax), AliasMax >= 0, AliasMax =< 65535,
+       (Version =:= 4 orelse Version =:= 5),
+       is_integer(Expiry), Expiry >= 0, Expiry =< 16#FFFFFFFF,
+       is_integer(RecvMax), RecvMax >= 0, RecvMax =< 65535,
+       is_integer(MaxPkt), MaxPkt >= 0, MaxPkt =< 16#FFFFFFFF,
+       is_list(Users) ->
+    _ = V5Info,
+    true = (CertInfo =:= undefined orelse is_map(CertInfo)) orelse erlang:error(badarg),
+    true = (WillInfo =:= undefined orelse is_map(WillInfo)) orelse erlang:error(badarg),
+    WillPresent = WillInfo =/= undefined,
+    Base0 = encode_head(ClientId, CleanStart, Keepalive, WillPresent, true),
+    WillBin = case WillInfo of
+        undefined -> <<>>;
+        #{topic := Topic, payload := Payload, qos := QoS, retain := Retain} ->
+            encode_will_bin(Topic, Payload, QoS, Retain)
+    end,
+    CredsBin = encode_creds_bin(Creds),
+    PeerBin = encode_peer_bin(Peer),
+    CertBin = case CertInfo of
+        undefined -> <<>>;
+        _ when is_map(CertInfo) ->
+            Payload0 = encode_cert_payload(CertInfo),
+            true = (byte_size(Payload0) =< 65535) orelse erlang:error(badarg),
+            <<(byte_size(Payload0)):16/big, Payload0/binary>>;
+        _ -> erlang:error(badarg)
+    end,
+    V5Payload = encode_v5_payload(Version, Expiry, RecvMax, MaxPkt, Users),
+    true = (byte_size(V5Payload) =< ?MAX_V5_SECTION_LEN) orelse erlang:error(badarg),
+    <<Base0/binary, WillBin/binary, CredsBin/binary, PeerBin/binary, CertBin/binary,
+      AliasMax:16/big, V5Payload/binary, (byte_size(V5Payload)):16/big>>;
+encode_bind_meta(_, _, _, _, _, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @private Encode the v5 section payload (version plus the CONNECT
+%% properties the kernel needs). Bounds: at most `MAX_V5_BIND_USERS'
+%% pairs, each key/value within `MAX_V5_BIND_STRING' bytes; keys are
+%% non-empty. Anything else is a caller bug (`error(badarg)', never a
+%% half bind).
+encode_v5_payload(Version, Expiry, RecvMax, MaxPkt, Users)
+  when (Version =:= 4 orelse Version =:= 5),
+       is_integer(Expiry), Expiry >= 0, Expiry =< 16#FFFFFFFF,
+       is_integer(RecvMax), RecvMax >= 0, RecvMax =< 65535,
+       is_integer(MaxPkt), MaxPkt >= 0, MaxPkt =< 16#FFFFFFFF,
+       is_list(Users) ->
+    true = (length(Users) =< ?MAX_V5_BIND_USERS) orelse erlang:error(badarg),
+    Pairs = lists:foldl(
+              fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                                     byte_size(K) >= 1,
+                                     byte_size(K) =< ?MAX_V5_BIND_STRING,
+                                     byte_size(V) =< ?MAX_V5_BIND_STRING ->
+                      <<Acc/binary, (byte_size(K)):16/big, K/binary,
+                        (byte_size(V)):16/big, V/binary>>;
+                 (_, _) ->
+                      erlang:error(badarg)
+              end, <<>>, Users),
+    <<Version:8, Expiry:32/big, RecvMax:16/big, MaxPkt:32/big,
+      (length(Users)):16/big, Pairs/binary>>.
+
+%% @private Defaults for binds without a v5 section (version 4 and every
+%% older encoding): session ends at disconnect, no flow-control or
+%% packet-size limit announced beyond the alias default, no user
+%% properties.
+v5_bind_defaults() ->
+    #{protocol_version => 4,
+      session_expiry => 0,
+      receive_maximum => 65535,
+      max_packet_size => 0,
+      user_properties => []}.
+
+%% @private Encode the will payload `WillTopicLen:16be | WillTopic |
+%% WillQos:8 | WillRetain:8 | WillPayloadLen:32be | WillPayload'. The
+%% topic rides the 16-bit wire field (at most 65535 bytes); the whole
+%% section stays within one frame meta (65535 bytes). Longer topics or a
+%% failed encode is rejected so one bind cannot balloon edge or kernel
+%% memory.
+-define(MAX_WILL_TOPIC_LEN, 65535).
+
+encode_will_payload(#{topic := Topic, qos := QoS, retain := Retain, payload := Payload})
+  when is_binary(Topic), byte_size(Topic) > 0,
+       byte_size(Topic) =< ?MAX_WILL_TOPIC_LEN,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_binary(Payload) ->
+    R = case Retain of true -> 1; false -> 0 end,
+    <<(byte_size(Topic)):16/big, Topic/binary, QoS:8, R:8,
+      (byte_size(Payload)):32/big, Payload/binary>>;
+encode_will_payload(_) ->
+    erlang:error(badarg).
+
+%% @private Encode the certificate payload `CnLen | Cn | SubjectLen |
+%% Subject | SanCount | (SanLen | San)*'. At most 16 SANs, each field at
+%% most 1024 bytes: longer inputs are rejected so one bind cannot balloon
+%% edge or kernel memory.
+-define(MAX_CERT_FIELD_LEN, 1024).
+-define(MAX_CERT_SANS, 16).
+
+encode_cert_payload(CertInfo) ->
+    Cn = cert_field(maps:get(cn, CertInfo, undefined)),
+    Subject = cert_field(maps:get(subject, CertInfo, undefined)),
+    Sans = case maps:get(sans, CertInfo, []) of
+               L when is_list(L) -> L;
+               _ -> erlang:error(badarg)
+           end,
+    true = (length(Sans) =< ?MAX_CERT_SANS) orelse erlang:error(badarg),
+    SanBin = lists:foldl(
+               fun(San, Acc) when is_binary(San) ->
+                       true = (byte_size(San) =< ?MAX_CERT_FIELD_LEN)
+                           orelse erlang:error(badarg),
+                       <<Acc/binary, (byte_size(San)):16/big, San/binary>>;
+                  (_, _) ->
+                       erlang:error(badarg)
+               end, <<>>, Sans),
+    <<(byte_size(Cn)):16/big, Cn/binary,
+      (byte_size(Subject)):16/big, Subject/binary,
+      (length(Sans)):16/big, SanBin/binary>>.
+
+cert_field(undefined) -> <<>>;
+cert_field(Bin) when is_binary(Bin) ->
+    true = (byte_size(Bin) =< ?MAX_CERT_FIELD_LEN) orelse erlang:error(badarg),
+    Bin;
+cert_field(_) ->
+    erlang:error(badarg).
+
 %% @private True when the binary is an IP literal (v4 or v6).
 is_peer_ip(PeerIp) when is_binary(PeerIp) ->
     case catch inet:parse_address(binary_to_list(PeerIp)) of
@@ -510,13 +790,43 @@ is_peer_ip(_) ->
     false.
 
 %% @doc Decode BindConnection metadata, including the optional
-%% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0)
-%% and the optional F1-01 will section after the keepalive (Flags bit 1;
-%% absent means no will). A trailing section that is neither valid
-%% credentials/peer bytes nor credentials/peer bytes plus the 2-byte
-%% alias section is malformed (fail closed, never a guessed identity).
+%% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0),
+%% the optional F1-01 will section after the keepalive (Flags bit 1;
+%% absent means no will) and the optional X1-01 v5 section (Flags bit
+%% 2; absent means a version-4 bind with defaulted v5 fields). A
+%% trailing section that is neither valid credentials/peer bytes nor
+%% credentials/peer bytes plus the known sections is malformed (fail
+%% closed, never a guessed identity).
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
+    case peek_bind_flags(Rest, IdLen) of
+        v5 ->
+            decode_bind_meta_v5(Rest, IdLen);
+        _ ->
+            case decode_bind_legacy(Rest, IdLen) of
+                {ok, Got} ->
+                    {ok, maps:merge(v5_bind_defaults(), Got)};
+                {error, _} = Err ->
+                    Err
+            end
+    end;
+decode_bind_meta(_) ->
+    {error, malformed_bind_meta}.
+
+%% @private True when the bind head carries Flags bit 2 (X1-01 v5
+%% section present). Anything too short for a head is legacy (and then
+%% malformed, never a guessed version).
+peek_bind_flags(Rest, IdLen) ->
+    case Rest of
+        <<_:IdLen/binary, Flags:8, _/binary>> when Flags band ?BIND_FLAG_V5 =/= 0 ->
+            v5;
+        _ ->
+            legacy
+    end.
+
+%% @private Decode a pre-v5 bind: the exact legacy body, else the body
+%% plus a trailing 2-byte alias section (absent means 0).
+decode_bind_legacy(Rest, IdLen) ->
     case decode_bind_body(Rest, IdLen) of
         {ok, _} = Ok ->
             Ok;
@@ -537,8 +847,112 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
                 false ->
                     {error, malformed_bind_meta}
             end
+    end.
+
+%% @private Decode a v5 bind: strip `V5Payload | V5Len:16be' from the
+%% end, decode the v5 payload, then decode the remainder exactly like a
+%% legacy alias-carrying bind and merge the v5 fields over the
+%% defaults. Every length is checked (fail closed, never a guessed
+%% identity or version).
+decode_bind_meta_v5(Rest, IdLen) ->
+    case Rest of
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
+            TSize = byte_size(Tail),
+            case TSize >= 4 of
+                false ->
+                    {error, malformed_bind_meta};
+                true ->
+                    V5Len = binary:decode_unsigned(binary:part(Tail, TSize - 2, 2), big),
+                    %% Smallest payload: Version:8 | Expiry:32 |
+                    %% RecvMax:16 | MaxPkt:32 | Count:16 with zero
+                    %% pairs (13 bytes), plus the alias maximum and
+                    %% the section length around it.
+                    case V5Len >= 13 andalso V5Len =< ?MAX_V5_SECTION_LEN
+                         andalso TSize >= 2 + V5Len + 2 of
+                        false ->
+                            {error, malformed_bind_meta};
+                        true ->
+                            LegacySize = TSize - 2 - V5Len - 2,
+                            <<Legacy:LegacySize/binary, AliasMax:16/big,
+                              V5Payload:V5Len/binary, V5Len:16/big>> = Tail,
+                            case decode_v5_payload(V5Payload) of
+                                {ok, V5} ->
+                                    HeadSize = IdLen + 1 + 2,
+                                    <<Head:HeadSize/binary, _/binary>> = Rest,
+                                    LegacyRest = <<Head/binary, Legacy/binary,
+                                                   AliasMax:16/big>>,
+                                    case decode_bind_legacy(LegacyRest, IdLen) of
+                                        {ok, Got} ->
+                                            {ok, maps:merge(
+                                                   maps:merge(v5_bind_defaults(), Got),
+                                                   #{protocol_version =>
+                                                         maps:get(version, V5),
+                                                     session_expiry =>
+                                                         maps:get(session_expiry, V5),
+                                                     receive_maximum =>
+                                                         maps:get(receive_max, V5),
+                                                     max_packet_size =>
+                                                         maps:get(max_packet_size, V5),
+                                                     user_properties =>
+                                                         maps:get(user_properties, V5),
+                                                     client_id => ClientId,
+                                                     clean_start =>
+                                                         (Flags band 16#01) =:= 16#01,
+                                                     keepalive => Keepalive})};
+                                        {error, _} = Err ->
+                                            Err
+                                    end;
+                                {error, _} = Err ->
+                                    Err
+                            end
+                    end
+            end;
+        _ ->
+            {error, malformed_bind_meta}
+    end.
+
+%% @private Decode one v5 section payload: `Version:8 |
+%% SessionExpiry:32be | RecvMax:16be | MaxPacketSize:32be |
+%% UserCount:16be | (KeyLen:16be | Key | ValLen:16be | Val)*'. The
+%% version is 4 | 5, at most `MAX_V5_BIND_USERS' pairs each within
+%% `MAX_V5_BIND_STRING' bytes, consuming the payload exactly;
+%% anything else is malformed (fail closed).
+decode_v5_payload(<<Version:8, Expiry:32/big, RecvMax:16/big,
+                    MaxPkt:32/big, Count:16/big, Pairs/binary>>)
+  when (Version =:= 4 orelse Version =:= 5),
+       Count =< ?MAX_V5_BIND_USERS ->
+    case decode_v5_pairs(Pairs, Count, []) of
+        {ok, Users, <<>>} ->
+            {ok, #{version => Version,
+                   session_expiry => Expiry,
+                   receive_max => RecvMax,
+                   max_packet_size => MaxPkt,
+                   user_properties => Users}};
+        _ ->
+            {error, malformed_bind_meta}
     end;
-decode_bind_meta(_) ->
+decode_v5_payload(_) ->
+    {error, malformed_bind_meta}.
+
+%% @private Decode Count user-property pairs, returning the pairs plus
+%% the unconsumed tail (empty on success).
+decode_v5_pairs(Tail, 0, Acc) ->
+    {ok, lists:reverse(Acc), Tail};
+decode_v5_pairs(<<KLen:16/big, Rest/binary>>, N, Acc)
+  when N > 0, KLen >= 1, KLen =< ?MAX_V5_BIND_STRING ->
+    case Rest of
+        <<K:KLen/binary, VLen:16/big, Rest1/binary>>
+          when VLen =< ?MAX_V5_BIND_STRING ->
+            case Rest1 of
+                <<V:VLen/binary, Tail/binary>> ->
+                    decode_v5_pairs(Tail, N - 1, [{K, V} | Acc]);
+                _ ->
+                    {error, malformed_bind_meta}
+            end;
+        _ ->
+            {error, malformed_bind_meta}
+    end;
+decode_v5_pairs(_, _, _) ->
     {error, malformed_bind_meta}.
 
 %% @private Decode the bind body without any alias section. When Flags
@@ -558,6 +972,9 @@ decode_bind_body(Rest, IdLen) ->
                            password => undefined,
                            peerhost => undefined,
                            client_alias_max => 0,
+                           cert_cn => undefined,
+                           cert_subject => undefined,
+                           cert_sans => [],
                            will_topic => undefined,
                            will_payload => undefined,
                            will_qos => 0,
@@ -567,8 +984,24 @@ decode_bind_body(Rest, IdLen) ->
             end;
         <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
             case decode_will_section(Tail, Flags) of
-                {ok, Will, CredsTail} ->
+                {ok, HeadWill, CredsTail} ->
                     case decode_bind_creds(CredsTail) of
+                        {ok, User, Pass, Peer, Cn, Subject, Sans, TailWill} ->
+                            MergedWill = merge_head_tail_will(HeadWill, TailWill),
+                            {ok, #{client_id => ClientId,
+                                   clean_start => (Flags band 16#01) =:= 16#01,
+                                   keepalive => Keepalive,
+                                   username => User,
+                                   password => Pass,
+                                   peerhost => Peer,
+                                   client_alias_max => 0,
+                                   cert_cn => Cn,
+                                   cert_subject => Subject,
+                                   cert_sans => Sans,
+                                   will_topic => will_field(MergedWill, topic),
+                                   will_payload => will_field(MergedWill, payload),
+                                   will_qos => will_field(MergedWill, qos),
+                                   will_retain => will_field(MergedWill, retain)}};
                         {ok, User, Pass, Peer} ->
                             {ok, #{client_id => ClientId,
                                    clean_start => (Flags band 16#01) =:= 16#01,
@@ -577,10 +1010,13 @@ decode_bind_body(Rest, IdLen) ->
                                    password => Pass,
                                    peerhost => Peer,
                                    client_alias_max => 0,
-                                   will_topic => maps:get(topic, Will),
-                                   will_payload => maps:get(payload, Will),
-                                   will_qos => maps:get(qos, Will),
-                                   will_retain => maps:get(retain, Will)}};
+                                   cert_cn => undefined,
+                                   cert_subject => undefined,
+                                   cert_sans => [],
+                                   will_topic => maps:get(topic, HeadWill),
+                                   will_payload => maps:get(payload, HeadWill),
+                                   will_qos => maps:get(qos, HeadWill),
+                                   will_retain => maps:get(retain, HeadWill)}};
                         {error, _} = Err ->
                             Err
                     end;
@@ -629,60 +1065,301 @@ decode_will_section(Tail, Flags) ->
             end
     end.
 
+%% @private Read one will field, defaulting an absent will to the same
+%% shape as a bind without a will section.
+will_field(undefined, topic) -> undefined;
+will_field(undefined, payload) -> undefined;
+will_field(undefined, qos) -> 0;
+will_field(undefined, retain) -> false;
+will_field(Will, Field) -> maps:get(Field, Will).
+
+%% @private Prefer the head will when present (Flags bit 1), else the tail will.
+%% Both absent means no will. A head will plus a tail will keeps the head
+%% (fail closed: the kernel re-validates; two wills never merge).
+merge_head_tail_will(#{topic := undefined}, TailWill) -> TailWill;
+merge_head_tail_will(HeadWill, _) -> HeadWill.
+
 %% @private Decode the trailing sections after the fixed bind header:
-%% a credentials section, optionally followed by a peer-address
-%% section; or, for an anonymous bind from a peer-aware edge, just the
-%% peer section. A trailing section that is neither valid credentials
-%% nor a valid peer address is malformed, exactly as trailing garbage
-%% was before the peer section existed. An empty tail is anonymous with
-%% no peer (mirrors the kernel `decode_bind_identity` empty case; the
-%% F1-01 will section leaves exactly this tail for anonymous binds).
+%% a credentials section, optionally followed by a peer-address section,
+%% optionally followed by a certificate section, optionally followed by a
+%% will section; or, for an anonymous bind from a peer-aware edge, just the
+%% peer (and optional certificate and will) sections. A trailing section that
+%% is none of these is malformed, exactly as trailing garbage was before the
+%% sections. An empty tail is anonymous with no peer, cert or will.
 decode_bind_creds(<<>>) ->
-    {ok, undefined, undefined, undefined};
-decode_bind_creds(<<ULen:16/big, Rest/binary>>) ->
+    {ok, undefined, undefined, undefined, undefined, undefined, [], undefined};
+decode_bind_creds(<<ULen:16/big, Rest/binary>> = Whole) ->
     case Rest of
         <<User:ULen/binary, PLen:16/big, PassRest/binary>> ->
             case PassRest of
                 <<Pass:PLen/binary>> when PLen > 0 ->
-                    {ok, User, Pass, undefined};
+                    %% Ambiguous wire (MT-05): an anonymous peer-plus-will/cert
+                    %% tail can also frame as username(IP) plus password(will
+                    %% bytes) with no trailing. Prefer anonymous when the whole
+                    %% input splits as a peer plus a will/cert tail carrying a
+                    %% will or cert (fail closed: never grant a username from
+                    %% a peer literal).
+                    case split_peer_prefix(Whole) of
+                        {ok, Peer, CertTail} ->
+                            case decode_cert_and_will_tail(CertTail) of
+                                {ok, Cn, Subject, Sans, Will}
+                                  when Will =/= undefined;
+                                       Cn =/= undefined;
+                                       Subject =/= undefined;
+                                       Sans =/= [] ->
+                                    {ok, undefined, undefined, Peer, Cn, Subject, Sans, Will};
+                                _ ->
+                                    {ok, User, Pass, undefined, undefined, undefined, [], undefined}
+                            end;
+                        error ->
+                            {ok, User, Pass, undefined, undefined, undefined, [], undefined}
+                    end;
                 <<Pass:PLen/binary, PeerTail/binary>> when PLen > 0 ->
-                    case decode_peer_section(PeerTail) of
-                        {ok, Peer} ->
-                            {ok, User, Pass, Peer};
+                    case split_peer_prefix(PeerTail) of
+                        {ok, Peer, CertTail} ->
+                            case decode_cert_and_will_tail(CertTail) of
+                                {ok, Cn, Subject, Sans, Will} ->
+                                    {ok, User, Pass, Peer, Cn, Subject, Sans, Will};
+                                error ->
+                                    %% Fallback (MT-05): credentialed trailing
+                                    %% sections did not decode; the whole input
+                                    %% may still be anonymous peer-plus-will/cert.
+                                    case anonymous_tail(Whole) of
+                                        {ok, _, _, _, _, _, _, _} = Anon -> Anon;
+                                        error -> {error, malformed_bind_meta}
+                                    end
+                            end;
+                        error ->
+                            %% A well-formed certificate/will tail without
+                            %% a peer section is accepted; anything else
+                            %% falls back to anonymous before failing.
+                            case decode_cert_and_will_tail(PeerTail) of
+                                {ok, Cn, Subject, Sans, Will} ->
+                                    {ok, User, Pass, undefined, Cn, Subject, Sans, Will};
+                                error ->
+                                    case anonymous_tail(Whole) of
+                                        {ok, _, _, _, _, _, _, _} = Anon -> Anon;
+                                        error -> {error, malformed_bind_meta}
+                                    end
+                            end
+                    end;
+                _ ->
+                    %% Credentialed lengths do not align; try anonymous
+                    %% (fail closed) before failing.
+                    case anonymous_tail(Whole) of
+                        {ok, _, _, _, _, _, _, _} = Anon -> Anon;
+                        error -> {error, malformed_bind_meta}
+                    end
+            end;
+        _ ->
+            case split_peer_prefix(<<ULen:16/big, Rest/binary>>) of
+                {ok, Peer, CertTail} ->
+                    case decode_cert_and_will_tail(CertTail) of
+                        {ok, Cn, Subject, Sans, Will} ->
+                            {ok, undefined, undefined, Peer, Cn, Subject, Sans, Will};
                         error ->
                             {error, malformed_bind_meta}
                     end;
-                _ ->
-                    {error, malformed_bind_meta}
-            end;
-        _ ->
-            case decode_peer_section(<<ULen:16/big, Rest/binary>>) of
-                {ok, Peer} ->
-                    {ok, undefined, undefined, Peer};
                 error ->
-                    {error, malformed_bind_meta}
+                    case decode_cert_and_will_tail(<<ULen:16/big, Rest/binary>>) of
+                        {ok, Cn, Subject, Sans, Will} ->
+                            {ok, undefined, undefined, undefined, Cn, Subject, Sans, Will};
+                        error ->
+                            {error, malformed_bind_meta}
+                    end
             end
     end;
 decode_bind_creds(_) ->
     {error, malformed_bind_meta}.
 
-%% @private Decode one peer-address section `PeerLen:16be | PeerIp':
-%% exactly those bytes and an IP literal, otherwise `error'.
-decode_peer_section(<<PLen:16/big, Rest/binary>>) ->
+%% @private Try the whole tail as an anonymous peer-plus-will/cert section
+%% (fail closed: only succeeds with a will or cert present, never bare).
+anonymous_tail(Whole) ->
+    case split_peer_prefix(Whole) of
+        {ok, Peer, CertTail} ->
+            case decode_cert_and_will_tail(CertTail) of
+                {ok, Cn, Subject, Sans, Will}
+                  when Will =/= undefined;
+                       Cn =/= undefined;
+                       Subject =/= undefined;
+                       Sans =/= [] ->
+                    {ok, undefined, undefined, Peer, Cn, Subject, Sans, Will};
+                _ ->
+                    error
+            end;
+        error ->
+            error
+    end.
+
+%% @private Split one peer-address prefix `PeerLen:16be | PeerIp' off the
+%% front, returning the IP literal plus the unconsumed tail. Only IP
+%% literals split here; anything else is not a peer section.
+split_peer_prefix(<<PLen:16/big, Rest/binary>>) when PLen > 0 ->
     case Rest of
-        <<Peer:PLen/binary>> ->
+        <<Peer:PLen/binary, Tail/binary>> ->
             case is_peer_ip(Peer) of
-                true -> {ok, Peer};
+                true -> {ok, Peer, Tail};
                 false -> error
             end;
         _ ->
             error
     end;
-decode_peer_section(_) ->
+split_peer_prefix(_) ->
     error.
 
 %% @doc Encode SessionBinding metadata for the given session outcome
 %% (pre-alias 10-byte form; decodes with alias maximum 0).
+%% @private Split the trailing certificate-plus-will tail (MT-01 plus
+%% MT-05): an optional certificate section followed by the optional
+%% will section. Empty means neither. Cert-first with a will-only
+%% fallback: a will-only tail whose bytes also frame a certificate
+%% prefix still decodes as the will it is (the fallback re-reads the
+%% whole tail as one will section). Anything else is `error' (fail
+%% closed), mirroring the kernel `decode_cert_and_will_tail'.
+decode_cert_and_will_tail(<<>>) ->
+    {ok, undefined, undefined, [], undefined};
+decode_cert_and_will_tail(Bin) ->
+    case split_cert_prefix(Bin) of
+        {ok, Cn, Subject, Sans, Rest} ->
+            case decode_will_tail(Rest) of
+                {ok, Will} ->
+                    {ok, Cn, Subject, Sans, Will};
+                error ->
+                    case decode_will_tail(Bin) of
+                        {ok, Will} when Will =/= undefined ->
+                            {ok, undefined, undefined, [], Will};
+                        _ ->
+                            error
+                    end
+            end;
+        error ->
+            case decode_will_tail(Bin) of
+                {ok, Will} when Will =/= undefined ->
+                    {ok, undefined, undefined, [], Will};
+                _ ->
+                    error
+            end
+    end.
+
+%% @private Split one certificate section `CertLen:16be | CertPayload'
+%% off the front, returning the fields plus the unconsumed tail (the
+%% will section, possibly empty).
+split_cert_prefix(<<CertLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<Payload:CertLen/binary, Tail/binary>> ->
+            case decode_cert_payload(Payload) of
+                {ok, Cn, Subject, Sans} ->
+                    {ok, Cn, Subject, Sans, Tail};
+                error ->
+                    error
+            end;
+        _ ->
+            error
+    end;
+split_cert_prefix(_) ->
+    error.
+
+%% @private Decode the optional trailing will tail: empty means no
+%% will; otherwise exactly one `WillLen:16be | WillPayload' section
+%% consuming the whole tail, else `error' (fail closed).
+decode_will_tail(<<>>) ->
+    {ok, undefined};
+decode_will_tail(Bin) ->
+    decode_will_section(Bin).
+
+%% @private Decode one will section. The topic must be non-empty, QoS
+%% 0..2 and retain 0/1; the payload length must consume the tail
+%% exactly; anything else is not a will section.
+decode_will_section(<<WillLen:16/big, Rest/binary>>) ->
+    case Rest of
+        <<Payload:WillLen/binary>> when byte_size(Rest) =:= WillLen ->
+            decode_will_payload(Payload);
+        _ ->
+            error
+    end;
+decode_will_section(_) ->
+    error.
+
+decode_will_payload(<<TopicLen:16/big, Rest/binary>>) when TopicLen > 0 ->
+    case Rest of
+        <<Topic:TopicLen/binary, QoS:8, R:8, PayloadLen:32/big, PayloadRest/binary>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1) ->
+            case PayloadRest of
+                <<Payload:PayloadLen/binary>>
+                  when byte_size(PayloadRest) =:= PayloadLen ->
+                    {ok, #{topic => Topic,
+                           qos => QoS,
+                           retain => R =:= 1,
+                           payload => Payload}};
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end;
+decode_will_payload(_) ->
+    error.
+
+decode_cert_payload(<<CnLen:16/big, Rest/binary>>)
+  when CnLen =< ?MAX_CERT_FIELD_LEN ->
+    case Rest of
+        <<Cn:CnLen/binary, SubLen:16/big, Rest2/binary>>
+          when SubLen =< ?MAX_CERT_FIELD_LEN ->
+            case Rest2 of
+                <<Subject:SubLen/binary, SanCount:16/big, Rest3/binary>> ->
+                    case decode_cert_sans(Rest3, SanCount, []) of
+                        {ok, Sans} ->
+                            {ok, cert_opt(Cn), cert_opt(Subject), Sans};
+                        error ->
+                            error
+                    end;
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end;
+decode_cert_payload(_) ->
+    error.
+
+decode_cert_sans(Rest, 0, Acc) ->
+    case Rest of
+        <<>> ->
+            {ok, lists:reverse(Acc)};
+        _ ->
+            error
+    end;
+decode_cert_sans(_, N, _) when N > ?MAX_CERT_SANS; N < 0 ->
+    error;
+decode_cert_sans(<<SanLen:16/big, Rest/binary>>, N, Acc) when N > 0 ->
+    case Rest of
+        <<San:SanLen/binary, Tail/binary>> when SanLen =< ?MAX_CERT_FIELD_LEN ->
+            decode_cert_sans(Tail, N - 1, [San | Acc]);
+        _ ->
+            error
+    end;
+decode_cert_sans(_, _, _) ->
+    error.
+
+%% @private Empty certificate strings decode as absent (`undefined').
+cert_opt(<<>>) -> undefined;
+cert_opt(Bin) when is_binary(Bin) -> Bin.
+
+%% Largest SessionBinding v5 section (bytes). Reason: one section must
+%% leave room for the 12-byte binding head inside the 65535-byte
+%% BrokerLink meta cap; 4 KiB covers a reason string plus realistic
+%% echoed user properties.
+-define(MAX_BINDING_V5_LEN, 4096).
+%% Most user properties carried per binding (count). Reason: bounds
+%% per-bind memory on the handshake path; mirrors the bind v5 bound.
+-define(MAX_BINDING_V5_USERS, 16).
+%% Largest single reason string, user-property key or value in a
+%% binding (bytes). Reason: bounds per-bind memory; mirrors the bind
+%% v5 string bound.
+-define(MAX_BINDING_V5_STRING, 1024).
+
+%% @doc Encode SessionBinding metadata for the given session outcome.
 -spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255) -> binary().
 encode_session_binding_meta(SessionId, SessionPresent, ReturnCode)
   when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
@@ -692,8 +1369,8 @@ encode_session_binding_meta(SessionId, SessionPresent, ReturnCode)
     <<SessionId:64/big, Present:8, ReturnCode:8>>.
 
 %% @doc Encode SessionBinding metadata with the B4-05 Topic Alias
-%% Maximum (12-byte form). The kernel always sends this form; the edge
-%% accepts both.
+%% Maximum (12-byte form). The kernel sends this form for version-4
+%% binds (unchanged bytes); the edge accepts all forms.
 -spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255, 0..65535) -> binary().
 encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax)
   when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
@@ -703,35 +1380,186 @@ encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax)
     Present = case SessionPresent of true -> 1; false -> 0 end,
     <<SessionId:64/big, Present:8, ReturnCode:8, AliasMax:16/big>>.
 
+%% @doc Encode SessionBinding metadata with the X1-02 v5 section
+%% (extended form for version-5 binds). `V5' is `undefined' or a map
+%% with `server_recv_max' (u16), `server_max_pkt' (u32),
+%% `session_expiry' (u32), `reason_string' (binary, possibly empty)
+%% and `user_properties' ([{Key, Value}]). `undefined' encodes exactly
+%% like {@link encode_session_binding_meta/4}, so version-4 binds stay
+%% byte-identical. A present section sets no flag (the head has no
+%% spare bits): the form is `Head12 | V5Payload | V5Len:16be' where
+%% `V5Payload' is `ServerRecv:16be | ServerMaxPkt:32be |
+%% GrantedExpiry:32be | ReasonLen:16be | Reason | UserCount:16be |
+%% (KeyLen:16be | Key | ValLen:16be | Val)*', and the trailing length
+%% rides last so the decoder strips it deterministically from the end.
+%% Bounds (fail closed at encode time): reason at most
+%% `MAX_BINDING_V5_STRING' bytes, at most `MAX_BINDING_V5_USERS'
+%% pairs each within `MAX_BINDING_V5_STRING' bytes with non-empty
+%% keys, whole section at most `MAX_BINDING_V5_LEN' bytes.
+-spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255, 0..65535,
+                                  map() | undefined) -> binary().
+encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax, undefined) ->
+    encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax);
+encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax,
+                            #{server_recv_max := RecvMax, server_max_pkt := MaxPkt,
+                              session_expiry := Expiry, reason_string := Reason,
+                              user_properties := Users})
+  when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
+       is_boolean(SessionPresent),
+       is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255,
+       is_integer(AliasMax), AliasMax >= 0, AliasMax =< 65535,
+       is_integer(RecvMax), RecvMax >= 0, RecvMax =< 65535,
+       is_integer(MaxPkt), MaxPkt >= 0, MaxPkt =< 16#FFFFFFFF,
+       is_integer(Expiry), Expiry >= 0, Expiry =< 16#FFFFFFFF,
+       is_binary(Reason), is_list(Users) ->
+    Head = encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax),
+    Payload = encode_binding_v5_payload(RecvMax, MaxPkt, Expiry, Reason, Users),
+    true = (byte_size(Payload) =< ?MAX_BINDING_V5_LEN) orelse erlang:error(badarg),
+    <<Head/binary, Payload/binary, (byte_size(Payload)):16/big>>;
+encode_session_binding_meta(_, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @private Encode one binding v5 payload. Caller-bug violations raise
+%% `error(badarg)' (never a half binding).
+encode_binding_v5_payload(RecvMax, MaxPkt, Expiry, Reason, Users) ->
+    true = (byte_size(Reason) =< ?MAX_BINDING_V5_STRING) orelse erlang:error(badarg),
+    true = (length(Users) =< ?MAX_BINDING_V5_USERS) orelse erlang:error(badarg),
+    Pairs = lists:foldl(
+              fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                                     byte_size(K) >= 1,
+                                     byte_size(K) =< ?MAX_BINDING_V5_STRING,
+                                     byte_size(V) =< ?MAX_BINDING_V5_STRING ->
+                      <<Acc/binary, (byte_size(K)):16/big, K/binary,
+                        (byte_size(V)):16/big, V/binary>>;
+                 (_, _) ->
+                      erlang:error(badarg)
+              end, <<>>, Users),
+    <<RecvMax:16/big, MaxPkt:32/big, Expiry:32/big,
+      (byte_size(Reason)):16/big, Reason/binary,
+      (length(Users)):16/big, Pairs/binary>>.
+
 %% @doc Decode SessionBinding metadata (10-byte pre-alias form decodes
-%% with alias maximum 0, 12-byte form carries it).
+%% with alias maximum 0, 12-byte form carries it, longer forms carry
+%% the X1-02 trailing v5 section `V5Payload | V5Len:16be'). A trailing
+%% section that is none of these is malformed (fail closed, never a
+%% guessed session).
 -spec decode_session_binding_meta(binary()) ->
     {ok, session_binding_meta()} | {error, term()}.
 decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8>>) ->
     decode_session_present(SessionId, Present, RC, 0);
 decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8, AliasMax:16/big>>) ->
     decode_session_present(SessionId, Present, RC, AliasMax);
+decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8, AliasMax:16/big, Rest/binary>>) ->
+    case decode_binding_v5_section(Rest) of
+        {ok, V5} ->
+            case decode_session_present(SessionId, Present, RC, AliasMax) of
+                {ok, Got} ->
+                    {ok, maps:merge(Got, V5)};
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end;
 decode_session_binding_meta(_) ->
     {error, malformed_session_binding_meta}.
 
-%% @private Share the Present-bit validation between both encodings.
+%% @private Strip `V5Payload | V5Len:16be' from the end of an extended
+%% binding and decode the v5 fields. Every length is checked (fail
+%% closed, never a guessed limit or reason).
+decode_binding_v5_section(Rest) ->
+    Size = byte_size(Rest),
+    case Size >= 2 of
+        false ->
+            {error, malformed_session_binding_meta};
+        true ->
+            V5Len = binary:decode_unsigned(binary:part(Rest, Size - 2, 2), big),
+            case V5Len >= 14 andalso V5Len =< ?MAX_BINDING_V5_LEN
+                 andalso Size =:= V5Len + 2 of
+                false ->
+                    {error, malformed_session_binding_meta};
+                true ->
+                    <<Payload:V5Len/binary, V5Len:16/big>> = Rest,
+                    decode_binding_v5_payload(Payload)
+            end
+    end.
+
+%% @private Decode one binding v5 payload: `ServerRecv:16be |
+%% ServerMaxPkt:32be | GrantedExpiry:32be | ReasonLen:16be | Reason |
+%% UserCount:16be | pairs'. Overlong, non-UTF-8 (reason/keys/values
+%% ride raw binaries here, validated as byte strings) or trailing
+%% bytes fail the section.
+decode_binding_v5_payload(<<RecvMax:16/big, MaxPkt:32/big, Expiry:32/big,
+                            RLen:16/big, Rest/binary>>)
+  when RLen =< ?MAX_BINDING_V5_STRING ->
+    case Rest of
+        <<Reason:RLen/binary, Count:16/big, Pairs/binary>> when Count =< ?MAX_BINDING_V5_USERS ->
+            case decode_binding_v5_pairs(Pairs, Count, []) of
+                {ok, Users, <<>>} ->
+                    {ok, #{server_recv_max => RecvMax,
+                           server_max_pkt => MaxPkt,
+                           session_expiry => Expiry,
+                           reason_string => Reason,
+                           user_properties => Users}};
+                _ ->
+                    {error, malformed_session_binding_meta}
+            end;
+        _ ->
+            {error, malformed_session_binding_meta}
+    end;
+decode_binding_v5_payload(_) ->
+    {error, malformed_session_binding_meta}.
+
+%% @private Decode Count user-property pairs, returning the pairs plus
+%% the unconsumed tail (empty on success).
+decode_binding_v5_pairs(Tail, 0, Acc) ->
+    {ok, lists:reverse(Acc), Tail};
+decode_binding_v5_pairs(<<KLen:16/big, Rest/binary>>, N, Acc)
+  when N > 0, KLen >= 1, KLen =< ?MAX_BINDING_V5_STRING ->
+    case Rest of
+        <<K:KLen/binary, VLen:16/big, Rest1/binary>>
+          when VLen =< ?MAX_BINDING_V5_STRING ->
+            case Rest1 of
+                <<V:VLen/binary, Tail/binary>> ->
+                    decode_binding_v5_pairs(Tail, N - 1, [{K, V} | Acc]);
+                _ ->
+                    {error, malformed_session_binding_meta}
+            end;
+        _ ->
+            {error, malformed_session_binding_meta}
+    end;
+decode_binding_v5_pairs(_, _, _) ->
+    {error, malformed_session_binding_meta}.
+
+%% @private Share the Present-bit validation between all encodings.
+%% Short (10/12-byte) bindings decode with defaulted v5 fields (no
+%% server limits, no expiry, no reason, no user properties); extended
+%% bindings merge the decoded v5 section over these defaults.
 decode_session_present(SessionId, 0, RC, AliasMax) ->
     {ok, #{session_id => SessionId,
             session_present => false,
             return_code => RC,
-            alias_max => AliasMax}};
+            alias_max => AliasMax,
+            server_recv_max => 0,
+            server_max_pkt => 0,
+            session_expiry => 0,
+            reason_string => <<>>,
+            user_properties => []}};
 decode_session_present(SessionId, 1, RC, AliasMax) ->
     {ok, #{session_id => SessionId,
             session_present => true,
             return_code => RC,
-            alias_max => AliasMax}};
+            alias_max => AliasMax,
+            server_recv_max => 0,
+            server_max_pkt => 0,
+            session_expiry => 0,
+            reason_string => <<>>,
+            user_properties => []}};
 decode_session_present(_, _, _, _) ->
     {error, malformed_session_binding_meta}.
 
-%%====================================================================
-%% BrokerLink metadata contracts (Sprint 3: messaging loop)
-%%====================================================================
-%%
+%%=============================================================%% BrokerLink metadata contracts (Sprint 3: messaging loop)
+%%=============================================================%%
 %% Layouts mirrored by `crates/broker-node/src/main.rs`:
 %%
 %% SubscribeMeta (Opcode 16#0030, BEAM -> Rust):
@@ -1046,10 +1874,8 @@ decode_meta_subs(<<FilterLen:16/big, Rest/binary>>, N, Acc) when FilterLen > 0, 
 decode_meta_subs(_, _, _) ->
     {error, malformed_subscribe_meta}.
 
-%%====================================================================
-%% gen_server IPC client API
-%%====================================================================
-
+%%=============================================================%% gen_server IPC client API
+%%=============================================================
 %% @doc Start an unregistered BrokerLink IPC client with default options.
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -1104,10 +1930,8 @@ send(Pid, Opcode, ConnId, SeqNo, MetaBin, PayloadBin) ->
             gen_server:call(Pid, {send, Opcode, ConnId, SeqNo, MetaBin, PayloadBin}, 5000)
     end.
 
-%%====================================================================
-%% gen_server callbacks
-%%====================================================================
-
+%%=============================================================%% gen_server callbacks
+%%=============================================================
 init(Opts) ->
     Transport = proplists:get_value(transport, Opts, tcp),
     Host = proplists:get_value(host, Opts, ?DEFAULT_HOST),
@@ -1180,10 +2004,8 @@ terminate(_Reason, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%%====================================================================
-%% Internal helpers
-%%====================================================================
-
+%%=============================================================%% Internal helpers
+%%=============================================================
 %% @doc Socket options for the BrokerLink TCP connection.
 %% `nodelay' avoids delayed-ACK interaction on small frames;
 %% 64 KiB buffers bound per-connection memory while giving the

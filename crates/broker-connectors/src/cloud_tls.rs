@@ -19,7 +19,7 @@ use tokio_rustls::TlsConnector;
 use super::{ConnectorError, Result};
 
 /// Split `host[:port]`; bare hosts take `default_port`.
-pub(crate) fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16)> {
+pub fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16)> {
     let rest = input.trim();
     if rest.is_empty() {
         return Err(ConnectorError::Dispatch(
@@ -54,13 +54,13 @@ pub(crate) fn parse_host_port(input: &str, default_port: u16) -> Result<(String,
 }
 
 /// Server name for TLS verification (DNS or IP literal).
-pub(crate) fn server_name_for_host(host: &str) -> Result<ServerName<'static>> {
+pub fn server_name_for_host(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host.to_string())
         .map_err(|_| ConnectorError::Dispatch(format!("cloud endpoint host invalid: {host:?}")))
 }
 
 /// All certificates in one PEM document.
-pub(crate) fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+pub fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut reader)
         .map_err(|e| ConnectorError::Dispatch(format!("cloud PEM certificate read failed: {e}")))?;
@@ -73,7 +73,7 @@ pub(crate) fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> 
 }
 
 /// First private key in one PEM document (PKCS#8, RSA or SEC1 EC).
-pub(crate) fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
+pub fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     loop {
         match rustls_pemfile::read_one(&mut reader)
@@ -100,7 +100,7 @@ pub(crate) fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> 
 /// Root store: OS system trust store plus one optional extra bundle.
 /// Falls back to bundled Mozilla roots when the OS store is empty or
 /// unreadable so loopback/offline tests still build.
-pub(crate) fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> {
+pub fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> {
     let mut store = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     let mut loaded = 0usize;
@@ -132,7 +132,7 @@ pub(crate) fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> 
 }
 
 /// Client TLS config with optional mutual authentication and ALPN.
-pub(crate) fn client_config(
+pub fn client_config(
     roots: RootCertStore,
     client_cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     alpn: &[String],
@@ -150,7 +150,7 @@ pub(crate) fn client_config(
 
 /// Dial TCP with a connect timeout, then complete the TLS handshake
 /// with its own timeout. The TCP socket is never used for cleartext.
-pub(crate) async fn tls_dial(
+pub async fn tls_dial(
     host: &str,
     port: u16,
     config: Arc<ClientConfig>,
@@ -176,7 +176,7 @@ pub(crate) async fn tls_dial(
 }
 
 /// Encode one MQTT 3.1.1 CONNECT frame.
-pub(crate) fn encode_mqtt_connect(
+pub fn encode_mqtt_connect(
     client_id: &str,
     clean_start: bool,
     keep_alive_secs: u16,
@@ -221,7 +221,7 @@ pub(crate) fn encode_mqtt_connect(
 }
 
 /// Write CONNECT and expect a `0x00` CONNACK over an established TLS stream.
-pub(crate) async fn mqtt_connect_over_tls(
+pub async fn mqtt_connect_over_tls(
     stream: &mut TlsStream<TcpStream>,
     connect: &[u8],
     context: &str,
@@ -251,8 +251,10 @@ pub(crate) async fn mqtt_connect_over_tls(
 }
 
 /// Read one CONNECT from a server-side TLS stream (used by tests).
-#[cfg(test)]
-pub(crate) async fn read_client_connect<S>(
+/// Unconditionally compiled: the enterprise crate's tests use this helper
+/// through the community crate, and `#[cfg(test)]` on a dependency is
+/// configured out for downstream test builds.
+pub async fn read_client_connect<S>(
     stream: &mut S,
 ) -> Result<(String, Option<String>, Option<String>)>
 where
@@ -335,11 +337,13 @@ where
 
 /// Minimal test CA + leaf certificate material (generated once with
 /// openssl for loopback TLS tests; never deployed).
-#[cfg(test)]
-pub(crate) mod test_certs {
+/// Unconditionally compiled: the enterprise crate's tests build their TLS
+/// acceptors from this helper, and `#[cfg(test)]` on a dependency is
+/// configured out for downstream test builds.
+pub mod test_certs {
     /// Build a `ServerConfig` from PEM cert/key, optionally requiring
     /// a client certificate verified against `client_ca_pem`.
-    pub(crate) fn server_config(
+    pub fn server_config(
         cert_pem: &str,
         key_pem: &str,
         client_ca_pem: Option<&str>,

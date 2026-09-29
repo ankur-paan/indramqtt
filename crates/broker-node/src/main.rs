@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, DbAuthSet, DbAuthSetConfig,
-    JwksAuthenticator, JwksConfig, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
-    LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth, WebhookConfig,
+    AuthnChain, AuthnSettingsStore, DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig,
+    KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
+    NodeAuthCache, WebhookAuth, WebhookConfig,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
 };
-use broker_config::{ConfigError, ConfigRegistry};
+use broker_config::{CliOverrides, ConfigError, ConfigRegistry, LayeredConfig};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{v5 as protocol_v5, QoS, Topic, TopicFilter};
@@ -17,7 +17,7 @@ use broker_router::{
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
     InflightMessage, InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage,
-    SessionManager,
+    SessionKey, SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::OfflineQueueStore;
@@ -65,6 +65,12 @@ struct Args {
     /// Created on boot when missing.
     #[arg(long, default_value = "./data")]
     data_dir: String,
+
+    /// Directory holding operator configuration (`indra.toml`).
+    /// Created on boot when missing.  A missing directory or a missing
+    /// `indra.toml` starts on defaults.
+    #[arg(long, default_value = broker_config::DEFAULT_CONFIG_DIR)]
+    config_dir: String,
 
     /// Enterprise commercial license key for multi-node clustering (or via INDRA_LICENSE_KEY env).
     #[arg(long)]
@@ -131,8 +137,9 @@ struct Args {
     /// per-session spill buffer (still tracked for DUP redelivery).
     /// Default 100 caps per-session live unacked state near 100 small
     /// frames while absorbing a short ack stall without spilling.
-    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_INFLIGHT)]
-    qos1_inflight_window: usize,
+    /// Schema home: `session.max_qos1_inflight`.
+    #[arg(long)]
+    qos1_inflight_window: Option<usize>,
 
     /// Per-session QoS 1 spill bound past the window (B4-01). Overflow
     /// beyond the window is still delivered live once and tracked here
@@ -141,8 +148,9 @@ struct Args {
     /// absorbs roughly a 1 s burst at 1k msg/s from a stalled
     /// acknowledger while keeping per-session tracked memory bounded
     /// near 1,100 messages total.
-    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_SPILL)]
-    qos1_spill: usize,
+    /// Schema home: `session.max_qos1_spill`.
+    #[arg(long)]
+    qos1_spill: Option<usize>,
 
     /// CoAP gateway UDP listen address (B1-04). Empty disables the
     /// gateway (the default): nothing listens, nothing is dispatched,
@@ -174,8 +182,9 @@ struct Args {
     /// once the pressure eases, surviving a restart. A directory that
     /// cannot be opened fails boot loudly rather than silently running
     /// memory-only.
-    #[arg(long, default_value = "")]
-    rule_spill_dir: String,
+    /// Schema home: `rules_engine.spill_dir`.
+    #[arg(long)]
+    rule_spill_dir: Option<String>,
 
     /// Directory server URL for LDAP authentication (B2-01). Empty (the
     /// default) disables LDAP: CONNECT falls back to the local user
@@ -260,8 +269,9 @@ struct Args {
     /// Replay-cache bound for Kerberos authenticators (default 1024,
     /// clamped 16..8192). Bounds CONNECT-only memory: each entry is
     /// under 128 bytes, so the default holds under 128 KiB.
-    #[arg(long, default_value_t = broker_auth::REPLAY_MAX_ENTRIES)]
-    kerberos_replay_max: usize,
+    /// Schema home: `kerberos.replay_max_entries`.
+    #[arg(long)]
+    kerberos_replay_max: Option<usize>,
 
     /// JWKS endpoint URL for JWT authentication (B5-02). Empty (the
     /// default) disables JWT: CONNECT falls back to the local user store
@@ -270,19 +280,22 @@ struct Args {
     /// at CONNECT (signature by `kid`, expiry, issuer, audience). A
     /// configured endpoint disables the anonymous open mode like a
     /// directory does, and any endpoint outage fails closed.
-    #[arg(long, default_value = "")]
-    jwks_url: String,
+    /// Schema home: `jwks.url`.
+    #[arg(long)]
+    jwks_url: Option<String>,
 
     /// Expected JWT issuer (`iss` claim). Empty skips the issuer check
     /// (signature plus expiry only); set it in production so a token
     /// minted for another service is refused.
-    #[arg(long, default_value = "")]
-    jwks_issuer: String,
+    /// Schema home: `jwks.issuer`.
+    #[arg(long)]
+    jwks_issuer: Option<String>,
 
     /// Expected JWT audience (`aud` claim). Empty skips the audience
     /// check; set it in production for the same reason as the issuer.
-    #[arg(long, default_value = "")]
-    jwks_audience: String,
+    /// Schema home: `jwks.audience`.
+    #[arg(long)]
+    jwks_audience: Option<String>,
 
     /// JWKS background refresh period in seconds (default 300: rotation
     /// propagates within five minutes; fast rotation is covered by the
@@ -453,8 +466,9 @@ struct Args {
     /// covers typical small-device alias use while capping
     /// per-connection alias memory near 10 topic strings; 0 disables
     /// inbound aliases (alias-carrying publishes are rejected).
-    #[arg(long, default_value_t = broker_session::DEFAULT_TOPIC_ALIAS_MAXIMUM)]
-    topic_alias_maximum: u16,
+    /// Schema home: `session.topic_alias_maximum`.
+    #[arg(long)]
+    topic_alias_maximum: Option<u16>,
 
     /// Monitor sampling interval in seconds (F1-02, T-72): how often the
     /// background sampler copies live counters into the bounded monitor
@@ -474,6 +488,189 @@ struct Args {
 /// stays far below the per-message path.
 const DEFAULT_MONITOR_SAMPLE_SECS: u64 = 10;
 
+/// Server Receive Maximum advertised in v5 CONNACK properties (X1-02):
+/// 65535, the wire maximum. Reason: the kernel enforces no inbound
+/// unacked-delivery cap today, so it advertises no throttling; a client
+/// sending within the wire format is never refused for quota. The
+/// CONNACK property carries this value explicitly so a v5 client
+/// observes the negotiated limit instead of an absent property.
+const SERVER_V5_RECEIVE_MAXIMUM: u16 = u16::MAX;
+
+/// Server Maximum Packet Size advertised in v5 CONNACK properties
+/// (X1-02): 268435455, the MQTT Remaining Length maximum. Reason: a
+/// larger frame cannot arrive as a single MQTT packet, so this is the
+/// wire's own ceiling rather than a kernel policy; the kernel enforces
+/// no smaller inbound size cap today. Advertised explicitly so a v5
+/// client observes the negotiated limit.
+const SERVER_V5_MAX_PACKET_SIZE: u32 = 268_435_455;
+
+/// Largest SessionBinding v5 section in bytes (X1-02, mirrors
+/// [`MAX_V5_SECTION_LEN`] on the bind path): one section must leave
+/// room for the 12-byte binding head inside the 65535-byte BrokerLink
+/// meta cap; 4 KiB covers a reason string plus realistic echoed user
+/// properties. At most [`MAX_V5_BIND_USERS`] user properties per
+/// binding, each key/value at most [`MAX_V5_BIND_STRING`] bytes
+/// (bounds per-bind memory on the handshake path).
+const MAX_BINDING_V5_SECTION_LEN: usize = 4096;
+
+/// v5 egress refusal: quota exceeded (client Receive Maximum reached).
+/// The frame is shed (counted via `inflight_dropped`, never silent);
+/// never sent above the client's unacked cap.
+const V5_RC_QUOTA_EXCEEDED: u8 = 0x97;
+
+/// v5 egress refusal: packet too large (client Maximum Packet Size).
+/// The frame is shed (counted via `messages_dropped`, never silent);
+/// never sent above the client's size cap.
+const V5_RC_PACKET_TOO_LARGE: u8 = 0x95;
+
+/// v5 bind refusal: protocol error (malformed v5 properties, e.g. a
+/// Receive Maximum of 0 which the wire forbids). Fail closed with no
+/// session created.
+const V5_RC_PROTOCOL_ERROR: u8 = 0x82;
+
+/// v5 quota refusal on CONNECT (too many connections for the user).
+/// Version-4 binds keep the existing `0x8B` byte unchanged; version-5
+/// binds carry the documented quota code below with a reason string.
+const V5_RC_CONNECT_QUOTA: u8 = 0x97;
+
+/// Server-side reason string for one CONNACK return code (X1-02).
+/// Our own wording, written for this broker (never copied): success
+/// and identifier-rejected omit the property (`None`) to keep the
+/// handshake small; every other failure carries a short human-readable
+/// cause the edge places in CONNACK property 28.
+fn v5_reason_string(rc: u8) -> Option<&'static str> {
+    match rc {
+        0 => None,
+        2 => None,
+        0x86 => Some("Bad username or password"),
+        0x87 => Some("Not authorized"),
+        0x8A => Some("Client banned"),
+        V5_RC_PROTOCOL_ERROR => Some("Protocol error: malformed request"),
+        0x85 => Some("Client identifier not valid"),
+        // X1-02: `V5_RC_CONNECT_QUOTA` and `V5_RC_QUOTA_EXCEEDED` share
+        // code 0x97 (CONNECT quota and egress window share the wire
+        // code; the reason string covers both), plus the legacy 0x8B byte.
+        V5_RC_QUOTA_EXCEEDED | 0x8B => Some("Quota exceeded: too many connections"),
+        V5_RC_PACKET_TOO_LARGE => Some("Packet too large for the client maximum"),
+        _ => Some("Connection refused"),
+    }
+}
+
+/// v5 CONNACK properties carried in one `SessionBinding` reply
+/// (X1-02): the granted session expiry plus the server limits for the
+/// CONNACK, with the failure reason string and the echoed CONNECT
+/// user properties. `reason` is empty on success; `user_properties`
+/// ride only on failure paths (echoed from CONNECT), never on
+/// success. Counts are bounded by [`MAX_V5_BIND_USERS`] /
+/// [`MAX_V5_BIND_STRING`] at encode time (fail closed: oversize
+/// input refuses the whole bind, never a truncated CONNACK).
+#[derive(Debug, Clone, Default)]
+struct SessionBindingV5 {
+    granted_expiry: u32,
+    server_recv_max: u16,
+    server_max_pkt: u32,
+    reason: String,
+    user_properties: Vec<(String, String)>,
+}
+
+/// Success v5 properties for one accepted bind (X1-02): the granted
+/// session expiry (the session's stored interval, echoed so the
+/// client observes what the kernel retained), the server limits, no
+/// reason string and no user properties.
+fn success_binding_v5(granted_expiry: u32) -> SessionBindingV5 {
+    SessionBindingV5 {
+        granted_expiry,
+        server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
+        server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+        reason: String::new(),
+        user_properties: Vec::new(),
+    }
+}
+
+/// Failure v5 properties for one refused bind (X1-02): granted expiry
+/// 0 (no session, so the edge omits the property), the server limits,
+/// the server-side reason string for `rc`, and the CONNECT user
+/// properties echoed back (bounded; over-bound input is dropped to the
+/// bound, never a truncated CONNACK — the refusal itself still goes
+/// out with the reason string).
+fn failure_binding_v5(req: &BindRequest, rc: u8) -> SessionBindingV5 {
+    let reason = v5_reason_string(rc)
+        .unwrap_or("Connection refused")
+        .to_string();
+    let mut users: Vec<(String, String)> = Vec::new();
+    if let Some(map) = req.user_properties.as_ref() {
+        let mut pairs: Vec<(&String, &String)> = map.iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in pairs.into_iter().take(MAX_V5_BIND_USERS) {
+            if k.len() > MAX_V5_BIND_STRING || v.len() > MAX_V5_BIND_STRING || k.is_empty() {
+                continue;
+            }
+            users.push((k.clone(), v.clone()));
+        }
+    }
+    SessionBindingV5 {
+        granted_expiry: 0,
+        server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
+        server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+        reason,
+        user_properties: users,
+    }
+}
+
+/// True when the raw `BindConnection` metadata carries Flags bit 2
+/// (X1-01 v5 section present), i.e. the peer negotiated version 5 and
+/// a malformed bind must answer with the v5 protocol-error code
+/// rather than the 3.1.1 identifier-rejected code. Anything too short
+/// for a head reads as version 4 (fail closed to the old code, never
+/// a guessed version).
+fn bind_looks_v5(meta: &[u8]) -> bool {
+    if meta.len() < 5 {
+        return false;
+    }
+    let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    if meta.len() < 2 + id_len + 1 + 2 {
+        return false;
+    }
+    meta[2 + id_len] & 0x04 != 0
+}
+
+/// Check one live v5 subscriber against its CONNECT caps before
+/// sending (X1-02, delivery event only): `None` means send; `Some(rc)`
+/// means shed the frame for this subscriber (counted by the caller,
+/// never silent, never sent). Version-4 sessions always send
+/// (`None`). Receive Maximum caps QoS 1/2 only (QoS 0 has no
+/// unacked state and is never counted against the window); Maximum
+/// Packet Size caps every QoS with the
+/// [`broker_session::V5_EGRESS_OVERHEAD_BYTES`] estimate. Both reads
+/// are relaxed atomic loads; uncapped sessions (defaults) return
+/// after two loads with no lock.
+fn v5_egress_refused(
+    session: &broker_session::Session,
+    effective_qos: u8,
+    topic_len: usize,
+    payload_len: usize,
+) -> Option<u8> {
+    if session.protocol_version() != 5 {
+        return None;
+    }
+    if effective_qos == 1 || effective_qos == 2 {
+        let cap = usize::from(session.client_receive_maximum().max(1));
+        if session.inflight_total_len() >= cap {
+            return Some(V5_RC_QUOTA_EXCEEDED);
+        }
+    }
+    let cap = session.client_max_packet_size();
+    if cap != 0 {
+        let estimated = topic_len
+            .saturating_add(payload_len)
+            .saturating_add(broker_session::V5_EGRESS_OVERHEAD_BYTES);
+        if estimated > cap as usize {
+            return Some(V5_RC_PACKET_TOO_LARGE);
+        }
+    }
+    None
+}
+
 /// Map an inbound frame to its synchronous reply, if any.
 ///
 /// Contracts (mirrored in `beam/src/indra_brokerlink.erl`):
@@ -483,9 +680,13 @@ const DEFAULT_MONITOR_SAMPLE_SECS: u64 = 10;
 ///   | Flags:8 (bit 0 = clean_start) | Keepalive:16be`, optionally
 ///   followed by credentials, a peer section and the B4-05 trailing
 ///   `ClientAliasMax:16be`. The canonical session is resolved via
-///   `SessionManager::get_or_create` and answered with `SessionBinding`
+///   `SessionManager::get_or_create_v5_in_tenant` (X1-02: clean-start
+///   plus Session Expiry; version-4 binds carry defaults and behave as
+///   before) and answered with `SessionBinding`
 ///   metadata `SessionId:64be | Present:8 | ReturnCode:8 |
-///   TopicAliasMaximum:16be` (RC 0 = accepted, 2 = identifier rejected).
+///   TopicAliasMaximum:16be` (RC 0 = accepted, 2 = identifier rejected),
+///   plus the X1-02 trailing v5 section on version-5 binds (granted
+///   expiry, server limits, reason string, echoed user properties).
 ///   Replies always mirror the request `conn_id` and `sequence_no`.
 /// * All other opcodes have no synchronous reply yet and return `None`.
 fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<BrokerFrame> {
@@ -504,7 +705,10 @@ fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<Bro
 /// Every `BindConnection` yields exactly one reply so the BEAM edge never
 /// hangs waiting for CONNACK parameters: malformed metadata (or a
 /// non-UTF-8 client id) is answered with return code 2, mirroring the
-/// MQTT 3.1.1 CONNACK "identifier rejected" code.
+/// MQTT 3.1.1 CONNACK "identifier rejected" code. Version-5 binds with
+/// a malformed v5 section answer with the v5 protocol-error code
+/// (`0x82`) plus a reason string instead, so a v5 client observes the
+/// failure honestly; version-4 bytes are unchanged.
 fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> BrokerFrame {
     let (session_id, present, return_code) = match decode_bind_meta(&frame.metadata) {
         Ok(req) => {
@@ -514,10 +718,61 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             let will = match will_from_bind(&req) {
                 Ok(will) => will,
                 Err(_) => {
-                    return session_binding_reply(frame, 0, false, 2u8, sessions.max_topic_alias());
+                    if req.protocol_version == 5 {
+                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                        return session_binding_reply_with_v5(
+                            frame,
+                            0,
+                            false,
+                            V5_RC_PROTOCOL_ERROR,
+                            sessions.max_topic_alias(),
+                            &v5,
+                        );
+                    }
+                    return refusal_for_req(frame, &req, 2u8, sessions.max_topic_alias());
                 }
             };
-            let (session, present) = sessions.get_or_create(&req.client_id, req.clean_start);
+            // X1-02: a Receive Maximum of 0 is a protocol error on the
+            // wire (the client would accept no QoS 1/2 downlink at
+            // all). Fail closed with no session created.
+            // TODO(parity): the specification's exact CONNACK code for
+            // a zero Receive Maximum is open (protocol error vs quota
+            // exceeded); the rulebook does not decide it. Current
+            // choice is the conservative protocol-error refusal.
+            if req.protocol_version == 5 && req.receive_maximum == 0 {
+                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                return session_binding_reply_with_v5(
+                    frame,
+                    0,
+                    false,
+                    V5_RC_PROTOCOL_ERROR,
+                    sessions.max_topic_alias(),
+                    &v5,
+                );
+            }
+            // X1-02: session resolution honours clean-start plus
+            // Session Expiry (expiry 0 drops at disconnect, nonzero
+            // retains past reconnect within the interval, absent
+            // defaults to 0 with its reason on the session type).
+            // Both versions resolve here: version-4 binds carry the
+            // documented defaults (4, 0, wire-max, 0), so a pure 3.1.1
+            // flow behaves bit for bit as before, while a reconnect
+            // in either version drops an elapsed v5 husk instead of
+            // resuming it (present=false).
+            let (session, present, _) = sessions.get_or_create_v5_in_tenant(
+                broker_session::tenant::DEFAULT_TENANT_ID,
+                &req.client_id,
+                req.clean_start,
+                req.protocol_version,
+                req.session_expiry,
+                req.receive_maximum,
+                req.max_packet_size,
+            );
+            // The synchronous reply path owns no router: an
+            // expired-drop replacement starts clean (fresh object,
+            // empty mirror), so no router sweep is needed here.
+            // The live `apply_bind` path sweeps the owning
+            // tenant's router copies from the returned filters.
             // Connection != Session: pin this edge connection to the session
             // so Unbind can later verify ownership before detaching.
             // Indexed (PERF-04): keeps conn_id -> client_id O(1).
@@ -530,13 +785,46 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             session.clear_aliases();
             session.set_inbound_alias_max(sessions.max_topic_alias());
             session.set_outbound_alias_max(req.client_alias_max);
+            observe_bind_v5(&req);
             // F1-01: the CONNECT last will rides the bind (edge forwards
             // what CONNECT carried). Stored on the session where the
             // disconnect decision lives; `None` clears a previous will.
             session.set_last_will(will);
+            if req.protocol_version == 5 {
+                let granted = session.session_expiry();
+                return session_binding_reply_with_v5(
+                    frame,
+                    session.id.0,
+                    present,
+                    0u8,
+                    sessions.max_topic_alias(),
+                    &success_binding_v5(granted),
+                );
+            }
             (session.id.0, present, 0u8)
         }
-        Err(_) => (0u64, false, 2u8),
+        Err(_) => {
+            if bind_looks_v5(&frame.metadata) {
+                let v5 = SessionBindingV5 {
+                    granted_expiry: 0,
+                    server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
+                    server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+                    reason: v5_reason_string(V5_RC_PROTOCOL_ERROR)
+                        .unwrap_or("Connection refused")
+                        .to_string(),
+                    user_properties: Vec::new(),
+                };
+                return session_binding_reply_with_v5(
+                    frame,
+                    0,
+                    false,
+                    V5_RC_PROTOCOL_ERROR,
+                    sessions.max_topic_alias(),
+                    &v5,
+                );
+            }
+            (0u64, false, 2u8)
+        }
     };
 
     session_binding_reply(
@@ -577,6 +865,205 @@ fn session_binding_reply(
     .expect("SessionBinding reply within size bounds")
 }
 
+/// Build one v5 `SessionBinding` reply frame (X1-02).
+///
+/// Metadata is the 12-byte head (`SessionId:64be | Present:8 |
+/// ReturnCode:8 | TopicAliasMaximum:16be`, identical to
+/// [`session_binding_reply`]) followed by `V5Payload | V5Len:16be`
+/// where `V5Payload` is `ServerRecvMax:16be | ServerMaxPkt:32be |
+/// GrantedExpiry:32be | ReasonLen:16be | Reason |
+/// UserCount:16be | (KeyLen:16be | Key | ValLen:16be | Val)*`.
+/// The trailing length rides last so the edge strips the section
+/// deterministically from the end; the head then parses exactly like
+/// a 12-byte binding. Version-4 binds never use this form (they stay
+/// byte-identical 12-byte replies). Every length is bounded
+/// ([`MAX_BINDING_V5_SECTION_LEN`], [`MAX_V5_BIND_USERS`],
+/// [`MAX_V5_BIND_STRING`]); over-bound input fails the encode and the
+/// caller falls back to the head-only 12-byte reply with the same
+/// return code (fail closed: the refusal still goes out, only the
+/// properties are dropped, counted in the refusal log).
+fn session_binding_reply_with_v5(
+    frame: &BrokerFrame,
+    session_id: u64,
+    present: bool,
+    return_code: u8,
+    alias_max: u16,
+    v5: &SessionBindingV5,
+) -> BrokerFrame {
+    let mut meta = Vec::with_capacity(12);
+    meta.extend_from_slice(&session_id.to_be_bytes());
+    meta.push(u8::from(present));
+    meta.push(return_code);
+    meta.extend_from_slice(&protocol_v5::encode_alias_maximum(alias_max));
+    if let Some(payload) = encode_binding_v5_payload(v5) {
+        meta.extend_from_slice(&payload);
+        meta.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    BrokerFrame::new(
+        OpCode::SessionBinding,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(meta),
+        Bytes::new(),
+    )
+    .expect("SessionBinding reply within size bounds")
+}
+
+/// Encode one binding v5 payload, or `None` when over bound (the
+/// caller falls back to the head-only reply with the same return
+/// code). Reason and user properties are UTF-8 `String`s already
+/// validated at the bind edge; lengths are re-checked here (fail
+/// closed, never a truncated section).
+fn encode_binding_v5_payload(v5: &SessionBindingV5) -> Option<Vec<u8>> {
+    if v5.reason.len() > MAX_V5_BIND_STRING || v5.user_properties.len() > MAX_V5_BIND_USERS {
+        return None;
+    }
+    for (k, v) in &v5.user_properties {
+        if k.is_empty() || k.len() > MAX_V5_BIND_STRING || v.len() > MAX_V5_BIND_STRING {
+            return None;
+        }
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&v5.server_recv_max.to_be_bytes());
+    payload.extend_from_slice(&v5.server_max_pkt.to_be_bytes());
+    payload.extend_from_slice(&v5.granted_expiry.to_be_bytes());
+    payload.extend_from_slice(&(v5.reason.len() as u16).to_be_bytes());
+    payload.extend_from_slice(v5.reason.as_bytes());
+    payload.extend_from_slice(&(v5.user_properties.len() as u16).to_be_bytes());
+    for (k, v) in &v5.user_properties {
+        payload.extend_from_slice(&(k.len() as u16).to_be_bytes());
+        payload.extend_from_slice(k.as_bytes());
+        payload.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        payload.extend_from_slice(v.as_bytes());
+    }
+    if payload.len() > MAX_BINDING_V5_SECTION_LEN {
+        return None;
+    }
+    Some(payload)
+}
+
+/// Decode one binding v5 payload back into its fields (tests and any
+/// future kernel read path; the edge decodes the same layout in
+/// `indra_brokerlink`). `None` on any truncation or over-bound value.
+fn decode_binding_v5_payload(payload: &[u8]) -> Option<SessionBindingV5> {
+    if payload.len() < 2 + 4 + 4 + 2 + 2 {
+        return None;
+    }
+    let server_recv_max = u16::from_be_bytes([payload[0], payload[1]]);
+    let server_max_pkt = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+    let granted_expiry = u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]);
+    let reason_len = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+    if reason_len > MAX_V5_BIND_STRING || payload.len() < 14 + reason_len {
+        return None;
+    }
+    let reason = std::str::from_utf8(&payload[12..12 + reason_len])
+        .ok()?
+        .to_string();
+    let base = 12 + reason_len;
+    let user_count = u16::from_be_bytes([payload[base], payload[base + 1]]) as usize;
+    if user_count > MAX_V5_BIND_USERS {
+        return None;
+    }
+    let mut cursor = &payload[base + 2..];
+    let mut user_properties = Vec::with_capacity(user_count);
+    for _ in 0..user_count {
+        let (key, tail) = take_binding_v5_string(cursor)?;
+        let (value, tail) = take_binding_v5_string(tail)?;
+        if key.is_empty() {
+            return None;
+        }
+        user_properties.push((key, value));
+        cursor = tail;
+    }
+    if !cursor.is_empty() {
+        return None;
+    }
+    Some(SessionBindingV5 {
+        granted_expiry,
+        server_recv_max,
+        server_max_pkt,
+        reason,
+        user_properties,
+    })
+}
+
+/// Take one length-prefixed string off the front of a binding v5
+/// cursor. Overlong, non-UTF-8 or truncated fails the section.
+fn take_binding_v5_string(cursor: &[u8]) -> Option<(String, &[u8])> {
+    if cursor.len() < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if len > MAX_V5_BIND_STRING || cursor.len() < 2 + len {
+        return None;
+    }
+    let text = std::str::from_utf8(&cursor[2..2 + len]).ok()?;
+    Some((text.to_string(), &cursor[2 + len..]))
+}
+
+/// Strip and decode the trailing v5 section of a `SessionBinding`
+/// reply, if present. Returns `(session_id, present, rc, alias_max,
+/// v5)` with `v5 == None` for 10/12-byte bindings (pre-v5 or
+/// version-4 replies). Used by tests; the edge implements the same
+/// layout in `indra_brokerlink:decode_session_binding_meta/1`.
+fn decode_session_binding_full(
+    meta: &[u8],
+) -> Option<(u64, bool, u8, u16, Option<SessionBindingV5>)> {
+    if meta.len() == 10 || meta.len() == 12 {
+        if meta.len() < 10 {
+            return None;
+        }
+        let session_id = u64::from_be_bytes(meta[0..8].try_into().ok()?);
+        let present = match meta[8] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let alias_max = if meta.len() == 12 {
+            protocol_v5::decode_alias_maximum(&meta[10..12]).unwrap_or(protocol_v5::NO_TOPIC_ALIAS)
+        } else {
+            protocol_v5::NO_TOPIC_ALIAS
+        };
+        return Some((session_id, present, meta[9], alias_max, None));
+    }
+    if meta.len() < 12 + 2 {
+        return None;
+    }
+    let session_id = u64::from_be_bytes(meta[0..8].try_into().ok()?);
+    let present = match meta[8] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let rc = meta[9];
+    let alias_max =
+        protocol_v5::decode_alias_maximum(&meta[10..12]).unwrap_or(protocol_v5::NO_TOPIC_ALIAS);
+    let v5_len = u16::from_be_bytes([meta[meta.len() - 2], meta[meta.len() - 1]]) as usize;
+    if v5_len > MAX_BINDING_V5_SECTION_LEN || meta.len() < 12 + v5_len + 2 {
+        return None;
+    }
+    let start = meta.len() - 2 - v5_len;
+    if start != 12 {
+        return None;
+    }
+    let v5 = decode_binding_v5_payload(&meta[12..12 + v5_len])?;
+    Some((session_id, present, rc, alias_max, Some(v5)))
+}
+
+/// Refusal for one decoded bind (X1-02): version-4 binds get the
+/// head-only 12-byte reply with `rc` (bytes unchanged); version-5
+/// binds get the extended reply with the server-side reason string
+/// and the echoed CONNECT user properties on top of the same `rc`.
+/// CONNECT-only, never on the delivery path.
+fn refusal_for_req(frame: &BrokerFrame, req: &BindRequest, rc: u8, alias_max: u16) -> BrokerFrame {
+    if req.protocol_version == 5 {
+        let v5 = failure_binding_v5(req, rc);
+        session_binding_reply_with_v5(frame, 0, false, rc, alias_max, &v5)
+    } else {
+        session_binding_reply(frame, 0, false, rc, alias_max)
+    }
+}
+
 /// Verify one JWT-shaped password against the live JWKS endpoint (B5-02).
 ///
 /// Shared by both CONNECT arms (populated and empty local store) so the
@@ -588,6 +1075,7 @@ fn session_binding_reply(
 /// the delivery path.
 async fn verify_jwks_connect(
     shared: &Shared,
+    tenant: &str,
     client_id: &str,
     password: Option<&[u8]>,
 ) -> Result<Option<String>, ()> {
@@ -603,7 +1091,10 @@ async fn verify_jwks_connect(
         shared.metrics.inc_auth_failures();
         return Err(());
     };
-    match jwks.verify_token(client_id, token).await {
+    // Tenant scope (MT-06): the JWT lookup carries the bind's tenant;
+    // only the built-in table holds per-tenant state in this wave, so a
+    // non-default tenant fails closed inside the verifier (deferred).
+    match jwks.verify_token_in_tenant(tenant, client_id, token).await {
         Ok(verified) => {
             // Wire every verified field live: subject, issuer, key id and
             // expiry (the token itself is never logged). Audit-logged for
@@ -649,6 +1140,20 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // learns it on the CONNECT event.
     let alias_max = shared.sessions.max_topic_alias();
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
+        // X1-02: a Receive Maximum of 0 is a protocol error on the wire
+        // (see the synchronous path for the code-choice rationale).
+        // Fail closed before bans/credentials/quotas so no session is
+        // created and no quota slot is consumed. Every bind is
+        // answered (counted via `connack_sent` at the send site), so
+        // no extra counter moves here.
+        if req.protocol_version == 5 && req.receive_maximum == 0 {
+            return Some(refusal_for_req(
+                frame,
+                &req,
+                V5_RC_PROTOCOL_ERROR,
+                alias_max,
+            ));
+        }
         // B1-03: banned identities never reach the session. Checked
         // before credentials and quotas so a banned client is refused
         // with the banned return code (0x8A, mapped to CONNACK 5 on the
@@ -661,7 +1166,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             req.peerhost.as_deref(),
         ) {
             shared.metrics.inc_auth_failures();
-            return Some(session_binding_reply(frame, 0, false, 0x8A, alias_max));
+            return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
         }
         // W2-02: authenticator-chain consult. Loads one lock-free
         // snapshot per connect and never takes the chain write lock;
@@ -681,7 +1186,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 "authentication chain has no live backend: refusing CONNECT"
             );
             shared.metrics.inc_auth_failures();
-            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
         }
         // W2-05: authentication-settings consult. Loads one lock-free
         // snapshot per connect to observe the backend-failure flag and
@@ -717,7 +1222,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 || shared.webhook.is_some()
             {
                 shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x87, alias_max));
+                return Some(refusal_for_req(frame, &req, 0x87, alias_max));
             }
         } else {
             let password = req.password.as_deref();
@@ -735,6 +1240,14 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // the open mode like LDAP does: non-Kerberos passwords fail
             // closed with 0x86 instead of falling through.
             let local_has_users = shared.auth.user_count() > 0;
+            // Tenant scope (MT-06): the credential lookup runs in the
+            // bind's own tenant, rendered here from the claimed username
+            // (the verified Kerberos principal/JWT subject is unknown
+            // until its own verification below; quota and session
+            // resolution re-render from the verified identity as before).
+            // Same pure function of the bind the session path renders, no
+            // shared state. CONNECT-only; publish/deliver never touch it.
+            let tenant_for_auth = bind_tenant_for_req(shared, &req, None);
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
             let looks_kerberos =
                 password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
@@ -749,9 +1262,20 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // users have no local quotas (unlimited).
             let mut via_webhook = false;
             if local_has_users {
+                // Tenant scope (MT-06): the same username in two tenants
+                // is two independent identities, so the local lookup runs
+                // in the bind's own tenant resolved above. The default
+                // tenant keeps today's passwords and open-when-empty
+                // behaviour; other tenants start closed (deny, counted,
+                // logged inside the store).
                 let local_ok = shared
                     .auth
-                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .authenticate_in_tenant(
+                        &tenant_for_auth,
+                        &req.client_id,
+                        req.username.as_deref(),
+                        password,
+                    )
                     .await
                     .is_ok();
                 if local_ok {
@@ -760,25 +1284,27 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     // B5-02: JWT-shaped passwords verify against the live
                     // JWKS endpoint when configured; success carries the
                     // verified subject for the ownership stamp below.
-                    match verify_jwks_connect(shared, &req.client_id, password).await {
+                    match verify_jwks_connect(shared, &tenant_for_auth, &req.client_id, password)
+                        .await
+                    {
                         Ok(subject) => {
                             via_jwks = true;
                             jwks_subject = subject;
                         }
                         Err(()) => {
-                            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                         }
                     }
                 } else if kerberos_enabled && looks_kerberos {
                     let Some(kerberos) = shared.kerberos.as_ref() else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     };
                     let Some(token) = password else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     };
-                    match kerberos.verify_token(&req.client_id, token) {
+                    match kerberos.verify_token_in_tenant(&tenant_for_auth, &req.client_id, token) {
                         Ok(verified) => {
                             // Wire every verified field live: client and
                             // service principals, session-key length and
@@ -802,33 +1328,49 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         }
                         Err(_) => {
                             shared.metrics.inc_auth_failures();
-                            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                         }
                     }
                 } else if let Some(ldap) = shared.ldap.as_ref() {
+                    // Tenant scope (MT-06): the directory lookup carries
+                    // the bind's tenant; only the built-in table holds
+                    // per-tenant state in this wave (deferred).
                     if ldap
-                        .authenticate(&req.client_id, req.username.as_deref(), password)
+                        .authenticate_in_tenant(
+                            &tenant_for_auth,
+                            &req.client_id,
+                            req.username.as_deref(),
+                            password,
+                        )
                         .await
                         .is_ok()
                     {
                         via_ldap = true;
                     } else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                 } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
                     // B5-03: database sources after the directory. A
                     // database outage fails closed with a clear log line
                     // inside the source and never grants access.
+                    // Tenant scope (MT-06): the lookup carries the bind's
+                    // tenant; only the built-in table holds per-tenant
+                    // state in this wave (deferred).
                     if db
-                        .authenticate(&req.client_id, req.username.as_deref(), password)
+                        .authenticate_in_tenant(
+                            &tenant_for_auth,
+                            &req.client_id,
+                            req.username.as_deref(),
+                            password,
+                        )
                         .await
                         .is_ok()
                     {
                         via_db = true;
                     } else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                 } else if let Some(webhook) = shared.webhook.as_ref() {
                     // B5-04: the local store (and the directory above)
@@ -842,14 +1384,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     // current choice keeps accepted LDAP/Kerberos behavior
                     // untouched and fails closed either way.
                     if webhook
-                        .authenticate(&req.client_id, req.username.as_deref(), password)
+                        .authenticate_in_tenant(
+                            &tenant_for_auth,
+                            &req.client_id,
+                            req.username.as_deref(),
+                            password,
+                        )
                         .await
                         .is_ok()
                     {
                         via_webhook = true;
                     } else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                 } else {
                     // No LDAP, no database, no webhook, and (no enabled Kerberos or a
@@ -858,34 +1405,35 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     // non-Kerberos password is not an open-mode accept.
                     if kerberos_enabled {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 }
             } else if jwks_enabled && looks_jwt {
                 // B5-02: same JWKS verification as above for the empty
                 // local store: the endpoint is the authority, so a
                 // JWT-shaped password never falls through to open mode.
-                match verify_jwks_connect(shared, &req.client_id, password).await {
+                match verify_jwks_connect(shared, &tenant_for_auth, &req.client_id, password).await
+                {
                     Ok(subject) => {
                         via_jwks = true;
                         jwks_subject = subject;
                     }
                     Err(()) => {
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                 }
             } else if kerberos_enabled && looks_kerberos {
                 let Some(kerberos) = shared.kerberos.as_ref() else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 };
                 let Some(token) = password else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 };
-                match kerberos.verify_token(&req.client_id, token) {
+                match kerberos.verify_token_in_tenant(&tenant_for_auth, &req.client_id, token) {
                     Ok(verified) => {
                         // Same live wiring as above: every verified field
                         // plus the authenticator config is read here.
@@ -906,61 +1454,85 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     }
                     Err(_) => {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                     }
                 }
             } else if let Some(ldap) = shared.ldap.as_ref() {
+                // Tenant scope (MT-06): the directory lookup carries the
+                // bind's tenant (deferred: only the built-in table holds
+                // per-tenant state in this wave).
                 if ldap
-                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .authenticate_in_tenant(
+                        &tenant_for_auth,
+                        &req.client_id,
+                        req.username.as_deref(),
+                        password,
+                    )
                     .await
                     .is_ok()
                 {
                     via_ldap = true;
                 } else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 }
             } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
                 // B5-03: a configured database disables the open mode
                 // like LDAP does: every credentialed CONNECT goes through
                 // the databases unless a local user matches (none exist
                 // here). An outage fails closed, never an accept.
+                // Tenant scope (MT-06): the lookup carries the bind's
+                // tenant (deferred: only the built-in table holds
+                // per-tenant state in this wave).
                 if db
-                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .authenticate_in_tenant(
+                        &tenant_for_auth,
+                        &req.client_id,
+                        req.username.as_deref(),
+                        password,
+                    )
                     .await
                     .is_ok()
                 {
                     via_db = true;
                 } else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 }
             } else if let Some(webhook) = shared.webhook.as_ref() {
                 // B5-04: no local user matched and no directory verdict
                 // above; the webhook decides instead of the open mode. An
                 // unreachable or slow endpoint fails closed with 0x86.
+                // Tenant scope (MT-06): the verdict carries the bind's
+                // tenant (deferred: only the built-in table holds
+                // per-tenant state in this wave).
                 if webhook
-                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .authenticate_in_tenant(
+                        &tenant_for_auth,
+                        &req.client_id,
+                        req.username.as_deref(),
+                        password,
+                    )
                     .await
                     .is_ok()
                 {
                     via_webhook = true;
                 } else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
                 }
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
                 shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                return Some(refusal_for_req(frame, &req, 0x86, alias_max));
             } else if jwks_enabled {
                 // B5-02: a configured JWKS endpoint disables the open mode
                 // like a directory does. A non-JWT password with no other
                 // mechanism configured fails closed instead of
                 // open-accepting: nothing unverified is ever granted.
                 shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                return Some(refusal_for_req(frame, &req, 0x86, alias_max));
             } else {
                 // Open broker: no users, no directory, no database, no webhook, no enabled Kerberos
                 // or JWKS. Fall through to the session resolution below
@@ -977,15 +1549,24 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 kerberos_principal.clone().or_else(|| req.username.clone())
             };
             // Takeover pre-release: a live session for this client means
-            // the previous holder was orphaned by this very bind.
+            // the previous holder was orphaned by this very bind. Resolved
+            // through the bind's own tenant (rendered here from this
+            // connection's credentials), so a takeover in another tenant
+            // never releases this tenant's slot. The tenant render is
+            // repeated at session resolution below (same pure function of
+            // the bind, no shared state) because quota admission must
+            // precede session creation on this path.
+            let tenant_for_quota = bind_tenant_for_req(shared, &req, kerberos_principal.as_deref());
             let already_live = shared
                 .sessions
-                .get(&req.client_id)
+                .get_in_tenant(&tenant_for_quota, &req.client_id)
                 .map(|session| *session.connected.read())
                 .unwrap_or(false);
             if already_live {
                 if let Some(username) = &effective_username {
-                    shared.sessions.release_connection_slot(username);
+                    shared
+                        .sessions
+                        .release_connection_slot_in_tenant(&tenant_for_quota, username);
                 }
             }
             if let Some(username) = &effective_username {
@@ -999,13 +1580,28 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 let max = if via_ldap || via_kerberos || via_jwks || via_db || via_webhook {
                     None
                 } else {
+                    // Tenant scope (MT-06): quotas are per (tenant,
+                    // username); one tenant's limits never gate another.
                     shared
                         .auth
-                        .get_quotas(username)
+                        .get_quotas_in_tenant(&tenant_for_quota, username)
                         .and_then(|quotas| quotas.max_connections)
                 };
-                if !shared.sessions.acquire_connection_slot(username, max) {
-                    return Some(session_binding_reply(frame, 0, false, 0x8B, alias_max));
+                if !shared.sessions.acquire_connection_slot_in_tenant(
+                    &tenant_for_quota,
+                    username,
+                    max,
+                ) {
+                    // X1-02: version-4 binds keep the existing `0x8B`
+                    // byte unchanged; version-5 binds carry the
+                    // documented quota code with a reason string plus
+                    // the echoed CONNECT user properties.
+                    let rc = if req.protocol_version == 5 {
+                        V5_RC_CONNECT_QUOTA
+                    } else {
+                        0x8B
+                    };
+                    return Some(refusal_for_req(frame, &req, rc, alias_max));
                 }
             }
             // W2-03: record the successful credentialed CONNECT in the
@@ -1016,24 +1612,222 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             }
         }
     }
-    // Clean-start bind discards any previous state for this client id,
-    // including router entries left by an earlier session: snapshot them
-    // before `get_or_create` drops the old session object.
-    let stale: (String, Vec<broker_protocol::TopicFilter>) = match decode_bind_meta(&frame.metadata)
-    {
-        Ok(req) if req.clean_start => (
-            req.client_id.clone(),
-            shared.sessions.subscription_filters(&req.client_id),
-        ),
-        Ok(req) => (req.client_id.clone(), Vec::new()),
-        Err(_) => (String::new(), Vec::new()),
+    // Tenant assignment (MT-01..MT-03): resolve the tenant BEFORE session
+    // creation so the `(tenant, client id)` key is known up front: the
+    // same client id in two tenants must land in two independent
+    // sessions, and a takeover must kick only the same-tenant session.
+    // Built from this connection's own credentials only (verified
+    // Kerberos principal, else the MQTT username): never from stored
+    // state of another tenant's namesake session, so a client can never
+    // be placed into a tenant it did not authenticate for (fail closed).
+    // TODO(parity): the bind carries no listener name or MQTT 5
+    // user-property map yet (the edge terminates CONNECT as 3.1.1 only),
+    // so both ride as absent: the default listener scope and no user
+    // properties. Absent means the default tenant, never another
+    // tenant's (fail closed).
+    // TODO(parity): an anonymous reconnect carries no username, so it
+    // renders the default tenant even when a previous credentialed bind
+    // for the same client id held a named tenant; the prior tenant's
+    // session stays detached in place (no cross-tenant migration, no
+    // displacement). The open question is whether a reconnect without
+    // credentials should inherit its own prior tenant.
+    // TODO(parity): a tenant-rule change between connects lands the
+    // client in a fresh session under the new tenant key; the old
+    // tenant's session stays detached in place for its own reconnect.
+    let tenant_for_bind: String = match decode_bind_meta(&frame.metadata) {
+        Ok(req) => bind_tenant_for_req(shared, &req, kerberos_principal.as_deref()),
+        Err(_) => broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
     };
-    let reply = reply_for_frame(frame, &shared.sessions);
+    // Clean-start bind discards any previous state for this
+    // `(tenant, client id)`, including router entries left by an earlier
+    // session: snapshot them before `get_or_create` drops the old
+    // session object. Scoped to the owning tenant: another tenant's
+    // namesake keeps its subscriptions.
+    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) =
+        match decode_bind_meta(&frame.metadata) {
+            Ok(req) if req.clean_start => (
+                SessionKey::new(&tenant_for_bind, &req.client_id),
+                shared
+                    .sessions
+                    .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
+            ),
+            Ok(req) => (
+                SessionKey::new(&tenant_for_bind, &req.client_id),
+                Vec::new(),
+            ),
+            Err(_) => (
+                SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
+                Vec::new(),
+            ),
+        };
+    // Session resolution in the owning tenant (MT-03): same takeover
+    // semantics as before, scoped to the key. The tenant is stamped
+    // before binding so the `conn_id -> session key` index carries the
+    // owning tenant. Keepalive is framing-validated at decode;
+    // supervision lives on the edge. Malformed binds answer return code
+    // 2 exactly like the synchronous reply path (0x82 with a reason
+    // string when the peer negotiated version 5).
+    let reply = match decode_bind_meta(&frame.metadata) {
+        Ok(req) => {
+            // F1-01: validate the CONNECT last will before touching
+            // session state, so an unusable will section rejects the bind
+            // with no session created (fail closed, like malformed meta).
+            let will = match will_from_bind(&req) {
+                Ok(will) => will,
+                Err(_) => {
+                    if req.protocol_version == 5 {
+                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                        return Some(session_binding_reply_with_v5(
+                            frame,
+                            0,
+                            false,
+                            V5_RC_PROTOCOL_ERROR,
+                            shared.sessions.max_topic_alias(),
+                            &v5,
+                        ));
+                    }
+                    return Some(session_binding_reply(
+                        frame,
+                        0,
+                        false,
+                        2u8,
+                        shared.sessions.max_topic_alias(),
+                    ));
+                }
+            };
+            // X1-02: a Receive Maximum of 0 is a protocol error on the
+            // wire. Fail closed with no session created (see the
+            // synchronous path for the code-choice rationale).
+            if req.protocol_version == 5 && req.receive_maximum == 0 {
+                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                return Some(session_binding_reply_with_v5(
+                    frame,
+                    0,
+                    false,
+                    V5_RC_PROTOCOL_ERROR,
+                    shared.sessions.max_topic_alias(),
+                    &v5,
+                ));
+            }
+            // X1-02: resolution honours clean-start plus Session
+            // Expiry (see `get_or_create_v5_in_tenant`). Both versions
+            // resolve here: version-4 binds carry the documented
+            // defaults, so pure 3.1.1 flows behave bit for bit as
+            // before, while a reconnect in either version drops an
+            // elapsed v5 husk instead of resuming it.
+            let (session, present, expired_swept) = shared.sessions.get_or_create_v5_in_tenant(
+                &tenant_for_bind,
+                &req.client_id,
+                req.clean_start,
+                req.protocol_version,
+                req.session_expiry,
+                req.receive_maximum,
+                req.max_packet_size,
+            );
+            session.set_tenant_id(tenant_for_bind.clone());
+            shared.sessions.bind_session(&session, frame.header.conn_id);
+            *session.keepalive_secs.write() = req.keepalive_secs;
+            // B4-05: a new connection renegotiates aliases. The inbound
+            // bound is the manager default (advertised below in CONNACK);
+            // the outbound bound is the client's CONNECT maximum (0 when
+            // the bind carries none). Tables start empty.
+            session.clear_aliases();
+            session.set_inbound_alias_max(shared.sessions.max_topic_alias());
+            session.set_outbound_alias_max(req.client_alias_max);
+            // F1-01: the CONNECT last will rides the bind (edge forwards
+            // what CONNECT carried). Stored on the session where the
+            // disconnect decision lives; `None` clears a previous will.
+            session.set_last_will(will);
+            // X1-02: version-5 success carries session-present, the
+            // granted expiry and the server limits; version-4 success
+            // keeps today's 12-byte layout and bytes.
+            let reply = if req.protocol_version == 5 {
+                let granted = session.session_expiry();
+                session_binding_reply_with_v5(
+                    frame,
+                    session.id.0,
+                    present,
+                    0,
+                    shared.sessions.max_topic_alias(),
+                    &success_binding_v5(granted),
+                )
+            } else {
+                session_binding_reply(
+                    frame,
+                    session.id.0,
+                    present,
+                    0,
+                    shared.sessions.max_topic_alias(),
+                )
+            };
+            // X1-02: sweep the dropped expired session's router copies
+            // (owning tenant only) so an elapsed persistent session
+            // resubscribes from nothing like a clean start. Empty
+            // unless the expired-drop path ran. Off the hot path
+            // (bind only).
+            for filter in &expired_swept {
+                shared
+                    .router
+                    .unsubscribe_in_tenant(filter, &req.client_id, &tenant_for_bind);
+            }
+            if !expired_swept.is_empty() {
+                refresh_subscription_stats(shared);
+            }
+            // X1-02: opportunistic bounded expiry sweep (one timer per
+            // persistent session, bounded: at most
+            // `MAX_EXPIRY_SWEEP` sessions scanned per bind). Reaps
+            // other detached expired sessions in the owning tenant
+            // whose timer elapsed without a reconnect; their router
+            // copies go with them. Detach/bind paths only; the
+            // publish and delivery paths never scan sessions.
+            for (victim, filters) in shared
+                .sessions
+                .prune_expired_bounded(&tenant_for_bind, broker_session::MAX_EXPIRY_SWEEP)
+            {
+                for filter in &filters {
+                    shared
+                        .router
+                        .unsubscribe_in_tenant(filter, &victim, &tenant_for_bind);
+                }
+                if !filters.is_empty() {
+                    refresh_subscription_stats(shared);
+                }
+            }
+            reply
+        }
+        Err(_) => {
+            if bind_looks_v5(&frame.metadata) {
+                let v5 = SessionBindingV5 {
+                    granted_expiry: 0,
+                    server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
+                    server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+                    reason: v5_reason_string(V5_RC_PROTOCOL_ERROR)
+                        .unwrap_or("Connection refused")
+                        .to_string(),
+                    user_properties: Vec::new(),
+                };
+                session_binding_reply_with_v5(
+                    frame,
+                    0,
+                    false,
+                    V5_RC_PROTOCOL_ERROR,
+                    shared.sessions.max_topic_alias(),
+                    &v5,
+                )
+            } else {
+                session_binding_reply(frame, 0, false, 2, shared.sessions.max_topic_alias())
+            }
+        }
+    };
     // Sweep the stale router copies so a clean reconnect resubscribes
-    // from nothing. Off the hot path (bind only); fan-out takes no new
+    // from nothing. Scoped to the owning tenant (MT-03): one tenant's
+    // clean start never removes another tenant's subscription for the
+    // same client id. Off the hot path (bind only); fan-out takes no new
     // lock and delivery cost is unchanged.
     for filter in &stale.1 {
-        shared.router.unsubscribe(filter, &stale.0);
+        shared
+            .router
+            .unsubscribe_in_tenant(filter, &stale.0.client_id, &stale.0.tenant);
     }
     if !stale.1.is_empty() {
         refresh_subscription_stats(shared);
@@ -1043,7 +1837,10 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // string, which the ticket supersedes); all other paths keep the MQTT
     // username. The principal was verified above, never re-verified here.
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
-        if let Some(session) = shared.sessions.get(&req.client_id) {
+        if let Some(session) = shared
+            .sessions
+            .get_in_tenant(&tenant_for_bind, &req.client_id)
+        {
             if let Some(principal) = &kerberos_principal {
                 *session.username.write() = Some(principal.clone());
             } else if let Some(subject) = &jwks_subject {
@@ -1057,13 +1854,29 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
         // Stamp the peer address for publish-time ban checks (B1-03):
         // only overwritten when the edge forwarded one, so a rebind
         // without a peer section keeps the last known address.
-        if let (Some(session), Some(peerhost)) =
-            (shared.sessions.get(&req.client_id), &req.peerhost)
-        {
+        if let (Some(session), Some(peerhost)) = (
+            shared
+                .sessions
+                .get_in_tenant(&tenant_for_bind, &req.client_id),
+            &req.peerhost,
+        ) {
             *session.peerhost.write() = Some(peerhost.clone());
         }
+        // The session already carries `tenant_for_bind` (stamped at
+        // creation above); propagate that same tenant onto the will so
+        // the disconnect/kick fire respects tenant isolation (MT-01).
+        // No second registry render here: re-rendering would count one
+        // rejection twice in `fallback_count`.
+        if let Some(session) = shared
+            .sessions
+            .get_in_tenant(&tenant_for_bind, &req.client_id)
+        {
+            if let Some(will) = session.last_will.write().as_mut() {
+                will.tenant = tenant_for_bind.clone();
+            }
+        }
     }
-    reply
+    Some(reply)
 }
 
 /// Whether a `SessionBinding` reply accepted the connection.
@@ -1074,7 +1887,17 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
 /// code 0 proceeds to the auto-subscribe hook. Malformed replies never
 /// trigger subscriptions.
 fn is_binding_accepted(reply: &BrokerFrame) -> bool {
-    (reply.metadata.len() == 10 || reply.metadata.len() == 12) && reply.metadata[9] == 0
+    // 10-byte (pre-alias) and 12-byte heads accept with code 0; v5
+    // extended bindings (12-byte head plus `V5Payload | V5Len:16be`)
+    // accept the same way. Only return code 0 proceeds to the
+    // auto-subscribe hook. Malformed replies never trigger
+    // subscriptions.
+    if reply.metadata.len() == 10 || reply.metadata.len() == 12 {
+        return reply.metadata[9] == 0;
+    }
+    decode_session_binding_full(&reply.metadata)
+        .map(|(_, _, rc, _, _)| rc == 0)
+        .unwrap_or(false)
 }
 
 /// Subscribe one freshly bound connection to the configured
@@ -1092,6 +1915,11 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
     if entries.is_empty() {
         return;
     }
+    // Tenant scope (MT-02, MT-03): auto-subscriptions live in the
+    // freshly bound session's tenant, so a wildcard installed here can
+    // never observe another tenant's topics. Resolved from the bound
+    // connection's own session. Runs once per bind, never per message.
+    let tenant = session_tenant_for_conn(shared, conn_id, client_id);
     let mut applied = false;
     for entry in &entries {
         let rendered =
@@ -1114,20 +1942,31 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
                 conn_id,
                 qos,
                 group: None,
+                tenant: tenant.clone().into(),
             },
         );
         if !stored {
             continue;
         }
-        shared
-            .sessions
-            .add_subscription_with_options(client_id, filter, qos, entry.nl, entry.rap, entry.rh);
+        shared.sessions.add_subscription_with_options_in_tenant(
+            &tenant, client_id, filter, qos, entry.nl, entry.rap, entry.rh,
+        );
         applied = true;
     }
     if applied {
         refresh_subscription_stats(shared);
     }
 }
+
+/// Longest accepted TLS certificate field (common name, subject or one
+/// subject-alt name). Reason: X.509 DN strings are short; 1 KiB bounds
+/// bind metadata while covering long distinguished names.
+const MAX_CERT_FIELD_LEN: usize = 1024;
+
+/// Most subject-alt names accepted from one client certificate.
+/// Reason: client certificates carry short SAN lists; 16 entries bound
+/// bind-time allocation while covering multi-SAN certificates.
+const MAX_CERT_SANS: usize = 16;
 
 /// Decode `BindConnection` metadata.
 ///
@@ -1139,15 +1978,32 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
 /// entirely when the client connects anonymously), optionally followed by
 /// a peer-address section `PeerLen:16be | PeerIp` carrying the client IP
 /// literal the edge saw on its socket (B1-03: drives `peerhost` /
-/// `peerhost_net` bans), optionally followed by a B4-05 alias section
-/// `ClientAliasMax:16be` carrying the client's receive limit (the kernel
-/// outbound bound; 0 or absent means the kernel never assigns an alias
-/// toward the client).
-/// Binds encoded before the peer/alias/will sections existed carry no
-/// trailing bytes and still decode with `peerhost` unset, alias
-/// maximum 0 and no will. The keepalive is framing-validated here;
-/// supervision lives on the edge. Flags bit 0 is clean_start; Flags bit
-/// 1 is will-present (mirrors `indra_brokerlink:encode_bind_meta/7`).
+/// `peerhost_net` bans), optionally followed by a certificate section
+/// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
+/// SanCount:16be | (SanLen:16be | San)*` carrying the TLS
+/// client-certificate fields the edge extracted where TLS terminates
+/// (MT-01: expression inputs for tenant assignment), optionally followed
+/// by a B4-05 alias section `ClientAliasMax:16be` carrying the client's
+/// receive limit (the kernel outbound bound; 0 or absent means the kernel
+/// never assigns an alias toward the client).
+/// Binds encoded before the peer/alias/will/cert sections existed carry
+/// no trailing bytes and still decode with `peerhost` unset, alias
+/// maximum 0, no will and no certificate. The keepalive is
+/// framing-validated here; supervision lives on the edge. Flags bit 0 is
+/// clean_start; Flags bit 1 is will-present (mirrors
+/// `indra_brokerlink:encode_bind_meta/7`); Flags bit 2 marks a trailing
+/// X1-01 v5 section `AliasMax:16be | V5Payload | V5Len:16be` carrying the
+/// negotiated version plus the decoded CONNECT properties the kernel
+/// needs (mirrors `indra_brokerlink:encode_bind_meta/9`). Version-4
+/// binds carry no v5 section and decode with defaulted v5 fields.
+/// Largest v5 section: [`MAX_V5_SECTION_LEN`] bytes (one section must
+/// leave room for the head, credentials, peer, certificate, will and
+/// alias sections inside the 65535-byte BrokerLink meta cap; 4 KiB
+/// covers realistic CONNECT properties). At most [`MAX_V5_BIND_USERS`]
+/// user properties per bind (bounds per-bind memory on the handshake
+/// path; mirrors the 16-SAN bound on the certificate section), each
+/// key/value at most [`MAX_V5_BIND_STRING`] bytes (bounds per-bind
+/// memory; mirrors the 1024-byte bound on certificate fields).
 struct BindRequest {
     client_id: String,
     clean_start: bool,
@@ -1159,7 +2015,47 @@ struct BindRequest {
     client_alias_max: u16,
     /// Last will from CONNECT, if the client registered one.
     will: Option<BindWill>,
+    /// TLS client-certificate common name forwarded in the bind, if any.
+    cert_cn: Option<String>,
+    /// TLS client-certificate subject forwarded in the bind, if any.
+    cert_subject: Option<String>,
+    /// TLS client-certificate subject-alt names forwarded in the bind.
+    cert_sans: Vec<String>,
+    /// Negotiated protocol level from the bind v5 section (4 when the
+    /// edge sent no v5 section). Drives the v5 session policy (X1-02):
+    /// version-4 binds keep 3.1.1 behaviour bit for bit.
+    protocol_version: u8,
+    /// Session Expiry Interval from CONNECT (seconds). Applied at
+    /// session resolution (X1-02): 0 drops detached state at
+    /// disconnect, nonzero retains it past reconnect within the
+    /// interval, absent defaults to
+    /// [`broker_session::DEFAULT_SESSION_EXPIRY_SECS`] with its
+    /// reason on the session type.
+    session_expiry: u32,
+    /// Receive Maximum from CONNECT. Enforced as a cap on what the
+    /// kernel sends the connection (X1-02): never more unacknowledged
+    /// QoS 1/2 than the client allows (shed with `0x97`, counted).
+    /// A wire 0 is rejected at bind (protocol error), never stored.
+    receive_maximum: u16,
+    /// Maximum Packet Size from CONNECT (0 means the client announced
+    /// no limit). Enforced as a cap on what the kernel sends the
+    /// connection (X1-02): never a frame above the maximum (shed with
+    /// `0x95`, counted).
+    max_packet_size: u32,
+    /// Client user properties from CONNECT (`Some` when the edge sent
+    /// a v5 section, even when empty; `None` on version-4 binds).
+    /// Echoed back on v5 failure CONNACKs (X1-02); success CONNACKs
+    /// omit them. No session, routing, auth or tenant logic reads
+    /// them beyond the echo.
+    user_properties: Option<std::collections::HashMap<String, String>>,
 }
+
+/// Largest v5 bind section in bytes (see [`BindRequest`]).
+const MAX_V5_SECTION_LEN: usize = 4096;
+/// Most client user properties carried per bind (see [`BindRequest`]).
+const MAX_V5_BIND_USERS: usize = 16;
+/// Largest single user-property key or value in a bind (see [`BindRequest`]).
+const MAX_V5_BIND_STRING: usize = 1024;
 
 /// Last will as carried in the bind (validated into a session will by
 /// [`will_from_bind`]).
@@ -1193,6 +2089,35 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     } else {
         None
     };
+    // X1-01: Flags bit 2 marks a trailing v5 section
+    // `AliasMax:16be | V5Payload | V5Len:16be'. The section is stripped
+    // from the end first; the remainder (ending in the alias maximum)
+    // then parses exactly like a legacy alias-carrying bind. Anything
+    // short or out of range is malformed (fail closed, never a guessed
+    // version or identity). The decoded values are stored on the
+    // request and ignored: X1-02 owns the session semantics.
+    if flags & 0x04 != 0 {
+        let (legacy_rest, v5) = decode_bind_v5_section(rest)?;
+        let (identity, client_alias_max) = decode_legacy_tail(legacy_rest)?;
+        return Ok(BindRequest {
+            client_id: client_id.to_string(),
+            clean_start: flags & 0x01 != 0,
+            keepalive_secs,
+            username: identity.username,
+            password: identity.password,
+            peerhost: identity.peerhost,
+            client_alias_max,
+            will,
+            cert_cn: identity.cert_cn,
+            cert_subject: identity.cert_subject,
+            cert_sans: identity.cert_sans,
+            protocol_version: v5.version,
+            session_expiry: v5.session_expiry,
+            receive_maximum: v5.receive_maximum,
+            max_packet_size: v5.max_packet_size,
+            user_properties: Some(v5.user_properties),
+        });
+    }
     // Preferred: exact legacy parse (no alias section).
     if let Ok(identity) = decode_bind_identity(rest) {
         return Ok(BindRequest {
@@ -1204,6 +2129,14 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             peerhost: identity.peerhost,
             client_alias_max: 0,
             will,
+            cert_cn: identity.cert_cn,
+            cert_subject: identity.cert_subject,
+            cert_sans: identity.cert_sans,
+            protocol_version: 4,
+            session_expiry: 0,
+            receive_maximum: u16::MAX,
+            max_packet_size: 0,
+            user_properties: None,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -1223,10 +2156,116 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 peerhost: identity.peerhost,
                 client_alias_max,
                 will,
+                cert_cn: identity.cert_cn,
+                cert_subject: identity.cert_subject,
+                cert_sans: identity.cert_sans,
+                protocol_version: 4,
+                session_expiry: 0,
+                receive_maximum: u16::MAX,
+                max_packet_size: 0,
+                user_properties: None,
             });
         }
     }
     Err("bind meta length mismatch")
+}
+
+/// Decode the credentials/peer/certificate tail allowing the trailing
+/// alias section: exact legacy parse first (no alias, maximum 0), else
+/// the last two bytes as the alias maximum over a legacy prefix.
+/// Anything else is malformed (fail closed).
+fn decode_legacy_tail(rest: &[u8]) -> Result<(BindIdentity, u16), &'static str> {
+    if let Ok(identity) = decode_bind_identity(rest) {
+        return Ok((identity, 0));
+    }
+    if rest.len() >= 2 {
+        let (prefix, suffix) = rest.split_at(rest.len() - 2);
+        if let Ok(identity) = decode_bind_identity(prefix) {
+            let client_alias_max =
+                protocol_v5::decode_alias_maximum(suffix).unwrap_or(protocol_v5::NO_TOPIC_ALIAS);
+            return Ok((identity, client_alias_max));
+        }
+    }
+    Err("bind meta length mismatch")
+}
+
+/// Decoded X1-01 v5 section: the negotiated version plus the CONNECT
+/// properties the kernel needs.
+struct BindV5 {
+    version: u8,
+    session_expiry: u32,
+    receive_maximum: u16,
+    max_packet_size: u32,
+    user_properties: std::collections::HashMap<String, String>,
+}
+
+/// Strip the trailing v5 section `AliasMax:16be | V5Payload |
+/// V5Len:16be' off the bind tail. Returns the remainder (ending in the
+/// alias maximum, parsed by [`decode_legacy_tail`]) plus the decoded v5
+/// fields. Every length is checked (fail closed, never a guessed
+/// version).
+fn decode_bind_v5_section(rest: &[u8]) -> Result<(&[u8], BindV5), &'static str> {
+    // Smallest payload: Version:8 | Expiry:32 | RecvMax:16 | MaxPkt:32
+    // | Count:16 with zero pairs (13 bytes), plus the alias maximum
+    // and the section length around it.
+    if rest.len() < 2 + 13 + 2 {
+        return Err("bind v5 section truncated");
+    }
+    let v5_len = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]) as usize;
+    if !(13..=MAX_V5_SECTION_LEN).contains(&v5_len) || rest.len() < 2 + v5_len + 2 {
+        return Err("bind v5 section length mismatch");
+    }
+    let payload_start = rest.len() - 2 - v5_len;
+    let payload = &rest[payload_start..payload_start + v5_len];
+    let version = payload[0];
+    if version != 4 && version != 5 {
+        return Err("bind v5 version out of range");
+    }
+    let session_expiry = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let receive_maximum = u16::from_be_bytes([payload[5], payload[6]]);
+    let max_packet_size = u32::from_be_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    let pair_count = u16::from_be_bytes([payload[11], payload[12]]) as usize;
+    if pair_count > MAX_V5_BIND_USERS {
+        return Err("bind v5 user properties over bound");
+    }
+    let mut cursor = &payload[13..];
+    let mut user_properties = std::collections::HashMap::with_capacity(pair_count);
+    for _ in 0..pair_count {
+        let (key, tail) = take_v5_string(cursor)?;
+        let (value, tail) = take_v5_string(tail)?;
+        user_properties.insert(key, value);
+        cursor = tail;
+    }
+    if !cursor.is_empty() {
+        return Err("bind v5 section trailing bytes");
+    }
+    // The remainder ends in the alias maximum and parses through the
+    // legacy tail decoder (exact or alias-stripped).
+    Ok((
+        &rest[..payload_start],
+        BindV5 {
+            version,
+            session_expiry,
+            receive_maximum,
+            max_packet_size,
+            user_properties,
+        },
+    ))
+}
+
+/// Take one length-prefixed string off the front of the v5 user-property
+/// cursor. Overlong (beyond [`MAX_V5_BIND_STRING`]), non-UTF-8 or
+/// truncated fails the whole section (fail closed).
+fn take_v5_string(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind v5 string truncated");
+    }
+    let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if len > MAX_V5_BIND_STRING || cursor.len() < 2 + len {
+        return Err("bind v5 string over bound");
+    }
+    let text = std::str::from_utf8(&cursor[2..2 + len]).map_err(|_| "bind v5 string not UTF-8")?;
+    Ok((text.to_string(), &cursor[2 + len..]))
 }
 
 /// Decode the F1-01 will section at the head of the bind tail:
@@ -1277,6 +2316,7 @@ fn will_from_bind(req: &BindRequest) -> Result<Option<broker_session::StoredWill
     let topic = Topic::new(will.topic.clone()).map_err(|_| "will topic invalid")?;
     let qos = QoS::try_from(will.qos).map_err(|_| "will qos invalid")?;
     Ok(Some(broker_session::StoredWill {
+        tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         topic,
         qos,
         retain: will.retain,
@@ -1284,28 +2324,59 @@ fn will_from_bind(req: &BindRequest) -> Result<Option<broker_session::StoredWill
     }))
 }
 
-/// Credentials plus peer address decoded from the bind tail.
+/// Observe the v5 bind properties on the CONNECT event (X1-02). Reads
+/// the negotiated version plus the CONNECT properties the session
+/// resolution and the delivery caps just applied, so the bind contract
+/// stays live in the kernel logs. CONNECT-only, never on the delivery
+/// path.
+fn observe_bind_v5(req: &BindRequest) {
+    tracing::debug!(
+        client_id = %req.client_id,
+        protocol_version = req.protocol_version,
+        session_expiry = req.session_expiry,
+        receive_maximum = req.receive_maximum,
+        max_packet_size = req.max_packet_size,
+        user_properties = req
+            .user_properties
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap_or(0),
+        "v5 bind properties applied (X1-02 session semantics)"
+    );
+}
+
+/// Credentials plus peer address plus certificate fields decoded from
+/// the bind tail.
 struct BindIdentity {
     username: Option<String>,
     password: Option<Vec<u8>>,
     peerhost: Option<String>,
+    cert_cn: Option<String>,
+    cert_subject: Option<String>,
+    cert_sans: Vec<String>,
 }
 
-/// Decode the optional trailing credentials and peer-address sections:
-/// empty means anonymous with no peer address; otherwise a credentials
-/// section `UserLen | Username | PassLen | Password` (password non-empty,
-/// mirroring the edge `decode_bind_creds' `PLen > 0' guard), optionally
-/// followed by a peer section `PeerLen:16be | PeerIp` (an IP literal). An
-/// anonymous bind from a peer-aware edge carries only the peer section. A
-/// trailing section that is neither valid credentials nor a valid peer
-/// address is malformed, exactly as trailing garbage was before the peer
-/// section.
+/// Decode the optional trailing credentials, peer-address and
+/// certificate sections: empty means anonymous with no peer address or
+/// certificate; otherwise a credentials section `UserLen | Username |
+/// PassLen | Password` (password non-empty, mirroring the edge
+/// `decode_bind_creds' `PLen > 0' guard), optionally followed by a peer
+/// section `PeerLen:16be | PeerIp` (an IP literal), optionally followed
+/// by a certificate section `CertLen:16be | CnLen:16be | Cn |
+/// SubjectLen:16be | Subject | SanCount:16be | (SanLen:16be | San)*`
+/// carrying the TLS client-certificate fields. An anonymous bind from a
+/// peer-aware edge carries only the peer (and optional certificate)
+/// sections. A trailing section that is none of these is malformed,
+/// exactly as trailing garbage was before the peer section.
 fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.is_empty() {
         return Ok(BindIdentity {
             username: None,
             password: None,
             peerhost: None,
+            cert_cn: None,
+            cert_subject: None,
+            cert_sans: Vec::new(),
         });
     }
     if rest.len() < 2 {
@@ -1314,14 +2385,31 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     let user_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
     if rest.len() < 2 + user_len + 2 {
         // Too short for credentials: it can only be an anonymous bind
-        // carrying just the peer section.
-        return match decode_peer_section(rest) {
-            Some(peerhost) => Ok(BindIdentity {
-                username: None,
-                password: None,
-                peerhost: Some(peerhost),
-            }),
-            None => Err("bind credentials truncated"),
+        // carrying just the peer and optional certificate sections.
+        return match split_peer_prefix(rest) {
+            Some((peerhost, after_peer)) => {
+                let (cert_cn, cert_subject, cert_sans) =
+                    decode_cert_tail(after_peer).ok_or("bind meta length mismatch")?;
+                Ok(BindIdentity {
+                    username: None,
+                    password: None,
+                    peerhost: Some(peerhost),
+                    cert_cn,
+                    cert_subject,
+                    cert_sans,
+                })
+            }
+            None => match decode_cert_tail(rest) {
+                Some((cert_cn, cert_subject, cert_sans)) => Ok(BindIdentity {
+                    username: None,
+                    password: None,
+                    peerhost: None,
+                    cert_cn,
+                    cert_subject,
+                    cert_sans,
+                }),
+                None => Err("bind credentials truncated"),
+            },
         };
     }
     let username = std::str::from_utf8(&rest[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
@@ -1330,6 +2418,17 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.len() < base + 2 + pass_len {
         return Err("bind credentials truncated");
     }
+    // Wire ambiguity (documented, not parsed around): an anonymous bind
+    // carrying peer plus certificate sections is byte-identical to
+    // credentials whose username is the peer literal and whose password
+    // is the certificate payload, and credentials win this parse. The
+    // edge sends no certificate section today, so no producer hits the
+    // ambiguous shape; certificate-only and credentialed
+    // credentials-plus-peer-plus-certificate binds decode correctly.
+    // TODO(parity): which side should win once the edge forwards
+    // certificates on anonymous binds? The rulebook does not decide the
+    // wire precedence; current choice keeps every bind the edge sends
+    // today decoding exactly as before.
     // B4-05 alias collision: an anonymous peer section plus the trailing
     // `ClientAliasMax:16be' of 0 is byte-identical to credentials with the
     // peer literal as username and an empty password (`PeerLen|Peer|0x0000'
@@ -1350,33 +2449,125 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             username: Some(username.to_string()),
             password: Some(password),
             peerhost: None,
+            cert_cn: None,
+            cert_subject: None,
+            cert_sans: Vec::new(),
         });
     }
-    match decode_peer_section(tail) {
-        Some(peerhost) => Ok(BindIdentity {
+    // After credentials: optional peer prefix, then optional certificate
+    // tail. Either section may be absent; anything else is malformed.
+    if let Some((peerhost, after_peer)) = split_peer_prefix(tail) {
+        let (cert_cn, cert_subject, cert_sans) =
+            decode_cert_tail(after_peer).ok_or("bind meta length mismatch")?;
+        return Ok(BindIdentity {
             username: Some(username.to_string()),
             password: Some(password),
             peerhost: Some(peerhost),
-        }),
-        None => Err("bind meta length mismatch"),
+            cert_cn,
+            cert_subject,
+            cert_sans,
+        });
     }
+    if let Some((cert_cn, cert_subject, cert_sans)) = decode_cert_tail(tail) {
+        // A well-formed certificate section without a peer section is
+        // accepted (the edge may forward certificate fields while the
+        // peer section is absent); anything else is malformed.
+        return Ok(BindIdentity {
+            username: Some(username.to_string()),
+            password: Some(password),
+            peerhost: None,
+            cert_cn,
+            cert_subject,
+            cert_sans,
+        });
+    }
+    Err("bind meta length mismatch")
 }
 
-/// Decode one peer-address section `PeerLen:16be | PeerIp`: exactly those
-/// bytes and an IP literal, otherwise `None`.
-fn decode_peer_section(section: &[u8]) -> Option<String> {
+/// Split one peer-address prefix `PeerLen:16be | PeerIp` off the front of
+/// `section`, returning the IP literal plus the unconsumed tail (peer,
+/// certificate or alias sections). `None` for a missing, empty,
+/// non-UTF-8 or non-IP peer: only IP literals travel here, anything else
+/// is malformed input, never a peer identity to match bans against.
+fn split_peer_prefix(section: &[u8]) -> Option<(String, &[u8])> {
     if section.len() < 2 {
         return None;
     }
     let peer_len = u16::from_be_bytes([section[0], section[1]]) as usize;
-    if section.len() != 2 + peer_len {
+    if peer_len == 0 || section.len() < 2 + peer_len {
         return None;
     }
-    let literal = std::str::from_utf8(&section[2..]).ok()?;
-    // Only IP literals travel here; anything else is malformed input,
-    // never a peer identity to match bans against.
+    let literal = std::str::from_utf8(&section[2..2 + peer_len]).ok()?;
     literal.parse::<std::net::IpAddr>().ok()?;
-    Some(literal.to_string())
+    Some((literal.to_string(), &section[2 + peer_len..]))
+}
+
+/// Decode the optional trailing certificate tail: empty means no
+/// certificate; otherwise exactly one `CertLen:16be | CertPayload`
+/// section that must consume the whole tail, else `None` (malformed).
+fn decode_cert_tail(tail: &[u8]) -> Option<(Option<String>, Option<String>, Vec<String>)> {
+    if tail.is_empty() {
+        return Some((None, None, Vec::new()));
+    }
+    decode_cert_section(tail)
+}
+
+/// Decode one certificate section `CertLen:16be | CertPayload` where the
+/// payload is `CnLen:16be | Cn | SubjectLen:16be | Subject |
+/// SanCount:16be | (SanLen:16be | San)*`. All strings must be UTF-8 and
+/// within [`MAX_CERT_FIELD_LEN`], with at most [`MAX_CERT_SANS`] SANs;
+/// anything else is not a certificate section (fail closed: the caller
+/// treats it as malformed bind metadata).
+fn decode_cert_section(section: &[u8]) -> Option<(Option<String>, Option<String>, Vec<String>)> {
+    if section.len() < 2 {
+        return None;
+    }
+    let cert_len = u16::from_be_bytes([section[0], section[1]]) as usize;
+    if section.len() != 2 + cert_len {
+        return None;
+    }
+    let mut cursor = &section[2..];
+    let cn = take_cert_string(&mut cursor)?;
+    let subject = take_cert_string(&mut cursor)?;
+    if cursor.len() < 2 {
+        return None;
+    }
+    let san_count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if san_count > MAX_CERT_SANS {
+        return None;
+    }
+    cursor = &cursor[2..];
+    let mut sans = Vec::with_capacity(san_count);
+    for _ in 0..san_count {
+        let san = take_cert_string(&mut cursor)?;
+        if let Some(san) = san {
+            sans.push(san);
+        }
+    }
+    if !cursor.is_empty() {
+        return None;
+    }
+    Some((cn, subject, sans))
+}
+
+/// Take one length-prefixed certificate string off the front of
+/// `cursor`. Empty decodes as absent (`None`); overlong or non-UTF-8
+/// fails the whole section (`None` at the section level).
+fn take_cert_string(cursor: &mut &[u8]) -> Option<Option<String>> {
+    if cursor.len() < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if len > MAX_CERT_FIELD_LEN || cursor.len() < 2 + len {
+        return None;
+    }
+    let bytes = &cursor[2..2 + len];
+    *cursor = &cursor[2 + len..];
+    if len == 0 {
+        return Some(None);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    Some(Some(text.to_string()))
 }
 
 /// State shared by every BrokerLink connection task on this node.
@@ -1918,6 +3109,12 @@ struct Shared {
     /// short cache lock on hit (one bounded round-trip on miss).
     webhook: Option<Arc<WebhookAuth>>,
     allow_anonymous: bool,
+    /// Tenant-assignment registry (MT-01): per-listener rules rendering
+    /// the tenant id from the connect context. Consulted once per bind
+    /// (`apply_bind`); the publish and deliver paths never touch it
+    /// (they read the stamped session tenant instead). Ships empty so a
+    /// default install lands every client in the default tenant.
+    tenant_registry: Arc<broker_session::tenant::TenantRegistry>,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
     /// boot; validated defaults in tests and before boot wiring runs.
     config: Arc<ConfigRegistry>,
@@ -2016,6 +3213,17 @@ struct Shared {
     /// wins so connection tasks can call it freely without spawning a
     /// recorder per connection.
     slow_claimed: Arc<std::sync::atomic::AtomicBool>,
+    /// Resolved listeners for `GET /listeners` (SY-02): the same
+    /// `listeners.*` section the kernel binds from, captured at boot.
+    /// `None` until boot resolves the layered config; `serve_api` shares
+    /// it into `ApiState` so the endpoint reports the running
+    /// configuration instead of defaults. One short read lock per API
+    /// boot; never touched on the per-message path.
+    api_listeners: Arc<std::sync::RwLock<Option<Arc<broker_config::schema::ListenersConf>>>>,
+    /// Resolved startup layers for `explain` (SY-02): the winning layer
+    /// per setting. `serve_api` shares it into `ApiState` so explain
+    /// reports the file, variable or flag that set each value.
+    api_startup_config: Arc<std::sync::RwLock<Option<Arc<LayeredConfig>>>>,
 }
 
 impl Shared {
@@ -2024,6 +3232,11 @@ impl Shared {
         let router = Arc::new(Router::new());
         let conns = Arc::new(ConnTable::default());
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
+        // Enterprise window split (X1-06): windowed rules execute in the
+        // enterprise crate; attach its executor before any rule is
+        // created so eager worker spawn covers the preseeds below and
+        // the registry seed after boot.
+        broker_rules_enterprise::attach(&engine);
         let metrics = Arc::new(Metrics::new());
         // Rule spill accounting (B4-07): mirror the ingress queue's
         // spill, replay, drop and recovery counters into the node
@@ -2121,6 +3334,7 @@ impl Shared {
             db_auth: None,
             webhook: None,
             allow_anonymous: false,
+            tenant_registry: Arc::new(broker_session::tenant::TenantRegistry::new()),
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
             coap: Arc::new(CoapGatewayHandler::new()),
@@ -2139,6 +3353,8 @@ impl Shared {
             slow_last_shed_ms: Arc::new(AtomicU64::new(0)),
             slow_dropped: Arc::new(AtomicU64::new(0)),
             slow_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            api_listeners: Arc::new(std::sync::RwLock::new(None)),
+            api_startup_config: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2269,6 +3485,9 @@ async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
         return;
     };
     let payload = Bytes::from(entry.payload.clone());
+    // The publisher's tenant rides into the deferred pipeline (MT-02):
+    // fan-out after the timer stays inside the same tenant it was
+    // scheduled in.
     let deliveries = ingress_pipeline_with_publisher(
         shared,
         &topic,
@@ -2276,6 +3495,7 @@ async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
         entry.retain,
         &payload,
         entry.publisher.as_deref(),
+        &entry.publisher_tenant,
     )
     .await;
     let mut enqueued = 0u64;
@@ -2386,6 +3606,59 @@ fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError>
     ConfigRegistry::load(std::path::Path::new(data_dir))
 }
 
+/// Resolve the startup configuration through the typed-schema layers
+/// (SY-02): schema defaults, `indra.toml`, `conf.d/*.toml`,
+/// `INDRA_*` environment, then explicitly passed flags. Main's defaults
+/// stay unchanged; a flag that is not passed leaves its setting to the
+/// lower layers. `--config-dir` is the bootstrap locator with no schema
+/// home. A missing directory or missing file starts on defaults; an
+/// unreadable, unparsable or invalid layer fails boot loudly.
+fn load_startup_config(args: &Args) -> Result<LayeredConfig, ConfigError> {
+    let cli = CliOverrides {
+        // SY-02: main's old-style flags given the typed-schema treatment.
+        // Each carries a `Schema home:` line on its clap field; an
+        // explicitly passed flag wins, otherwise the file, env and schema
+        // defaults apply with main's defaults unchanged.
+        qos1_inflight_window: args.qos1_inflight_window,
+        qos1_spill: args.qos1_spill,
+        rule_spill_dir: args.rule_spill_dir.clone(),
+        kerberos_replay_max: args.kerberos_replay_max,
+        jwks_url: args.jwks_url.clone(),
+        jwks_issuer: args.jwks_issuer.clone(),
+        jwks_audience: args.jwks_audience.clone(),
+        topic_alias_maximum: args.topic_alias_maximum,
+        ..Default::default()
+    };
+    broker_config::load_layered(std::path::Path::new(&args.config_dir), &cli)
+}
+
+/// Install the configured tenant assignment rules (SY-02): `TenantsConf`
+/// rows become the registry entries the CONNECT hook assigns from. Empty
+/// ships default-only; a bad row fails boot loudly, never a silent
+/// default-tenant fallback.
+fn install_tenant_rules(
+    shared: &Shared,
+    cfg: &broker_config::schema::BrokerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rules: Vec<broker_session::tenant::TenantRule> = cfg
+        .tenants
+        .rules
+        .iter()
+        .map(|row| {
+            broker_session::tenant::TenantRule::new(
+                row.listener.clone(),
+                row.attribute.clone(),
+                row.expression.clone(),
+            )
+        })
+        .collect();
+    shared
+        .tenant_registry
+        .replace(rules)
+        .map_err(|e| format!("invalid tenants.rules: {e}"))?;
+    Ok(())
+}
+
 /// [`BrokerSink`] that forwards rule output directly to local router
 /// subscribers. Pure in-memory fan-out: no sockets, no MQTT loopback.
 struct InMemoryBrokerSink {
@@ -2404,6 +3677,11 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
+        // TODO(parity): rule republished output carries no tenant yet, so
+        // it fans out in the default tenant only (fail closed: no
+        // cross-tenant leak, single-tenant behaviour unchanged). The open
+        // question is the tenant attribution for derived messages once
+        // the rule engine dispatches per tenant.
         let deliveries = build_downlink_frames(
             &self.router,
             &self.sessions,
@@ -2412,6 +3690,7 @@ impl BrokerSink for InMemoryBrokerSink {
             qos,
             retain,
             &payload,
+            broker_session::tenant::DEFAULT_TENANT_ID,
         );
         // Only frames that reached a live mailbox count as
         // forwarded/sent/delivered. Drops are already counted inside
@@ -2461,7 +3740,10 @@ async fn handle_connection(
     // forever-connected (and their gauge counts). Every bind pushes;
     // Unbind prunes; death detaches whatever remains. Each entry owns
     // exactly one `inc_connections`, balanced by its prune or detach.
-    let mut bound: Vec<(String, u64)> = Vec::new();
+    // Entries carry the full session key (MT-03) so a dead socket
+    // detaches only the owning tenant's sessions, never another
+    // tenant's namesake.
+    let mut bound: Vec<(SessionKey, u64)> = Vec::new();
 
     loop {
         tokio::select! {
@@ -2673,7 +3955,7 @@ async fn handle_connection(
 /// makes progress. Never blocks; pops only what is queued.
 fn drain_qos0_for_transport(
     shared: &Shared,
-    bound: &[(String, u64)],
+    bound: &[(SessionKey, u64)],
     max_frames: usize,
     max_bytes: usize,
 ) -> Vec<BrokerFrame> {
@@ -2764,15 +4046,18 @@ fn merge_egress_batch(
 /// session plus atomics, so deaths on other transports never block this
 /// one. Router sweeps run once per detached clean session, off the hot
 /// path; fan-out takes no new lock.
-fn detach(bound: &[(String, u64)], shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
+fn detach(bound: &[(SessionKey, u64)], shared: &Shared, tx: &UnboundedSender<BrokerFrame>) {
     shared.conns.prune_sender(tx);
     if bound.is_empty() {
         return;
     }
-    for (client_id, conn_id) in bound {
-        let swept = shared.sessions.unbind_connection(client_id, *conn_id);
+    for (key, conn_id) in bound {
+        let swept =
+            shared
+                .sessions
+                .unbind_connection_in_tenant(&key.tenant, &key.client_id, *conn_id);
         for filter in &swept {
-            shared.router.unsubscribe(filter, client_id);
+            unsubscribe_scoped_in_tenant(shared, &key.tenant, &key.client_id, filter);
         }
         let active = shared.metrics.dec_connections();
         shared.stats.set_connections(active.max(0) as u64);
@@ -2786,16 +4071,17 @@ fn detach(bound: &[(String, u64)], shared: &Shared, tx: &UnboundedSender<BrokerF
 /// Lifecycle points only (bind, detach, unbind, subscribe): the
 /// per-message publish path performs no session/router scans.
 fn refresh_subscription_stats(shared: &Shared) {
-    let active_ids = shared.sessions.active_client_ids();
+    // Snapshot connected sessions directly (MT-03): iterating bare
+    // client ids plus a default-tenant `get` would miss (or conflate)
+    // non-default tenants sharing a client id.
+    let active = shared.sessions.active_sessions();
     let mut subs = 0u64;
     let mut topic_set = std::collections::HashSet::new();
-    for cid in &active_ids {
-        if let Some(s) = shared.sessions.get(cid) {
-            let map = s.subscriptions.read();
-            subs += map.len() as u64;
-            for f in map.keys() {
-                topic_set.insert(f.as_str().to_string());
-            }
+    for s in &active {
+        let map = s.subscriptions.read();
+        subs += map.len() as u64;
+        for f in map.keys() {
+            topic_set.insert(f.as_str().to_string());
         }
     }
     shared.stats.set_subscriptions(subs);
@@ -2803,13 +4089,13 @@ fn refresh_subscription_stats(shared: &Shared) {
 }
 
 /// Recount retained topics into the stats store after a successful
-/// insert/remove. Uses the existing `find_matching("#")` read path (no
-/// new store API), so concurrent retained writes self-heal instead of
-/// drifting the way check-then-act deltas would.
+/// insert/remove. Counts across all tenants in O(1) (no scan, no
+/// allocation), so concurrent retained writes self-heal instead of
+/// drifting the way check-then-act deltas would. Single-tenant installs
+/// observe the same count as the old `#`-match read.
 async fn sync_retained_stat(shared: &Shared) {
-    let filter = TopicFilter::new("#").expect("# matches every retained topic");
-    match shared.retained.find_matching(&filter).await {
-        Ok(matched) => shared.stats.set_retained(matched.len() as u64),
+    match shared.retained.count_retained().await {
+        Ok(count) => shared.stats.set_retained(count as u64),
         Err(e) => warn!("Retained recount failed: {}", e),
     }
 }
@@ -2879,7 +4165,7 @@ async fn handle_inbound_frame<S>(
     shared: &Shared,
     tx: &UnboundedSender<BrokerFrame>,
     transport: &FramedTransport<S>,
-    bound: &mut Vec<(String, u64)>,
+    bound: &mut Vec<(SessionKey, u64)>,
     waker: &Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -2913,7 +4199,16 @@ where
                         .conns
                         .set_client_label(frame.header.conn_id, &req.client_id);
                     shared.conns.set_waker(frame.header.conn_id, waker);
-                    bound.push((req.client_id.clone(), frame.header.conn_id));
+                    // Death-detach key (MT-03): the index authoritative
+                    // key for this fresh bind, so teardown prunes only
+                    // the owning tenant's session. Falls back to the
+                    // default-tenant key when the bind was refused
+                    // before a session existed (nothing to detach).
+                    let key = shared
+                        .sessions
+                        .key_for_conn(frame.header.conn_id)
+                        .unwrap_or_else(|| SessionKey::default_tenant(&req.client_id));
+                    bound.push((key, frame.header.conn_id));
                     // Auto-subscribe hook (W1-39): only on accepted binds.
                     // Per-connect cost only; fan-out takes no new lock.
                     if accepted {
@@ -3111,6 +4406,14 @@ async fn apply_subscribe(
 
     let mut codes = Vec::with_capacity(subs.len());
     let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
+    // Tenant scope (MT-02, MT-03): resolved once from the subscribing
+    // connection's own session, before any authorization decision is
+    // recorded, so the denial/grant below lands on the owning tenant's
+    // session and never on a default-tenant namesake. Two tenants sharing
+    // a client id subscribe independently; a tenant mismatch at publish
+    // time delivers nothing, counted, never an error to the publisher.
+    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
+    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
     for (raw_filter_str, qos_raw) in subs {
         // B4-04 ordered regex filter rewriting (subscribe scope): the
         // first matching subscribe/both rule wins and the router, the
@@ -3139,17 +4442,21 @@ async fn apply_subscribe(
                 continue;
             }
         };
+        // Tenant scope (MT-06): authorisation runs in the subscriber's
+        // own tenant resolved above, so a rule in one tenant never
+        // grants subscribe in another. Same single-guard discipline as
+        // the publish path.
         if shared
             .auth
-            .authorize_subscribe(&client_id, &filter)
+            .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
             .await
             .is_err()
         {
-            // Per-client decision cache (W2-01): record the denial so the
-            // management read observes it. One bounded per-session insert
-            // on the subscribe authorization event only; delivery never
-            // touches this lock.
-            if let Some(session) = shared.sessions.get(&client_id) {
+            // Per-client decision cache (W2-01): record the denial on the
+            // owning tenant's session so the management read observes it.
+            // One bounded per-session insert on the subscribe
+            // authorization event only; delivery never touches this lock.
+            if let Some(session) = owner.as_ref() {
                 session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
             }
             // MQTT 5 style "Not Authorized"; registers nothing.
@@ -3158,21 +4465,33 @@ async fn apply_subscribe(
         }
         // B5-03: database ACLs for users with no local record (same key
         // rule as the publish path: session username, else client id).
-        // A database outage fails closed like a local denial.
+        // The username rides the owning tenant's session resolved above,
+        // never a default-tenant namesake. A database outage fails closed
+        // like a local denial.
         if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            let username = shared
-                .sessions
-                .get(&client_id)
-                .and_then(|s| s.username.read().clone());
-            let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+            let username = owner.as_ref().and_then(|s| s.username.read().clone());
+            // Tenant scope (MT-06): the probe and the lookup run in the
+            // subscriber's own tenant (deferred: only the built-in table
+            // holds per-tenant state).
+            let is_local = username
+                .as_deref()
+                .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
             if !is_local {
                 let key = username.as_deref().unwrap_or(&client_id);
-                if db.authorize_subscribe(key, &filter).await.is_err() {
+                if db
+                    .authorize_subscribe_in_tenant(&tenant, key, &filter)
+                    .await
+                    .is_err()
+                {
                     codes.push(0x87);
                     continue;
                 }
             }
         }
+        // Tenant scope (MT-02, MT-03): the subscription carries the
+        // subscriber's tenant resolved above from the subscribing
+        // connection's own session, so two tenants sharing a client id
+        // subscribe independently.
         // B4-08 bound: a new entry past MAX_SUBSCRIPTIONS is denied fail
         // closed (existing delivery proceeds); report MQTT 5 0x97 Quota
         // Exceeded — the same code the broker uses for publish rate quota
@@ -3187,25 +4506,28 @@ async fn apply_subscribe(
                 conn_id: frame.header.conn_id,
                 qos,
                 group,
+                tenant: tenant.clone().into(),
             },
         );
         if !stored {
             codes.push(0x97);
             continue;
         }
-        // Per-client decision cache (W2-01): record the grant alongside
-        // the session mirror below. Same bounded per-session insert, same
-        // event; delivery never touches this lock. Recorded only after
-        // the router accepts the entry so a quota denial records
-        // nothing and changes no session state.
-        if let Some(session) = shared.sessions.get(&client_id) {
+        // Per-client decision cache (W2-01): record the grant on the
+        // owning tenant's session alongside the session mirror below.
+        // Same bounded per-session insert, same event; delivery never
+        // touches this lock. Recorded only after the router accepts the
+        // entry so a quota denial records nothing and changes no session
+        // state.
+        if let Some(session) = owner.as_ref() {
             session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
         }
-        // Mirror the grant on the session for observability (the router
-        // stays the routing authority).
+        // Mirror the grant on the owning tenant's session for
+        // observability (the router stays the routing authority).
+        // Another tenant's namesake session is never touched.
         shared
             .sessions
-            .add_subscription(&client_id, filter.clone(), qos);
+            .add_subscription_in_tenant(&tenant, &client_id, filter.clone(), qos);
         granted.push((filter, qos_raw));
         codes.push(qos_raw);
     }
@@ -3237,9 +4559,21 @@ async fn apply_subscribe(
 
     // Retained state follows the SubAck on the same transport.
     let mut retained = Vec::new();
-    let session = shared.sessions.get(&client_id);
+    // Owning tenant's session (MT-03): retained fetch and downlink ids
+    // stay within the subscriber's own tenant, so one tenant never
+    // observes another tenant's retained state.
+    let session = session_for_conn_if_client(shared, frame.header.conn_id, &client_id)
+        .or_else(|| shared.sessions.get(&client_id));
+    let subscriber_tenant = session
+        .as_ref()
+        .map(|session| session.tenant_id.read().clone())
+        .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
     for (filter, sub_qos) in &granted {
-        let matched = match shared.retained.find_matching(filter).await {
+        let matched = match shared
+            .retained
+            .find_matching_in_tenant(filter, &subscriber_tenant)
+            .await
+        {
             Ok(matched) => matched,
             Err(e) => {
                 warn!("Retained lookup failed for {}: {}", filter.as_str(), e);
@@ -3248,6 +4582,37 @@ async fn apply_subscribe(
         };
         for msg in matched {
             let effective = std::cmp::min(*sub_qos, u8::from(msg.qos));
+            // X1-02: retained replays are fresh deliveries toward this
+            // connection, so the v5 CONNECT caps apply here exactly as
+            // on live fan-out (shed with the documented code, counted,
+            // never silent). Reconnect replay of already-tracked
+            // unacked state (`replay_offline`) is intentionally
+            // uncapped: those frames were accepted under an earlier
+            // window and must redeliver at-least-once.
+            // TODO(parity): should reconnect replay honour a smaller
+            // renegotiated Receive Maximum instead of redelivering the
+            // full unacked set? The rulebook does not decide the replay
+            // policy; current choice redelivers (fail to keep).
+            if let Some(session) = &session {
+                if let Some(rc) = v5_egress_refused(
+                    session,
+                    effective,
+                    msg.topic.as_str().len(),
+                    msg.payload.len(),
+                ) {
+                    if rc == V5_RC_QUOTA_EXCEEDED {
+                        shared.metrics.inc_inflight_dropped();
+                    } else {
+                        shared.metrics.inc_messages_dropped();
+                    }
+                    tracing::debug!(
+                        client_id = %session.client_id,
+                        reason_code = rc,
+                        "v5 egress cap shed retained delivery"
+                    );
+                    continue;
+                }
+            }
             let downlink_id = if effective == 0 {
                 0u16
             } else {
@@ -3310,7 +4675,13 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
         Ok(req) => req,
         Err(_) => return 0,
     };
-    let session = match shared.sessions.get(&req.client_id) {
+    // Replay delivers only the owning tenant's queued state (MT-03):
+    // prefer the session bound to this connection (tenant-correct when
+    // two tenants share the client id), falling back to the
+    // default-tenant record for binds that predate the index entry.
+    let session = match session_for_conn_if_client(shared, frame.header.conn_id, &req.client_id)
+        .or_else(|| shared.sessions.get(&req.client_id))
+    {
         Some(session) => session,
         None => return 0,
     };
@@ -3602,14 +4973,65 @@ async fn apply_publish(
     // publishes die here (QoS 1 still gets its PubAck, stamped 0x87;
     // QoS 2 completes its handshake with PUBREC so the publisher never
     // stalls, but nothing is stored and the later PUBREL routes nothing).
-    if let Some(publisher) = shared.sessions.client_id_for_conn(frame.header.conn_id) {
+    // Tenant scope (MT-02): the publisher's tenant is read from the same
+    // session object the ban check already fetches. Single-tenant fast
+    // path: one relaxed atomic load (`tenant_is_default`, set at bind via
+    // `Session::set_tenant_id`) borrows the default static with no lock
+    // and no per-message allocation, so the BENCH single-tenant load pays
+    // no new lock/allocation on publish. Only a non-default tenant takes
+    // the short field read plus one bounded copy (at most 128 chars per
+    // the MT-01 bound), resolved once, with per-delivery filtering on the
+    // subscription's own tag.
+    // Publisher session (MT-03): resolve through the connection index
+    // so a non-default tenant's publish is attributed to its own
+    // session, never to the default-tenant namesake. Falls back to the
+    // legacy client-id lookup for connections bound outside the hook.
+    // Resolved once per publish, never per delivery: fan-out takes no
+    // new lock and no per-message allocation on the single-tenant fast
+    // path (one relaxed atomic plus the default static borrow).
+    let publisher_session = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        });
+    let publisher_opt = publisher_session
+        .as_ref()
+        .map(|session| session.client_id.clone());
+    let tenant_buf: Option<String> = publisher_session.as_ref().and_then(|session| {
+        if session
+            .tenant_is_default
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            None
+        } else {
+            let stored = session.tenant_id.read();
+            if stored.as_str() != broker_session::tenant::DEFAULT_TENANT_ID {
+                Some(stored.clone())
+            } else {
+                session
+                    .tenant_is_default
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    });
+    let tenant: &str = tenant_buf
+        .as_deref()
+        .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID);
+    if let Some(publisher) = publisher_opt {
         // B1-03: a client banned mid-session stops being served. The ban
         // directory is consulted on every publish authorisation: one read
         // lock that returns after a length check when no bans exist, one
         // short scan otherwise (QoS 1 timings before/after are in the
         // B1-03 report). Denied publishes die exactly like ACL denials.
-        let session_opt = shared.sessions.get(&publisher);
-        let (username, peerhost) = match session_opt.as_ref() {
+        // The ban identity comes from the owning session resolved above
+        // (tenant-correct for shared client ids), not a second lookup.
+        let (username, peerhost) = match publisher_session.as_ref() {
             Some(session) => (
                 session.username.read().clone(),
                 session.peerhost.read().clone(),
@@ -3627,16 +5049,20 @@ async fn apply_publish(
             };
             return (ack, Vec::new());
         }
+        // Tenant scope (MT-06): authorisation runs in the publisher's
+        // own tenant resolved above, so a rule in one tenant never
+        // grants publish in another. One short guard with no new lock
+        // and no allocation on the single-tenant fast path.
         let allowed = shared
             .auth
-            .authorize_publish(&publisher, &topic)
+            .authorize_publish_in_tenant(tenant, &publisher, &topic)
             .await
             .is_ok();
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
         // per-session insert on the publish authorization event only;
         // delivery never touches this lock.
-        if let Some(session) = session_opt.as_ref() {
+        if let Some(session) = publisher_session.as_ref() {
             session.record_authz_decision("publish", topic.as_str(), qos_raw, retain, allowed);
         }
         if !allowed {
@@ -3659,10 +5085,19 @@ async fn apply_publish(
         // (pool_size bound, default 8) plus one DB round-trip consulting at
         // most MAX_ACL_ROWS rows on a miss.
         if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+            // Tenant scope (MT-06): the local-user probe and the database
+            // lookup both run in the publisher's own tenant (deferred:
+            // only the built-in table holds per-tenant state).
+            let is_local = username
+                .as_deref()
+                .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
             if !is_local {
                 let key = username.as_deref().unwrap_or(&publisher);
-                if db.authorize_publish(key, &topic).await.is_err() {
+                if db
+                    .authorize_publish_in_tenant(tenant, key, &topic)
+                    .await
+                    .is_err()
+                {
                     let ack = match qos {
                         QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                         QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -3693,7 +5128,14 @@ async fn apply_publish(
         // carry no MQTT credential context, so they keep the local ACL
         // rather than inventing a publish context for them.
         if let Some(webhook) = shared.webhook.as_ref() {
-            if webhook.authorize_publish(&publisher, &topic).await.is_err() {
+            // Tenant scope (MT-06): the verdict carries the publisher's
+            // own tenant (deferred: only the built-in table holds
+            // per-tenant state).
+            if webhook
+                .authorize_publish_in_tenant(tenant, &publisher, &topic)
+                .await
+                .is_err()
+            {
                 let ack = match qos {
                     QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                     QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -3730,8 +5172,10 @@ async fn apply_publish(
     // Delayed delivery: ack now (the publisher must not stall), defer
     // everything else past the timer.
     if let Some((delay_secs, inner)) = strip_delayed_prefix(&topic_str) {
-        return apply_delayed_publish(frame, shared, delay_secs, inner, qos, retain, packet_id)
-            .await;
+        return apply_delayed_publish(
+            frame, shared, delay_secs, inner, qos, retain, packet_id, tenant,
+        )
+        .await;
     }
 
     // B4-06 fail-closed: snapshot the durable offline persist-failure
@@ -3749,8 +5193,13 @@ async fn apply_publish(
 
     // B4-02: resolve the publisher once for the shared `hash_clientid`
     // strategy. `None` (unknown session) hashes the empty string in the
-    // router; delivery still proceeds to exactly one member.
-    let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
+    // router; delivery still proceeds to exactly one member. The fan-out
+    // stays inside the publisher's tenant (MT-02), resolved once above.
+    // The hashing id comes from the owning session (tenant-correct for
+    // shared client ids), not a second connection lookup.
+    let publisher = publisher_session
+        .as_ref()
+        .map(|session| session.client_id.clone());
     let deliveries = ingress_pipeline_with_publisher(
         shared,
         &topic,
@@ -3758,6 +5207,7 @@ async fn apply_publish(
         retain,
         &frame.payload,
         publisher.as_deref(),
+        tenant,
     )
     .await;
     forward_cluster(shared, &topic, qos, &frame.payload).await;
@@ -3771,6 +5221,9 @@ async fn apply_publish(
                 .unwrap_or(false)
         });
         if persist_failed {
+            // The PUBACK is deferred (withheld) here so the publisher
+            // retries: count it where the event happens.
+            shared.metrics.inc_puback_deferred();
             warn!("Offline queue persist failed: withholding QoS 1 ack so the publisher retries");
             None
         } else {
@@ -3791,6 +5244,7 @@ async fn apply_publish(
 /// `<data-dir>/delayed.jsonl` (see `delayed.rs`) before the ack is
 /// returned, so the publisher is never stalled past the timer and a
 /// restart keeps the entry on schedule.
+#[allow(clippy::too_many_arguments)]
 async fn apply_delayed_publish(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -3799,6 +5253,7 @@ async fn apply_delayed_publish(
     qos: QoS,
     retain: bool,
     packet_id: u16,
+    publisher_tenant: &str,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
     let inner_topic = match Topic::new(inner.to_string()) {
         Ok(topic) => topic,
@@ -3817,6 +5272,7 @@ async fn apply_delayed_publish(
             shared.sessions.offline_store().map(|s| s.persist_failed());
         // B4-02: delayed delivery keeps the publisher when the session
         // still exists so `hash_clientid` stays stable across the defer.
+        // The deferred fan-out stays inside the publisher's tenant (MT-02).
         let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
         let deliveries = ingress_pipeline_with_publisher(
             shared,
@@ -3825,6 +5281,7 @@ async fn apply_delayed_publish(
             retain,
             &frame.payload,
             publisher.as_deref(),
+            publisher_tenant,
         )
         .await;
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
@@ -3837,6 +5294,9 @@ async fn apply_delayed_publish(
                     .unwrap_or(false)
             });
             if persist_failed {
+                // Same deferred-PUBACK count as the immediate path: the
+                // ack is withheld so the publisher retries.
+                shared.metrics.inc_puback_deferred();
                 warn!(
                     "Offline queue persist failed: withholding delayed QoS 1 ack so the publisher retries"
                 );
@@ -3870,6 +5330,9 @@ async fn apply_delayed_publish(
         retain,
         payload: frame.payload.to_vec(),
         publisher: shared.sessions.client_id_for_conn(frame.header.conn_id),
+        // The publisher's tenant rides into the deferred pipeline (MT-02):
+        // fan-out after the timer stays inside the same tenant.
+        publisher_tenant: publisher_tenant.to_string(),
     };
     match shared.delayed.persist_and_schedule(entry, delay_secs) {
         Ok(()) => {
@@ -3909,11 +5372,18 @@ async fn apply_qos2_publish(
     if packet_id == 0 {
         return (None, Vec::new());
     }
-    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
-        Some(client_id) => client_id,
-        None => return (None, Vec::new()),
-    };
-    let session = match shared.sessions.get(&client_id) {
+    // Owner session first (MT-03), legacy lookup behind, so QoS 2
+    // inbound state stays per `(tenant, client id)`.
+    let session = match shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        }) {
         Some(session) => session,
         None => return (None, Vec::new()),
     };
@@ -3948,14 +5418,28 @@ async fn apply_qos2_pubrel(
         Some(packet_id) => packet_id,
         None => return (None, Vec::new()),
     };
-    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
-        Some(client_id) => client_id,
-        None => return (None, Vec::new()),
-    };
-    let session = match shared.sessions.get(&client_id) {
+    // Owner session first (MT-03), legacy lookup behind, so the PUBREL
+    // routes the owning tenant's stored message exactly once.
+    let session = match shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        }) {
         Some(session) => session,
         None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
     };
+    // Publisher identity for shared-strategy hashing and delayed
+    // entries comes from the owning session (tenant-correct for shared
+    // client ids), not a second connection lookup.
+    let client_id = session.client_id.clone();
+    // QoS 2 routes on PUBREL inside the publisher's tenant (MT-02):
+    // the tenant rides from the owning session into the pipeline below.
+    let publisher_tenant = session.tenant_id.read().clone();
     let stored = match session.take_qos2_inbound(packet_id) {
         Some(stored) => stored,
         None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
@@ -3987,6 +5471,7 @@ async fn apply_qos2_pubrel(
                 stored.retain,
                 &stored.payload,
                 Some(client_id.as_str()),
+                &publisher_tenant,
             )
             .await;
             forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
@@ -4034,6 +5519,9 @@ async fn apply_qos2_pubrel(
             retain: stored.retain,
             payload: stored.payload.to_vec(),
             publisher: Some(client_id.clone()),
+            // The publisher's tenant rides into the deferred pipeline:
+            // fan-out after the timer stays inside the same tenant.
+            publisher_tenant: publisher_tenant.clone(),
         };
         if let Err(e) = shared.delayed.persist_and_schedule(entry, delay_secs) {
             // The scheduler already bumped the matching drop counter;
@@ -4052,6 +5540,7 @@ async fn apply_qos2_pubrel(
         stored.retain,
         &stored.payload,
         Some(client_id.as_str()),
+        &publisher_tenant,
     )
     .await;
     forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
@@ -4078,8 +5567,17 @@ async fn apply_qos2_pubrel(
 /// PUBREL was lost). Unknown ids are ignored.
 fn apply_qos2_pubrec(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     let packet_id = decode_qos2_meta(&frame.metadata)?;
-    let client_id = shared.sessions.client_id_for_conn(frame.header.conn_id)?;
-    let session = shared.sessions.get(&client_id)?;
+    // Owner session first (MT-03), legacy lookup behind.
+    let session = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        })?;
     if session.complete_qos2_pubrec(packet_id) {
         return qos2_reply(OpCode::PubRelOut, frame, packet_id);
     }
@@ -4101,11 +5599,19 @@ fn apply_qos2_pubcomp(frame: &BrokerFrame, shared: &Shared) {
         Some(packet_id) => packet_id,
         None => return,
     };
-    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
-        Some(client_id) => client_id,
-        None => return,
-    };
-    if let Some(session) = shared.sessions.get(&client_id) {
+    // Owner session first (MT-03), legacy lookup behind: a PUBCOMP
+    // releases only the owning tenant's downlink id.
+    let session = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        });
+    if let Some(session) = session {
         session.ack_qos2_pubcomp(packet_id);
     }
 }
@@ -4171,22 +5677,30 @@ fn decode_qos2_meta_with_reason(meta: &[u8]) -> Option<(u16, u8)> {
 
 /// The shared ingress pipeline: retained store/clear, rule execution,
 /// and local fan-out. Used by immediate delivery and, after its timer,
-/// by delayed delivery alike.
+/// by delayed delivery alike. Default-tenant entry; publish paths that
+/// know the publisher call [`ingress_pipeline_with_publisher`] with the
+/// publisher's tenant instead.
 async fn ingress_pipeline(
     shared: &Shared,
     topic: &Topic,
     qos: QoS,
     retain: bool,
     payload: &Bytes,
+    tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
-    ingress_pipeline_with_publisher(shared, topic, qos, retain, payload, None).await
+    ingress_pipeline_with_publisher(shared, topic, qos, retain, payload, None, tenant).await
 }
 
 /// [`ingress_pipeline`] with publisher context for shared strategies
-/// (B4-02). The MQTT ingress path passes the publishing client id; all
-/// other ingress paths (delayed timers without a live session, QoS 2
-/// second phase without a stored publisher, CoAP gateway, rule and
-/// management publishes) pass `None`.
+/// (B4-02) and tenant scope (MT-02). The MQTT ingress path passes the
+/// publishing client id plus its tenant; all other ingress paths
+/// (delayed timers without a live session, QoS 2 second phase without a
+/// stored publisher, CoAP gateway, rule and management publishes) pass
+/// `None` plus the tenant they fan out in (default unless the caller
+/// knows better). Retained reads/writes and fan-out stay inside
+/// `publisher_tenant`: the same topic string in two tenants is two
+/// independent spaces, and a mismatch delivers nothing, counted, never
+/// an error to the publisher.
 async fn ingress_pipeline_with_publisher(
     shared: &Shared,
     topic: &Topic,
@@ -4194,6 +5708,7 @@ async fn ingress_pipeline_with_publisher(
     retain: bool,
     payload: &Bytes,
     publisher: Option<&str>,
+    publisher_tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message. Enforces
@@ -4203,10 +5718,15 @@ async fn ingress_pipeline_with_publisher(
     // (when non-zero) are dropped while replacements still land. The
     // hard cap in broker_storage::MAX_RETAINED_MESSAGES always applies
     // inside the store. Retained-only work; non-retained fan-out and
-    // fan-in never take the config lock.
+    // fan-in never take the config lock. Scoped to the publisher's
+    // tenant: retained state never crosses tenants.
     if retain {
         if payload.is_empty() {
-            if let Err(e) = shared.retained.clear_retained(topic).await {
+            if let Err(e) = shared
+                .retained
+                .clear_retained_in_tenant(topic, publisher_tenant)
+                .await
+            {
                 warn!("Retained clear failed for {}: {}", topic.as_str(), e);
             } else {
                 sync_retained_stat(shared).await;
@@ -4224,7 +5744,7 @@ async fn ingress_pipeline_with_publisher(
                 if cap > 0 {
                     let already = shared
                         .retained
-                        .get_retained(topic)
+                        .get_retained_in_tenant(topic, publisher_tenant)
                         .await
                         .ok()
                         .flatten()
@@ -4238,7 +5758,7 @@ async fn ingress_pipeline_with_publisher(
                 // Delivered but not stored, matching the management path.
             } else if let Err(e) = shared
                 .retained
-                .set_retained(topic.clone(), qos, payload.clone())
+                .set_retained_in_tenant(topic.clone(), qos, payload.clone(), publisher_tenant)
                 .await
             {
                 warn!("Retained store failed for {}: {}", topic.as_str(), e);
@@ -4286,6 +5806,7 @@ async fn ingress_pipeline_with_publisher(
         retain,
         payload,
         publisher,
+        publisher_tenant,
     );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
@@ -4338,7 +5859,15 @@ async fn apply_coap_publish(
     shared.metrics.inc_publish_received();
     shared.metrics.inc_qos0_received();
     shared.metrics.inc_messages_received();
-    let deliveries = ingress_pipeline(shared, &topic, QoS::AtMostOnce, true, payload).await;
+    let deliveries = ingress_pipeline(
+        shared,
+        &topic,
+        QoS::AtMostOnce,
+        true,
+        payload,
+        broker_session::tenant::DEFAULT_TENANT_ID,
+    )
+    .await;
     forward_cluster(shared, &topic, QoS::AtMostOnce, payload).await;
     Some(deliveries)
 }
@@ -4484,7 +6013,12 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                         .coap
                         .register_observer(&topic_str, peer, req.token.clone());
                 }
-                let retained = shared.retained.get_retained(&topic).await.ok().flatten();
+                let retained = shared
+                    .retained
+                    .get_retained_in_tenant(&topic, broker_session::tenant::DEFAULT_TENANT_ID)
+                    .await
+                    .ok()
+                    .flatten();
                 match retained {
                     Some(stored) => {
                         let resp = if observing {
@@ -4522,7 +6056,12 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                     continue;
                 };
                 if let Ok(topic) = Topic::new(topic_str) {
-                    if shared.retained.clear_retained(&topic).await.is_ok() {
+                    if shared
+                        .retained
+                        .clear_retained_in_tenant(&topic, broker_session::tenant::DEFAULT_TENANT_ID)
+                        .await
+                        .is_ok()
+                    {
                         sync_retained_stat(&shared).await;
                     }
                 }
@@ -4544,6 +6083,117 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
     }
 }
 
+/// Tenant for one bind request (MT-01..MT-03): renders the tenant
+/// registry against this connection's own credentials (verified Kerberos
+/// principal, else the MQTT username; certificate, peer and client-id
+/// inputs from the bind itself), never against stored state of another
+/// tenant's namesake session. Pure function of the bind: quota admission
+/// and session resolution call it independently with the same result.
+/// Fail-closed to the default tenant on undecodable binds.
+fn bind_tenant_for_req(
+    shared: &Shared,
+    req: &BindRequest,
+    kerberos_principal: Option<&str>,
+) -> String {
+    let ctx = broker_session::tenant::ConnectContext {
+        client_id: req.client_id.clone(),
+        username: kerberos_principal
+            .map(str::to_string)
+            .or_else(|| req.username.clone()),
+        peer_host: req.peerhost.clone(),
+        listener: String::new(),
+        cert_cn: req.cert_cn.clone(),
+        cert_subject: req.cert_subject.clone(),
+        cert_sans: req.cert_sans.clone(),
+        user_properties: req.user_properties.clone(),
+    };
+    shared.tenant_registry.assign(&ctx)
+}
+
+/// Tenant id recorded on one session, or the default tenant when the
+/// session is unknown. Unknown fails closed to the pre-tenancy path,
+/// never to another tenant's space. One short session read on
+/// subscribe/bind/unsubscribe paths only; the per-message publish path
+/// resolves the publisher once per publish (below), never per delivery,
+/// so fan-out itself takes no new lock.
+/// Default-tenant lookup; connection-scoped callers prefer
+/// [`session_tenant_for_conn`] below so a non-default tenant's
+/// connection resolves to its own tenant.
+fn session_tenant(shared: &Shared, client_id: &str) -> String {
+    shared
+        .sessions
+        .get(client_id)
+        .map(|session| session.tenant_id.read().clone())
+        .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string())
+}
+
+/// Tenant of the session owning `conn_id` when it also owns
+/// `client_id` (MT-03): a non-default tenant's connection resolves to
+/// its own tenant, never to the default-tenant namesake. Falls back to
+/// the bare [`session_tenant`] lookup when the connection is unbound or
+/// has been rebound to another client (fail closed to the pre-tenancy
+/// path). One short index read plus at most one short session read;
+/// subscribe/unsubscribe paths only, never per delivery.
+fn session_tenant_for_conn(shared: &Shared, conn_id: u64, client_id: &str) -> String {
+    if let Some(session) = shared.sessions.session_for_conn(conn_id) {
+        if session.client_id == client_id {
+            return session.tenant_id.read().clone();
+        }
+    }
+    session_tenant(shared, client_id)
+}
+
+/// Session owning `conn_id` when it also owns `client_id` (MT-03),
+/// else `None`. Connection ids are unique per edge connection, so the
+/// index identifies exactly one `(tenant, client id)` pair; the
+/// client-id check guards a conn id rebound to another client.
+/// Connection paths only; the per-message publish path resolves the
+/// publisher once per publish, never per delivery.
+fn session_for_conn_if_client(
+    shared: &Shared,
+    conn_id: u64,
+    client_id: &str,
+) -> Option<Arc<broker_session::Session>> {
+    let session = shared.sessions.session_for_conn(conn_id)?;
+    if session.client_id == client_id {
+        Some(session)
+    } else {
+        None
+    }
+}
+
+/// Remove one session's router copies in its own tenant only, so one
+/// tenant's teardown can never remove another tenant's subscription for
+/// the same client id. Falls back to the unscoped sweep when the session
+/// (and its tenant) is already gone: removing too much on a dead session
+/// is fail-closed, keeping a stray copy would leak across reconnects.
+/// Runs off the hot path (unbind/detach only).
+fn unsubscribe_scoped(shared: &Shared, client_id: &str, filter: &TopicFilter) {
+    if let Some(session) = shared.sessions.get(client_id) {
+        let tenant = session.tenant_id.read().clone();
+        shared
+            .router
+            .unsubscribe_in_tenant(filter, client_id, &tenant);
+    } else {
+        shared.router.unsubscribe(filter, client_id);
+    }
+}
+
+/// Remove one `(tenant, client id)` session's router copies in its own
+/// tenant only (MT-03). Used by death sweeps that already carry the
+/// owning key, so one tenant's teardown can never remove another
+/// tenant's subscription for the same client id.
+fn unsubscribe_scoped_in_tenant(
+    shared: &Shared,
+    tenant: &str,
+    client_id: &str,
+    filter: &TopicFilter,
+) {
+    shared
+        .router
+        .unsubscribe_in_tenant(filter, client_id, tenant);
+}
+
 /// Build one `PublishOut` frame per router match. Shared by the standard
 /// fan-out and the rule [`BrokerSink`] so both paths downgrade QoS and
 /// allocate downlink packet ids identically.
@@ -4561,7 +6211,10 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
 /// `hash_clientid` strategy. The MQTT ingress path passes the real id;
 /// rule republishes, retained replays, cluster forwards and management
 /// publishes pass `None` (the router hashes the empty string there; see
-/// its open-question note on that branch).
+/// its open-question note on that branch). Default-tenant entry; fan-out
+/// paths that know the publisher's tenant call
+/// [`build_downlink_frames_with_publisher`] instead.
+#[allow(clippy::too_many_arguments)]
 fn build_downlink_frames(
     router: &Router,
     sessions: &SessionManager,
@@ -4570,17 +6223,20 @@ fn build_downlink_frames(
     qos: QoS,
     retain: bool,
     payload: &Bytes,
+    tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
     build_downlink_frames_with_publisher(
-        router, sessions, metrics, topic, qos, retain, payload, None,
+        router, sessions, metrics, topic, qos, retain, payload, None, tenant,
     )
 }
 
 /// [`build_downlink_frames`] with publisher context for shared
-/// strategies. This is the delivery event that drives
-/// `balance_shared_groups` (via `matches_with_publisher`): every publish
-/// fan-out reduces the matched shared groups through the router call and
-/// consumes the reduced set here.
+/// strategies plus tenant scope (MT-02). This is the delivery event that
+/// drives `balance_shared_groups` (via `matches_in_tenant_counted`):
+/// every publish fan-out reduces the matched shared groups through the
+/// router call and consumes the reduced set here. Only the publisher's
+/// tenant matches: a tenant mismatch delivers nothing and is counted via
+/// `tenant_mismatch_dropped`, never an error to the publisher.
 #[allow(clippy::too_many_arguments)]
 fn build_downlink_frames_with_publisher(
     router: &Router,
@@ -4591,6 +6247,7 @@ fn build_downlink_frames_with_publisher(
     retain: bool,
     payload: &Bytes,
     publisher: Option<&str>,
+    publisher_tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
@@ -4605,14 +6262,47 @@ fn build_downlink_frames_with_publisher(
     // `clone` below shares this single root.
     let shared = payload.clone();
     let mut deliveries = Vec::new();
-    for sub in router.matches_with_publisher(topic, publisher) {
+    let (matched, tenant_skipped) =
+        router.matches_in_tenant_counted(topic, publisher, publisher_tenant);
+    if tenant_skipped > 0 {
+        metrics.inc_tenant_mismatch_dropped_by(tenant_skipped);
+    }
+    for sub in matched {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-        match sessions.get(&sub.client_id) {
+        // Session in the subscription's own tenant (MT-03): the same
+        // client id in two tenants delivers from independent sessions
+        // with independent queues and inflight state. A missing session
+        // in this tenant falls back to the legacy conn-id route below.
+        match sessions.get_in_tenant(&sub.tenant, &sub.client_id) {
             Some(session) => {
                 let connected = *session.connected.read();
                 let live = *session.conn_id.read();
                 match (connected, live) {
                     (true, Some(conn_id)) => {
+                        // X1-02: honour the v5 CONNECT caps on what the
+                        // kernel sends this connection (never more
+                        // unacknowledged QoS 1/2 than the client allows;
+                        // never a frame above its maximum — shed with
+                        // the documented reason code, counted, never
+                        // silent). Version-4 sessions always send.
+                        // Uncapped sessions return after two atomic
+                        // loads; the publish fast path pays no lock.
+                        if let Some(rc) =
+                            v5_egress_refused(&session, effective, topic_str.len(), shared.len())
+                        {
+                            if rc == V5_RC_QUOTA_EXCEEDED {
+                                metrics.inc_inflight_dropped();
+                            } else {
+                                metrics.inc_messages_dropped();
+                            }
+                            tracing::debug!(
+                                client_id = %session.client_id,
+                                reason_code = rc,
+                                effective_qos = effective,
+                                "v5 egress cap shed delivery"
+                            );
+                            continue;
+                        }
                         let downlink_id = if effective == 0 {
                             0u16
                         } else {
@@ -4708,8 +6398,10 @@ fn build_downlink_frames_with_publisher(
                     }
                     _ => {
                         // Detached (or half-bound) session: durable
-                        // sessions buffer for replay, clean ones drop.
-                        if !session.clean_start {
+                        // sessions buffer for replay, sessions that drop
+                        // state at disconnect (X1-02: v5 expiry 0, v4
+                        // clean start) drop.
+                        if !session.drops_state_at_disconnect() {
                             // Hook only: the eviction itself stays
                             // inside `push_offline_with_limit` under the
                             // manager's configured cap; count what the
@@ -4765,26 +6457,72 @@ fn build_downlink_frames_with_publisher(
 /// True means route; false means drop. Anonymous, unknown, and
 /// unconfigured clients are unlimited.
 async fn check_publish_quota(frame: &BrokerFrame, shared: &Shared) -> bool {
-    let Some(client_id) = shared.sessions.client_id_for_conn(frame.header.conn_id) else {
-        return true;
-    };
-    let Some(session) = shared.sessions.get(&client_id) else {
+    // Owner session first (MT-03), legacy lookup behind: one tenant's
+    // publishes consume only its own budget, even for identical client
+    // ids. Anonymous, unknown, and unconfigured clients are unlimited.
+    let session = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        });
+    let Some(session) = session else {
         return true;
     };
     let username = session.username.read().clone();
     let Some(username) = username else {
         return true;
     };
-    let Some(quotas) = shared.auth.get_quotas(&username) else {
+    // Tenant scope (MT-06): quotas are per (tenant, username). Fast path
+    // borrows the default static with one relaxed atomic load (no lock,
+    // no allocation); only a non-default tenant takes the short field
+    // read plus one bounded copy.
+    let quota_tenant_buf: Option<String> = if session
+        .tenant_is_default
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        None
+    } else {
+        Some(session.tenant_id.read().clone())
+    };
+    let quota_tenant: &str = quota_tenant_buf
+        .as_deref()
+        .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID);
+    let Some(quotas) = shared.auth.get_quotas_in_tenant(quota_tenant, &username) else {
         return true;
     };
     let Some(rate) = quotas.max_publish_rate else {
         return true;
     };
     let burst = quotas.max_publish_burst.unwrap_or(rate);
-    shared
-        .sessions
-        .check_publish_budget(&client_id, rate, burst)
+    // The budget key is the session's own (tenant, client id): the
+    // connection index already resolved the owning tenant above.
+    // Borrowed lookup takes no per-publish allocation on the
+    // single-tenant fast path (default static plus the session's own
+    // `client_id` borrow). Only a non-default tenant takes one bounded
+    // copy (at most 128 chars per the MT-01 `MAX_TENANT_ID_LEN` bound).
+    if session
+        .tenant_is_default
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return shared.sessions.check_publish_budget_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            session.client_id.as_str(),
+            rate,
+            burst,
+        );
+    }
+    let tenant = session.tenant_id.read().clone();
+    shared.sessions.check_publish_budget_in_tenant(
+        tenant.as_str(),
+        session.client_id.as_str(),
+        rate,
+        burst,
+    )
 }
 
 /// Build one `PubAckOut` reply mirroring the request identity.
@@ -4888,6 +6626,10 @@ async fn run_cluster_inbox(shared: Shared) {
 /// with no retained writes, no rule execution (both already happened at
 /// the ingress node), and no re-forward.
 async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
+    // TODO(parity): `ClusterMessage` carries no tenant yet, so peer forwards
+    // fan out in the default tenant only (fail closed, single-node
+    // single-tenant behaviour unchanged). The open question is the tenant
+    // attribution for cluster forwards once the cluster protocol carries one.
     for (conn_id, frame) in build_downlink_frames(
         &shared.router,
         &shared.sessions,
@@ -4896,6 +6638,7 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
         msg.qos,
         false,
         &msg.payload,
+        broker_session::tenant::DEFAULT_TENANT_ID,
     ) {
         // A dead mailbox is already counted inside `ConnTable::route`.
         let _ = shared.conns.route(conn_id, frame);
@@ -4919,16 +6662,45 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
 /// connection's will.
 fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
     if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
-        if let Some(session) = shared.sessions.get(&client_id) {
-            if *session.conn_id.read() == Some(frame.header.conn_id) {
-                session.take_last_will();
+        // The connection index is authoritative for ownership (MT-03):
+        // the key identifies the owning `(tenant, client id)` even when
+        // two tenants share the client id, so teardown detaches and
+        // sweeps only the owning tenant. A stale decoded id for a
+        // rebound connection never detaches the new owner: the key wins.
+        // Unindexed connections fall back to the default-tenant detach.
+        // F1-01: a clean `DISCONNECT` (unbind) suppresses the last will.
+        // The stored will is taken and dropped, but only for the verified
+        // owner, so a racing teardown for a superseded conn_id never
+        // clears the fresh connection's will.
+        match shared.sessions.key_for_conn(frame.header.conn_id) {
+            Some(key) => {
+                if let Some(session) = shared.sessions.get_in_tenant(&key.tenant, &key.client_id) {
+                    if *session.conn_id.read() == Some(frame.header.conn_id) {
+                        session.take_last_will();
+                    }
+                }
+                let swept = shared.sessions.unbind_connection_in_tenant(
+                    &key.tenant,
+                    &key.client_id,
+                    frame.header.conn_id,
+                );
+                for filter in &swept {
+                    unsubscribe_scoped_in_tenant(shared, &key.tenant, &key.client_id, filter);
+                }
             }
-        }
-        let swept = shared
-            .sessions
-            .unbind_connection(&client_id, frame.header.conn_id);
-        for filter in &swept {
-            shared.router.unsubscribe(filter, &client_id);
+            None => {
+                if let Some(session) = shared.sessions.get(&client_id) {
+                    if *session.conn_id.read() == Some(frame.header.conn_id) {
+                        session.take_last_will();
+                    }
+                }
+                let swept = shared
+                    .sessions
+                    .unbind_connection(&client_id, frame.header.conn_id);
+                for filter in &swept {
+                    unsubscribe_scoped(shared, &client_id, filter);
+                }
+            }
         }
         refresh_subscription_stats(shared);
     }
@@ -4971,7 +6743,18 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         shared.conns.unregister(frame.header.conn_id);
         return Vec::new();
     };
-    let Some(session) = shared.sessions.get(&client_id) else {
+    // Owner session first (MT-03): the connection index identifies the
+    // owning `(tenant, client id)` even when two tenants share the client
+    // id, so an ungraceful close detaches and fires the will in the right
+    // tenant. Falls back to the default-tenant record for unindexed
+    // connections. A decoded id that does not own this connection is
+    // stale (rebound conn): ignored entirely, like a superseded conn_id.
+    let Some(session) = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .filter(|session| session.client_id == client_id)
+        .or_else(|| shared.sessions.get(&client_id))
+    else {
         shared.conns.unregister(frame.header.conn_id);
         return Vec::new();
     };
@@ -4982,12 +6765,15 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // clears the binding the checks below read).
     let username = session.username.read().clone();
     let peerhost = session.peerhost.read().clone();
+    let tenant = session.tenant_id.read().clone();
     let will = session.take_last_will();
-    let swept = shared
-        .sessions
-        .unbind_connection(&client_id, frame.header.conn_id);
+    let swept = shared.sessions.unbind_connection_in_tenant(
+        &tenant,
+        &session.client_id,
+        frame.header.conn_id,
+    );
     for filter in &swept {
-        shared.router.unsubscribe(filter, &client_id);
+        unsubscribe_scoped_in_tenant(shared, &tenant, &session.client_id, filter);
     }
     refresh_subscription_stats(shared);
     shared.conns.unregister(frame.header.conn_id);
@@ -5013,9 +6799,12 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // Per-client decision cache (W2-01): record the will-publish decision
     // like any other publish from this client. Same bounded per-session
     // insert; delivery never touches this lock.
+    // Tenant scope (MT-06): the will authorises in its own tenant (the
+    // session's tenant captured above), like any other publish from this
+    // client. Disconnect events only; never on the hot path.
     let will_allowed = shared
         .auth
-        .authorize_publish(&client_id, &will.topic)
+        .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
         .await
         .is_ok();
     session.record_authz_decision(
@@ -5031,10 +6820,16 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // B5-03: database ACLs gate the will like any other publish from a
     // user with no local record (session username, else client id).
     if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-        let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+        let is_local = username
+            .as_deref()
+            .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
         if !is_local {
             let key = username.as_deref().unwrap_or(&client_id);
-            if db.authorize_publish(key, &will.topic).await.is_err() {
+            if db
+                .authorize_publish_in_tenant(&tenant, key, &will.topic)
+                .await
+                .is_err()
+            {
                 return Vec::new();
             }
         }
@@ -5045,7 +6840,7 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     // delivery) with a clear log line, never allowed.
     if let Some(webhook) = shared.webhook.as_ref() {
         if webhook
-            .authorize_publish(&client_id, &will.topic)
+            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
             .await
             .is_err()
         {
@@ -5062,6 +6857,7 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         will.retain,
         &will.payload,
         Some(client_id.as_str()),
+        &tenant,
     )
     .await;
     forward_cluster(shared, &will.topic, will.qos, &will.payload).await;
@@ -5087,11 +6883,19 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
         Some(packet_id) => packet_id,
         None => return,
     };
-    let client_id = match shared.sessions.client_id_for_conn(frame.header.conn_id) {
-        Some(client_id) => client_id,
-        None => return,
-    };
-    let Some(session) = shared.sessions.get(&client_id) else {
+    // Owner session first (MT-03), legacy lookup behind: an ack from
+    // one tenant's connection never releases another tenant's entry.
+    let session = shared
+        .sessions
+        .session_for_conn(frame.header.conn_id)
+        .or_else(|| {
+            shared
+                .sessions
+                .client_id_for_conn(frame.header.conn_id)
+                .as_deref()
+                .and_then(|p| shared.sessions.get(p))
+        });
+    let Some(session) = session else {
         return;
     };
     let Some(entry) = session.ack_inflight_timed(packet_id) else {
@@ -5272,10 +7076,26 @@ fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
     if let Ok(close) = BrokerFrame::new(OpCode::ConnClose, conn_id, 0, Bytes::new(), Bytes::new()) {
         let _ = shared.conns.route(conn_id, close);
     }
-    if let Some(client_id) = shared.sessions.client_id_for_conn(conn_id) {
-        let swept = shared.sessions.unbind_connection(&client_id, conn_id);
-        for filter in &swept {
-            shared.router.unsubscribe(filter, &client_id);
+    // Owner key first (MT-03), decoded id behind: a faulty connection in
+    // one tenant detaches and sweeps only its own tenant, never another
+    // tenant's namesake session.
+    match shared.sessions.key_for_conn(conn_id) {
+        Some(key) => {
+            let swept =
+                shared
+                    .sessions
+                    .unbind_connection_in_tenant(&key.tenant, &key.client_id, conn_id);
+            for filter in &swept {
+                unsubscribe_scoped_in_tenant(shared, &key.tenant, &key.client_id, filter);
+            }
+        }
+        None => {
+            if let Some(client_id) = shared.sessions.client_id_for_conn(conn_id) {
+                let swept = shared.sessions.unbind_connection(&client_id, conn_id);
+                for filter in &swept {
+                    unsubscribe_scoped(shared, &client_id, filter);
+                }
+            }
         }
     }
 }
@@ -5297,11 +7117,17 @@ fn resolve_inbound_alias_topic(
     raw: &str,
     alias: u16,
 ) -> InboundAliasOutcome {
-    let client_id = match shared.sessions.client_id_for_conn(conn_id) {
-        Some(client_id) => client_id,
-        None => return InboundAliasOutcome::Reject,
-    };
-    let session = match shared.sessions.get(&client_id) {
+    // Owner session first (MT-03), legacy lookup behind: alias tables are
+    // per session, so a non-default tenant's aliases register and resolve
+    // on its own session, never on the default-tenant namesake.
+    let session = shared.sessions.session_for_conn(conn_id).or_else(|| {
+        shared
+            .sessions
+            .client_id_for_conn(conn_id)
+            .as_deref()
+            .and_then(|client_id| shared.sessions.get(client_id))
+    });
+    let session = match session {
         Some(session) => session,
         None => return InboundAliasOutcome::Reject,
     };
@@ -5479,6 +7305,20 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // appends reuse the store's per-session byte cap.
     state.traces = shared.traces.clone();
     state.tracing = shared.tracing.clone();
+    // SY-02: share the boot-resolved listeners and startup provenance so
+    // `GET /listeners` and `explain` report the running configuration
+    // instead of defaults. `None` in tests keeps the defaults behaviour.
+    if let Some(listeners) = shared.api_listeners.read().expect("listeners lock").clone() {
+        state.listeners = listeners;
+    }
+    if let Some(startup) = shared
+        .api_startup_config
+        .read()
+        .expect("startup config lock")
+        .clone()
+    {
+        *state.startup_config.write().expect("startup config lock") = Some(startup);
+    }
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -5492,6 +7332,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     broker_observability::init_tracing();
     let args = Args::parse();
+
+    // SY-02: resolve the startup configuration through the typed-schema
+    // layers (defaults, `indra.toml`, `conf.d`, `INDRA_` env, flags).
+    // Every reader below uses the resolved value; an explicitly passed
+    // flag wins via `CliOverrides`, main's defaults stay unchanged.
+    let layered = load_startup_config(&args)?;
+    let cfg = layered.config().clone();
 
     info!(
         "Starting IndraMQTT Kernel v{} on {}",
@@ -5511,17 +7358,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // B4-01: apply the configured QoS 1 window and spill bounds to the
     // session manager before any edge binds. Two atomic stores at boot;
     // future sessions inherit them at creation, and the publish fast
-    // path pays one relaxed load for the window check only.
+    // path pays one relaxed load for the window check only. SY-02: the
+    // window and spill resolve through the typed-schema layers
+    // (`session.max_qos1_inflight`, `session.max_qos1_spill`), so
+    // `indra.toml` and `INDRA_` variables apply with main's defaults
+    // unchanged.
     shared
         .sessions
-        .set_max_qos1_inflight(args.qos1_inflight_window);
-    shared.sessions.set_max_qos1_spill(args.qos1_spill);
+        .set_max_qos1_inflight(cfg.session.max_qos1_inflight);
+    shared
+        .sessions
+        .set_max_qos1_spill(cfg.session.max_qos1_spill);
     // B4-05: apply the configured inbound topic-alias bound to the
     // session manager before any edge binds. One atomic store at boot;
     // future sessions inherit it at creation and advertise it in CONNACK.
+    // SY-02: resolves through the layers (`session.topic_alias_maximum`).
     shared
         .sessions
-        .set_max_topic_alias(args.topic_alias_maximum);
+        .set_max_topic_alias(cfg.session.topic_alias_maximum);
+    // Tenants (MT-01): install the configured assignment rules before
+    // any edge binds. Validated whole; a bad row fails boot loudly.
+    install_tenant_rules(&shared, &cfg)?;
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -5588,7 +7445,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MQTT users/ACLs: seed the shared `MemoryAuth` in place (the same
     // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
     // enforces persisted credentials from the first accepted connection.
-    shared.auth.seed_from_registry(&shared.config);
+    shared
+        .auth
+        .seed_from_registry(&shared.config)
+        .map_err(|e| format!("seeding MQTT users from the config registry failed: {e}"))?;
     // Authenticator chain (W2-02): seed the shared chain in place (the
     // same instance `serve_api` shares with `ApiState`), so the CONNECT
     // consult enforces the persisted chain from the first connection.
@@ -5611,14 +7471,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .authn_node_cache
             .apply_settings(current.node_cache.enable, current.node_cache.max_count);
     }
-    // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
+    // Rule spill buffer (B4-07): opt-in via `rules_engine.spill_dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
     // A directory that cannot be opened fails boot loudly rather than
     // silently running without disk backing.
-    if !args.rule_spill_dir.is_empty() {
-        match RuleEngine::new_with_spill(1024, args.rule_spill_dir.as_str()) {
+    if !cfg.rules_engine.spill_dir.is_empty() {
+        match RuleEngine::new_with_spill(1024, cfg.rules_engine.spill_dir.as_str()) {
             Ok(engine) => {
+                let engine = Arc::new(engine);
                 engine.set_metrics(&shared.metrics);
                 // B4-07 boot wiring: carry the live broker sink onto the
                 // replacement engine (cf. `Shared::new` installing it at
@@ -5628,6 +7489,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // spill engine serves exactly what the memory engine would
                 // before the registry seed below replaces both.
                 engine.set_broker_sink(shared.sink.clone());
+                // Enterprise window split (X1-06): the spill replacement
+                // engine needs the window executor too, before its
+                // preseeds and the registry seed below.
+                broker_rules_enterprise::attach(&engine);
                 let _ = engine.create_rule(
                     "factory-telemetry-to-kafka".to_string(),
                     TopicFilter::new("sensors/+/telemetry").unwrap(),
@@ -5658,13 +7523,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         connector_id: "pgsql:postgres-analytics".to_string(),
                     }],
                 );
-                info!("Rule spill buffer enabled in {}", args.rule_spill_dir);
-                shared.engine = Arc::new(engine);
+                info!(
+                    "Rule spill buffer enabled in {}",
+                    cfg.rules_engine.spill_dir
+                );
+                shared.engine = Arc::clone(&engine);
             }
             Err(e) => {
-                return Err(
-                    format!("cannot open rule spill dir {}: {e}", args.rule_spill_dir).into(),
-                );
+                return Err(format!(
+                    "cannot open rule spill dir {}: {e}",
+                    cfg.rules_engine.spill_dir
+                )
+                .into());
             }
         }
     }
@@ -5728,7 +7598,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // branch and benchmarks see no new work. When set, CONNECT consults
     // the local store first, then Kerberos for SPNEGO/AP-REQ tokens; a
     // missing or unreadable keytab disables explicitly with a clear log
-    // line inside the authenticator and never accepts tokens.
+    // line inside the authenticator and never accepts tokens. SY-02: the
+    // replay bound resolves through the layers
+    // (`kerberos.replay_max_entries`).
     if !args.kerberos_keytab.is_empty() {
         let allowed_realms: Vec<String> = args
             .kerberos_allowed_realms
@@ -5760,7 +7632,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allowed_realms,
             keytab_path: args.kerberos_keytab.clone(),
             clock_skew_secs: args.kerberos_clock_skew_secs,
-            replay_max_entries: args.kerberos_replay_max,
+            replay_max_entries: cfg.kerberos.replay_max_entries,
             principal_role_map,
         };
         info!(
@@ -5775,19 +7647,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // passwords against the live endpoint (signature by `kid`, expiry,
     // issuer, audience); unknown `kid`s trigger one singleflight refresh
     // and any endpoint outage fails closed. The background task keeps the
-    // bounded key cache fresh without a restart.
-    if !args.jwks_url.is_empty() {
-        if !args.jwks_url.starts_with("https://") {
+    // bounded key cache fresh without a restart. SY-02: the endpoint,
+    // issuer and audience resolve through the layers (`jwks.url`,
+    // `jwks.issuer`, `jwks.audience`) with main's defaults unchanged.
+    if !cfg.jwks.url.is_empty() {
+        if !cfg.jwks.url.starts_with("https://") {
             return Err(format!(
-                "invalid --jwks-url {}: must start with https:// (field `jwks_url`)",
-                args.jwks_url
+                "invalid jwks.url {}: must start with https:// (field `jwks.url`)",
+                cfg.jwks.url
             )
             .into());
         }
         let jwks_config = JwksConfig {
-            jwks_url: args.jwks_url.clone(),
-            issuer: args.jwks_issuer.clone(),
-            audience: args.jwks_audience.clone(),
+            jwks_url: cfg.jwks.url.clone(),
+            issuer: cfg.jwks.issuer.clone(),
+            audience: cfg.jwks.audience.clone(),
             refresh_period_secs: args.jwks_refresh_period_secs,
             fetch_timeout_ms: args.jwks_fetch_timeout_ms,
             refresh_timeout_ms: args.jwks_refresh_timeout_ms,
@@ -5802,7 +7676,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(args.jwks_ca_cert.clone())
             },
         };
-        info!("JWT authentication enabled for {}", args.jwks_url);
+        info!("JWT authentication enabled for {}", cfg.jwks.url);
         let jwks = Arc::new(JwksAuthenticator::new(jwks_config));
         jwks.spawn_background_refresh();
         shared.jwks = Some(jwks);
@@ -6016,6 +7890,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.api_bind.is_empty() {
         let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
         info!("Management API listening on {}", args.api_bind);
+        // SY-02: assign the resolved listeners and startup provenance so
+        // `GET /listeners` and `explain` report the running configuration
+        // instead of defaults. The api row reports the bound address: the
+        // flag is the bind the kernel actually listens on.
+        let mut listeners = cfg.listeners.clone();
+        listeners.api.bind = args.api_bind.clone();
+        *shared.api_listeners.write().expect("listeners lock") = Some(Arc::new(listeners));
+        *shared
+            .api_startup_config
+            .write()
+            .expect("startup config lock") = Some(Arc::new(layered.clone()));
         let api_shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_api(listener, api_shared).await {
@@ -6049,7 +7934,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broker_auth::{AclAction, AclRule, PasswordAlgorithm, PasswordHashPolicy};
+    use broker_auth::{AclAction, AclRule, Authorizer as _, PasswordAlgorithm, PasswordHashPolicy};
     use broker_session::MAX_OFFLINE_QUEUE;
 
     /// Unique scratch data dir under the OS temp dir (no dev-dependency).
@@ -6136,27 +8021,31 @@ mod tests {
     }
 
     /// Decode `SessionBinding` metadata into `(session_id, present, rc)`.
-    /// Accepts 10-byte (pre-alias) and 12-byte (B4-05 with the trailing
-    /// Topic Alias Maximum) encodings.
+    /// Accepts 10-byte (pre-alias), 12-byte (B4-05 with the trailing
+    /// Topic Alias Maximum) and X1-02 extended
+    /// (`Head12 | V5Payload | V5Len:16be`) encodings; the head always
+    /// parses the same way.
     fn decode_session_binding_meta(meta: &[u8]) -> (u64, bool, u8) {
-        assert!(
-            meta.len() == 10 || meta.len() == 12,
-            "SessionBinding meta must be 10 or 12 bytes, got {}",
-            meta.len()
-        );
-        let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
-        (session_id, meta[8] != 0, meta[9])
+        let (session_id, present, rc, _, _) =
+            super::decode_session_binding_full(meta).expect("SessionBinding meta must decode");
+        (session_id, present, rc)
     }
 
     /// Decode the B4-05 Topic Alias Maximum out of a `SessionBinding`
-    /// reply (0 for pre-alias 10-byte encodings).
+    /// reply (0 for pre-alias 10-byte encodings; the head value for
+    /// 12-byte and X1-02 extended encodings).
     fn decode_session_binding_alias_max(meta: &[u8]) -> u16 {
-        match meta.len() {
-            10 => protocol_v5::NO_TOPIC_ALIAS,
-            12 => protocol_v5::decode_alias_maximum(&meta[10..12])
-                .unwrap_or(protocol_v5::NO_TOPIC_ALIAS),
-            len => panic!("SessionBinding meta must be 10 or 12 bytes, got {len}"),
-        }
+        let (_, _, _, alias_max, _) =
+            super::decode_session_binding_full(meta).expect("SessionBinding meta must decode");
+        alias_max
+    }
+
+    /// Decode the X1-02 v5 section of a `SessionBinding` reply, if
+    /// present (`None` for 10/12-byte bindings).
+    fn decode_session_binding_v5(meta: &[u8]) -> Option<super::SessionBindingV5> {
+        let (_, _, _, _, v5) =
+            super::decode_session_binding_full(meta).expect("SessionBinding meta must decode");
+        v5
     }
 
     /// Encode `BindConnection` metadata with a B4-05 client alias maximum
@@ -6331,6 +8220,7 @@ mod tests {
             QoS::AtMostOnce,
             false,
             &Bytes::from_static(b"21.5"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
         );
 
         assert!(deliveries.is_empty());
@@ -6376,6 +8266,7 @@ mod tests {
             QoS::AtMostOnce,
             false,
             &Bytes::from_static(b"new"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
         );
 
         assert!(deliveries.is_empty());
@@ -6433,6 +8324,484 @@ mod tests {
                 opcode
             );
         }
+    }
+
+    /// Encode `BindConnection` metadata with an X1-01 v5 section
+    /// (test mirror of the BEAM `encode_bind_meta/9` contract):
+    /// `AliasMax:16be | V5Payload | V5Len:16be` with Flags bit 2 set,
+    /// where `V5Payload` is `Version:8 | Expiry:32be | RecvMax:16be |
+    /// MaxPkt:32be | Count:16be | pairs`.
+    /// Parameters ride one struct so the helper stays under the
+    /// seven-argument clippy bound; one value per bind, never partial.
+    struct V5BindParams<'a> {
+        client_id: &'a str,
+        clean_start: bool,
+        keepalive: u16,
+        alias_max: u16,
+        session_expiry: u32,
+        receive_max: u16,
+        max_packet_size: u32,
+        user_properties: &'a [(&'a str, &'a str)],
+    }
+
+    fn encode_bind_meta_v5(params: V5BindParams<'_>) -> Bytes {
+        let V5BindParams {
+            client_id,
+            clean_start,
+            keepalive,
+            alias_max,
+            session_expiry,
+            receive_max,
+            max_packet_size,
+            user_properties,
+        } = params;
+        assert!(user_properties.len() <= MAX_V5_BIND_USERS);
+        let id = client_id.as_bytes();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        // clean_start plus Flags bit 2 (v5 section present), no will.
+        meta.push(u8::from(clean_start) | 0x04);
+        meta.extend_from_slice(&keepalive.to_be_bytes());
+        meta.extend_from_slice(&alias_max.to_be_bytes());
+        let mut payload = Vec::new();
+        payload.push(5u8);
+        payload.extend_from_slice(&session_expiry.to_be_bytes());
+        payload.extend_from_slice(&receive_max.to_be_bytes());
+        payload.extend_from_slice(&max_packet_size.to_be_bytes());
+        payload.extend_from_slice(&(user_properties.len() as u16).to_be_bytes());
+        for (key, value) in user_properties {
+            payload.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            payload.extend_from_slice(key.as_bytes());
+            payload.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            payload.extend_from_slice(value.as_bytes());
+        }
+        meta.extend_from_slice(&payload);
+        meta.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        Bytes::from(meta)
+    }
+
+    #[test]
+    fn bind_connection_v5_section_decodes_and_replies() {
+        // Through the broker: a version-5 bind reaches the session and
+        // the transported properties decode; the reply stays accepted.
+        let meta = encode_bind_meta_v5(V5BindParams {
+            client_id: "device-v5",
+            clean_start: true,
+            keepalive: 60,
+            alias_max: 10,
+            session_expiry: 3600,
+            receive_max: 100,
+            max_packet_size: 65536,
+            user_properties: &[("k", "v")],
+        });
+        let req = decode_bind_meta(&meta).expect("v5 bind decodes");
+        assert_eq!(req.protocol_version, 5);
+        assert_eq!(req.session_expiry, 3600);
+        assert_eq!(req.receive_maximum, 100);
+        assert_eq!(req.max_packet_size, 65536);
+        assert_eq!(req.client_alias_max, 10);
+        assert_eq!(
+            req.user_properties
+                .as_ref()
+                .and_then(|m| m.get("k"))
+                .map(String::as_str),
+            Some("v")
+        );
+
+        let sessions = SessionManager::new();
+        let frame = bind_frame(21, 1, meta);
+        let reply = reply_for_frame(&frame, &sessions).expect("v5 bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "accepted v5 bind must carry return code 0");
+        // X1-02: the accepted v5 reply carries the extended section
+        // (granted expiry, server limits) with no reason string and no
+        // echoed user properties; the session stores the CONNECT caps.
+        let v5 = decode_session_binding_v5(&reply.metadata).expect("v5 section present");
+        assert_eq!(v5.granted_expiry, 3600);
+        assert_eq!(v5.server_recv_max, SERVER_V5_RECEIVE_MAXIMUM);
+        assert_eq!(v5.server_max_pkt, SERVER_V5_MAX_PACKET_SIZE);
+        assert!(v5.reason.is_empty(), "success carries no reason string");
+        assert!(
+            v5.user_properties.is_empty(),
+            "success echoes no user properties"
+        );
+        let session = sessions.get("device-v5").expect("session stored");
+        assert_eq!(session.protocol_version(), 5);
+        assert_eq!(session.session_expiry(), 3600);
+        assert_eq!(session.client_receive_maximum(), 100);
+        assert_eq!(session.client_max_packet_size(), 65536);
+        assert_eq!(session.outbound_alias_max(), 10);
+
+        // Version-4 binds still decode with defaulted v5 fields.
+        let legacy = decode_bind_meta(&encode_bind_meta("device-004", true, 60))
+            .expect("legacy bind decodes");
+        assert_eq!(legacy.protocol_version, 4);
+        assert_eq!(legacy.session_expiry, 0);
+        assert_eq!(legacy.receive_maximum, u16::MAX);
+        assert_eq!(legacy.max_packet_size, 0);
+        assert!(legacy.user_properties.is_none());
+
+        // A truncated v5 section fails closed (never a guessed version).
+        let mut truncated = encode_bind_meta_v5(V5BindParams {
+            client_id: "d",
+            clean_start: true,
+            keepalive: 60,
+            alias_max: 0,
+            session_expiry: 0,
+            receive_max: 10,
+            max_packet_size: 0,
+            user_properties: &[],
+        })
+        .to_vec();
+        truncated.truncate(truncated.len() - 3);
+        assert!(decode_bind_meta(&truncated).is_err());
+    }
+
+    #[test]
+    fn v5_session_expiry_zero_drops_state_at_disconnect() {
+        // Through the broker bind path: a v5 session with expiry 0
+        // drops its subscriptions at disconnect, and the next
+        // reconnect observes session_present=false with nothing left.
+        let sessions = SessionManager::new();
+        let first = bind_frame(
+            41,
+            1,
+            encode_bind_meta_v5(V5BindParams {
+                client_id: "v5-expiry-zero",
+                clean_start: false,
+                keepalive: 60,
+                alias_max: 0,
+                session_expiry: 0,
+                receive_max: 100,
+                max_packet_size: 0,
+                user_properties: &[],
+            }),
+        );
+        let first_reply = reply_for_frame(&first, &sessions).expect("first v5 bind replies");
+        let (_, first_present, rc) = decode_session_binding_meta(&first_reply.metadata);
+        assert!(!first_present);
+        assert_eq!(rc, 0);
+        let filter = TopicFilter::new("v5/zero/state").unwrap();
+        sessions.add_subscription("v5-expiry-zero", filter, QoS::AtLeastOnce);
+        assert_eq!(
+            sessions.subscription_filters("v5-expiry-zero").len(),
+            1,
+            "subscription stored before disconnect"
+        );
+        sessions.unbind_connection("v5-expiry-zero", 41);
+        assert!(
+            sessions.subscription_filters("v5-expiry-zero").is_empty(),
+            "expiry 0 must drop subscriptions at disconnect"
+        );
+        let second = bind_frame(
+            42,
+            1,
+            encode_bind_meta_v5(V5BindParams {
+                client_id: "v5-expiry-zero",
+                clean_start: false,
+                keepalive: 60,
+                alias_max: 0,
+                session_expiry: 0,
+                receive_max: 100,
+                max_packet_size: 0,
+                user_properties: &[],
+            }),
+        );
+        let second_reply = reply_for_frame(&second, &sessions).expect("reconnect replies");
+        let (_, present, rc) = decode_session_binding_meta(&second_reply.metadata);
+        assert!(
+            !present,
+            "dropped session must reconnect with present=false"
+        );
+        assert_eq!(rc, 0);
+        assert!(
+            sessions.subscription_filters("v5-expiry-zero").is_empty(),
+            "nothing survives an expiry-0 disconnect"
+        );
+    }
+
+    #[test]
+    fn v5_session_expiry_nonzero_retains_and_expires() {
+        // Through the broker bind path: a v5 session with a nonzero
+        // expiry retains its subscriptions past a reconnect within the
+        // interval (present=true) and drops them after it (present=false).
+        let sessions = SessionManager::new();
+        let bind_expiry = |conn: u64, seq: u64| {
+            bind_frame(
+                conn,
+                seq,
+                encode_bind_meta_v5(V5BindParams {
+                    client_id: "v5-expiry-kept",
+                    clean_start: false,
+                    keepalive: 60,
+                    alias_max: 0,
+                    session_expiry: 3600,
+                    receive_max: 100,
+                    max_packet_size: 0,
+                    user_properties: &[],
+                }),
+            )
+        };
+        let first_reply = reply_for_frame(&bind_expiry(51, 1), &sessions).expect("bind replies");
+        let (_, first_present, _) = decode_session_binding_meta(&first_reply.metadata);
+        assert!(!first_present);
+        let filter = TopicFilter::new("v5/kept/state").unwrap();
+        sessions.add_subscription("v5-expiry-kept", filter, QoS::AtLeastOnce);
+        sessions.unbind_connection("v5-expiry-kept", 51);
+        assert_eq!(
+            sessions.subscription_filters("v5-expiry-kept").len(),
+            1,
+            "nonzero expiry must retain subscriptions at disconnect"
+        );
+        let second_reply = reply_for_frame(&bind_expiry(52, 1), &sessions).expect("reconnect");
+        let (_, present, rc) = decode_session_binding_meta(&second_reply.metadata);
+        assert!(
+            present,
+            "unexpired session must reconnect with present=true"
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(
+            sessions.subscription_filters("v5-expiry-kept").len(),
+            1,
+            "retained subscription survives reconnect within the interval"
+        );
+        // Detach again and backdate the end past the interval: the
+        // next reconnect must treat the session as expired.
+        sessions.unbind_connection("v5-expiry-kept", 52);
+        {
+            let session = sessions.get("v5-expiry-kept").expect("detached session");
+            let past = broker_session::now_ms().saturating_sub((3600 + 10) * 1000);
+            *session.ended_at_ms.write() = Some(past);
+        }
+        let third_reply = reply_for_frame(&bind_expiry(53, 1), &sessions).expect("reconnect");
+        let (_, present, rc) = decode_session_binding_meta(&third_reply.metadata);
+        assert!(
+            !present,
+            "expired session must reconnect with present=false"
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn v5_receive_maximum_caps_inflight_qos1() {
+        // Through the broker delivery path: a v5 client announcing
+        // receive-maximum 1 gets one QoS 1 downlink tracked, and the
+        // next one is shed (counted via `inflight_dropped`, never
+        // sent above the client's unacked cap).
+        let router = Router::new();
+        let sessions = SessionManager::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("v5/capped/inflight").unwrap();
+        let bind = bind_frame(
+            61,
+            1,
+            encode_bind_meta_v5(V5BindParams {
+                client_id: "v5-capped-rx",
+                clean_start: true,
+                keepalive: 60,
+                alias_max: 0,
+                session_expiry: 0,
+                receive_max: 1,
+                max_packet_size: 0,
+                user_properties: &[],
+            }),
+        );
+        let reply = reply_for_frame(&bind, &sessions).expect("v5 bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        router.subscribe(
+            &filter,
+            Subscription::new("v5-capped-rx", 61, QoS::AtLeastOnce),
+        );
+        let topic = Topic::new("v5/capped/inflight").unwrap();
+        let first = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtLeastOnce,
+            false,
+            &Bytes::from_static(b"one"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        );
+        assert_eq!(first.len(), 1, "first downlink fits the window");
+        let session = sessions.get("v5-capped-rx").expect("session");
+        assert_eq!(session.inflight_total_len(), 1);
+        let second = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtLeastOnce,
+            false,
+            &Bytes::from_static(b"two"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        );
+        assert!(
+            second.is_empty(),
+            "second downlink must shed above receive-maximum 1"
+        );
+        assert_eq!(metrics.inflight_dropped(), 1, "a counter must move");
+        assert_eq!(
+            session.inflight_total_len(),
+            1,
+            "shed frame stays untracked"
+        );
+    }
+
+    #[test]
+    fn v5_max_packet_size_sheds_oversize_publish() {
+        // Through the broker delivery path: an oversize publish toward
+        // a capped v5 client is refused with the packet-too-large code
+        // and a counter moves (never sent above the maximum, never
+        // silent).
+        let router = Router::new();
+        let sessions = SessionManager::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("v5/capped/size").unwrap();
+        let bind = bind_frame(
+            71,
+            1,
+            encode_bind_meta_v5(V5BindParams {
+                client_id: "v5-capped-size",
+                clean_start: true,
+                keepalive: 60,
+                alias_max: 0,
+                session_expiry: 0,
+                receive_max: 65535,
+                max_packet_size: 30,
+                user_properties: &[],
+            }),
+        );
+        let reply = reply_for_frame(&bind, &sessions).expect("v5 bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        router.subscribe(
+            &filter,
+            Subscription::new("v5-capped-size", 71, QoS::AtLeastOnce),
+        );
+        let session = sessions.get("v5-capped-size").expect("session");
+        let refused = super::v5_egress_refused(&session, 1, "v5/capped/size".len(), 100);
+        assert_eq!(
+            refused,
+            Some(super::V5_RC_PACKET_TOO_LARGE),
+            "oversize frame must refuse with packet-too-large"
+        );
+        let topic = Topic::new("v5/capped/size").unwrap();
+        let deliveries = build_downlink_frames(
+            &router,
+            &sessions,
+            &metrics,
+            &topic,
+            QoS::AtLeastOnce,
+            false,
+            &Bytes::from(vec![0x41; 100]),
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        );
+        assert!(
+            deliveries.is_empty(),
+            "oversize publish must not deliver above the maximum"
+        );
+        assert_eq!(metrics.messages_dropped(), 1, "a counter must move");
+    }
+
+    #[test]
+    fn v5_receive_maximum_zero_rejected_with_protocol_error() {
+        // Through the broker bind path: a v5 CONNECT announcing
+        // receive-maximum 0 fails closed with the protocol-error code,
+        // a server-side reason string and the echoed CONNECT user
+        // properties — with no session created.
+        let sessions = SessionManager::new();
+        let frame = bind_frame(
+            81,
+            1,
+            encode_bind_meta_v5(V5BindParams {
+                client_id: "v5-bad-rx",
+                clean_start: true,
+                keepalive: 60,
+                alias_max: 0,
+                session_expiry: 0,
+                receive_max: 0,
+                max_packet_size: 0,
+                user_properties: &[("trace", "abc")],
+            }),
+        );
+        let reply = reply_for_frame(&frame, &sessions).expect("malformed v5 bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert!(!present);
+        assert_eq!(rc, super::V5_RC_PROTOCOL_ERROR);
+        let v5 = decode_session_binding_v5(&reply.metadata).expect("v5 section present");
+        assert!(!v5.reason.is_empty(), "failure must carry a reason string");
+        assert_eq!(
+            v5.user_properties,
+            vec![("trace".to_string(), "abc".to_string())],
+            "failure must echo the CONNECT user properties"
+        );
+        assert!(
+            sessions.get("v5-bad-rx").is_none(),
+            "rejected bind must create no session"
+        );
+    }
+
+    #[test]
+    fn v5_failure_reason_strings_and_user_echo() {
+        // Unit cover for the failure CONNACK properties: every refusal
+        // code maps to a server-side reason string, and the CONNECT
+        // user properties echo back sorted and bounded.
+        assert!(super::v5_reason_string(0).is_none());
+        for rc in [0x86u8, 0x87, 0x8A, 0x82, 0x97, 0x8B, 0x95] {
+            let reason = super::v5_reason_string(rc).expect("reason string");
+            assert!(!reason.is_empty(), "rc {rc:#04x} needs a reason string");
+        }
+        let meta = encode_bind_meta_v5(V5BindParams {
+            client_id: "v5-echo",
+            clean_start: true,
+            keepalive: 60,
+            alias_max: 0,
+            session_expiry: 0,
+            receive_max: 10,
+            max_packet_size: 0,
+            user_properties: &[("b", "2"), ("a", "1")],
+        });
+        let req = decode_bind_meta(&meta).expect("v5 bind decodes");
+        let v5 = super::failure_binding_v5(&req, 0x86);
+        assert!(!v5.reason.is_empty());
+        assert_eq!(
+            v5.user_properties,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ],
+            "echoed properties must round-trip"
+        );
+    }
+
+    #[test]
+    fn v4_binds_keep_today_layout_and_defaults() {
+        // 3.1.1 integration unchanged: a version-4 bind keeps the
+        // 12-byte reply with no v5 section, defaulted caps and the
+        // clean-session drop behaviour.
+        let sessions = SessionManager::new();
+        let frame = bind_frame(91, 1, encode_bind_meta("device-v4-unchanged", true, 60));
+        let reply = reply_for_frame(&frame, &sessions).expect("v4 bind replies");
+        assert_eq!(
+            reply.metadata.len(),
+            12,
+            "v4 replies keep the 12-byte layout"
+        );
+        assert!(
+            decode_session_binding_v5(&reply.metadata).is_none(),
+            "v4 replies carry no v5 section"
+        );
+        let session = sessions.get("device-v4-unchanged").expect("session stored");
+        assert_eq!(session.protocol_version(), 4);
+        assert_eq!(session.session_expiry(), 0);
+        assert_eq!(
+            session.client_receive_maximum(),
+            broker_session::DEFAULT_CLIENT_RECEIVE_MAXIMUM
+        );
+        assert_eq!(session.client_max_packet_size(), 0);
     }
 
     #[test]
@@ -6729,6 +9098,7 @@ mod tests {
             false,
             &Bytes::from(payload.to_vec()),
             publisher,
+            broker_session::tenant::DEFAULT_TENANT_ID,
         )
         .await
         .into_iter()
@@ -7222,6 +9592,7 @@ mod tests {
             QoS::AtMostOnce,
             false,
             &big,
+            broker_session::tenant::DEFAULT_TENANT_ID,
         );
         assert_eq!(deliveries.len(), 3, "one delivery per subscriber");
         for (_, frame) in &deliveries {
@@ -7269,6 +9640,7 @@ mod tests {
             QoS::AtMostOnce,
             false,
             &big,
+            broker_session::tenant::DEFAULT_TENANT_ID,
         );
         assert!(deliveries.is_empty(), "detached queues buffer, not deliver");
         let a = sessions.get("off-a").expect("session a");
@@ -9428,6 +11800,7 @@ mod tests {
                 QoS::AtMostOnce,
                 false,
                 &Bytes::from(vec![i]),
+                broker_session::tenant::DEFAULT_TENANT_ID,
             );
             assert!(deliveries.is_empty());
         }
@@ -9573,6 +11946,7 @@ mod tests {
                 QoS::AtMostOnce,
                 false,
                 black_box(&payload),
+                broker_session::tenant::DEFAULT_TENANT_ID,
             );
             assert!(deliveries.is_empty());
         }
@@ -9620,6 +11994,7 @@ mod tests {
                 QoS::AtMostOnce,
                 false,
                 black_box(&payload),
+                broker_session::tenant::DEFAULT_TENANT_ID,
             );
             assert!(deliveries.is_empty());
         }
@@ -10059,6 +12434,7 @@ mod tests {
                 conn_id: 901,
                 qos: QoS::AtMostOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -10184,6 +12560,7 @@ mod tests {
                 conn_id: 921,
                 qos: QoS::AtMostOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -10206,6 +12583,7 @@ mod tests {
                 conn_id: 922,
                 qos: QoS::AtMostOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -10322,6 +12700,7 @@ mod tests {
                 conn_id: 911,
                 qos: QoS::AtLeastOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
         let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -10341,6 +12720,7 @@ mod tests {
                 conn_id: 912,
                 qos: QoS::AtLeastOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -11578,6 +13958,7 @@ mod tests {
                 conn_id,
                 qos: QoS::AtMostOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
     }
@@ -12931,6 +15312,39 @@ mod tests {
         Bytes::from(meta)
     }
 
+    /// Test mirror of the edge certificate section: append
+    /// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
+    /// SanCount:16be | (SanLen:16be | San)*` to an encoded bind, ahead of
+    /// any trailing alias section.
+    fn encode_bind_meta_cert(
+        base: Bytes,
+        cn: Option<&str>,
+        subject: Option<&str>,
+        sans: &[&str],
+    ) -> Bytes {
+        fn push_cert_string(out: &mut Vec<u8>, value: Option<&str>) {
+            match value {
+                Some(text) => {
+                    out.extend_from_slice(&(text.len() as u16).to_be_bytes());
+                    out.extend_from_slice(text.as_bytes());
+                }
+                None => out.extend_from_slice(&0u16.to_be_bytes()),
+            }
+        }
+        let mut payload = Vec::new();
+        push_cert_string(&mut payload, cn);
+        push_cert_string(&mut payload, subject);
+        payload.extend_from_slice(&(sans.len() as u16).to_be_bytes());
+        for san in sans {
+            payload.extend_from_slice(&(san.len() as u16).to_be_bytes());
+            payload.extend_from_slice(san.as_bytes());
+        }
+        let mut meta = base.to_vec();
+        meta.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        meta.extend_from_slice(&payload);
+        Bytes::from(meta)
+    }
+
     fn ban_entry(as_type: &str, who: &str, until: &str) -> broker_api::v5::banned::BanEntry {
         broker_api::v5::banned::BanEntry {
             as_type: as_type.to_string(),
@@ -13066,6 +15480,882 @@ mod tests {
         empty_pw.extend_from_slice(b"u");
         empty_pw.extend_from_slice(&(0u16).to_be_bytes());
         assert!(decode_bind_meta(&Bytes::from(empty_pw)).is_err());
+    }
+
+    #[test]
+    fn bind_meta_cert_section_round_trip() {
+        // Credentials plus peer plus certificate decode together (the
+        // credentialed order the edge will send once it forwards
+        // certificates: peer literal, then the certificate section).
+        let base = encode_bind_meta_peer(
+            encode_bind_meta_creds("dev-cert", true, 60, "alice", b"pw"),
+            "192.0.2.10",
+        );
+        let meta = encode_bind_meta_cert(base, Some("sensor-9"), Some("CN=sensor-9"), &["dns:s9"]);
+        let req = decode_bind_meta(&meta).expect("cert bind decodes");
+        assert_eq!(req.client_id, "dev-cert");
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        assert_eq!(req.cert_cn.as_deref(), Some("sensor-9"));
+        assert_eq!(req.cert_subject.as_deref(), Some("CN=sensor-9"));
+        assert_eq!(req.cert_sans, vec!["dns:s9".to_string()]);
+        // Anonymous bind with only a certificate section decodes.
+        let meta = encode_bind_meta_cert(encode_bind_meta("dev-anon", true, 60), None, None, &[]);
+        let req = decode_bind_meta(&meta).expect("anon cert bind decodes");
+        assert!(req.cert_cn.is_none());
+        assert!(req.cert_sans.is_empty());
+        // Legacy binds without a certificate section still decode absent.
+        let req =
+            decode_bind_meta(&encode_bind_meta("dev-legacy", true, 60)).expect("legacy decodes");
+        assert!(req.cert_cn.is_none());
+        assert!(req.cert_subject.is_none());
+        assert!(req.cert_sans.is_empty());
+        // A truncated certificate section stays malformed (fail closed).
+        let mut truncated = encode_bind_meta("dev-bad", true, 60).to_vec();
+        truncated.extend_from_slice(&[0, 10, 0, 3, b'a', b'b']);
+        assert!(decode_bind_meta(&Bytes::from(truncated)).is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_two_tenants_recorded_through_broker_connect() {
+        // Two real clients whose connect contexts render two different
+        // tenant ids connect concurrently through `apply_bind` (the same
+        // entry point the edge uses); the kernel records two distinct
+        // tenant ids and each client's self-delivery works. Full
+        // isolation is proved in MT-02; here self-delivery plus distinct
+        // records is enough.
+        use broker_session::tenant::{TenantRule, DEFAULT_TENANT_ID};
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        let frame_a = bind_frame(91, 1, encode_bind_meta("mt-tenant-a", true, 60));
+        let frame_b = bind_frame(92, 1, encode_bind_meta("mt-tenant-b", true, 60));
+        let (reply_a, reply_b) =
+            tokio::join!(apply_bind(&frame_a, &shared), apply_bind(&frame_b, &shared));
+        for reply in [reply_a, reply_b] {
+            let reply = reply.expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        // MT-03: sessions are keyed by `(tenant, client id)`, so the
+        // lookup is qualified with the rendered tenant.
+        let tenant_a = shared
+            .sessions
+            .get_in_tenant("t-mt-tenant-a", "mt-tenant-a")
+            .expect("client a session")
+            .tenant_id
+            .read()
+            .clone();
+        let tenant_b = shared
+            .sessions
+            .get_in_tenant("t-mt-tenant-b", "mt-tenant-b")
+            .expect("client b session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant_a, "t-mt-tenant-a");
+        assert_eq!(tenant_b, "t-mt-tenant-b");
+        assert_ne!(tenant_a, tenant_b);
+        assert_ne!(tenant_a, DEFAULT_TENANT_ID);
+        // Each client's self-delivery works within its own tenant.
+        for (client, conn) in [("mt-tenant-a", 91u64), ("mt-tenant-b", 92u64)] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[(format!("t/{client}").as_str(), 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+            let topic = format!("t/{client}");
+            let (meta, payload) = encode_publish_meta(&topic, 0, 0, false, b"hello");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(conn, 2, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "self-delivery must work for {client}");
+            assert_eq!(deliveries[0].0, conn);
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_default_behaves_as_before() {
+        // A client with no tenant attribute connects with the default
+        // (empty) expression and behaves exactly as before the change:
+        // subscribe, publish, deliver round trip unchanged, tenant id is
+        // the default.
+        use broker_session::tenant::DEFAULT_TENANT_ID;
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        let frame = bind_frame(93, 1, encode_bind_meta("mt-default-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("mt-default-1")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+        let sub = subscribe_frame(
+            93,
+            1,
+            encode_subscribe_meta(1, "mt-default-1", &[("t/default/rt", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("t/default/rt", 0, 0, false, b"ping");
+        let (_, deliveries) = apply_publish(&publish_frame(93, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 93);
+    }
+
+    #[tokio::test]
+    async fn tenant_router_isolates_two_tenants_through_broker() {
+        // Two tenants through the real broker path (bind, subscribe,
+        // publish, deliver): the same filter (and one `#`, and one
+        // shared group name) in tenant A and tenant B never cross. A
+        // publish in A is received only in A and a publish in B only in
+        // B; mismatches deliver nothing and are counted, never an error
+        // to the publisher (QoS 1 still gets its clean ack).
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+        // a1 and a2 share tenant u-alice; b1 lives in u-bob.
+        for (conn, client, user) in [
+            (101u64, "mt2-a1", "alice"),
+            (102u64, "mt2-a2", "alice"),
+            (103u64, "mt2-b1", "bob"),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        // MT-03: sessions are keyed by `(tenant, client id)`, so the
+        // lookup is qualified with the rendered tenant.
+        assert_eq!(
+            shared
+                .sessions
+                .get_in_tenant("u-alice", "mt2-a1")
+                .expect("a1")
+                .tenant_id
+                .read()
+                .clone(),
+            "u-alice"
+        );
+        assert_eq!(
+            shared
+                .sessions
+                .get_in_tenant("u-bob", "mt2-b1")
+                .expect("b1")
+                .tenant_id
+                .read()
+                .clone(),
+            "u-bob"
+        );
+        // Phase 1: `#` in A never observes B. Only a1 subscribes yet,
+        // so every delivery assertion below is exact.
+        let sub = subscribe_frame(101, 1, encode_subscribe_meta(1, "mt2-a1", &[("#", 0)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("mt2/probe", 0, 0, false, b"probe-a");
+        let (_, deliveries) = apply_publish(&publish_frame(101, 2, meta, payload), &shared).await;
+        let conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert_eq!(conns, vec![101], "A's `#` sees A's own traffic");
+        let before = shared.metrics.tenant_mismatch_dropped();
+        let (meta, payload) = encode_publish_meta("mt2/probe", 0, 0, false, b"probe-b");
+        let (_, deliveries) = apply_publish(&publish_frame(103, 3, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "nobody in B subscribed; A's `#` must not see B"
+        );
+        assert!(
+            shared.metrics.tenant_mismatch_dropped() > before,
+            "A's `#` is counted on B's publish, never delivered"
+        );
+        // Phase 2..4 run without the `#` (one tenant's teardown removes
+        // only its own copy) so group sizes stay exact.
+        shared.router.unsubscribe_in_tenant(
+            &TopicFilter::new("#").expect("valid filter"),
+            "mt2-a1",
+            "u-alice",
+        );
+
+        // Same exact filter in both tenants, and the same `$share`
+        // group name in both tenants.
+        for (conn, client, filter) in [
+            (101u64, "mt2-a1", "mt2/data"),
+            (102u64, "mt2-a2", "mt2/data"),
+            (103u64, "mt2-b1", "mt2/data"),
+            (101u64, "mt2-a1", "$share/mt2pool/mt2/jobs"),
+            (102u64, "mt2-a2", "$share/mt2pool/mt2/jobs"),
+            (103u64, "mt2-b1", "$share/mt2pool/mt2/jobs"),
+        ] {
+            let sub = subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[(filter, 0)]));
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+
+        // Publish in A: only A's exact subscribers see it.
+        let before = shared.metrics.tenant_mismatch_dropped();
+        let (meta, payload) = encode_publish_meta("mt2/data", 0, 0, false, b"from-a");
+        let (_, deliveries) = apply_publish(&publish_frame(101, 4, meta, payload), &shared).await;
+        let mut conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        conns.sort_unstable();
+        assert_eq!(conns, vec![101, 102], "A's publish stays in A");
+        assert!(
+            shared.metrics.tenant_mismatch_dropped() > before,
+            "B's exact copy is counted, never delivered"
+        );
+
+        // Publish in B: only B sees it.
+        let before = shared.metrics.tenant_mismatch_dropped();
+        let (meta, payload) = encode_publish_meta("mt2/data", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(103, 5, meta, payload), &shared).await;
+        let conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert_eq!(conns, vec![103], "B's publish stays in B");
+        assert!(
+            shared.metrics.tenant_mismatch_dropped() > before,
+            "A's exact copies are counted, never delivered"
+        );
+
+        // Shared groups balance independently per tenant: two publishes
+        // in A rotate over a1/a2 only, never touching b1.
+        let mut owners = Vec::new();
+        for seq in 0..4u64 {
+            let (meta, payload) = encode_publish_meta("mt2/jobs", 0, 0, false, b"job");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(101, 10 + seq, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "exactly one group member per publish");
+            owners.push(deliveries[0].0);
+        }
+        assert_eq!(owners, vec![101, 102, 101, 102]);
+        let (meta, payload) = encode_publish_meta("mt2/jobs", 0, 0, false, b"job-b");
+        let (_, deliveries) = apply_publish(&publish_frame(103, 20, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 103, "B's group rotates on its own cursor");
+
+        // QoS 1 in A still acks cleanly: mismatch is silent, not an error.
+        let (meta, payload) = encode_publish_meta("mt2/data", 7, 1, false, b"qos1-a");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(101, 30, meta, payload), &shared).await;
+        assert!(ack.is_some(), "QoS 1 publisher still gets its ack");
+        assert_eq!(deliveries.len(), 2, "both A subscribers delivered");
+    }
+
+    #[tokio::test]
+    async fn mt06_auth_two_tenants_same_username_isolated_through_broker() {
+        // MT-06 through the real broker path (bind, subscribe, publish,
+        // deliver — never store-only): the same username `sam` in two
+        // tenants holds two independent passwords and rule sets. Tenants
+        // render from the client id (`t-<clientid>`) so both tenants can
+        // share the username. A publishes under a rule that allows A
+        // only: A's subscriber receives it while B's subscriber (and any
+        // cross-tenant subscribe attempt) is refused; A's password
+        // against B fails to connect, as does an unknown tenant.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        // Per-tenant credentials: same username, different passwords.
+        shared
+            .auth
+            .add_user_in_tenant("t-mt6-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        shared
+            .auth
+            .add_user_in_tenant("t-mt6-b", "sam", b"pw-for-b")
+            .expect("tenant-b user stores");
+        // Rules grant publish and subscribe on mt6/# in A only; B stays
+        // closed (no users' rules, deny).
+        shared
+            .auth
+            .add_rule_in_tenant(
+                "t-mt6-a",
+                broker_auth::AclRule::new("*", broker_auth::AclAction::Publish, "mt6/#", true),
+            )
+            .expect("tenant-a publish rule stores");
+        shared
+            .auth
+            .add_rule_in_tenant(
+                "t-mt6-a",
+                broker_auth::AclRule::new("*", broker_auth::AclAction::Subscribe, "mt6/#", true),
+            )
+            .expect("tenant-a subscribe rule stores");
+        // A connects with A's password, B with B's (same username).
+        for (conn, client, pw) in [
+            (301u64, "mt6-a", b"pw-for-a".as_slice()),
+            (302u64, "mt6-b", b"pw-for-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, "sam", pw);
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0, "{client} connects with its own password");
+        }
+        // Sessions are keyed by (tenant, client id).
+        assert_eq!(
+            shared
+                .sessions
+                .get_in_tenant("t-mt6-a", "mt6-a")
+                .expect("a session")
+                .tenant_id
+                .read()
+                .clone(),
+            "t-mt6-a"
+        );
+        assert_eq!(
+            shared
+                .sessions
+                .get_in_tenant("t-mt6-b", "mt6-b")
+                .expect("b session")
+                .tenant_id
+                .read()
+                .clone(),
+            "t-mt6-b"
+        );
+        // A's password against B fails to connect (bad credentials).
+        let meta = encode_bind_meta_creds("mt6-b", true, 60, "sam", b"pw-for-a");
+        let reply = apply_bind(&bind_frame(303, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "A's password against B must fail");
+        // An unknown tenant (no users, no rules) fails to connect too.
+        let meta = encode_bind_meta_creds("mt6-c", true, 60, "sam", b"pw-for-a");
+        let reply = apply_bind(&bind_frame(304, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "unknown tenant must fail closed");
+        // Subscribe: A granted, B refused (0x87, not authorized).
+        let sub = subscribe_frame(
+            301,
+            1,
+            encode_subscribe_meta(1, "mt6-a", &[("mt6/data", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(reply.metadata[2], 0, "A's subscribe is granted");
+        let sub = subscribe_frame(
+            302,
+            1,
+            encode_subscribe_meta(1, "mt6-b", &[("mt6/data", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(
+            reply.metadata[2], 0x87,
+            "B's cross-tenant subscribe is refused"
+        );
+        // Publish in A: A's subscriber receives it, B never does.
+        let (meta, payload) = encode_publish_meta("mt6/data", 0, 0, false, b"from-a");
+        let (_, deliveries) = apply_publish(&publish_frame(301, 2, meta, payload), &shared).await;
+        let conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert_eq!(conns, vec![301], "A's publish stays in A");
+        // Publish in B is refused like an ACL denial (QoS 1 ack 0x87,
+        // nothing delivered).
+        let (meta, payload) = encode_publish_meta("mt6/data", 9, 1, false, b"from-b");
+        let (ack, deliveries) = apply_publish(&publish_frame(302, 3, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 publisher gets its ack");
+        assert_eq!(ack.metadata[2], 0x87, "B's publish is refused");
+        assert!(deliveries.is_empty(), "B's publish delivers nothing");
+    }
+
+    #[tokio::test]
+    async fn mt06_auth_default_tenant_keeps_working_through_broker() {
+        // MT-06: the pre-change username/password and ACL rows keep
+        // working unchanged through the real broker path while no tenant
+        // rule is configured (every client lands in the default tenant
+        // seeded from today's tables).
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .auth
+            .add_user("base", b"base-pw")
+            .expect("user stores");
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::Publish,
+                "base/#",
+                true,
+            ))
+            .expect("publish rule stores");
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::Subscribe,
+                "base/#",
+                true,
+            ))
+            .expect("subscribe rule stores");
+        let meta = encode_bind_meta_creds("mt6-base", true, 60, "base", b"base-pw");
+        let reply = apply_bind(&bind_frame(311, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "default-tenant credentials keep working");
+        let sub = subscribe_frame(
+            311,
+            1,
+            encode_subscribe_meta(1, "mt6-base", &[("base/1", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(reply.metadata[2], 0, "default-tenant subscribe granted");
+        let (meta, payload) = encode_publish_meta("base/1", 0, 0, false, b"ping");
+        let (_, deliveries) = apply_publish(&publish_frame(311, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "default-tenant delivery works");
+        assert_eq!(deliveries[0].0, 311);
+        // A wrong password still fails.
+        let meta = encode_bind_meta_creds("mt6-base-wrong", true, 60, "base", b"wrong");
+        let reply = apply_bind(&bind_frame(312, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "wrong password still refused");
+    }
+
+    #[tokio::test]
+    async fn tenant_retained_isolates_two_tenants_through_broker() {
+        // Retained scope through the real broker path (bind, retained
+        // publish, subscribe-time fan-out): the same topic retained in two
+        // tenants reads back independently; `#` in one tenant excludes the
+        // other's messages; clearing in one tenant leaves the other intact.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+        for (conn, client, user) in [(201u64, "mtR-a1", "alice"), (202u64, "mtR-b1", "bob")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        // Same topic retained in both tenants with different payloads.
+        let (meta, payload) = encode_publish_meta("mt2/retained", 0, 0, true, b"from-a");
+        let (_, _) = apply_publish(&publish_frame(201, 2, meta, payload), &shared).await;
+        let (meta, payload) = encode_publish_meta("mt2/retained", 0, 0, true, b"from-b");
+        let (_, _) = apply_publish(&publish_frame(202, 3, meta, payload), &shared).await;
+        // Late subscribers in each tenant receive only their own message.
+        for (conn, client, user, expect) in [
+            (203u64, "mtR-a2", "alice", b"from-a".as_slice()),
+            (204u64, "mtR-b2", "bob", b"from-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("mt2/retained", 0)]),
+            );
+            let (reply, retained) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+            assert_eq!(retained.len(), 1, "one retained message in {client}");
+            assert_eq!(retained[0].payload.as_ref(), expect);
+        }
+        // `#` in A sees only A's retained message, never B's.
+        let sub = subscribe_frame(203, 2, encode_subscribe_meta(2, "mtR-a2", &[("#", 0)]));
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        assert_eq!(retained.len(), 1, "A's `#` sees only A's retained");
+        assert_eq!(retained[0].payload.as_ref(), b"from-a");
+        // Clearing in A (empty retained publish) leaves B intact.
+        let (meta, payload) = encode_publish_meta("mt2/retained", 0, 0, true, b"");
+        let (_, _) = apply_publish(&publish_frame(201, 4, meta, payload), &shared).await;
+        for (conn, client, user, expect_len, expect) in [
+            (205u64, "mtR-a3", "alice", 0usize, b"".as_slice()),
+            (206u64, "mtR-b3", "bob", 1usize, b"from-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("mt2/retained", 0)]),
+            );
+            let (reply, retained) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+            assert_eq!(retained.len(), expect_len, "clear stays in {client}");
+            if expect_len == 1 {
+                assert_eq!(retained[0].payload.as_ref(), expect);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_same_client_id_in_two_tenants_are_independent() {
+        // MT-03 through the real broker path (connect, publish,
+        // deliver): the same client id in tenant A and tenant B
+        // connects concurrently with durable sessions; each side
+        // publishes while the other is offline and, on reconnect,
+        // receives only its own tenant's offline queue; a takeover in
+        // A never disconnects B.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+
+        // Same client id, two tenants, durable sessions, concurrently.
+        for (conn, user) in [(301u64, "alice"), (302u64, "bob")] {
+            let meta = encode_bind_meta_creds("mt3-dup", false, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+            assert!(!present, "first durable bind must be fresh");
+        }
+        let session_a = shared
+            .sessions
+            .get_in_tenant("u-alice", "mt3-dup")
+            .expect("A session");
+        let session_b = shared
+            .sessions
+            .get_in_tenant("u-bob", "mt3-dup")
+            .expect("B session");
+        assert_ne!(session_a.id, session_b.id, "two tenants, two sessions");
+        assert!(*session_a.connected.read());
+        assert!(*session_b.connected.read());
+        // The bare default lookup sees neither tenant's session.
+        assert!(shared.sessions.get("mt3-dup").is_none());
+
+        // Same filter in both tenants, via each connection's own session.
+        // QoS 1 subscriptions so detached QoS 1 publishes queue with
+        // effective QoS 1 and replay through the guaranteed mailbox
+        // (QoS 0 replays ride the bounded QoS 0 backlog, not `rx`).
+        for (conn, client) in [(301u64, "mt3-dup"), (302u64, "mt3-dup")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("mt3/data", 1)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        // Live publish stays in its own tenant despite the shared id.
+        let (meta, payload) = encode_publish_meta("mt3/data", 0, 0, false, b"from-a");
+        let (_, deliveries) = apply_publish(&publish_frame(301, 2, meta, payload), &shared).await;
+        assert_eq!(
+            deliveries.iter().map(|(conn, _)| *conn).collect::<Vec<_>>(),
+            vec![301],
+            "A's publish reaches only A"
+        );
+        let (meta, payload) = encode_publish_meta("mt3/data", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(302, 2, meta, payload), &shared).await;
+        assert_eq!(
+            deliveries.iter().map(|(conn, _)| *conn).collect::<Vec<_>>(),
+            vec![302],
+            "B's publish reaches only B"
+        );
+
+        // Takeover in A (second connection, same id, same tenant)
+        // resumes A's durable session and never disconnects B.
+        let meta = encode_bind_meta_creds("mt3-dup", false, 60, "alice", b"pw");
+        let reply = apply_bind(&bind_frame(303, 1, meta), &shared)
+            .await
+            .expect("takeover replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(present, "durable takeover resumes the same session");
+        let resumed_a = shared
+            .sessions
+            .get_in_tenant("u-alice", "mt3-dup")
+            .expect("A session after takeover");
+        assert_eq!(resumed_a.id, session_a.id);
+        assert_eq!(shared.sessions.key_for_conn(301), None, "old A conn pruned");
+        let b_after = shared
+            .sessions
+            .session_for_conn(302)
+            .expect("B still bound after A's takeover");
+        assert_eq!(b_after.id, session_b.id, "takeover in A leaves B untouched");
+        assert!(*b_after.connected.read());
+
+        // Detach both; each tenant queues exactly one offline message.
+        apply_unbind(&unbind_frame(303, 3, "mt3-dup"), &shared);
+        apply_unbind(&unbind_frame(302, 3, "mt3-dup"), &shared);
+        assert!(!*session_a.connected.read());
+        assert!(!*session_b.connected.read());
+        for (conn, client, user) in [(304u64, "mt3-pub-a", "alice"), (305u64, "mt3-pub-b", "bob")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("publisher binds");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let (meta, payload) = encode_publish_meta("mt3/data", 11, 1, false, b"queued-a");
+        let (ack, deliveries) = apply_publish(&publish_frame(304, 2, meta, payload), &shared).await;
+        assert!(ack.is_some());
+        assert!(deliveries.is_empty(), "A detached: queued, not delivered");
+        let (meta, payload) = encode_publish_meta("mt3/data", 12, 1, false, b"queued-b");
+        let (ack, deliveries) = apply_publish(&publish_frame(305, 2, meta, payload), &shared).await;
+        assert!(ack.is_some());
+        assert!(deliveries.is_empty(), "B detached: queued, not delivered");
+        assert_eq!(session_a.offline_len(), 1);
+        assert_eq!(session_b.offline_len(), 1);
+
+        // Reconnect each: every side replays only its own tenant's queue.
+        for (conn, user, expect) in [
+            (306u64, "alice", b"queued-a".as_slice()),
+            (307u64, "bob", b"queued-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds("mt3-dup", false, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("reconnect replies");
+            let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+            assert!(present, "durable reconnect resumes within its tenant");
+            let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+            shared.conns.register(conn, tx);
+            let rebind = bind_frame(
+                conn,
+                1,
+                encode_bind_meta_creds("mt3-dup", false, 60, user, b"pw"),
+            );
+            assert_eq!(replay_offline(&rebind, &shared).await, 1);
+            let got = rx.try_recv().expect("own offline queue replays");
+            assert_eq!(
+                got.payload.as_ref(),
+                expect,
+                "{user} must receive only its own tenant's queue"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "exactly one queued message for {user}"
+            );
+        }
+        assert_eq!(session_a.offline_len(), 0);
+        assert_eq!(session_b.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn sessions_default_tenant_takeover_resume_unchanged() {
+        // MT-03 default tenant through the tenant-aware bind path:
+        // clean-start takeover, durable resume and offline-queue
+        // redelivery behave exactly as before the change.
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+
+        // Clean-start takeover replaces the session and prunes the old
+        // connection.
+        let reply = apply_bind(
+            &bind_frame(401, 1, encode_bind_meta("mt3-clean", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("bind replies");
+        let (first_id, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(!present);
+        let reply = apply_bind(
+            &bind_frame(402, 1, encode_bind_meta("mt3-clean", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("takeover replies");
+        let (second_id, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(!present, "clean start always creates");
+        assert_ne!(first_id, second_id);
+        assert_eq!(shared.sessions.key_for_conn(401), None);
+
+        // Durable disconnect/reconnect resumes the same session.
+        let reply = apply_bind(
+            &bind_frame(403, 1, encode_bind_meta("mt3-durable", false, 60)),
+            &shared,
+        )
+        .await
+        .expect("bind replies");
+        let (durable_id, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(!present);
+        let sub = subscribe_frame(
+            403,
+            2,
+            encode_subscribe_meta(1, "mt3-durable", &[("mt3/keep", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        apply_unbind(&unbind_frame(403, 3, "mt3-durable"), &shared);
+
+        // While detached, a QoS 1 publish queues for the durable session.
+        let reply = apply_bind(
+            &bind_frame(405, 1, encode_bind_meta("mt3-sender", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("sender binds");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let (meta, payload) = encode_publish_meta("mt3/keep", 21, 1, false, b"kept");
+        let (ack, deliveries) = apply_publish(&publish_frame(405, 2, meta, payload), &shared).await;
+        assert!(ack.is_some());
+        assert!(deliveries.is_empty());
+
+        let reply = apply_bind(
+            &bind_frame(404, 1, encode_bind_meta("mt3-durable", false, 60)),
+            &shared,
+        )
+        .await
+        .expect("reconnect replies");
+        let (resumed_id, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(present, "durable reconnect resumes");
+        assert_eq!(resumed_id, durable_id);
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(404, tx);
+        let rebind = bind_frame(404, 1, encode_bind_meta("mt3-durable", false, 60));
+        assert_eq!(replay_offline(&rebind, &shared).await, 1);
+        let got = rx.try_recv().expect("offline queue redelivers");
+        assert_eq!(got.payload.as_ref(), b"kept");
+    }
+
+    #[tokio::test]
+    async fn tenant_default_shared_round_trip_unchanged() {
+        // Single-tenant installs behave exactly as before, including a
+        // shared subscription: one group member plus the plain
+        // subscriber per publish, rotating deterministically, with no
+        // tenant-mismatch counts.
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        for (conn, client) in [(111u64, "mt2-d1"), (112u64, "mt2-d2"), (113u64, "mt2-d3")] {
+            let reply = apply_bind(
+                &bind_frame(conn, 1, encode_bind_meta(client, true, 60)),
+                &shared,
+            )
+            .await
+            .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client, filter) in [
+            (111u64, "mt2-d1", "$share/mt2pool/mt2/jobs"),
+            (112u64, "mt2-d2", "$share/mt2pool/mt2/jobs"),
+            (113u64, "mt2-d3", "mt2/jobs"),
+        ] {
+            let sub = subscribe_frame(conn, 1, encode_subscribe_meta(1, client, &[(filter, 0)]));
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        let mut owners = Vec::new();
+        for seq in 0..4u64 {
+            let (meta, payload) = encode_publish_meta("mt2/jobs", 0, 0, false, b"job");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(111, 10 + seq, meta, payload), &shared).await;
+            assert_eq!(
+                deliveries.len(),
+                2,
+                "one group member plus the plain subscriber"
+            );
+            let mut conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+            conns.sort_unstable();
+            assert!(conns.contains(&113), "plain subscriber always present");
+            owners.push(if conns[0] == 113 { conns[1] } else { conns[0] });
+        }
+        assert_eq!(owners, vec![111, 112, 111, 112]);
+        assert_eq!(shared.metrics.tenant_mismatch_dropped(), 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_cert_cn_drives_assignment_through_bind() {
+        // The TLS certificate common name forwarded in the bind drives
+        // the tenant expression through the same `apply_bind` path.
+        use broker_session::tenant::{TenantRule, DEFAULT_TENANT_ID};
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "cn-${cert_cn}")])
+            .expect("tenant rules store");
+        let base = encode_bind_meta("mt-cert-1", true, 60);
+        let meta = encode_bind_meta_cert(base, Some("sensor-9"), None, &[]);
+        let frame = bind_frame(94, 1, meta);
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        // MT-03: sessions are keyed by `(tenant, client id)`, so the
+        // lookup is qualified with the rendered tenant.
+        let tenant = shared
+            .sessions
+            .get_in_tenant("cn-sensor-9", "mt-cert-1")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, "cn-sensor-9");
+        // No certificate: the same expression falls back to default.
+        let frame = bind_frame(95, 1, encode_bind_meta("mt-nocert-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("mt-nocert-1")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+    }
+
+    #[tokio::test]
+    async fn tenant_overlong_render_rejected_to_default_through_bind() {
+        // An overlong rendered id is rejected to the default tenant
+        // through the broker connect path, counted and logged.
+        use broker_session::tenant::{TenantRule, DEFAULT_TENANT_ID, MAX_TENANT_ID_LEN};
+        let shared = test_shared();
+        let long = "t-".to_string() + &"x".repeat(MAX_TENANT_ID_LEN);
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", long)])
+            .expect("long rule stores");
+        let before = shared.tenant_registry.fallback_count();
+        let frame = bind_frame(96, 1, encode_bind_meta("mt-long-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "overlong tenant must not refuse the connect");
+        let tenant = shared
+            .sessions
+            .get("mt-long-1")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+        assert_eq!(shared.tenant_registry.fallback_count(), before + 1);
     }
 
     #[tokio::test]
@@ -13979,6 +17269,7 @@ mod tests {
             broker_protocol::QoS::AtMostOnce,
             true,
             &big_payload,
+            broker_session::tenant::DEFAULT_TENANT_ID,
         )
         .await;
         let stored = shared
@@ -14002,6 +17293,7 @@ mod tests {
             broker_protocol::QoS::AtMostOnce,
             true,
             &bytes::Bytes::from_static(b"one"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
         )
         .await;
         assert!(shared
@@ -14017,6 +17309,7 @@ mod tests {
             broker_protocol::QoS::AtMostOnce,
             true,
             &bytes::Bytes::from_static(b"two"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
         )
         .await;
         assert!(
@@ -14035,6 +17328,7 @@ mod tests {
             broker_protocol::QoS::AtMostOnce,
             true,
             &bytes::Bytes::from_static(b"one-v2"),
+            broker_session::tenant::DEFAULT_TENANT_ID,
         )
         .await;
         let replaced = shared
@@ -14805,7 +18099,15 @@ mod tests {
         // Real broker ingress, not a direct store call.
         let topic = Topic::new("journal/probe").unwrap();
         let payload = Bytes::from_static(b"journalled-bytes");
-        let deliveries = ingress_pipeline(&shared, &topic, QoS::AtLeastOnce, false, &payload).await;
+        let deliveries = ingress_pipeline(
+            &shared,
+            &topic,
+            QoS::AtLeastOnce,
+            false,
+            &payload,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        )
+        .await;
         let _ = deliveries;
 
         // The publish path never blocks: it only enqueued. The background
@@ -14892,7 +18194,15 @@ mod tests {
             Bytes::from_static(b"four"),
         ] {
             // Real broker ingress, not `engine.input().push`.
-            let _ = ingress_pipeline(&shared, &topic, QoS::AtMostOnce, false, &payload).await;
+            let _ = ingress_pipeline(
+                &shared,
+                &topic,
+                QoS::AtMostOnce,
+                false,
+                &payload,
+                broker_session::tenant::DEFAULT_TENANT_ID,
+            )
+            .await;
         }
         let stats = shared.engine.spill_stats();
         assert_eq!(stats.spilled, 2, "overflow spills, never errors: {stats:?}");
@@ -14922,6 +18232,87 @@ mod tests {
         assert_eq!(shared.metrics.rule_spill_dropped(), 0);
         shared.engine.input().sync_spill().expect("sync");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Enterprise window split (X1-06): the production engine built by
+    /// `Shared::new` carries the enterprise window executor, so a
+    /// windowed rule created through the management path evaluates end
+    /// to end through the rule engine exactly as before the split.
+    #[tokio::test]
+    async fn production_shared_engine_executes_windowed_rules() {
+        #[derive(Debug, Default)]
+        struct ProbeSink {
+            published: std::sync::Mutex<Vec<(Topic, Bytes, QoS, bool)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl BrokerSink for ProbeSink {
+            async fn publish(
+                &self,
+                topic: Topic,
+                payload: Bytes,
+                qos: QoS,
+                retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                self.published
+                    .lock()
+                    .unwrap()
+                    .push((topic, payload, qos, retain));
+                Ok(())
+            }
+        }
+
+        let shared = Shared::new();
+        let rule = shared
+            .engine
+            .create_rule(
+                "x1-06-window-probe".to_string(),
+                TopicFilter::new("x106/+").unwrap(),
+                Some(
+                    r#"SELECT avg(temperature) AS avg_temp FROM "x106/+" GROUP BY COUNTWINDOW(2)"#
+                        .to_string(),
+                ),
+                true,
+                vec![broker_rules::RuleAction::Republish {
+                    topic: Topic::new("x106/agg").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("windowed rule creates");
+        assert_eq!(shared.engine.window_worker_count(), 1);
+        let sink = Arc::new(ProbeSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        // Window flushes dispatch back through the engine's stored sink
+        // (see `RuleEngine::dispatch_window_row`), not the per-call
+        // ingress sink: install the probe so the COUNTWINDOW aggregate
+        // below lands where this test reads it.
+        shared.engine.set_broker_sink(sink_obj.clone());
+        let topic = Topic::new("x106/kitchen").unwrap();
+        for payload in [
+            Bytes::from_static(br#"{ "temperature": 10.0 }"#),
+            Bytes::from_static(br#"{ "temperature": 30.0 }"#),
+        ] {
+            shared
+                .engine
+                .dispatch_ingress(&topic, &payload, QoS::AtMostOnce, &sink_obj)
+                .await;
+        }
+        for _ in 0..60 {
+            if !sink.published.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let published = sink.published.lock().unwrap();
+        assert_eq!(published.len(), 1, "one row per closed window");
+        assert_eq!(published[0].0.as_str(), "x106/agg");
+        let row: serde_json::Value = serde_json::from_slice(&published[0].1).expect("row is JSON");
+        assert_eq!(row["avg_temp"], serde_json::json!(20.0));
+        assert!(shared
+            .engine
+            .remove_rule(&rule.id)
+            .expect("remove cannot fail"));
+        assert_eq!(shared.engine.window_worker_count(), 0);
     }
     #[test]
     fn b2_04_mqtt_serves_in_trial_grace_and_lapsed() {
@@ -14967,6 +18358,7 @@ mod tests {
                 QoS::AtLeastOnce,
                 false,
                 &Bytes::from_static(b"hello"),
+                broker_session::tenant::DEFAULT_TENANT_ID,
             );
             assert!(
                 !deliveries.is_empty(),

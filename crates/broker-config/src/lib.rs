@@ -18,6 +18,15 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod layers;
+pub mod runtime;
+pub mod schema;
+pub mod secrets;
+
+pub use layers::{load_layered, CliOverrides, LayeredConfig, DEFAULT_CONFIG_DIR};
+pub use runtime::{ConfigDiff, ConfigHistory, ConfigVersion};
+pub use schema::BrokerConfig;
+
 /// Name of the persistence file inside the state directory.
 pub const STATE_FILE_NAME: &str = "state.toml";
 
@@ -949,6 +958,12 @@ impl FullSnapshot {
         self.authn_settings.validate()?;
         Ok(())
     }
+
+    /// Validates every root plus cross-root references (M1-05 whole-config
+    /// validation). Reports every offending setting in one error.
+    pub fn validate_whole(&self) -> Result<(), ConfigError> {
+        runtime::validate_whole(self)
+    }
 }
 
 /// One validated root ready to be committed.
@@ -984,10 +999,16 @@ fn state_path(dir: &Path) -> PathBuf {
 /// helpers), which validates the incoming root before swapping it into
 /// view; invalid state can never become visible. [`ConfigRegistry::save`]
 /// persists the current snapshot atomically.
+///
+/// Runtime changes (M1-05) persist into the kernel data directory
+/// (`state.toml` plus `config-history.json` beside it). The broker never
+/// writes into the operator config directory (`indra.toml`, `conf.d/`);
+/// reloads read those files but only the data directory is ever written.
 #[derive(Debug)]
 pub struct ConfigRegistry {
     dir: PathBuf,
     current: ArcSwap<FullSnapshot>,
+    history: ConfigHistory,
 }
 
 impl ConfigRegistry {
@@ -995,7 +1016,9 @@ impl ConfigRegistry {
     ///
     /// A missing file yields validated defaults (all roots empty). A
     /// corrupt file or a validation failure is an error naming the file
-    /// and the field; defaults are never silently substituted.
+    /// and the field; defaults are never silently substituted. The version
+    /// history loads from `<dir>/config-history.json` when present and is
+    /// seeded with the boot snapshot otherwise.
     pub fn load(dir: &Path) -> Result<Self, ConfigError> {
         let file = state_path(dir);
         let snapshot = if !file.exists() {
@@ -1020,10 +1043,16 @@ impl ConfigRegistry {
             })?;
             parsed
         };
-        Ok(Self {
+        let registry = Self {
             dir: dir.to_path_buf(),
-            current: ArcSwap::from(Arc::new(snapshot)),
-        })
+            current: ArcSwap::from(Arc::new(snapshot.clone())),
+            history: ConfigHistory::new(),
+        };
+        registry.load_history_file();
+        if registry.history.is_empty() {
+            registry.seed_boot_version();
+        }
+        Ok(registry)
     }
 
     /// Returns the directory this registry persists into.
@@ -1055,46 +1084,237 @@ impl ConfigRegistry {
     }
 
     /// Commits a validated admin-users root.
+    ///
+    /// Records a version in the history (actor `api`, naming the root) so
+    /// every applied change is versioned, and persists the history file
+    /// alongside `state.toml`.
     pub fn commit_admin_users(&self, conf: AdminUsersConf) -> Result<(), ConfigError> {
         conf.validate()?;
+        let old = self.snapshot();
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.admin_users = conf.clone();
             next
         });
+        let next = self.snapshot();
+        self.history
+            .record("api", "commit admin_users", &old, &next);
+        self.save_history_file()?;
         Ok(())
     }
 
     /// Commits a validated MQTT-users root.
+    ///
+    /// Records a version in the history (actor `api`, naming the root) so
+    /// every applied change is versioned, and persists the history file
+    /// alongside `state.toml`.
     pub fn commit_mqtt_users(&self, conf: MqttUsersConf) -> Result<(), ConfigError> {
         conf.validate()?;
+        let old = self.snapshot();
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.mqtt_users = conf.clone();
             next
         });
+        let next = self.snapshot();
+        self.history.record("api", "commit mqtt_users", &old, &next);
+        self.save_history_file()?;
         Ok(())
     }
 
     /// Commits a validated rules root.
+    ///
+    /// Records a version in the history (actor `api`, naming the root) so
+    /// every applied change is versioned, and persists the history file
+    /// alongside `state.toml`.
     pub fn commit_rules(&self, conf: RulesConf) -> Result<(), ConfigError> {
         conf.validate()?;
+        let old = self.snapshot();
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.rules = conf.clone();
             next
         });
+        let next = self.snapshot();
+        self.history.record("api", "commit rules", &old, &next);
+        self.save_history_file()?;
         Ok(())
     }
 
     /// Commits a validated connectors root.
+    ///
+    /// Records a version in the history (actor `api`, naming the root) so
+    /// every applied change is versioned, and persists the history file
+    /// alongside `state.toml`.
     pub fn commit_connectors(&self, conf: ConnectorsConf) -> Result<(), ConfigError> {
         conf.validate()?;
+        let old = self.snapshot();
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.connectors = conf.clone();
             next
         });
+        let next = self.snapshot();
+        self.history.record("api", "commit connectors", &old, &next);
+        self.save_history_file()?;
+        Ok(())
+    }
+
+    /// Validates a whole snapshot across roots without changing visible state.
+    ///
+    /// Reports every offending setting in one error; the running snapshot
+    /// is untouched on failure.
+    pub fn validate_whole_snapshot(&self, next: &FullSnapshot) -> Result<(), ConfigError> {
+        next.validate_whole()
+    }
+
+    /// Diffs two snapshots into per-setting rows (setting, old, new).
+    #[must_use]
+    pub fn diff(&self, old: &FullSnapshot, new: &FullSnapshot) -> Vec<ConfigDiff> {
+        runtime::diff_snapshots(old, new)
+    }
+
+    /// Commits a whole snapshot atomically after whole-config validation.
+    ///
+    /// Either the entire change set becomes visible or nothing does; a
+    /// failure names every offending setting and leaves the running
+    /// snapshot untouched. Records a version in the history and persists
+    /// both files on success.
+    pub fn commit_whole(
+        &self,
+        next: FullSnapshot,
+        actor: &str,
+        summary: &str,
+    ) -> Result<u64, ConfigError> {
+        self.validate_whole_snapshot(&next)?;
+        let old = self.snapshot();
+
+        // Prepare the new history entry without mutating shared state yet.
+        let changes = runtime::diff_snapshots(&old, &next);
+        let id = self.history.next_id();
+        let new_version = runtime::ConfigVersion {
+            id,
+            timestamp_secs: runtime::now_secs(),
+            actor: actor.to_string(),
+            summary: summary.to_string(),
+            changes,
+            snapshot: next.clone(),
+        };
+
+        // Serialise both artefacts to bytes first.
+        let snapshot_bytes = toml::to_string(&next).map_err(|err| ConfigError::Save {
+            file: state_path(&self.dir).display().to_string(),
+            reason: format!("cannot serialise snapshot: {err}"),
+        })?;
+        let mut history_versions = self.history.list();
+        history_versions.push(new_version.clone());
+        while history_versions.len() > runtime::MAX_HISTORY_ENTRIES {
+            history_versions.remove(0);
+        }
+        let history_bytes =
+            serde_json::to_string_pretty(&history_versions).map_err(|err| ConfigError::Save {
+                file: self.history_path().display().to_string(),
+                reason: format!("cannot serialise history: {err}"),
+            })?;
+
+        // Persist both files atomically (temp-then-rename, fsynced).
+        self.write_atomic(&state_path(&self.dir), snapshot_bytes.as_bytes())?;
+        self.write_atomic(&self.history_path(), history_bytes.as_bytes())?;
+
+        // Only now mutate in-memory state.
+        self.current.store(Arc::new(next));
+        self.history.commit_record(new_version);
+        Ok(id)
+    }
+
+    /// Lists versions newest-first.
+    #[must_use]
+    pub fn history_list(&self) -> Vec<ConfigVersion> {
+        self.history.list()
+    }
+
+    /// Fetches one version by id.
+    #[must_use]
+    pub fn history_get(&self, id: u64) -> Option<ConfigVersion> {
+        self.history.get(id)
+    }
+
+    /// Restores a recorded version through the same validate-whole path.
+    pub fn history_restore(&self, id: u64, actor: &str) -> Result<u64, ConfigError> {
+        let version = self.history_get(id).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "config version {id} does not exist (field `version`)"
+            ))
+        })?;
+        self.commit_whole(version.snapshot, actor, &format!("restore version {id}"))
+    }
+
+    /// Truncate history to at most `max_len` versions (newest removed first).
+    /// Used to roll back history when a reload fails after a version was recorded.
+    pub fn history_truncate_to(&self, max_len: usize) {
+        self.history.truncate_to(max_len);
+    }
+
+    /// Truncate history and persist the result to disk. Used when a reload
+    /// fails after live owners were applied but before the whole commit.
+    pub fn truncate_history_and_save(&self, max_len: usize) -> Result<(), ConfigError> {
+        self.history.truncate_to(max_len);
+        self.save_history_file()
+    }
+
+    /// Seeds the boot version when history is empty (load path).
+    pub fn seed_boot_version(&self) {
+        self.history.seed_boot(&self.snapshot());
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.dir.join(runtime::HISTORY_FILE_NAME)
+    }
+
+    fn load_history_file(&self) {
+        let path = self.history_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        if let Ok(versions) = serde_json::from_str::<Vec<ConfigVersion>>(&text) {
+            self.history.replace(versions);
+        }
+    }
+
+    pub fn save_history_file(&self) -> Result<(), ConfigError> {
+        let path = self.history_path();
+        let versions = self.history.list();
+        let text = serde_json::to_string_pretty(&versions).map_err(|err| ConfigError::Save {
+            file: path.display().to_string(),
+            reason: format!("cannot serialise history: {err}"),
+        })?;
+        // Atomic write beside state.toml (same temp-then-rename discipline,
+        // fsynced before the rename); never touches the config directory.
+        std::fs::create_dir_all(&self.dir).map_err(|err| ConfigError::Save {
+            file: path.display().to_string(),
+            reason: format!("cannot create directory: {err}"),
+        })?;
+        let tmp = self.dir.join(format!(
+            ".{}.{}.tmp",
+            runtime::HISTORY_FILE_NAME,
+            std::process::id()
+        ));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut handle = std::fs::File::create(&tmp)?;
+            handle.write_all(text.as_bytes())?;
+            handle.sync_all()?;
+            drop(handle);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ConfigError::Save {
+                file: path.display().to_string(),
+                reason: format!("cannot write file: {err}"),
+            });
+        }
         Ok(())
     }
 

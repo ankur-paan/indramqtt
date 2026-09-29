@@ -616,6 +616,17 @@ async fn handle_subscribe(
                     // cap is denied fail closed with 0x97 Quota Exceeded
                     // (the same code the kernel subscribe path reports),
                     // registering nothing and changing no session state.
+                    // Tenant scope (MT-02): console subscriptions carry
+                    // the session's tenant. Console connects never run
+                    // tenant assignment, so this is the default tenant
+                    // until gateway identity is scoped.
+                    // TODO(parity): what tenant should a console session
+                    // act in once gateway identity carries one?
+                    let tenant = state
+                        .sessions
+                        .get(&sess.client_id)
+                        .map(|stored| stored.tenant_id.read().clone())
+                        .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
                     let stored = state.router.subscribe(
                         &filter,
                         Subscription {
@@ -623,6 +634,7 @@ async fn handle_subscribe(
                             conn_id,
                             qos,
                             group: None,
+                            tenant: tenant.into(),
                         },
                     );
                     if !stored {
@@ -714,8 +726,26 @@ async fn handle_publish(
     }
     state.metrics.inc_messages_received();
     let mut delivered = 0u64;
-    for sub in state.router.matches(&topic) {
-        let Some(target) = state.sessions.get(sub.client_id.as_ref()) else {
+    // Tenant scope (MT-02, MT-03): console publishes fan out in the
+    // default tenant only (console sessions never run tenant
+    // assignment), so one tenant's subscriptions never observe console
+    // traffic from another tenant's topic space. Mismatches deliver
+    // nothing, counted, never an error to the publisher.
+    // TODO(parity): what tenant should a console session act in once
+    // gateway identity carries one?
+    let (matched, tenant_skipped) = state.router.matches_in_tenant_counted(
+        &topic,
+        None,
+        broker_session::tenant::DEFAULT_TENANT_ID,
+    );
+    if tenant_skipped > 0 {
+        state.metrics.inc_tenant_mismatch_dropped_by(tenant_skipped);
+    }
+    for sub in matched {
+        let Some(target) = state.sessions.get_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            sub.client_id.as_ref(),
+        ) else {
             continue;
         };
         if !*target.connected.read() {

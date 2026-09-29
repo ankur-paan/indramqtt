@@ -560,6 +560,61 @@ impl Authenticator for WebhookAuth {
     }
 }
 
+impl WebhookAuth {
+    /// Tenant-aware authentication (MT-06): the lookup signature carries
+    /// the connection's tenant. Only the built-in table executes
+    /// per-tenant state in this wave (deferred-backend rule): the verdict
+    /// endpoint is global, so the default tenant delegates to the live
+    /// endpoint (a missing, slow or disagreeing endpoint denies, never
+    /// grants) while a non-default tenant fails closed (deny + log)
+    /// until per-tenant webhook routing is specified.
+    // TODO(parity): how are webhook verdicts partitioned per tenant
+    // (per-tenant endpoint or tenant field in the verdict request)? The
+    // rulebook does not decide the mapping; current choice fails closed
+    // for non-default tenants until the checker pins it.
+    pub async fn authenticate_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        username: Option<&str>,
+        password: Option<&[u8]>,
+    ) -> Result<()> {
+        if !tenant.is_empty() && tenant != crate::DEFAULT_TENANT_ID {
+            tracing::warn!(
+                client_id,
+                tenant,
+                "webhook authentication refused: non-default tenant verdict is deferred, failing closed"
+            );
+            return Err(Self::fail_auth(
+                client_id,
+                "presented webhook credentials that cannot be verified in this tenant",
+            ));
+        }
+        <Self as Authenticator>::authenticate(self, client_id, username, password).await
+    }
+
+    /// Tenant-aware publish authorisation (MT-06): same deferred-backend
+    /// rule as [`WebhookAuth::authenticate_in_tenant`].
+    pub async fn authorize_publish_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        topic: &Topic,
+    ) -> Result<()> {
+        if !tenant.is_empty() && tenant != crate::DEFAULT_TENANT_ID {
+            tracing::warn!(
+                client_id,
+                tenant,
+                "webhook publish authorization refused: non-default tenant verdict is deferred, failing closed"
+            );
+            return Err(AuthError::PublishDenied(format!(
+                "{client_id} cannot publish"
+            )));
+        }
+        <Self as Authorizer>::authorize_publish(self, client_id, topic).await
+    }
+}
+
 #[async_trait]
 impl Authorizer for WebhookAuth {
     async fn authorize_publish(&self, client_id: &str, topic: &Topic) -> Result<()> {

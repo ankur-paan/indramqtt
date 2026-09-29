@@ -1,36 +1,73 @@
-# IndraMQTT One-Click Evaluation Environment
-# https://indramqtt.com
-version: '3.8'
+# IndraMQTT single-node evaluation stack (M1-09).
+#
+# One-node start wired to the real M1-04 config mechanism: the mounted
+# `indra.toml` file first, then `INDRA_*` environment overrides on top.
+# Precedence (M1-04 loader, `crates/broker-config/src/layers.rs`):
+# built-in schema defaults, then `indra.toml`, then `conf.d/*.toml` in
+# file-name order, then `INDRA_*` variables, then command-line flags.
+#
+# Start from a clean tree with: `docker compose up -d --build`
+# Then follow deploy/compose/README.md (health check, MQTT round trip,
+# proof that the INDRA_* override wins, persistence check).
 
 services:
   indramqtt:
     build:
       context: .
       dockerfile: Dockerfile
-    image: indramqtt/indramqtt:latest
+    # Pinned image reference: the workspace version (Cargo.toml
+    # `[workspace.package]`), never `:latest`, so an operator always knows
+    # which tree produced the running container.
+    image: indramqtt/indramqtt:0.1.0
     container_name: indramqtt-broker
     restart: unless-stopped
+    # Effective API bind: the image bakes `CMD ["--api-bind",
+    # "0.0.0.0:18083"]` (Dockerfile) and a passed flag wins over files and
+    # the environment (`crates/broker-node/src/main.rs`), so without this
+    # override a non-default `listeners.api.bind` in indra.toml would leave
+    # the effective bind at 18083 while the file and `ports:` moved. Keep
+    # this value, `listeners.api.bind` in deploy/compose/indra.toml, and
+    # the `ports:` mapping below in agreement; change all three together.
+    command: ["--api-bind", "0.0.0.0:18083"]
     ports:
-      # Standard MQTT TCP listener
+      # Plaintext MQTT listener (`listeners.tcp.bind` in the mounted file).
       - "1883:1883"
-      # Secure MQTT TLS listener
-      - "8883:8883"
-      # MQTT-over-WebSocket listener
+      # MQTT-over-WebSocket listener (`listeners.ws.bind`).
       - "8083:8083"
-      # REST Management API & Web Dashboard SPA
+      # Management API and readiness probe (`listeners.api.bind`).
       - "18083:18083"
     environment:
-      - RUST_LOG=info,broker_node=debug
-      - INDRA_API_BIND=0.0.0.0:18083
+      - RUST_LOG=info
+      # Canonical M1-04 override proving the layer works: the mounted file
+      # below sets `[logging] level = "info"` and this variable wins over
+      # it. Canonical double-underscore form (`INDRA_<SECTION>__<SETTING>`);
+      # an unknown INDRA_* name refuses startup (fail closed), so every
+      # name here must match the schema in
+      # `crates/broker-config/src/schema.rs`.
+      - INDRA_LOGGING__LEVEL=debug
     volumes:
+      # The image's one data root: every byte the broker mutates
+      # (`node.data_dir`, `state.toml` beside it, the stream journal when
+      # configured) lives under /var/lib/indramqtt and survives restarts.
       - indramqtt_data:/var/lib/indramqtt
-      - ./indramqtt.example.toml:/etc/indramqtt/indramqtt.toml:ro
+      # The operator's main config file. The loader reads only
+      # `<config-dir>/indra.toml` (default dir /etc/indramqtt); any other
+      # file name silently boots on defaults, so the target name matters.
+      - ./deploy/compose/indra.toml:/etc/indramqtt/indra.toml:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:18083/api/v1/health || exit 1"]
+      # Settled readiness probe: the public unauthenticated `/healthz`
+      # route answering `OK` (the only readiness route the kernel
+      # implements; it is in the OpenAPI document and covered by the
+      # management API tests). `/api/v1/health` does not exist, so a probe
+      # against it fails closed with a 404 and must not be used here.
+      # Interval 10 s bounds detection delay for orchestrators while
+      # keeping probe load off the publish path; 3 retries ride out a slow
+      # boot replaying state.toml on a cold volume.
+      test: ["CMD-SHELL", "curl -f http://localhost:18083/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 30s
 
 volumes:
   indramqtt_data:

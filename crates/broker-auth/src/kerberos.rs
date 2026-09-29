@@ -473,6 +473,38 @@ impl KerberosAuthenticator {
     }
 }
 
+impl KerberosAuthenticator {
+    /// Tenant-aware token verification (MT-06): the lookup signature
+    /// carries the connection's tenant. Only the built-in table executes
+    /// per-tenant state in this wave (deferred-backend rule): the keytab
+    /// is global, so the default tenant delegates to live verification
+    /// while a non-default tenant fails closed (deny + log) until
+    /// per-tenant service principals are specified.
+    // TODO(parity): how are Kerberos service principals partitioned per
+    // tenant (per-tenant keytab entries or realms)? The rulebook does not
+    // decide the mapping; current choice fails closed for non-default
+    // tenants until the checker pins it.
+    pub fn verify_token_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        token: &[u8],
+    ) -> Result<VerifiedKerberos> {
+        if !tenant.is_empty() && tenant != crate::DEFAULT_TENANT_ID {
+            tracing::warn!(
+                client_id,
+                tenant,
+                "Kerberos authentication refused: non-default tenant verifier is deferred, failing closed"
+            );
+            return Err(Self::fail(
+                client_id,
+                "presented a kerberos token that cannot be verified in this tenant",
+            ));
+        }
+        self.verify_token(client_id, token)
+    }
+}
+
 #[async_trait]
 impl Authenticator for KerberosAuthenticator {
     async fn authenticate(

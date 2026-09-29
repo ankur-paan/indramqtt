@@ -253,6 +253,26 @@ decode_connect_captures_username_password_test() ->
     ?assertEqual(<<"alice">>, maps:get(username, Conn)),
     ?assertEqual(<<"s3cret">>, maps:get(password, Conn)).
 
+decode_connect_captures_will_topic_and_payload_test() ->
+    %% Flags 04 (will) | 02 (clean): 0x06, QoS 0, no retain.
+    Var = <<0, 4, "MQTT", 4, 16#06, 0, 60>>,
+    Body = <<Var/binary, 0, 3, "cid", 0, 5, "w/bye", 0, 7, "goodbye">>,
+    Bin = <<16#10, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(true, maps:get(will_flag, Conn)),
+    ?assertEqual(0, maps:get(will_qos, Conn)),
+    ?assertEqual(false, maps:get(will_retain, Conn)),
+    ?assertEqual(<<"w/bye">>, maps:get(will_topic, Conn)),
+    ?assertEqual(<<"goodbye">>, maps:get(will_payload, Conn)).
+
+decode_connect_without_will_has_no_will_fields_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(false, maps:get(will_flag, Conn)),
+    ?assertEqual(undefined, maps:get(will_topic, Conn)),
+    ?assertEqual(undefined, maps:get(will_payload, Conn)).
+
 decode_connect_anonymous_has_no_credentials_test() ->
     {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
     {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
@@ -293,6 +313,150 @@ decode_connect_v4_reports_zero_alias_max_test() ->
     {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
     ?assertEqual(4, maps:get(protocol_level, Conn)),
     ?assertEqual(0, maps:get(alias_max, Conn)).
+
+%%====================================================================
+%% CONNECT v5 properties (X1-01: framing + transport fields)
+%%====================================================================
+
+%% @private Build a level-5 CONNECT body with the given properties
+%% block and a one-byte client id "a".
+v5_connect_body(Props) ->
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    <<Var/binary, (byte_size(Props)):8, Props/binary, 0, 1, "a">>.
+
+decode_connect_v5_each_property_in_isolation_test() ->
+    %% Session Expiry Interval (17, u32 3600).
+    {ok,Expiry} =
+        indra_mqtt_codec:decode_connect(v5_connect_body(<<17, 0, 0, 14, 16>>)),
+    ?assertEqual(3600, maps:get(session_expiry, Expiry)),
+    ?assertEqual(65535, maps:get(receive_max, Expiry)),
+    %% Receive Maximum (33, u16 100).
+    {ok, Recv} = indra_mqtt_codec:decode_connect(v5_connect_body(<<33, 0, 100>>)),
+    ?assertEqual(100, maps:get(receive_max, Recv)),
+    ?assertEqual(0, maps:get(session_expiry, Recv)),
+    %% Maximum Packet Size (39, u32 65536).
+    {ok, MaxPkt} =
+        indra_mqtt_codec:decode_connect(v5_connect_body(<<39, 0, 1, 0, 0>>)),
+    ?assertEqual(65536, maps:get(max_packet_size, MaxPkt)),
+    %% Topic Alias Maximum (34, u16 10).
+    {ok, Alias} = indra_mqtt_codec:decode_connect(v5_connect_body(<<34, 0, 10>>)),
+    ?assertEqual(10, maps:get(alias_max, Alias)),
+    %% Request Response Information (25, u8 1).
+    {ok, Resp} = indra_mqtt_codec:decode_connect(v5_connect_body(<<25, 1>>)),
+    ?assertEqual(true, maps:get(req_resp_info, Resp)),
+    %% Request Problem Information (23, u8 0).
+    {ok, Prob} = indra_mqtt_codec:decode_connect(v5_connect_body(<<23, 0>>)),
+    ?assertEqual(false, maps:get(req_problem_info, Prob)),
+    %% Authentication Method (21, UTF-8 "SCRAM").
+    {ok, AuthM} =
+        indra_mqtt_codec:decode_connect(v5_connect_body(<<21, 0, 5, "SCRAM">>)),
+    ?assertEqual(<<"SCRAM">>, maps:get(auth_method, AuthM)),
+    %% Authentication Data (22, binary <<1,2,3>>).
+    {ok, AuthD} =
+        indra_mqtt_codec:decode_connect(v5_connect_body(<<22, 0, 3, 1, 2, 3>>)),
+    ?assertEqual(<<1, 2, 3>>, maps:get(auth_data, AuthD)),
+    %% User Property (38, "k" -> "v").
+    {ok, Users} =
+        indra_mqtt_codec:decode_connect(v5_connect_body(<<38, 0, 1, "k", 0, 1, "v">>)),
+    ?assertEqual([{<<"k">>, <<"v">>}], maps:get(user_properties, Users)).
+
+decode_connect_v5_defaults_when_absent_test() ->
+    %% Empty properties: every field reports its default.
+    {ok, Conn} = indra_mqtt_codec:decode_connect(v5_connect_body(<<>>)),
+    ?assertEqual(0, maps:get(session_expiry, Conn)),
+    ?assertEqual(65535, maps:get(receive_max, Conn)),
+    ?assertEqual(0, maps:get(max_packet_size, Conn)),
+    ?assertEqual(false, maps:get(req_resp_info, Conn)),
+    ?assertEqual(true, maps:get(req_problem_info, Conn)),
+    ?assertEqual(undefined, maps:get(auth_method, Conn)),
+    ?assertEqual(undefined, maps:get(auth_data, Conn)),
+    ?assertEqual([], maps:get(user_properties, Conn)),
+    ?assertEqual(0, maps:get(alias_max, Conn)).
+
+decode_connect_v4_reports_v5_defaults_test() ->
+    %% Level 4 has no properties section: same defaults as an empty v5
+    %% block, so the bind fields below never see a version skew.
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(0, maps:get(session_expiry, Conn)),
+    ?assertEqual(65535, maps:get(receive_max, Conn)),
+    ?assertEqual(0, maps:get(max_packet_size, Conn)),
+    ?assertEqual([], maps:get(user_properties, Conn)).
+
+decode_connect_v5_truncated_property_length_test() ->
+    %% Property length 5 but only 2 property bytes present.
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    ?assertEqual({error, truncated_connect},
+                 indra_mqtt_codec:decode_connect(<<Var/binary, 5, 34, 0, 0, 1, "a">>)).
+
+decode_connect_v5_overlong_properties_test() ->
+    %% Duplicate single-occurrence property (two session-expiry values).
+    ?assertEqual({error, malformed_connect_properties},
+                 indra_mqtt_codec:decode_connect(
+                   v5_connect_body(<<17, 0, 0, 0, 1, 17, 0, 0, 0, 2>>))),
+    %% Request Response Information with a value outside 0 | 1.
+    ?assertEqual({error, malformed_connect_properties},
+                 indra_mqtt_codec:decode_connect(v5_connect_body(<<25, 2>>))).
+
+decode_connect_v5_trailing_garbage_test() ->
+    Var = <<0, 4, "MQTT", 5, 16#02, 0, 60>>,
+    ?assertEqual({error, trailing_connect_bytes},
+                 indra_mqtt_codec:decode_connect(
+                   <<Var/binary, 0, 0, 1, "a", 16#FF>>)).
+
+%%====================================================================
+%% CONNACK v5 encoding (X1-01)
+%%====================================================================
+
+encode_connack_v5_success_vector_test() ->
+    %% No session present, success, alias maximum 10 only:
+    %% Body = SP(0) RC(0) PropLen(3) Props(34 0 10).
+    Bin = indra_mqtt_codec:encode_connack_v5(false, 0, #{alias_max => 10}),
+    ?assertEqual(<<16#20, 6, 0, 0, 3, 34, 0, 10>>, Bin),
+    {ok, Dec} = indra_mqtt_codec:decode_connack_v5(binary:part(Bin, 2, 6)),
+    ?assertEqual(false, maps:get(session_present, Dec)),
+    ?assertEqual(0, maps:get(reason_code, Dec)),
+    ?assertEqual(10, maps:get(alias_max, Dec)).
+
+encode_connack_v5_bad_credentials_with_reason_string_test() ->
+    %% Session absent, RC 16#86, reason string "bad password":
+    %% Props = 28 Len(12) Str + no alias.
+    Bin = indra_mqtt_codec:encode_connack_v5(
+            false, 16#86, #{reason_string => <<"bad password">>}),
+    {ok, Dec} = indra_mqtt_codec:decode_connack_v5(binary:part(Bin, 2, byte_size(Bin) - 2)),
+    ?assertEqual(16#86, maps:get(reason_code, Dec)),
+    ?assertEqual(<<"bad password">>, maps:get(reason_string, Dec)),
+    ?assertEqual(undefined, maps:get(assigned_client_id, Dec)).
+
+encode_connack_v5_user_properties_roundtrip_test() ->
+    Opts = #{assigned_client_id => <<"auto-1">>,
+             session_expiry => 3600,
+             receive_max => 100,
+             max_packet_size => 65536,
+             reason_string => <<"ok">>,
+             user_properties => [{<<"k">>, <<"v">>}, {<<"a">>, <<"b">>}]},
+    Bin = indra_mqtt_codec:encode_connack_v5(true, 0, Opts),
+    {ok, Dec} = indra_mqtt_codec:decode_connack_v5(binary:part(Bin, 2, byte_size(Bin) - 2)),
+    ?assertEqual(true, maps:get(session_present, Dec)),
+    ?assertEqual(<<"auto-1">>, maps:get(assigned_client_id, Dec)),
+    ?assertEqual(3600, maps:get(session_expiry, Dec)),
+    ?assertEqual(100, maps:get(receive_max, Dec)),
+    ?assertEqual(65536, maps:get(max_packet_size, Dec)),
+    ?assertEqual([{<<"k">>, <<"v">>}, {<<"a">>, <<"b">>}],
+                 maps:get(user_properties, Dec)).
+
+encode_connack_v5_empty_props_vector_test() ->
+    %% No properties at all: PropLen 0, body is 3 bytes.
+    Bin = indra_mqtt_codec:encode_connack_v5(false, 0, #{}),
+    ?assertEqual(<<16#20, 3, 0, 0, 0>>, Bin).
+
+encode_connack_v4_shape_unchanged_test() ->
+    %% The 3.1.1 encoder is untouched by the v5 work: fixed 4-byte
+    %% shape whatever the session flags are.
+    ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                 indra_mqtt_codec:encode_connack(false, 0)),
+    ?assertEqual(<<16#20, 16#02, 16#01, 16#00>>,
+                 indra_mqtt_codec:encode_connack(true, 0)).
 
 decode_connect_reserved_flag_rejected_test() ->
     ?assertEqual({error, {invalid_connect_flags, 16#03}},

@@ -59,6 +59,33 @@ pub trait RetainedStore: Send + Sync {
     /// All retained messages whose topic matches `filter`, ordered by
     /// topic for deterministic delivery to new subscribers.
     async fn find_matching(&self, filter: &TopicFilter) -> Result<Vec<StoredMessage>>;
+    /// Tenant-scoped retained (MT-02): the same topic string in two
+    /// tenants holds two independent retained messages; matching, reads
+    /// and clears in one tenant never observe another tenant's messages.
+    /// The default tenant follows the unscoped path with identical
+    /// semantics. Subscribe-time and publish-time callers pass the
+    /// subscriber's/publisher's tenant (MT-01 id).
+    async fn set_retained_in_tenant(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        payload: Bytes,
+        tenant: &str,
+    ) -> Result<()>;
+    async fn get_retained_in_tenant(
+        &self,
+        topic: &Topic,
+        tenant: &str,
+    ) -> Result<Option<StoredMessage>>;
+    async fn clear_retained_in_tenant(&self, topic: &Topic, tenant: &str) -> Result<()>;
+    async fn find_matching_in_tenant(
+        &self,
+        filter: &TopicFilter,
+        tenant: &str,
+    ) -> Result<Vec<StoredMessage>>;
+    /// Total retained entries across all tenants (for the global
+    /// `stats.retained` counter). O(1) map length, no scan, no allocation.
+    async fn count_retained(&self) -> Result<usize>;
 }
 
 #[async_trait]
@@ -67,11 +94,36 @@ pub trait SessionStore: Send + Sync {
     async fn get_cursor(&self, session_id: u64) -> Result<u64>;
 }
 
+/// Tenant id for retained entries with no tenant attribute (MT-01
+/// default). Single-tenant installs only ever carry this value, so their
+/// store/clear/match path is identical to the pre-tenancy one.
+pub const DEFAULT_TENANT_ID: &str = "default";
+
+/// Longest tenant tag stored on a retained key. Mirrors the MT-01 render
+/// bound so one key's tenant part can never outgrow the assignment it came
+/// from: at most ~128 bytes of shared string per retained topic. Empty or
+/// overlong ids fall back to the default tenant (fail closed, never another
+/// tenant's).
+pub const MAX_TENANT_ID_LEN: usize = 128;
+
+/// Clamp a tenant id to what a retained key may store: empty or overlong
+/// ids become the default tenant (fail closed, never another tenant's).
+fn normalize_tenant_key(tenant: &str) -> std::sync::Arc<str> {
+    if tenant.is_empty() || tenant.len() > MAX_TENANT_ID_LEN {
+        std::sync::Arc::from(DEFAULT_TENANT_ID)
+    } else {
+        std::sync::Arc::from(tenant)
+    }
+}
+
 /// Maximum retained topics held by [`MemoryStore`].
 ///
-/// The map holds at most this many exact topics; inserts past the cap
-/// keep delivery working but drop the new topic (existing topics may still
-/// be replaced), so one client cannot balloon the node. Management-plane
+/// The map holds at most this many `(tenant, topic)` pairs across all
+/// tenants; inserts past the cap keep delivery working but drop the new
+/// topic (existing topics may still be replaced), so one client cannot
+/// balloon the node. The cap stays global so per-tenant memory is bounded
+/// by the same limit with no second unlimited default (per-tenant
+/// accounting arrives in MT-04). Management-plane
 /// reads clone at most one entry (single lookup) or a bounded page (list),
 /// never scanning without a cap, and take only short read locks so they
 /// never block delivery.
@@ -85,7 +137,7 @@ pub const MAX_RETAINED_MESSAGES: usize = 100_000;
 #[derive(Default)]
 pub struct MemoryStore {
     messages: RwLock<Vec<StoredMessage>>,
-    retained: RwLock<HashMap<Topic, StoredMessage>>,
+    retained: RwLock<HashMap<(std::sync::Arc<str>, Topic), StoredMessage>>,
     cursors: RwLock<HashMap<u64, u64>>,
 }
 
@@ -122,12 +174,38 @@ impl MessageStore for MemoryStore {
 #[async_trait]
 impl RetainedStore for MemoryStore {
     async fn set_retained(&self, topic: Topic, qos: QoS, payload: Bytes) -> Result<()> {
+        self.set_retained_in_tenant(topic, qos, payload, DEFAULT_TENANT_ID)
+            .await
+    }
+
+    async fn get_retained(&self, topic: &Topic) -> Result<Option<StoredMessage>> {
+        self.get_retained_in_tenant(topic, DEFAULT_TENANT_ID).await
+    }
+
+    async fn clear_retained(&self, topic: &Topic) -> Result<()> {
+        self.clear_retained_in_tenant(topic, DEFAULT_TENANT_ID)
+            .await
+    }
+
+    async fn find_matching(&self, filter: &TopicFilter) -> Result<Vec<StoredMessage>> {
+        self.find_matching_in_tenant(filter, DEFAULT_TENANT_ID)
+            .await
+    }
+
+    async fn set_retained_in_tenant(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        payload: Bytes,
+        tenant: &str,
+    ) -> Result<()> {
+        let key = (normalize_tenant_key(tenant), topic.clone());
         let mut map = self.retained.write();
-        if map.len() >= MAX_RETAINED_MESSAGES && !map.contains_key(&topic) {
+        if map.len() >= MAX_RETAINED_MESSAGES && !map.contains_key(&key) {
             return Ok(());
         }
         map.insert(
-            topic.clone(),
+            key,
             StoredMessage {
                 offset: 0,
                 topic,
@@ -140,26 +218,43 @@ impl RetainedStore for MemoryStore {
         Ok(())
     }
 
-    async fn get_retained(&self, topic: &Topic) -> Result<Option<StoredMessage>> {
+    async fn get_retained_in_tenant(
+        &self,
+        topic: &Topic,
+        tenant: &str,
+    ) -> Result<Option<StoredMessage>> {
         let map = self.retained.read();
-        Ok(map.get(topic).cloned())
+        Ok(map
+            .get(&(normalize_tenant_key(tenant), topic.clone()))
+            .cloned())
     }
 
-    async fn clear_retained(&self, topic: &Topic) -> Result<()> {
+    async fn clear_retained_in_tenant(&self, topic: &Topic, tenant: &str) -> Result<()> {
         let mut map = self.retained.write();
-        map.remove(topic);
+        map.remove(&(normalize_tenant_key(tenant), topic.clone()));
         Ok(())
     }
 
-    async fn find_matching(&self, filter: &TopicFilter) -> Result<Vec<StoredMessage>> {
+    async fn find_matching_in_tenant(
+        &self,
+        filter: &TopicFilter,
+        tenant: &str,
+    ) -> Result<Vec<StoredMessage>> {
+        let scope = normalize_tenant_key(tenant);
         let map = self.retained.read();
         let mut matched: Vec<StoredMessage> = map
-            .values()
-            .filter(|msg| filter.matches(&msg.topic))
-            .cloned()
+            .iter()
+            .filter(|((entry_tenant, _), msg)| {
+                entry_tenant.as_ref() == scope.as_ref() && filter.matches(&msg.topic)
+            })
+            .map(|(_, msg)| msg.clone())
             .collect();
         matched.sort_by(|a, b| a.topic.as_str().cmp(b.topic.as_str()));
         Ok(matched)
+    }
+
+    async fn count_retained(&self) -> Result<usize> {
+        Ok(self.retained.read().len())
     }
 }
 

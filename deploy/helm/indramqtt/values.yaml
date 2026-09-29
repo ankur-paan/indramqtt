@@ -1,0 +1,67 @@
+# Default values for the indramqtt single-node chart (M1-09).
+#
+# The operator is expected to change the named values below only: image
+# tag, service ports, storage size, the config knobs and extraEnv. The
+# chart renders the same ports, volume and probes as the compose example
+# (docker-compose.yml plus deploy/compose/indra.toml) when left at
+# defaults. Minimal means one node with no clustering: `replicaCount` is
+# deliberately not a value (see templates/deployment.yaml).
+
+image:
+  # Pinned image reference: repository plus tag, never `:latest`, so an
+  # operator always knows which tree produced the running container. The
+  # default tag follows the workspace version (Cargo.toml
+  # `[workspace.package]`); change it to track releases.
+  repository: indramqtt/indramqtt
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  # Service type for the broker ports. ClusterIP keeps the broker inside
+  # the cluster; set NodePort or LoadBalancer to reach it from outside.
+  type: ClusterIP
+  # Broker ports. Each one mirrors the bind rendered into indra.toml from
+  # the same value (see templates/configmap.yaml), and the API port is
+  # additionally passed as the container `--api-bind` arg (see
+  # templates/deployment.yaml): the image bakes `--api-bind 0.0.0.0:18083`
+  # and a passed flag wins over files and the environment, so without the
+  # arg a non-default apiPort would leave the effective bind behind. With
+  # it, change a port in one place only: the Service, the container ports
+  # and args, the probes and the file stay in agreement by construction.
+  mqttPort: 1883
+  wsPort: 8083
+  apiPort: 18083
+
+storage:
+  # Size of the broker's one persistent volume claim. Reason: a
+  # single-node broker keeps one node's state.toml, retained messages and
+  # an optional stream journal under /var/lib/indramqtt; 10 Gi of headroom
+  # covers months of evaluation traffic without a resize, while staying
+  # small enough for a modest cluster default class.
+  size: 10Gi
+  # Storage class for the claim. Empty (the default) uses the cluster's
+  # default provisioner; name one explicitly for production.
+  storageClassName: ""
+
+config:
+  # Unique identifier for this broker node.
+  nodeId: indra-node-1
+  # Evaluation default: accept anonymous clients so the round trip in
+  # README.md works with no users configured. Production sets this to
+  # `false` and creates users first; a non-empty user store always
+  # rejects unauthenticated clients regardless of this knob.
+  allowAnonymous: true
+  # Kernel log level in the mounted file. `extraEnv` below overrides it
+  # at runtime to prove the layering; change the file value for the
+  # default without an override.
+  logLevel: info
+
+# INDRA_* environment overrides (M1-04 layer): each entry wins over the
+# mounted indra.toml. The default proves the mechanism the same way the
+# compose example does: the file sets log level `info` and this variable
+# wins with `debug`. Names must match the schema in
+# `crates/broker-config/src/schema.rs`; an unknown INDRA_* name refuses
+# startup (fail closed).
+extraEnv:
+  - name: INDRA_LOGGING__LEVEL
+    value: debug

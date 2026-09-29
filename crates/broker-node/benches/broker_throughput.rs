@@ -161,6 +161,7 @@ fn build_router(subscriptions: usize) -> Router {
                 conn_id: i as u64,
                 qos: QoS::AtMostOnce,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
     }
@@ -176,6 +177,7 @@ fn build_router(subscriptions: usize) -> Router {
                 conn_id: 1_000_000,
                 qos,
                 group: None,
+                tenant: broker_router::DEFAULT_TENANT_ID.into(),
             },
         );
     }

@@ -1,0 +1,31 @@
+# Broker Service: the same ports as the compose example (M1-09).
+#
+# MQTT plus the management API (and the WebSocket listener): 1883, 8083
+# and 18083 by default, each mirroring the bind rendered into indra.toml
+# from the same value. Change a port in values.yaml once; Service,
+# container ports, probes and the config file follow together.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-indramqtt
+  labels:
+    app.kubernetes.io/name: indramqtt
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: indramqtt
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: mqtt
+      port: {{ .Values.service.mqttPort }}
+      targetPort: mqtt
+      protocol: TCP
+    - name: ws
+      port: {{ .Values.service.wsPort }}
+      targetPort: ws
+      protocol: TCP
+    - name: api
+      port: {{ .Values.service.apiPort }}
+      targetPort: api
+      protocol: TCP

@@ -1,6 +1,6 @@
 # IndraMQTT Master Roadmap
 
-**IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is on a mission to build the world's most concurrent, low-latency, and extensible distributed MQTT and stream processing platform.
+**IndraMQTT** ([indramqtt.com](https://indramqtt.com)) is building a distributed MQTT and stream processing platform.
 
 This roadmap outlines our completed milestones, active capabilities, and future platform vision.
 

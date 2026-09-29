@@ -12,8 +12,10 @@
 %% waits for the {@code SessionBinding} reply.</li>
 %% <li>{@code connected}: runs the messaging loop — SUBSCRIBE forwards to
 %% Rust and answers SUBACK, PUBLISH forwards raw bytes (QoS 1 answered
-%% with PUBACK), PINGREQ is answered on the edge, DISCONNECT unbinds and
-%% closes. Inbound Rust frames (PublishOut, PubAckOut, SubAckOut) are
+%% with PUBACK), PINGREQ is answered on the edge, DISCONNECT unbinds
+%% (suppressing the CONNECT will) and closes while any other death
+%% reports to the kernel so a stored will fires once. Inbound Rust
+%% frames (PublishOut, PubAckOut, SubAckOut) are
 %% encoded back onto the socket. MQTT keepalive (1.5 x keepalive seconds)
 %% still supervises idle peers.</li>
 %% <li>{@code await_core}: the BrokerLink IPC is down (core crash,
@@ -82,12 +84,11 @@
                    | {conn_id, non_neg_integer()}
                    | {connect_timeout_ms, pos_integer()}
                    | {psk_identity, binary()}
-                   | {transport, tcp | ssl}.
+                   | {ws_max_frame_bytes, pos_integer()}
+                   | {transport, tcp | ssl | ws | wss}.
 
-%%====================================================================
-%% API
-%%====================================================================
-
+%%=============================================================%% API
+%%=============================================================
 %% @doc Start a connection process for an accepted socket.
 %%
 %% The socket must be in passive mode and owned by the caller; ownership
@@ -106,8 +107,16 @@
 %% other CONNECT identity; a CONNECT username that is neither absent
 %% nor identical fails the connection closed with no bind sent. Absent
 %% on plaintext and certificate connections (unchanged path).</li>
-%% <li>{@code {transport, tcp | ssl}} — socket driver; default
-%% {@code tcp}. Must match how the socket was accepted.</li>
+%% <li>{@code {transport, tcp | ssl | ws | wss}} — socket driver; default
+%% {@code tcp}. Must match how the socket was accepted: {@code ws} is a
+%% plaintext socket that already completed the WebSocket upgrade, and
+%% {@code wss} is a TLS socket that completed its TLS handshake first
+%% and then the WebSocket upgrade (see {@link indra_ws_listener}), so
+%% MQTT bytes travel inside WS binary messages on the same bind path as
+%% TCP.</li>
+%% <li>{@code {ws_max_frame_bytes, N}} — WS frame and reassembled-message
+%% cap for {@code ws}/{@code wss} transports, default 1 MiB (see
+%% {@link indra_ws:default_max_frame_bytes/0}). Ignored otherwise.</li>
 %% </ul>
 -spec start_link(gen_tcp:socket(), [conn_opt()]) -> {ok, pid()} | {error, term()}.
 start_link(Sock, Opts) when is_list(Opts) ->
@@ -123,10 +132,8 @@ stop(Pid) ->
 broker_frame(Pid, Header, Meta, Payload) ->
     gen_statem:cast(Pid, {broker_frame, Header, Meta, Payload}).
 
-%%====================================================================
-%% gen_statem callbacks
-%%====================================================================
-
+%%=============================================================%% gen_statem callbacks
+%%=============================================================
 callback_mode() ->
     handle_event_function.
 
@@ -175,9 +182,9 @@ init_shard(Sock, Opts, Shards) ->
     PskIdentity = proplists:get_value(psk_identity, Opts, undefined),
     case PskIdentity of
         undefined ->
-            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, undefined);
+            init_shard_validated(Sock, Opts, Shards, ConnId, Timeout, Transport, undefined);
         PskIdentity when is_binary(PskIdentity) ->
-            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity);
+            init_shard_validated(Sock, Opts, Shards, ConnId, Timeout, Transport, PskIdentity);
         _ ->
             {stop, {invalid_option, psk_identity}}
     end.
@@ -186,8 +193,10 @@ init_shard(Sock, Opts, Shards) ->
 %% TLS PSK identity the listener negotiated (`undefined' on plaintext
 %% and certificate sockets); it is consulted at CONNECT time to map
 %% the bind username (see handle_connect_packet/3).
-init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity) ->
-    SockMod = case Transport of ssl -> ssl; _ -> gen_tcp end,
+init_shard_validated(Sock, Opts, Shards, ConnId, Timeout, Transport, PskIdentity) ->
+    SockMod = case Transport of ssl -> ssl; ws -> ws; wss -> wss; _ -> gen_tcp end,
+    WsMax = proplists:get_value(ws_max_frame_bytes, Opts,
+                                indra_ws:default_max_frame_bytes()),
     Broker = pick_shard(ConnId, Shards),
     Data = #{sock => Sock,
              sockmod => SockMod,
@@ -195,31 +204,38 @@ init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity) ->
              brokers => Shards,
              shard => shard_index(ConnId, length(Shards)),
              conn_id => ConnId,
-              connect_timeout_ms => Timeout,
-              buffer => <<>>,
-              seq => 0,
-              %% B5-05 TLS PSK identity negotiated for this socket
-              %% (`undefined' on plaintext and certificate sockets).
-              %% Mapped onto the bind username at CONNECT time; the
-              %% kernel then authenticates and authorizes it like any
-              %% other CONNECT identity.
-              psk_identity => PskIdentity,
-               pending => undefined,
-               client_id => undefined,
-               keepalive => 0,
-               %% F1-01 last will captured from CONNECT (undefined when
-               %% the client registered none). Forwarded in every bind
-               %% (including rebinds after a core restart) and reported
-               %% via DisconnectIn on ungraceful close; the kernel owns
-               %% the session and the publish decision.
-               will => undefined,
-               %% B4-05 negotiated protocol level (4 or 5) and the
-               %% CONNECT Topic Alias Maximum (client receive limit).
-               %% Level gates the CONNACK shape and PUBLISH decoding;
-               %% the maximum rides every (re)bind so the kernel
-               %% outbound table survives core restarts.
-               proto_level => 4,
-               client_alias_max => 0,
+             connect_timeout_ms => Timeout,
+             buffer => <<>>,
+             seq => 0,
+             %% B5-05 TLS PSK identity negotiated for this socket
+             %% (`undefined' on plaintext and certificate sockets).
+             %% Mapped onto the bind username at CONNECT time; the
+             %% kernel then authenticates and authorizes it like any
+             %% other CONNECT identity.
+             psk_identity => PskIdentity,
+             pending => undefined,
+             client_id => undefined,
+             keepalive => 0,
+             %% F1-01 last will captured from CONNECT (undefined when
+             %% the client registered none). Forwarded in every bind
+             %% (including rebinds after a core restart) and reported
+             %% via DisconnectIn on ungraceful close; the kernel owns
+             %% the session and the publish decision.
+             will => undefined,
+             %% B4-05 negotiated protocol level (4 or 5) and the
+             %% CONNECT Topic Alias Maximum (client receive limit).
+             %% Level gates the CONNACK shape and PUBLISH decoding;
+             %% the maximum rides every (re)bind so the kernel
+             %% outbound table survives core restarts.
+             proto_level => 4,
+             client_alias_max => 0,
+             %% WS reassembly state (used only when `sockmod' is `ws'
+             %% or `wss'): `ws_buf' holds the raw unparsed frame tail,
+             %% `ws_frag' the open fragmented message, `ws_max_frame'
+             %% its bound.
+             ws_buf => <<>>,
+             ws_frag => none,
+             ws_max_frame => WsMax,
              session_id => undefined,
              subs_pending => #{},
              pubs_pending => #{},
@@ -522,7 +538,54 @@ handle_event(cast, {broker_frame, Header, Meta, _Payload}, await_core, Data) ->
             {keep_state, Data}
     end;
 
+%% --- client WSS bytes: unwrap binary messages to MQTT first --------
+%% A `wss' socket delivers `{ssl, Sock, Bytes}' (TLS-decrypted WS
+%% frames). These clauses must precede the generic `{ssl, ...}'
+%% normalization below, which is only for plain `ssl' sockets; routing
+%% WSS bytes through it would treat WS framing as raw MQTT. Decoding
+%% and the bind path are otherwise identical to `ws'.
+handle_event(info, {ssl, Sock, Bytes}, await_connect,
+             #{sock := Sock, sockmod := wss} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            handle_connect_bytes(Buf, Data1#{buffer => <<>>});
+        {stop, _, _} = Stop ->
+            Stop
+    end;
+handle_event(info, {ssl, Sock, Bytes}, connected,
+             #{sock := Sock, sockmod := wss} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            handle_connected_bytes(Buf, Data1#{buffer => <<>>});
+        {stop, _, _} = Stop ->
+            Stop
+    end;
+handle_event(info, {ssl, Sock, Bytes}, await_core,
+             #{sock := Sock, sockmod := wss} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            case byte_size(Buf) > ?MAX_HOLD_BUFFER_BYTES of
+                true ->
+                    stop_with(Data1, hold_overflow);
+                false ->
+                    hold_bytes(Buf, Data1#{buffer => <<>>})
+            end;
+        {stop, _, _} = Stop ->
+            Stop
+    end;
+
 %% --- socket transport normalization (ssl driver support) --------------
+%% Plain `ssl' sockets only: `wss' data is claimed by the clauses above
+%% and never reaches here.
 handle_event(info, {ssl, Sock, Bytes}, State, #{sock := Sock} = Data) ->
     handle_event(info, {tcp, Sock, Bytes}, State, Data);
 handle_event(info, {ssl_closed, Sock}, State, #{sock := Sock} = Data) ->
@@ -546,6 +609,52 @@ handle_event(info, {tcp_passive, Sock}, _State, #{sock := Sock} = Data) ->
             ok
     end,
     {keep_state, Data};
+
+%% --- client WS bytes: unwrap binary messages to MQTT first -----------
+%% A `ws' socket still delivers `{tcp, Sock, Bytes}', but the bytes are
+%% WS frames. They decode to MQTT here and then take the exact TCP path
+%% below (same CONNECT parsing, same bind metadata, same keepalive), so
+%% the kernel sees no difference. WS-level pings never reset the MQTT
+%% keepalive timer: only MQTT bytes do. `wss' is identical except the
+%% bytes arrive as `{ssl, Sock, Bytes}' (handled above).
+handle_event(info, {tcp, Sock, Bytes}, await_connect,
+             #{sock := Sock, sockmod := ws} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            handle_connect_bytes(Buf, Data1#{buffer => <<>>});
+        {stop, _, _} = Stop ->
+            Stop
+    end;
+handle_event(info, {tcp, Sock, Bytes}, connected,
+             #{sock := Sock, sockmod := ws} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            handle_connected_bytes(Buf, Data1#{buffer => <<>>});
+        {stop, _, _} = Stop ->
+            Stop
+    end;
+handle_event(info, {tcp, Sock, Bytes}, await_core,
+             #{sock := Sock, sockmod := ws} = Data) ->
+    case ws_mqtt_bytes(Bytes, Data) of
+        {mqtt, <<>>, Data1} ->
+            {keep_state, Data1};
+        {mqtt, Mqtt, Data1} ->
+            Buf = <<(maps:get(buffer, Data1))/binary, Mqtt/binary>>,
+            case byte_size(Buf) > ?MAX_HOLD_BUFFER_BYTES of
+                true ->
+                    stop_with(Data1, hold_overflow);
+                false ->
+                    hold_bytes(Buf, Data1#{buffer => <<>>})
+            end;
+        {stop, _, _} = Stop ->
+            Stop
+    end;
 
 %% --- client TCP bytes while awaiting CONNECT --------------------------
 %% No per-message re-arm: the socket is counted-active (`{active, 10}'
@@ -624,17 +733,60 @@ terminate(_Reason, _State, #{sock := Sock, sockmod := Mod, conn_id := ConnId} = 
     catch indra_edge_counters:inc(edge_puback_unacked_at_close_total, Unacked),
     catch indra_edge_counters:credit_delete(ConnId),
     catch indra_conn_registry:unregister(ConnId),
+    maybe_signal_unexpected_death(Data),
     catch sock_close(Mod, Sock),
     ok;
 terminate(_Reason, _State, _Data) ->
     ok.
 
-%%====================================================================
-%% Socket driver helpers (tcp | ssl)
-%%====================================================================
+%% @private Report an unexpected client death to the kernel (MT-05): a
+%% stored CONNECT will must fire exactly once on every death that is not
+%% a clean client DISCONNECT nor a kernel-ordered close (connection
+%% loss, keepalive timeout, protocol error). A kernel close (kick) already
+%% took and fired the will on the kernel side, so no notice follows. The
+%% DisconnectIn frame reuses the
+%% unbind meta layout (`IdLen | ClientId`); the kernel takes the slot
+%% (fire-once) and detaches only on verified ownership, so a stale
+%% notice for a superseded connection finds nothing and is harmless.
+%% Best-effort and asynchronous: spawned so terminate never
+%% blocks on the kernel, and skipped entirely before the handshake bound
+%% a client id (nothing could be stored yet).
+%% TODO(parity): a notice lost with the edge (the VM halting between the
+%% socket close and the send) leaves the will stored until a takeover or
+%% reconnect consumes it; the open question is a kernel-side sweep for
+%% such orphans.
+maybe_signal_unexpected_death(Data) ->
+    case maps:get(stop_cause, Data, unknown) of
+        client_disconnect ->
+            %% Clean DISCONNECT already unbound (will suppressed).
+            ok;
+        kernel_close ->
+            %% Kernel-ordered close (kick): the kernel already took and
+            %% fired the will, so no death notice follows (fire-once).
+            ok;
+        _ ->
+            case Data of
+                #{broker := Broker, conn_id := ConnId, seq := Seq,
+                  client_id := ClientId}
+                  when is_pid(Broker), is_binary(ClientId),
+                       byte_size(ClientId) > 0 ->
+                    Meta = indra_brokerlink:encode_unbind_meta(ClientId),
+                    catch spawn(fun() ->
+                        catch indra_brokerlink:send(Broker, ?DISCONNECT_IN,
+                                                    ConnId, Seq + 1, Meta, <<>>)
+                    end),
+                    ok;
+                _ ->
+                    ok
+            end
+    end.
 
+%%=============================================================%% Socket driver helpers (tcp | ssl | ws | wss)
+%%=============================================================
 sock_send(gen_tcp, Sock, Bin) -> gen_tcp:send(Sock, Bin);
-sock_send(ssl, Sock, Bin) -> ssl:send(Sock, Bin).
+sock_send(ssl, Sock, Bin) -> ssl:send(Sock, Bin);
+sock_send(ws, Sock, Bin) -> gen_tcp:send(Sock, indra_ws:encode_binary(Bin));
+sock_send(wss, Sock, Bin) -> ssl:send(Sock, indra_ws:encode_binary(Bin)).
 
 %% @doc Socket options armed on every client connection socket.
 %% Counted-active (`{active, 10}'): the socket delivers up to 10
@@ -653,14 +805,55 @@ conn_sock_opts() ->
     [{active, 10}, {nodelay, true}, {recbuf, 65536}, {sndbuf, 65536}].
 
 sock_setopts(gen_tcp, Sock) -> inet:setopts(Sock, conn_sock_opts());
-sock_setopts(ssl, Sock) -> ssl:setopts(Sock, conn_sock_opts()).
+sock_setopts(ssl, Sock) -> ssl:setopts(Sock, conn_sock_opts());
+sock_setopts(ws, Sock) -> inet:setopts(Sock, conn_sock_opts());
+sock_setopts(wss, Sock) -> ssl:setopts(Sock, conn_sock_opts()).
 
 sock_close(gen_tcp, Sock) -> gen_tcp:close(Sock);
-sock_close(ssl, Sock) -> ssl:close(Sock).
+sock_close(ssl, Sock) -> ssl:close(Sock);
+sock_close(ws, Sock) -> gen_tcp:close(Sock);
+sock_close(wss, Sock) -> ssl:close(Sock).
 
 arm_socket(#{sock := Sock, sockmod := Mod}) ->
     catch sock_setopts(Mod, Sock),
     ok.
+
+%% @private Unwrap WS frames to MQTT bytes. Returns `{mqtt, Bin, Data}'
+%% (possibly empty when only control frames arrived), or a stop when a
+%% framing violation, a close frame or a pong-send failure ends the
+%% connection. Transport pings are answered here and never reach the
+%% MQTT layer.
+ws_mqtt_bytes(Bytes, Data) ->
+    Raw = <<(maps:get(ws_buf, Data, <<>>))/binary, Bytes/binary>>,
+    Max = maps:get(ws_max_frame, Data, indra_ws:default_max_frame_bytes()),
+    case indra_ws:feed(Raw, maps:get(ws_frag, Data, none), Max) of
+        {ok, Events, Rest, Frag} ->
+            ws_events(Events, <<>>, Data#{ws_buf => Rest, ws_frag => Frag});
+        {error, _Reason} ->
+            stop_with(Data, protocol_error)
+    end.
+
+ws_events([], Acc, Data) ->
+    {mqtt, Acc, Data};
+ws_events([{binary, P} | Rest], Acc, Data) ->
+    ws_events(Rest, <<Acc/binary, P/binary>>, Data);
+ws_events([{pong, _} | Rest], Acc, Data) ->
+    ws_events(Rest, Acc, Data);
+ws_events([{ping, P} | Rest], Acc, Data) ->
+    case ws_transport_send(Data, indra_ws:encode_pong(P)) of
+        ok -> ws_events(Rest, Acc, Data);
+        {error, _} -> stop_with(bump_send_failed(Data), send_failed)
+    end;
+ws_events([{close, _} | _], _Acc, Data) ->
+    catch ws_transport_send(Data, indra_ws:encode_close()),
+    stop_with(Data, peer_closed).
+
+%% @private Send one WS control reply on the connection's own driver
+%% (`ws' writes plaintext, `wss' writes on the TLS channel).
+ws_transport_send(#{sock := Sock, sockmod := wss}, Bin) ->
+    ssl:send(Sock, Bin);
+ws_transport_send(#{sock := Sock}, Bin) ->
+    gen_tcp:send(Sock, Bin).
 
 %% @private Stop with a recorded cause (read back in terminate/3 for
 %% the stop-cause aggregates). Every `{stop, ...}' site in this module
@@ -745,10 +938,8 @@ drain_close_discards(Qos0, Qos1) ->
         {Qos0, Qos1}
     end.
 
-%%====================================================================
-%% Handshake helpers
-%%====================================================================
-
+%%=============================================================%% Handshake helpers
+%%=============================================================
 handle_connect_bytes(Buf, Data) ->
     case indra_mqtt_codec:decode_packet(Buf) of
         {ok, #{type := 1, payload := Payload}, Rest} ->
@@ -797,6 +988,13 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
             %% identity; confirm the intended policy.
             ProtoLevel = maps:get(protocol_level, Conn, 4),
             ClientAliasMax = maps:get(alias_max, Conn, 0),
+            %% X1-01: a version-5 CONNECT carries the negotiated version
+            %% plus the decoded properties the kernel needs (session
+            %% expiry, receive maximum, maximum packet size, client
+            %% user-properties) in the bind v5 section (/9); a
+            %% version-4 CONNECT encodes exactly like before (/9 with
+            %% `undefined' is byte-identical to /8).
+            V5Info = make_v5_info(ProtoLevel, Conn),
             case psk_username(maps:get(psk_identity, Data, undefined), User) of
                 {error, _} ->
                     stop_with(Data, protocol_error);
@@ -805,21 +1003,15 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                         {error, _} ->
                             stop_with(Data, protocol_error);
                         {ok, Will} ->
-                            %% No will rides the /6 encoding byte-for-byte;
-                            %% a will rides the /7 encoding (both carry the
-                            %% CONNECT alias maximum).
-                            Meta = case Will of
-                                undefined ->
-                                    (catch indra_brokerlink:encode_bind_meta(
-                                             ClientId, CleanStart, Keepalive,
-                                             {MappedUser, Pass},
-                                             peer_ip_opt(Data), ClientAliasMax));
-                                _ ->
-                                    (catch indra_brokerlink:encode_bind_meta(
-                                             ClientId, CleanStart, Keepalive,
-                                             {MappedUser, Pass},
-                                             peer_ip_opt(Data), ClientAliasMax, Will))
-                            end,
+                            %% Canonical SY-02 encoding carries alias maximum,
+                            %% certificate fields and will together (/8); a WebSocket
+                            %% connection gets PSK, will and alias handling exactly
+                            %% as TCP does. X1-01 appends the v5 section (/9).
+                            Meta = (catch indra_brokerlink:encode_bind_meta(
+                                         ClientId, CleanStart, Keepalive,
+                                         {MappedUser, Pass},
+                                         peer_ip_opt(Data), ClientAliasMax,
+                                         cert_info_opt(Data), Will, V5Info)),
                             case Meta of
                                 <<_/binary>> ->
                                     case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
@@ -830,6 +1022,7 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                                                         will => Will,
                                                         proto_level => ProtoLevel,
                                                         client_alias_max => ClientAliasMax,
+                                                        v5_info => V5Info,
                                                         username => MappedUser,
                                                         password => Pass},
                                             %% Stash bytes pipelined behind CONNECT; they drain once
@@ -849,6 +1042,62 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)
+    end.
+
+%% @private Build the bind v5 section from a decoded CONNECT (X1-01).
+%% Version 4 (and anything older) carries no v5 section: `undefined'
+%% encodes exactly like the /8 bind, byte-identical to before. Version
+%% 5 carries the negotiated version plus the CONNECT properties the
+%% kernel needs; the kernel owns their session semantics (X1-02), the
+%% edge only frames and transports them.
+make_v5_info(5, Conn) ->
+    #{version => 5,
+      session_expiry => maps:get(session_expiry, Conn, 0),
+      receive_max => maps:get(receive_max, Conn, 65535),
+      max_packet_size => maps:get(max_packet_size, Conn, 0),
+      user_properties => maps:get(user_properties, Conn, [])};
+make_v5_info(_, _) ->
+    undefined.
+
+%% @private CONNACK v5 properties for the live handshake path (X1-02).
+%% The kernel binding carries the negotiated session state: the
+%% inbound alias maximum, the granted session expiry, the server
+%% receive-maximum / maximum-packet-size limits, the server-side
+%% reason string and the echoed CONNECT user properties. Each rides
+%% only when meaningful (nonzero maxima/expiry, non-empty reason and
+%% user list); the codec omits the rest, so success CONNACKs carry
+%% session-present plus the assigned values and server limits while
+%% failure CONNACKs carry the reason code plus the reason string and
+%% the echoed properties. Version-4 sockets never reach here (they
+%% take the folded 4-byte shape).
+v5_connack_opts(Binding) when is_map(Binding) ->
+    AliasMax = maps:get(alias_max, Binding, 0),
+    RecvMax = maps:get(server_recv_max, Binding, 0),
+    MaxPkt = maps:get(server_max_pkt, Binding, 0),
+    Expiry = maps:get(session_expiry, Binding, 0),
+    Reason = maps:get(reason_string, Binding, <<>>),
+    Users = maps:get(user_properties, Binding, []),
+    Base = #{user_properties => Users},
+    WithAlias = case AliasMax of
+        N when is_integer(N), N >= 1 -> Base#{alias_max => N};
+        _ -> Base
+    end,
+    WithRecv = case RecvMax of
+        R when is_integer(R), R >= 1 -> WithAlias#{receive_max => R};
+        _ -> WithAlias
+    end,
+    WithPkt = case MaxPkt of
+        P when is_integer(P), P >= 1 -> WithRecv#{max_packet_size => P};
+        _ -> WithRecv
+    end,
+    WithExpiry = case Expiry of
+        E when is_integer(E), E >= 1 -> WithPkt#{session_expiry => E};
+        _ -> WithPkt
+    end,
+    case Reason of
+        <<>> -> WithExpiry;
+        RS when is_binary(RS), byte_size(RS) >= 1 -> WithExpiry#{reason_string => RS};
+        _ -> WithExpiry
     end.
 
 %% @private Map the TLS PSK identity onto the bind username (B5-05).
@@ -888,22 +1137,30 @@ make_will(_, _, _, _, _) ->
     {error, invalid_will_topic}.
 
 %% @private Re-send the pending bind to a replacement broker (core flap
-%% mid-handshake). Drops back to waiting on failure.
+%% mid-handshake). Drops back to waiting on failure. The pending will
+%% rides along: the first bind never completed, so without it the
+%% kernel would register the session with no will.
 resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
     Will = maps:get(will, Pending, undefined),
     ClientAliasMax = maps:get(client_alias_max, Pending, 0),
     Username = maps:get(username, Pending, undefined),
     Password = maps:get(password, Pending, undefined),
+    %% X1-01: the pending v5 section re-rides the rebind (the first
+    %% bind never completed); `undefined' on version-4 handshakes keeps
+    %% the encoding byte-identical to before.
+    V5Info = maps:get(v5_info, Pending, undefined),
     Meta = case Will of
         undefined ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {Username, Password},
-                                                     peer_ip_opt(Data), ClientAliasMax));
+                                                     peer_ip_opt(Data), ClientAliasMax,
+                                             cert_info_opt(Data), undefined, V5Info));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {Username, Password},
-                                                     peer_ip_opt(Data), ClientAliasMax, Will))
+                                                     peer_ip_opt(Data), ClientAliasMax,
+                                             cert_info_opt(Data), Will, V5Info))
     end,
     case Meta of
         <<_/binary>> ->
@@ -943,31 +1200,245 @@ peer_ip(Sock, ssl) ->
         _ ->
             undefined
     end;
+peer_ip(Sock, ws) ->
+    %% A WS socket is a plaintext TCP socket past the upgrade: the peer
+    %% is the TCP peer, exactly as for `gen_tcp'.
+    case catch inet:peername(Sock) of
+        {ok, {IP, _Port}} ->
+            list_to_binary(inet:ntoa(IP));
+        _ ->
+            undefined
+    end;
+peer_ip(Sock, wss) ->
+    %% A WSS socket is a TLS socket past the upgrade: the peer is the
+    %% TLS peer, exactly as for `ssl'.
+    case catch ssl:peername(Sock) of
+        {ok, {IP, _Port}} ->
+            list_to_binary(inet:ntoa(IP));
+        _ ->
+            undefined
+    end;
 peer_ip(_, _) ->
     undefined.
+
+%% @private TLS client-certificate fields for the bind certificate
+%% section (MT-01): the common name, subject and subject-alt names the
+%% edge extracted where TLS terminates. `undefined' on plaintext
+%% transports or when no client certificate was presented; the kernel
+%% then assigns the default tenant instead of failing the bind. A
+%% certificate that cannot be parsed also forwards as absent (fail
+%% closed to the default tenant, never to another tenant's).
+cert_info_opt(#{sock := Sock, sockmod := SockMod}) ->
+    cert_info(Sock, SockMod);
+cert_info_opt(_) ->
+    undefined.
+
+cert_info(Sock, ssl) ->
+    peer_cert_info(Sock);
+cert_info(Sock, wss) ->
+    %% A WSS socket is a TLS socket past the upgrade: the client
+    %% certificate is the TLS peer certificate, exactly as for `ssl'.
+    peer_cert_info(Sock);
+cert_info(_, _) ->
+    undefined.
+
+peer_cert_info(Sock) ->
+    case catch ssl:peercert(Sock) of
+        {ok, Der} ->
+            parse_cert_info(Der);
+        _ ->
+            undefined
+    end.
+
+parse_cert_info(Der) when is_binary(Der) ->
+    case catch public_key:pkix_decode_cert(Der, otp) of
+        {'OTPCertificate', Tbs, _, _} ->
+            cert_from_tbs(Tbs);
+        _ ->
+            undefined
+    end;
+parse_cert_info(_) ->
+    undefined.
+
+cert_from_tbs(Tbs) ->
+    try
+        %% OTPTBSCertificate layout: 1 = record name, 2 = version,
+        %% 3 = serial, 4 = signature, 5 = issuer, 6 = validity,
+        %% 7 = subject, 8 = public key, 9-10 = unique ids,
+        %% 11 = extensions.
+        Subject = element(7, Tbs),
+        Extensions = cert_extensions(Tbs),
+        Cn = cert_common_name(Subject),
+        Sans = cert_alt_names(Extensions),
+        #{cn => Cn, subject => cert_subject_bin(Subject), sans => Sans}
+    catch
+        _:_ ->
+            undefined
+    end.
+
+%% @private Certificate extensions (position 11 of OTPTBSCertificate),
+%% `undefined' when absent.
+cert_extensions(Tbs) ->
+    case catch element(11, Tbs) of
+        {'asn1_NOVALUE', _} -> undefined;
+        asn1_NOVALUE -> undefined;
+        undefined -> undefined;
+        Extensions -> Extensions
+    end.
+
+%% @private First commonName attribute of the subject, if any.
+cert_common_name({rdnSequence, Rdns}) ->
+    find_cn(Rdns);
+cert_common_name(_) ->
+    undefined.
+
+find_cn([]) ->
+    undefined;
+find_cn([[{'AttributeTypeAndValue', Oid, Value} | _] | Rest]) ->
+    case is_cn_oid(Oid) of
+        true -> cert_value_bin(Value);
+        false -> find_cn(Rest)
+    end;
+find_cn([Rdn | Rest]) when is_list(Rdn) ->
+    case find_cn_in_rdn(Rdn) of
+        undefined -> find_cn(Rest);
+        Found -> Found
+    end;
+find_cn([_ | Rest]) ->
+    find_cn(Rest).
+
+find_cn_in_rdn([]) ->
+    undefined;
+find_cn_in_rdn([{'AttributeTypeAndValue', Oid, Value} | _])
+  when is_tuple(Oid) ->
+    case is_cn_oid(Oid) of
+        true -> cert_value_bin(Value);
+        false -> undefined
+    end;
+find_cn_in_rdn([_ | Rest]) ->
+    find_cn_in_rdn(Rest).
+
+%% @private OID 2.5.4.3 is commonName.
+is_cn_oid({2, 5, 4, 3}) -> true;
+is_cn_oid(_) -> false.
+
+%% @private Subject distinguished name rendered as a slash-separated
+%% binary (`/CN=../O=..'); `undefined' when it cannot be rendered.
+cert_subject_bin({rdnSequence, Rdns}) ->
+    try
+        Parts = lists:flatmap(fun cert_rdn_parts/1, Rdns),
+        case Parts of
+            [] -> undefined;
+            _ -> list_to_binary([$/ | lists:join($/, Parts)])
+        end
+    catch
+        _:_ -> undefined
+    end;
+cert_subject_bin(_) ->
+    undefined.
+
+cert_rdn_parts(Rdn) when is_list(Rdn) ->
+    lists:filtermap(
+      fun({'AttributeTypeAndValue', Oid, Value}) when is_tuple(Oid) ->
+              case {catch cert_attr_name(Oid), catch cert_value_bin(Value)} of
+                  {Name, Bin} when is_list(Name), is_binary(Bin) ->
+                      {true, Name ++ "=" ++ binary_to_list(Bin)};
+                  _ ->
+                      false
+              end;
+         (_) ->
+              false
+      end, Rdn);
+cert_rdn_parts(_) ->
+    [].
+
+cert_attr_name({2, 5, 4, 3}) -> "CN";
+cert_attr_name({2, 5, 4, 10}) -> "O";
+cert_attr_name({2, 5, 4, 11}) -> "OU";
+cert_attr_name({2, 5, 4, 7}) -> "L";
+cert_attr_name({2, 5, 4, 8}) -> "ST";
+cert_attr_name({2, 5, 4, 6}) -> "C";
+cert_attr_name(_) -> erlang:error(badattr).
+
+cert_value_bin({utf8String, Bin}) when is_binary(Bin) -> Bin;
+cert_value_bin({printableString, Chars}) -> list_to_binary(Chars);
+cert_value_bin({teletexString, Bin}) when is_binary(Bin) -> Bin;
+cert_value_bin({ia5String, Bin}) when is_binary(Bin) -> Bin;
+cert_value_bin(Bin) when is_binary(Bin) -> Bin;
+cert_value_bin(Chars) when is_list(Chars) -> list_to_binary(Chars);
+cert_value_bin(_) -> erlang:error(badvalue).
+
+%% @private Subject-alt names (dNSName and iPAddress entries only) from
+%% the extension list; anything unparsable yields no SANs (fail closed
+%% to fewer inputs, never to a wrong tenant).
+cert_alt_names(undefined) ->
+    [];
+cert_alt_names(Extensions) when is_list(Extensions) ->
+    lists:flatmap(fun cert_alt_names_ext/1, Extensions);
+cert_alt_names(_) ->
+    [].
+
+cert_alt_names_ext({'Extension', {2, 5, 29, 17}, _, AltNames}) when is_list(AltNames) ->
+    lists:filtermap(fun san_bin/1, AltNames);
+cert_alt_names_ext(_) ->
+    [].
+
+%% @private One subject-alt name as a binary. dNSName rides verbatim;
+%% iPAddress rides as raw bytes (4 or 16) or as a tuple and is rendered
+%% with `inet:ntoa/1'. Anything else (URIs, other names, malformed
+%% entries) is skipped: fewer inputs fail closed to the default tenant,
+%% never to a wrong one, and one bad SAN never drops the whole cert.
+san_bin({dNSName, Name}) when is_list(Name) ->
+    {true, list_to_binary(Name)};
+san_bin({dNSName, Name}) when is_binary(Name) ->
+    {true, Name};
+san_bin({iPAddress, {_, _, _, _} = Ip}) ->
+    {true, list_to_binary(inet:ntoa(Ip))};
+san_bin({iPAddress, {_, _, _, _, _, _, _, _} = Ip}) ->
+    {true, list_to_binary(inet:ntoa(Ip))};
+san_bin({iPAddress, <<A, B, C, D>>}) ->
+    {true, list_to_binary(inet:ntoa({A, B, C, D}))};
+san_bin({iPAddress, <<A:16/big, B:16/big, C:16/big, D:16/big,
+                      E:16/big, F:16/big, G:16/big, H:16/big>>}) ->
+    {true, list_to_binary(inet:ntoa({A, B, C, D, E, F, G, H}))};
+san_bin(_) ->
+    false.
 
 handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_session_binding_meta(Meta) of
         %% B4-05: the binding carries the kernel inbound alias maximum for
         %% CONNACK negotiation. MQTT 5 peers learn it through the CONNACK
-        %% property (34) via encode_connack/3; 3.1.1 peers always get the
+        %% property (34) via the v5 encoder; 3.1.1 peers always get the
         %% 4-byte encode_connack/2 shape (a property section would break
         %% their framing), so alias_max 0 and every level-4 socket encode
         %% with no property. Fail closed: a client never sends aliases it
         %% was never told about. Table ownership: kernel holds both
         %% tables; the edge only frames the wire values.
+        %% X1-01: version-5 connections get a v5 CONNACK (acknowledge
+        %% flags + raw v5 reason code + properties) used only on those
+        %% sockets; version-4 behaviour (folded return codes, fixed
+        %% 4-byte shape) is unchanged.
+        %% X1-02: the v5 binding section carries the granted session
+        %% expiry, the server receive-maximum / maximum-packet-size
+        %% limits, the server-side reason string and the echoed CONNECT
+        %% user properties; success CONNACKs advertise the assigned
+        %% values and server limits, failure CONNACKs the reason code
+        %% plus the reason string and echoed properties.
         {ok, #{session_id := SessionId,
                session_present := Present,
                return_code := RC} = Binding} ->
-            AliasMax = maps:get(alias_max, Binding, 0),
             Pending0 = maps:get(pending, Data, #{client_id => <<>>,
                                                  keepalive => 0}),
             ProtoLevel = maps:get(proto_level, Pending0, 4),
-            Connack = case ProtoLevel =:= 5 andalso AliasMax > 0 of
-                true ->
-                    indra_mqtt_codec:encode_connack(
-                      Present, indra_mqtt_codec:connack_return_code(RC), AliasMax);
-                false ->
+            Connack = case ProtoLevel of
+                5 ->
+                    indra_mqtt_codec:encode_connack_v5(
+                      Present, RC, v5_connack_opts(Binding));
+                _ ->
+                    %% Version 4 always gets the fixed 4-byte shape: a
+                    %% property section would break 3.1.1 framing, even
+                    %% when the kernel advertises an inbound alias
+                    %% maximum (3.1.1 peers never use aliases).
                     indra_mqtt_codec:encode_connack(
                       Present, indra_mqtt_codec:connack_return_code(RC))
             end,
@@ -979,6 +1450,7 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
                                   keepalive => maps:get(keepalive, Pending, 0),
                                   will => maps:get(will, Pending, undefined),
                                   proto_level => ProtoLevel,
+                                  v5_info => maps:get(v5_info, Pending, undefined),
                                   client_alias_max =>
                                       maps:get(client_alias_max, Pending, 0)},
                     {next_state, connected, Data1,
@@ -996,10 +1468,8 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
             stop_with(Data, protocol_error)
     end.
 
-%%====================================================================
-%% Core holding + rebind (Sprint 11 restart immunity)
-%%====================================================================
-
+%%=============================================================%% Core holding + rebind (Sprint 11 restart immunity)
+%%=============================================================
 %% @private Begin recovery: re-bind the session, always non-clean so a
 %% surviving core resumes (present=true, offline replay follows) while a
 %% fresh core simply recreates. Core-side tracking resets; the client
@@ -1010,15 +1480,22 @@ start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
   when is_binary(ClientId) ->
     Will = maps:get(will, Data, undefined),
     ClientAliasMax = maps:get(client_alias_max, Data, 0),
+    %% X1-01: the stored v5 section re-rides the rebind so the kernel
+    %% outbound table and session properties survive core restarts;
+    %% `undefined' on version-4 connections keeps the encoding
+    %% byte-identical to before.
+    V5Info = maps:get(v5_info, Data, undefined),
     Meta = case Will of
         undefined ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data), ClientAliasMax));
+                                                     peer_ip_opt(Data), ClientAliasMax,
+                                             cert_info_opt(Data), undefined, V5Info));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data), ClientAliasMax, Will))
+                                                     peer_ip_opt(Data), ClientAliasMax,
+                                             cert_info_opt(Data), Will, V5Info))
     end,
     case Meta of
         <<_/binary>> ->
@@ -1117,10 +1594,8 @@ hold_scan(Buf, #{sock := Sock, sockmod := Mod} = Data, Held) ->
             stop_with(Data, protocol_error)
     end.
 
-%%====================================================================
-%% Connected messaging loop
-%%====================================================================
-
+%%=============================================================%% Connected messaging loop
+%%=============================================================
 %% @private Drain one or more client packets; any handled packet resets
 %% the keepalive timer.
 handle_connected_bytes(<<>>, Data) ->
@@ -1329,10 +1804,8 @@ handle_pubcomp_in(<<PacketId:16/big>>, #{broker := Broker, conn_id := ConnId,
 handle_pubcomp_in(_, Data) ->
     {ok, Data}.
 
-%%====================================================================
-%% Inbound Rust frames while connected
-%%====================================================================
-
+%%=============================================================%% Inbound Rust frames while connected
+%%=============================================================
 handle_suback(Meta, #{sock := Sock, sockmod := Mod, subs_pending := Pending,
                       quiet_subs := Quiet} = Data) ->
     case indra_brokerlink:decode_suback_meta(Meta) of

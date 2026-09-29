@@ -9,6 +9,7 @@ pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
 pub mod gateways;
+pub mod listeners;
 pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
@@ -174,6 +175,8 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/nodes/:node/metrics", get(monitoring::get_metrics_node))
         .route("/nodes/:node/stats", get(monitoring::get_stats_node))
         .route("/nodes/:node/clients/:clientid", get(clients::get_client))
+        // Listeners (M1-06): configured listener list on real boot state.
+        .route("/listeners", get(listeners::list_listeners))
         // Clients & Subscriptions
         .route("/clients", get(clients::list_clients))
         .route("/clients_v2", get(clients::list_clients))

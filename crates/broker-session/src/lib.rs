@@ -5,12 +5,51 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
+pub mod tenant;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
+
+/// Canonical session identity (MT-03): the same client id in two tenants
+/// is two independent sessions with independent subscriptions, inflight,
+/// QoS 2 state, offline queues and expiry timers. Takeover kicks only the
+/// same-tenant session; a connection in another tenant never displaces it.
+///
+/// The manager holds a two-level map `tenant -> client_id -> session`:
+/// one entry per live session exactly as before, only grouped by tenant,
+/// so lookups resolve via borrowed `&str` with no per-message allocation.
+/// Bare-`client_id` methods are default-tenant shims preserving the
+/// pre-tenancy behaviour bit for bit. Both levels are bounded (see
+/// [`MAX_TENANTS`] and [`MAX_SESSIONS_PER_TENANT`]); a tenant whose last
+/// session ends is pruned from the outer map at unbind.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub tenant: String,
+    pub client_id: String,
+}
+
+impl SessionKey {
+    pub fn new(tenant: &str, client_id: &str) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            client_id: client_id.to_string(),
+        }
+    }
+
+    /// Default-tenant key: what every pre-tenancy caller meant.
+    pub fn default_tenant(client_id: &str) -> Self {
+        Self {
+            tenant: tenant::DEFAULT_TENANT_ID.to_string(),
+            client_id: client_id.to_string(),
+        }
+    }
+}
 
 /// Granted subscription options mirrored on the session for the
 /// management API. `qos` is the granted QoS; `nl`, `rap` and `rh` are
@@ -52,6 +91,7 @@ impl From<QoS> for SubscriptionOptions {
 /// bounded near 128 KiB by the wire limit, with no new config needed.
 #[derive(Debug, Clone)]
 pub struct StoredWill {
+    pub tenant: String,
     pub topic: Topic,
     pub qos: QoS,
     pub retain: bool,
@@ -200,6 +240,21 @@ pub struct Session {
     /// Authenticated username that owns this session, if any. Maintained
     /// by the edge at bind time; drives per-user quota accounting.
     pub username: RwLock<Option<String>>,
+    /// Tenant id assigned once per connecting client at connect
+    /// (MT-01). Rendered from the tenant registry against the connect
+    /// context; `"default"` preserves the pre-tenancy behaviour until
+    /// later waves enforce isolation. Recorded where the session is
+    /// already being written (bind); read-only afterwards for MT-02...
+    pub tenant_id: RwLock<String>,
+    /// Lock-free single-tenant fast path for the publish path (MT-02).
+    /// True while `tenant_id` holds the default tenant, set wherever
+    /// `tenant_id` is written (bind) via [`Session::set_tenant_id`].
+    /// The publish path reads this one relaxed atomic (no lock, no
+    /// allocation) and borrows the default static without touching the
+    /// `tenant_id` lock; only a non-default tenant takes the short read
+    /// plus one bounded copy. Reason: single-tenant installs only ever
+    /// carry the default value, so their publish path stays flat.
+    pub tenant_is_default: AtomicBool,
     /// Peer IP literal the edge saw on the client socket, if forwarded
     /// in the bind. Maintained by the kernel at bind time (only
     /// overwritten when a peer address arrives); drives `peerhost` and
@@ -211,6 +266,14 @@ pub struct Session {
     /// `None` means the session predates timestamp recording; API reads
     /// must omit the field rather than substituting anything.
     pub connected_at_ms: RwLock<Option<u64>>,
+    /// Wall-clock time this session last ended (verified detach), as
+    /// millis since the Unix epoch. `None` while the session never ended
+    /// (live, or detached before end-stamping existed); cleared on
+    /// reconnect. Read only by the ended-session prune
+    /// ([`SessionManager::prune_ended_in_tenant`]), which reaps detached
+    /// stateless sessions past [`ENDED_SESSION_TTL_SECS`]. Detach path
+    /// only; the publish and delivery paths never touch this lock.
+    pub ended_at_ms: RwLock<Option<u64>>,
     /// Per-client authorization decision cache for the management read
     /// (W2-01). Written on the publish/subscribe authorization event,
     /// read and cleared from the management plane only. The delivery
@@ -218,6 +281,38 @@ pub struct Session {
     /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
     pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
     next_packet_id: AtomicU16,
+    /// Negotiated protocol level for this session (X1-02): 4 (3.1.1) or
+    /// 5. Written on the CONNECT (bind) event from the bind metadata;
+    /// read on the disconnect event (expiry policy) and the delivery
+    /// event (egress caps). One relaxed atomic load; never on the QoS 0
+    /// fast path except through the capped-delivery helper (two loads).
+    protocol_version: AtomicU8,
+    /// Session Expiry Interval in seconds from the latest v5 CONNECT
+    /// (X1-02). 0 means the session ends at disconnect (drop state);
+    /// nonzero retains detached state for the interval;
+    /// [`SESSION_EXPIRY_NEVER`] (0xFFFF_FFFF) retains indefinitely
+    /// (explicit client opt-in). Version-4 sessions always hold 0 and
+    /// use `clean_start` instead. Written on bind, read on
+    /// disconnect/reconnect. Absent on the wire (version-4 binds, or a
+    /// v5 CONNECT without the property) defaults to
+    /// [`DEFAULT_SESSION_EXPIRY_SECS`] (0): drop at disconnect bounds
+    /// per-session state and matches 3.1.1 clean-session behaviour,
+    /// while a nonzero expiry is an explicit persistent opt-in.
+    session_expiry: AtomicU32,
+    /// Client Receive Maximum from the latest v5 CONNECT (X1-02): the
+    /// most unacknowledged QoS 1/2 downlinks the client accepts. Caps
+    /// what the kernel sends that connection (delivery event). 0 on the
+    /// wire is a protocol error (rejected at bind, never stored); the
+    /// stored value is always >= 1, defaulting to
+    /// [`DEFAULT_CLIENT_RECEIVE_MAXIMUM`] (wire maximum, no effective
+    /// cap) when the client announces nothing. Version-4 sessions hold
+    /// the default and enforce nothing.
+    client_receive_max: AtomicU16,
+    /// Client Maximum Packet Size from the latest v5 CONNECT (X1-02):
+    /// the largest single frame the client accepts. Caps what the
+    /// kernel sends that connection (delivery event). 0 means the
+    /// client announced no limit (no cap). Version-4 sessions hold 0.
+    client_max_packet_size: AtomicU32,
 }
 
 /// Current wall-clock time as millis since the Unix epoch. Read once per
@@ -228,6 +323,22 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// True when a session has ended with nothing left to replay (MT-03
+/// bound enforcement): detached, with no subscriptions, queued, inflight
+/// or QoS 2 entries. Such sessions are safe to reap or evict (a
+/// reconnect recreates them); anything else stays for reconnect replay.
+/// Short reads only; detach and connect paths, never publish or deliver.
+fn is_ended_stateless(session: &Session) -> bool {
+    if *session.connected.read() {
+        return false;
+    }
+    session.subscriptions.read().is_empty()
+        && session.offline_len() == 0
+        && session.inflight_total_len() == 0
+        && session.qos2_inbound_len() == 0
+        && session.qos2_outbound_len() == 0
 }
 
 /// One buffered message for a detached durable session (LOG + CURSOR
@@ -344,6 +455,56 @@ pub const DEFAULT_TOPIC_ALIAS_MAXIMUM: u16 = 10;
 /// Maximum alias value the tables can ever index (wire `u16` range).
 pub const MAX_TOPIC_ALIAS_VALUE: u16 = u16::MAX;
 
+/// Documented default Session Expiry Interval in seconds (X1-02): 0,
+/// drop detached state at disconnect. Rationale: bounds per-session
+/// state to live connections plus explicitly persistent sessions, and
+/// matches 3.1.1 clean-session behaviour bit for bit, so version-4
+/// binds and v5 CONNECTs without the property behave identically.
+/// A nonzero expiry is an explicit persistent opt-in by the client.
+/// Source: the CONNECT Session Expiry Interval property when present
+/// (transported in the bind v5 section), else this default.
+pub const DEFAULT_SESSION_EXPIRY_SECS: u32 = 0;
+
+/// Session Expiry value meaning "never expire" (X1-02, wire
+/// 0xFFFF_FFFF): a detached persistent session with this expiry is
+/// retained until its next clean start or an explicit prune, bounded
+/// by [`MAX_SESSIONS_PER_TENANT`] like every other session. Explicit
+/// client opt-in only; the code never chooses it (the default is
+/// [`DEFAULT_SESSION_EXPIRY_SECS`]).
+pub const SESSION_EXPIRY_NEVER: u32 = 0xFFFF_FFFF;
+
+/// Documented default client Receive Maximum (X1-02): 65535, the wire
+/// maximum, i.e. no effective cap. Rationale: version-4 clients and v5
+/// CONNECTs without the property announce no flow-control limit, so the
+/// kernel sends up to its own window/spill bounds; a smaller announced
+/// value caps egress below those bounds. A wire 0 is a protocol error
+/// (rejected at bind, never stored).
+pub const DEFAULT_CLIENT_RECEIVE_MAXIMUM: u16 = u16::MAX;
+
+/// Documented default client Maximum Packet Size (X1-02): 0, meaning
+/// the client announced no limit (no cap). Rationale: mirrors the wire
+/// encoding where 0/absent means no limit; the kernel estimates every
+/// egress frame and sheds above a nonzero cap.
+pub const DEFAULT_CLIENT_MAX_PACKET_SIZE: u32 = 0;
+
+/// Most detached expired sessions reaped by one bounded expiry sweep
+/// (X1-02). Rationale: caps one sweep's work near 128 small session
+/// objects so a bind/unbind never pays an unbounded scan; the sweep
+/// repeats on later binds/unbinds until caught up. Detach/bind paths
+/// only; the publish and delivery paths never scan sessions.
+pub const MAX_EXPIRY_SWEEP: usize = 128;
+
+/// Estimated per-frame wire overhead in bytes for the v5
+/// maximum-packet-size egress check (X1-02): fixed header (up to 5 for
+/// large frames), packet id (2 on QoS > 0), minimal property length
+/// (1) and the BrokerLink-to-wire framing slack. Added to
+/// `topic.len() + payload.len()`; a frame estimating above the
+/// client's maximum is shed (counted, never silent). The estimate
+/// over-counts small frames by a few bytes (conservative: sheds only
+/// frames certainly above the cap) and is read next to the check, not
+/// on the hot path for uncapped (limit 0) sessions.
+pub const V5_EGRESS_OVERHEAD_BYTES: usize = 10;
+
 /// Rejection cause for one inbound alias use. Both map to reason code
 /// `0x94` (Topic Alias Invalid) on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +582,44 @@ pub const DEFAULT_MAX_OFFLINE_QUEUE: usize = 10_000;
 /// never touched by the list read.
 pub const MAX_GLOBAL_SUBSCRIPTIONS: usize = 100_000;
 
+/// Maximum tenants held in the session map (MT-03). Outer entries vanish
+/// when their last session ends (pruned in
+/// [`SessionManager::unbind_connection_in_tenant`]), so the map holds one
+/// entry per tenant that still owns sessions; past the cap a new tenant
+/// evicts the oldest fully-ended tenant first (no live sessions and no
+/// queued state anywhere inside, so nothing replayable is lost), and only
+/// inserts alongside live tenants when every tenant still holds state.
+/// Rationale: one outer entry is one map header plus short strings (tens
+/// of KiB for the whole table at the cap) while covering multi-tenant
+/// installs far past real deployments (tens of tenants); the cap is a
+/// backstop against unbounded tenant creation, never a sizing target.
+pub const MAX_TENANTS: usize = 1024;
+
+/// Maximum sessions held per tenant (MT-03). Sessions that end stateless
+/// linger only past [`ENDED_SESSION_TTL_SECS`], then the prune where
+/// sessions end reaps them, so the map holds live sessions plus detached
+/// sessions that still own replayable state; past the cap a new session
+/// evicts the oldest detached stateless session first (reconnect
+/// recreates it), and only grows past the cap when every session is live
+/// or stateful.
+/// Rationale: mirrors [`MAX_SUBSCRIPTIONS`] (100 000) so session state
+/// shares one memory story with the subscription trie; one session is on
+/// the order of a kilobyte of control state plus its already-bounded
+/// queues, so the cap holds per-tenant session memory near hundreds of
+/// megabytes worst case while covering fleets far past real deployments.
+pub const MAX_SESSIONS_PER_TENANT: usize = 100_000;
+
+/// How long a detached stateless session lingers before the ended-session
+/// prune reaps it (MT-03). Sessions that still own replayable state
+/// (subscriptions, queued, inflight or QoS 2 entries) are never reaped by
+/// age; live sessions are never touched. A reconnect recreates a reaped
+/// session fresh.
+/// Rationale: 24 hours bounds husk memory near one small object per ended
+/// session per day while keeping recently-ended sessions visible to
+/// management reads and fast reconnects; day-scale matches operational
+/// debugging windows, and anything older is cold enough to rebuild.
+pub const ENDED_SESSION_TTL_SECS: u64 = 24 * 3_600;
+
 /// One row of the global subscription index: owner plus the granted
 /// filter and its options, as mirrored on the session by the subscribe
 /// routes (same state the per-client list reads).
@@ -474,11 +673,159 @@ impl Session {
             outbound_alias_max: AtomicU16::new(0),
             keepalive_secs: RwLock::new(0),
             last_will: RwLock::new(None),
+            tenant_id: RwLock::new(crate::tenant::DEFAULT_TENANT_ID.to_string()),
+            tenant_is_default: AtomicBool::new(true),
             username: RwLock::new(None),
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
+            ended_at_ms: RwLock::new(None),
             authz_cache: RwLock::new(VecDeque::new()),
             next_packet_id: AtomicU16::new(1),
+            protocol_version: AtomicU8::new(4),
+            session_expiry: AtomicU32::new(DEFAULT_SESSION_EXPIRY_SECS),
+            client_receive_max: AtomicU16::new(DEFAULT_CLIENT_RECEIVE_MAXIMUM),
+            client_max_packet_size: AtomicU32::new(DEFAULT_CLIENT_MAX_PACKET_SIZE),
+        }
+    }
+
+    /// Record the tenant assigned at bind (MT-01 assignment, MT-02
+    /// enforcement). Single writer (bind), lock-free readers on publish:
+    /// updates the `tenant_id` string and the `tenant_is_default` fast-path
+    /// flag together so the publish path can borrow the default static
+    /// without taking the `tenant_id` lock. Off the hot path (bind only).
+    pub fn set_tenant_id(&self, tenant_id: String) {
+        let is_default = tenant_id == tenant::DEFAULT_TENANT_ID;
+        *self.tenant_id.write() = tenant_id;
+        self.tenant_is_default.store(is_default, Ordering::Relaxed);
+    }
+
+    /// Negotiated protocol level for this session (X1-02): 4 or 5.
+    /// One relaxed atomic load; bind/disconnect/delivery paths only.
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version.load(Ordering::Relaxed)
+    }
+
+    /// Record the negotiated protocol level (CONNECT event only).
+    pub fn set_protocol_version(&self, version: u8) {
+        self.protocol_version
+            .store(if version == 5 { 5 } else { 4 }, Ordering::Relaxed);
+    }
+
+    /// Stored Session Expiry Interval in seconds (X1-02). One relaxed
+    /// atomic load; bind/disconnect/reconnect paths only.
+    pub fn session_expiry(&self) -> u32 {
+        self.session_expiry.load(Ordering::Relaxed)
+    }
+
+    /// Record the Session Expiry Interval from CONNECT (CONNECT event
+    /// only). Version-4 sessions always store
+    /// [`DEFAULT_SESSION_EXPIRY_SECS`].
+    pub fn set_session_expiry(&self, expiry: u32) {
+        self.session_expiry.store(expiry, Ordering::Relaxed);
+    }
+
+    /// Stored client Receive Maximum (X1-02, always >= 1). One relaxed
+    /// atomic load; the delivery path reads it only for version-5
+    /// sessions with QoS 1/2 downlinks.
+    pub fn client_receive_maximum(&self) -> u16 {
+        self.client_receive_max.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Record the client Receive Maximum from CONNECT (CONNECT event
+    /// only). A wire 0 must be rejected at bind and never reaches here;
+    /// defensively floors to 1 so the delivery cap always holds at
+    /// least one unacked downlink.
+    pub fn set_client_receive_maximum(&self, max: u16) {
+        self.client_receive_max.store(max.max(1), Ordering::Relaxed);
+    }
+
+    /// Stored client Maximum Packet Size (X1-02, 0 = no limit). One
+    /// relaxed atomic load; the delivery path reads it only for
+    /// version-5 sessions.
+    pub fn client_max_packet_size(&self) -> u32 {
+        self.client_max_packet_size.load(Ordering::Relaxed)
+    }
+
+    /// Record the client Maximum Packet Size from CONNECT (CONNECT
+    /// event only). 0 means no limit announced.
+    pub fn set_client_max_packet_size(&self, max: u32) {
+        self.client_max_packet_size.store(max, Ordering::Relaxed);
+    }
+
+    /// Apply one v5 CONNECT's session parameters atomically from the
+    /// bind (X1-02, CONNECT event only): protocol version, session
+    /// expiry, receive maximum and maximum packet size. Version-4
+    /// callers pass the documented defaults (4, 0, wire-max, 0) which
+    /// restore 3.1.1 behaviour bit for bit.
+    pub fn apply_v5_connect(&self, version: u8, expiry: u32, receive_max: u16, max_packet: u32) {
+        self.set_protocol_version(version);
+        self.set_session_expiry(if version == 5 {
+            expiry
+        } else {
+            DEFAULT_SESSION_EXPIRY_SECS
+        });
+        self.set_client_receive_maximum(if version == 5 {
+            receive_max.max(1)
+        } else {
+            DEFAULT_CLIENT_RECEIVE_MAXIMUM
+        });
+        self.set_client_max_packet_size(if version == 5 {
+            max_packet
+        } else {
+            DEFAULT_CLIENT_MAX_PACKET_SIZE
+        });
+    }
+
+    /// True when this detached session's retained state has outlived
+    /// its Session Expiry Interval (X1-02, reconnect path only). Live
+    /// sessions never expire; version-4 sessions never expire through
+    /// this path (their lifecycle is `clean_start`-driven, so a v5
+    /// resume of a durable 3.1.1 session resumes instead of dropping
+    /// it); `SESSION_EXPIRY_NEVER` never expires; a version-5 expiry
+    /// of 0 means "drop at disconnect" (expired once detached — the
+    /// unbind already cleared the state, so this only catches paths
+    /// that bypassed the clear). Otherwise expired when
+    /// `now_ms - ended_at > expiry * 1000`. Sessions that never ended
+    /// (`ended_at_ms == None`) while detached predate end-stamping and
+    /// are treated as unexpired (fail to retain, never to drop a
+    /// session whose age is unknown).
+    /// TODO(parity): should a detached session with unknown age
+    /// (`ended_at_ms == None`) and a nonzero expiry be treated as
+    /// freshly ended or as expired? The rulebook does not decide the
+    /// tombstone policy; current choice retains (fail to keep) so an
+    /// old husk is never dropped on age it never recorded.
+    pub fn session_expired(&self, now: u64) -> bool {
+        if *self.connected.read() {
+            return false;
+        }
+        if self.protocol_version.load(Ordering::Relaxed) != 5 {
+            return false;
+        }
+        let expiry = self.session_expiry.load(Ordering::Relaxed);
+        if expiry == SESSION_EXPIRY_NEVER {
+            return false;
+        }
+        if expiry == DEFAULT_SESSION_EXPIRY_SECS {
+            return true;
+        }
+        match *self.ended_at_ms.read() {
+            None => false,
+            Some(ended_at) => {
+                let elapsed = now.saturating_sub(ended_at);
+                elapsed > u64::from(expiry).saturating_mul(1_000)
+            }
+        }
+    }
+
+    /// Whether disconnect state for this session must be dropped
+    /// (X1-02, detach path only): version-5 sessions drop when their
+    /// expiry is 0; version-4 sessions drop when `clean_start` is set.
+    /// Centralises the policy so the manager and the kernel agree.
+    pub fn drops_state_at_disconnect(&self) -> bool {
+        if self.protocol_version.load(Ordering::Relaxed) == 5 {
+            self.session_expiry.load(Ordering::Relaxed) == DEFAULT_SESSION_EXPIRY_SECS
+        } else {
+            self.clean_start
         }
     }
 
@@ -1003,7 +1350,9 @@ impl Session {
     /// never takes a clock.
     ///
     /// Durable backing (B4-06): when an offline store is installed, the
-    /// entry is appended to the per-client queue file (flushed, plus
+    /// entry is appended to the owning tenant's queue file (MT-03:
+    /// `(tenant, client id)` key, so the same client id in two tenants
+    /// appends to two independent files) (flushed, plus
     /// `sync_data` under the default fsync policy) before it enters the
     /// memory queue, so an acknowledged publish that buffered here has
     /// already reached stable storage. Evictions past the cap rewrite the
@@ -1059,7 +1408,8 @@ impl Session {
             .offline_persist
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = store.append(&self.client_id, &record) {
+        let tenant = self.offline_tenant();
+        if let Err(e) = store.append_in_tenant(&tenant, &self.client_id, &record) {
             tracing::warn!("Offline queue persist failed for {}: {e}", self.client_id);
             return false;
         }
@@ -1092,7 +1442,8 @@ impl Session {
             }
         };
         if let Some(snapshot) = snapshot {
-            if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
+            let tenant = self.offline_tenant();
+            if let Err(e) = store.rewrite_in_tenant(&tenant, &self.client_id, &snapshot) {
                 tracing::warn!("Offline queue rewrite failed for {}: {e}", self.client_id);
                 return false;
             }
@@ -1127,6 +1478,21 @@ impl Session {
         dropped
     }
 
+    /// Owning tenant for durable file keys (MT-03): the default tenant
+    /// resolves via the `tenant_is_default` fast-path flag (one relaxed
+    /// atomic load, no lock, no copy of the stored string) so the
+    /// single-tenant deliver path pays no new lock; only a non-default
+    /// tenant takes the short `tenant_id` read plus one bounded copy.
+    /// Detached-buffer path only (which already appends to a file);
+    /// live deliveries to connected sessions never call here.
+    fn offline_tenant(&self) -> String {
+        if self.tenant_is_default.load(Ordering::Relaxed) {
+            tenant::DEFAULT_TENANT_ID.to_string()
+        } else {
+            self.tenant_id.read().clone()
+        }
+    }
+
     /// Point the session at the durable offline backing (`None` returns
     /// to memory-only buffering). Called by the manager for new sessions
     /// and when the kernel installs the store at boot; never per message.
@@ -1135,7 +1501,9 @@ impl Session {
     }
 
     /// Take every buffered message, leaving the queue empty. When a
-    /// durable store is installed the queue file is deleted alongside, so
+    /// durable store is installed the owning tenant's queue file is
+    /// deleted alongside (MT-03: `(tenant, client id)` key, so one
+    /// tenant's drain never deletes another tenant's namesake file), so
     /// a restart after the handoff replays nothing (replay hands each
     /// entry to the new connection exactly once per drain, matching the
     /// previous memory-only semantics). The persist mutex is held across
@@ -1159,7 +1527,8 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner());
         let drained: Vec<QueuedMessage> = self.offline_queue.write().drain(..).collect();
         if !drained.is_empty() {
-            store.remove(&self.client_id);
+            let tenant = self.offline_tenant();
+            store.remove_in_tenant(&tenant, &self.client_id);
         }
         drained
     }
@@ -1235,7 +1604,8 @@ impl Session {
                 })
                 .collect()
         };
-        if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
+        if let Err(e) = store.rewrite_in_tenant(&self.offline_tenant(), &self.client_id, &snapshot)
+        {
             tracing::warn!(
                 "Offline queue confirm rewrite failed for {}: {e}",
                 self.client_id
@@ -1260,6 +1630,22 @@ impl Session {
     /// observes `None` and publishes nothing. Disconnect events only.
     pub fn take_last_will(&self) -> Option<StoredWill> {
         self.last_will.write().take()
+    }
+
+    /// Register a last will (MT-05, tenant-carrying). Replaces any previous will.
+    pub fn register_will(&self, will: StoredWill) -> bool {
+        *self.last_will.write() = Some(will);
+        true
+    }
+
+    /// Take the will exactly once (fire-once). Used for unexpected disconnects.
+    pub fn take_will(&self) -> Option<StoredWill> {
+        self.last_will.write().take()
+    }
+
+    /// True when a will is stored.
+    pub fn has_will(&self) -> bool {
+        self.last_will.read().is_some()
     }
 }
 
@@ -1301,21 +1687,52 @@ impl TokenBucket {
 }
 
 pub struct SessionManager {
-    sessions: RwLock<HashMap<String, Arc<Session>>>,
+    // X1-02: session expiry is evaluated lazily (no background timers:
+    // zero timers is bounded by one per persistent session). The
+    // reconnect path checks the single session O(1)
+    // (`get_or_create_v5_in_tenant`); opportunistic sweeps
+    // (`prune_expired_bounded`) scan at most `MAX_EXPIRY_SWEEP`
+    // sessions. Every sweep keys by `SessionKey` and prunes only the
+    // owning tenant's entries, never another tenant's namesake.
+    // Two-level map `tenant -> client_id -> session` (MT-03): the same
+    // client id in two tenants yields two independent entries with no
+    // per-lookup allocation on the publish/deliver path (both levels
+    // resolve via borrowed `&str`, unlike an owned composite key which
+    // builds two `String`s per lookup). Both levels are bounded (see
+    // [`MAX_TENANTS`] and [`MAX_SESSIONS_PER_TENANT`]): ended sessions
+    // are reaped where sessions end past [`ENDED_SESSION_TTL_SECS`], and
+    // empty outer entries are pruned in `unbind_connection_in_tenant`,
+    // so the map holds live sessions plus detached sessions that still
+    // own replayable state.
+    sessions: RwLock<HashMap<String, HashMap<String, Arc<Session>>>>,
     next_session_id: AtomicU64,
-    /// O(1) reverse map `conn_id -> client_id` (PERF-04). Populated by
-    /// [`SessionManager::bind_session`], pruned by `unbind_connection`
-    /// and by `get_or_create` on clean-start replacement. Lookups take a
-    /// short read; bind/unbind a short write; the lock is never held
-    /// across dispatch, routing, or I/O.
-    conn_index: RwLock<HashMap<u64, String>>,
-    /// Live connection count per username (INDRA-127 quotas). Anonymous
-    /// binds bypass accounting entirely.
-    conn_counts: RwLock<HashMap<String, AtomicU32>>,
-    /// Publish token buckets per client id (INDRA-128 rate limits).
-    /// Pruned on unbind so reconnects start full and state cannot grow
-    /// without bound.
-    buckets: RwLock<HashMap<String, TokenBucket>>,
+    /// O(1) reverse map `conn_id -> (tenant, client id)` (PERF-04, MT-03).
+    /// Populated by [`SessionManager::bind_session`], pruned by
+    /// `unbind_connection` and by `get_or_create` on clean-start
+    /// replacement. Lookups take a short read; bind/unbind a short write;
+    /// the lock is never held across dispatch, routing, or I/O. Keyed by
+    /// the full session key so two tenants sharing a client id never
+    /// resolve to each other's session.
+    conn_index: RwLock<HashMap<u64, SessionKey>>,
+    /// Live connection count per `(tenant, username)` (INDRA-127 quotas,
+    /// MT-03), grouped `tenant -> username -> count` so the connect path
+    /// resolves via borrowed `&str` with no per-connect allocation (only
+    /// the cold miss for a new pair inserts owned keys). Anonymous binds
+    /// bypass accounting entirely. Quotas stay per username within each
+    /// tenant: the tenant is the bind's own tenant resolved BEFORE session
+    /// creation, so the same username in two tenants holds two independent
+    /// budgets. Callers that do not know the tenant yet (the WS console,
+    /// tests) keep the default-tenant shims below; the kernel bind hook
+    /// always passes the owning tenant.
+    conn_counts: RwLock<HashMap<String, HashMap<String, AtomicU32>>>,
+    /// Publish token buckets per `(tenant, client id)` (INDRA-128 rate
+    /// limits, MT-03), grouped `tenant -> client_id -> bucket` so the
+    /// publish path resolves via borrowed `&str` with no per-message
+    /// allocation (hit path takes no owned key). Same cardinality as
+    /// the session map (one entry per live session at most); pruned on
+    /// unbind so reconnects start full and state cannot grow without
+    /// bound (empty outer entries removed with the last inner entry).
+    buckets: RwLock<HashMap<String, HashMap<String, TokenBucket>>>,
     /// Live-session count for the management count endpoint (W1-13).
     /// Maintained by `get_or_create` (increment on a newly connected
     /// session) and `unbind_connection` (decrement on a verified detach),
@@ -1346,6 +1763,11 @@ pub struct SessionManager {
     /// from it via [`SessionManager::restore_offline_queues`]. One `Arc`
     /// clone at boot; the publish path never touches this lock (each
     /// session holds its own clone).
+    /// Files are keyed by `(tenant, client id)` (MT-03): the default
+    /// tenant keeps the pre-tenancy bare `<client>.log` layout so
+    /// existing files restore in place; any other tenant uses
+    /// `<tenant>+<client>.log`, so two tenants sharing a client id hold
+    /// two independent files.
     offline_store: RwLock<Option<Arc<OfflineQueueStore>>>,
 }
 
@@ -1421,7 +1843,12 @@ impl SessionManager {
     /// wiring still persist. Boot-time only; never per message.
     pub fn set_offline_store(&self, store: Arc<OfflineQueueStore>) {
         *self.offline_store.write() = Some(store.clone());
-        let sessions: Vec<Arc<Session>> = self.sessions.read().values().cloned().collect();
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .read()
+            .values()
+            .flat_map(|inner| inner.values().cloned())
+            .collect();
         for session in sessions {
             session.set_offline_store(Some(store.clone()));
         }
@@ -1433,15 +1860,17 @@ impl SessionManager {
     }
 
     /// Rebuild the in-memory offline index from the durable store after a
-    /// restart (B4-06). For every client id with a queue file, loads its
-    /// records in order (truncating a torn tail with a counter, never
-    /// served) and refills a detached persistent session: sessions that
-    /// do not exist yet are created detached (`clean_start = false`,
-    /// unconnected, invisible to the live-session count) and filled
-    /// without writing back. Files holding more than the configured cap
-    /// keep the newest entries and are rewritten to the survivors.
-    /// Sessions that already exist are left untouched and their files are
-    /// left for the next restart.
+    /// restart (B4-06). For every `(tenant, client id)` pair with a queue
+    /// file (legacy bare files decode to the default tenant, so queues
+    /// written before tenancy restore in place), loads its records in
+    /// order (truncating a torn tail with a counter, never served) and
+    /// refills a detached persistent session in that same tenant:
+    /// sessions that do not exist yet are created detached
+    /// (`clean_start = false`, unconnected, invisible to the
+    /// live-session count) and filled without writing back. Files holding
+    /// more than the configured cap keep the newest entries and are
+    /// rewritten to the survivors. Sessions that already exist are left
+    /// untouched and their files are left for the next restart.
     /// TODO(parity): should a reload merge into an already-live session
     /// (e.g. a store installed after traffic started) instead of
     /// skipping it? The rulebook does not decide the merge order; current
@@ -1462,16 +1891,21 @@ impl SessionManager {
             torn: 0,
             capped_dropped: 0,
         };
-        for client_id in store.client_ids() {
-            let (records, torn) = store.load(&client_id);
+        for (tenant, client_id) in store.queue_keys() {
+            let (records, torn) = store.load_in_tenant(&tenant, &client_id);
             stats.torn += torn;
             if records.is_empty() {
                 if torn > 0 {
-                    store.remove(&client_id);
+                    store.remove_in_tenant(&tenant, &client_id);
                 }
                 continue;
             }
-            if self.sessions.read().contains_key(&client_id) {
+            if self
+                .sessions
+                .read()
+                .get(tenant.as_str())
+                .is_some_and(|inner| inner.contains_key(&client_id))
+            {
                 continue;
             }
             let messages: Vec<QueuedMessage> = records
@@ -1486,6 +1920,7 @@ impl SessionManager {
                 .collect();
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.clone(), false));
+            session.set_tenant_id(tenant.clone());
             self.apply_qos1_limits(&session);
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(Some(store.clone()));
@@ -1505,12 +1940,19 @@ impl SessionManager {
                         publish_at_ms: queued.publish_at_ms,
                     })
                     .collect();
-                if store.rewrite(&client_id, &snapshot).is_err() {
+                if store
+                    .rewrite_in_tenant(&tenant, &client_id, &snapshot)
+                    .is_err()
+                {
                     tracing::warn!("Offline restore rewrite failed for {client_id}");
                 }
             }
             let restored = session.offline_len();
-            self.sessions.write().insert(client_id, session);
+            self.sessions
+                .write()
+                .entry(tenant.clone())
+                .or_default()
+                .insert(client_id, session);
             if restored > 0 {
                 stats.messages += restored;
                 stats.clients += 1;
@@ -1582,82 +2024,164 @@ impl SessionManager {
     /// Buffer one message for a detached session, applying this
     /// manager's offline cap. False when the client has no session or when
     /// the durable persist failed and nothing was queued (fail closed).
+    /// Default-tenant shim; tenant callers use
+    /// [`SessionManager::queue_offline_in_tenant`].
     pub fn queue_offline(&self, client_id: &str, message: QueuedMessage) -> bool {
-        match self.get(client_id) {
+        self.queue_offline_in_tenant(tenant::DEFAULT_TENANT_ID, client_id, message)
+    }
+
+    /// Buffer one message for a detached session in `tenant`, applying
+    /// this manager's offline cap. False when that tenant holds no
+    /// session for the client or when the durable persist failed and
+    /// nothing was queued (fail closed): another tenant's queue is never
+    /// touched.
+    pub fn queue_offline_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        message: QueuedMessage,
+    ) -> bool {
+        match self.get_in_tenant(tenant, client_id) {
             Some(session) => session.push_offline_with_limit(message, self.max_offline_queue),
             None => false,
         }
     }
 
+    /// Default-tenant session lookup; tenant callers use
+    /// [`SessionManager::get_in_tenant`].
     pub fn get(&self, client_id: &str) -> Option<Arc<Session>> {
-        self.sessions.read().get(client_id).cloned()
+        self.get_in_tenant(tenant::DEFAULT_TENANT_ID, client_id)
+    }
+
+    /// Session for one `(tenant, client id)`: the same client id in two
+    /// tenants yields two independent sessions (or `None` for an unknown
+    /// pair, never the other tenant's session). Borrowed two-level
+    /// lookup takes no allocation, so the deliver path pays no new
+    /// allocation per subscriber per publish.
+    pub fn get_in_tenant(&self, tenant: &str, client_id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().get(tenant)?.get(client_id).cloned()
     }
 
     /// Reverse lookup: owner of a live edge connection, if bound.
-    /// O(1) via the `conn_id -> client_id` index; falls back to the
+    /// O(1) via the `conn_id -> session key` index; falls back to the
     /// legacy scan only on a miss so sessions bound through direct
     /// `conn_id` writes (paths outside the indexed bind hook) still
     /// resolve exactly as before.
     pub fn client_id_for_conn(&self, conn_id: u64) -> Option<String> {
         if let Some(owner) = self.conn_index.read().get(&conn_id).cloned() {
-            return Some(owner);
+            return Some(owner.client_id);
         }
-        self.sessions
-            .read()
-            .iter()
-            .find(|(_, session)| *session.conn_id.read() == Some(conn_id))
-            .map(|(client_id, _)| client_id.clone())
+        self.sessions.read().iter().find_map(|(_, inner)| {
+            inner
+                .iter()
+                .find(|(_, session)| *session.conn_id.read() == Some(conn_id))
+                .map(|(_, session)| session.client_id.clone())
+        })
+    }
+
+    /// Full session key owning a live edge connection, if bound (MT-03).
+    /// Tenant-correct where [`SessionManager::client_id_for_conn`] plus a
+    /// bare `get` would land in the default tenant: connection ids are
+    /// unique per edge connection, so the index identifies exactly one
+    /// `(tenant, client id)` pair.
+    pub fn key_for_conn(&self, conn_id: u64) -> Option<SessionKey> {
+        self.conn_index.read().get(&conn_id).cloned()
+    }
+
+    /// Session owning a live edge connection, if bound (MT-03). Resolves
+    /// through the `conn_id -> session key` index, so a connection in a
+    /// non-default tenant yields its own session, never the
+    /// default-tenant namesake. `None` when the connection is unbound or
+    /// its session is gone. Borrowed two-level lookup clones only the
+    /// `Arc` (no `String` allocation), so the publish path pays no new
+    /// allocation per publish; the two short reads are never held across
+    /// dispatch, routing, or I/O.
+    pub fn session_for_conn(&self, conn_id: u64) -> Option<Arc<Session>> {
+        let index = self.conn_index.read();
+        let owner = index.get(&conn_id)?;
+        let sessions = self.sessions.read();
+        sessions
+            .get(owner.tenant.as_str())?
+            .get(owner.client_id.as_str())
+            .cloned()
+    }
+
+    /// Owning key of one session: its recorded tenant plus its client id.
+    /// The bind hook stamps the tenant before binding, so the index key
+    /// always matches what the session reports.
+    fn key_of(session: &Session) -> SessionKey {
+        SessionKey {
+            tenant: session.tenant_id.read().clone(),
+            client_id: session.client_id.clone(),
+        }
     }
 
     /// Pin an edge connection to its session and record the reverse
-    /// mapping. Replaces any previous `conn_id` for this client (the
+    /// mapping. Replaces any previous `conn_id` for this session (the
     /// stale entry is removed) and overwrites a reused `conn_id` left
-    /// by another client. Short locks only: session write, then index
+    /// by another session. Short locks only: session write, then index
     /// write; never held across dispatch, routing, or I/O. Records the
     /// bind instant as the session connect time where the session is
-    /// already being written.
+    /// already being written. Callers stamp the tenant (via
+    /// [`Session::set_tenant_id`]) before binding so the index key
+    /// carries the owning tenant.
     pub fn bind_session(&self, session: &Arc<Session>, conn_id: u64) {
+        let key = Self::key_of(session);
         let old = *session.conn_id.read();
         if old == Some(conn_id) {
             let present = self
                 .conn_index
                 .read()
                 .get(&conn_id)
-                .map(|owner| owner == &session.client_id)
+                .map(|owner| owner == &key)
                 .unwrap_or(false);
             if present {
                 return;
             }
-            self.conn_index
-                .write()
-                .insert(conn_id, session.client_id.clone());
+            self.conn_index.write().insert(conn_id, key);
             return;
         }
         *session.conn_id.write() = Some(conn_id);
         *session.connected_at_ms.write() = Some(now_ms());
         let mut index = self.conn_index.write();
         if let Some(prev) = old {
-            let owned = index
-                .get(&prev)
-                .map(|owner| owner == &session.client_id)
-                .unwrap_or(false);
+            let owned = index.get(&prev).map(|owner| owner == &key).unwrap_or(false);
             if owned {
                 index.remove(&prev);
             }
         }
-        index.insert(conn_id, session.client_id.clone());
+        index.insert(conn_id, key);
     }
 
     /// Sorted ids of currently connected clients (for the management API).
+    /// TODO(parity): the list is global across tenants until MT-07
+    /// (management-output changes) scopes it; two tenants sharing a
+    /// client id appear twice, once per session.
     pub fn active_client_ids(&self) -> Vec<String> {
         let sessions = self.sessions.read();
         let mut ids: Vec<String> = sessions
-            .iter()
-            .filter(|(_, session)| *session.connected.read())
-            .map(|(client_id, _)| client_id.clone())
+            .values()
+            .flat_map(|inner| inner.values())
+            .filter(|session| *session.connected.read())
+            .map(|session| session.client_id.clone())
             .collect();
         ids.sort();
         ids
+    }
+
+    /// Snapshot of currently connected sessions across all tenants, for
+    /// broker-internal scans (stats recounts) that must not miss a
+    /// non-default tenant behind a bare-`client_id` lookup. One short map
+    /// read; management-plane and lifecycle paths only, never publish or
+    /// deliver.
+    pub fn active_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions
+            .read()
+            .values()
+            .flat_map(|inner| inner.values())
+            .filter(|session| *session.connected.read())
+            .cloned()
+            .collect()
     }
 
     /// Snapshot every subscription in the system for the global list
@@ -1672,19 +2196,21 @@ impl SessionManager {
     pub fn global_subscriptions(&self) -> Vec<GlobalSubscription> {
         let sessions = self.sessions.read();
         let mut rows: Vec<GlobalSubscription> = Vec::new();
-        for (client_id, session) in sessions.iter() {
-            for (filter, options) in session.subscriptions.read().iter() {
+        for inner in sessions.values() {
+            for (client_id, session) in inner.iter() {
+                for (filter, options) in session.subscriptions.read().iter() {
+                    if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
+                        break;
+                    }
+                    rows.push(GlobalSubscription {
+                        client_id: client_id.clone(),
+                        filter: filter.clone(),
+                        options: *options,
+                    });
+                }
                 if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
                     break;
                 }
-                rows.push(GlobalSubscription {
-                    client_id: client_id.clone(),
-                    filter: filter.clone(),
-                    options: *options,
-                });
-            }
-            if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
-                break;
             }
         }
         drop(sessions);
@@ -1699,38 +2225,63 @@ impl SessionManager {
     }
 
     /// Full detail row for one client, if known (for the management API).
+    /// Default-tenant row; tenant callers use
+    /// [`SessionManager::client_info_in_tenant`].
+    /// TODO(parity): row selection across tenants is MT-07's call.
     pub fn client_info(&self, client_id: &str) -> Option<ClientInfo> {
-        self.get(client_id).map(|session| ClientInfo {
-            client_id: session.client_id.clone(),
-            session_id: session.id.0,
-            conn_id: *session.conn_id.read(),
-            keepalive_secs: *session.keepalive_secs.read(),
-            clean_start: session.clean_start,
-            connected: *session.connected.read(),
-            queued: session.offline_len(),
-            subscriptions: {
-                let mut subs: Vec<String> = session
-                    .subscriptions
-                    .read()
-                    .keys()
-                    .map(|filter| filter.as_str().to_string())
-                    .collect();
-                subs.sort();
-                subs
-            },
-        })
+        self.client_info_in_tenant(tenant::DEFAULT_TENANT_ID, client_id)
+    }
+
+    /// Full detail row for one `(tenant, client id)` pair, if known.
+    pub fn client_info_in_tenant(&self, tenant: &str, client_id: &str) -> Option<ClientInfo> {
+        self.get_in_tenant(tenant, client_id)
+            .map(|session| ClientInfo {
+                client_id: session.client_id.clone(),
+                session_id: session.id.0,
+                conn_id: *session.conn_id.read(),
+                keepalive_secs: *session.keepalive_secs.read(),
+                clean_start: session.clean_start,
+                connected: *session.connected.read(),
+                queued: session.offline_len(),
+                subscriptions: {
+                    let mut subs: Vec<String> = session
+                        .subscriptions
+                        .read()
+                        .keys()
+                        .map(|filter| filter.as_str().to_string())
+                        .collect();
+                    subs.sort();
+                    subs
+                },
+            })
     }
 
     /// Track one granted subscription on the session (mirrors the router).
     /// Legacy and live-MQTT callers only carry a QoS; the subscription
-    /// options default to `nl = 0, rap = 0, rh = 0`.
+    /// options default to `nl = 0, rap = 0, rh = 0`. Default-tenant
+    /// mirror; tenant callers use
+    /// [`SessionManager::add_subscription_in_tenant`].
     pub fn add_subscription(&self, client_id: &str, filter: TopicFilter, qos: QoS) {
         self.add_subscription_with_options(client_id, filter, qos, 0, 0, 0);
+    }
+
+    /// Track one granted subscription on one tenant's session (mirrors
+    /// the router copy in that tenant). Another tenant's namesake
+    /// session is never touched.
+    pub fn add_subscription_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        filter: TopicFilter,
+        qos: QoS,
+    ) {
+        self.add_subscription_with_options_in_tenant(tenant, client_id, filter, qos, 0, 0, 0);
     }
 
     /// Track one granted management subscription with its full options.
     /// Values are already validated by the caller (`nl <= 1`, `rap <= 1`,
     /// `rh <= 2`); re-subscribing the same filter replaces the entry.
+    /// Default-tenant mirror.
     pub fn add_subscription_with_options(
         &self,
         client_id: &str,
@@ -1740,7 +2291,34 @@ impl SessionManager {
         rap: u8,
         rh: u8,
     ) {
-        if let Some(session) = self.get(client_id) {
+        self.add_subscription_with_options_in_tenant(
+            tenant::DEFAULT_TENANT_ID,
+            client_id,
+            filter,
+            qos,
+            nl,
+            rap,
+            rh,
+        );
+    }
+
+    /// Track one granted subscription with its full options on one
+    /// tenant's session. Values are already validated by the caller;
+    /// re-subscribing the same filter replaces the entry.
+    // MT-03: tenant plus full subscription options kept flat so callers
+    // take no new allocation; allowed like the existing handlers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_subscription_with_options_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        filter: TopicFilter,
+        qos: QoS,
+        nl: u8,
+        rap: u8,
+        rh: u8,
+    ) {
+        if let Some(session) = self.get_in_tenant(tenant, client_id) {
             session
                 .subscriptions
                 .write()
@@ -1749,20 +2327,56 @@ impl SessionManager {
     }
 
     /// Forget one subscription (unsubscribe / connection teardown).
+    /// Default-tenant mirror.
     pub fn remove_subscription(&self, client_id: &str, filter: &TopicFilter) {
-        if let Some(session) = self.get(client_id) {
+        self.remove_subscription_in_tenant(tenant::DEFAULT_TENANT_ID, client_id, filter);
+    }
+
+    /// Forget one subscription on one tenant's session (unsubscribe /
+    /// connection teardown). Another tenant's namesake keeps its copy.
+    pub fn remove_subscription_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        filter: &TopicFilter,
+    ) {
+        if let Some(session) = self.get_in_tenant(tenant, client_id) {
             session.subscriptions.write().remove(filter);
         }
     }
 
+    /// Default-tenant session resolution; tenant callers use
+    /// [`SessionManager::get_or_create_in_tenant`]. Behaviour for the
+    /// default tenant is exactly as before the change.
     pub fn get_or_create(&self, client_id: &str, clean_start: bool) -> (Arc<Session>, bool) {
+        self.get_or_create_in_tenant(tenant::DEFAULT_TENANT_ID, client_id, clean_start)
+    }
+
+    /// Resolve one `(tenant, client id)` session (MT-03): the same client
+    /// id in two tenants yields two independent sessions; a clean-start
+    /// takeover replaces only the same-tenant object and prunes only its
+    /// index entry, so a connection in another tenant never displaces
+    /// this one. Durable disconnect/reconnect resumes the same-tenant
+    /// `Arc`; the live-session counter keeps its exactness per session.
+    /// New sessions record `tenant` before they are visible (plus the
+    /// `tenant_is_default` fast-path flag via [`Session::set_tenant_id`]).
+    pub fn get_or_create_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+    ) -> (Arc<Session>, bool) {
         // Cloned up front so no branch nests the store lock inside the
         // session-map guard (see `set_offline_store` for the other order,
-        // which runs only at boot before serving starts).
+        // which runs only at boot before serving starts). Connect path
+        // only (never publish/deliver): owned keys are fine.
         let store = self.offline_store.read().clone();
+        let key = SessionKey::new(tenant, client_id);
 
         if clean_start {
-            // A clean start discards previous durable state by definition.
+            // A clean start discards this tenant's previous durable state
+            // by definition (MT-03: `(tenant, client id)` key, so another
+            // tenant's namesake file is never touched).
             // The queue file goes before the replacement session is
             // visible: the map is crash-volatile, so remove-first is the
             // crash-consistent order (a crash between remove and insert
@@ -1771,7 +2385,7 @@ impl SessionManager {
             // restore). File I/O never runs under the map guard. A
             // missing file is a no-op.
             if let Some(store) = store.clone() {
-                store.remove(client_id);
+                store.remove_in_tenant(tenant, client_id);
             }
         }
         let mut map = self.sessions.write();
@@ -1783,17 +2397,32 @@ impl SessionManager {
             // Capture the old connected flag too so the live-session
             // counter stays exact: replacing a connected session keeps the
             // count, replacing a disconnected (or absent) one increments.
-            let stale_conn = map.get(client_id).and_then(|s| *s.conn_id.read());
+            // Scoped to this tenant's key: another tenant's namesake
+            // session (and its connection) is untouched.
+            let stale_conn = map
+                .get(tenant)
+                .and_then(|inner| inner.get(client_id))
+                .and_then(|s| *s.conn_id.read());
             let stale_connected = map
-                .get(client_id)
+                .get(tenant)
+                .and_then(|inner| inner.get(client_id))
                 .map(|s| *s.connected.read())
                 .unwrap_or(false);
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
             self.apply_qos1_limits(&session);
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(store.clone());
-            map.insert(client_id.to_string(), session.clone());
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            // Bound the maps where sessions are created (MT-03): evict
+            // past the caps. Live and stateful sessions are never
+            // evicted. Both helpers return after integer compares when
+            // under the caps.
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
             drop(map);
             if !stale_connected {
                 self.connected_count.fetch_add(1, Ordering::SeqCst);
@@ -1802,18 +2431,23 @@ impl SessionManager {
                 let mut index = self.conn_index.write();
                 if index
                     .get(&stale)
-                    .map(|owner| owner == client_id)
+                    .map(|owner| owner == &key)
                     .unwrap_or(false)
                 {
                     index.remove(&stale);
                 }
             }
             (session, false)
-        } else if let Some(existing) = map.get(client_id) {
+        } else if let Some(existing) = map
+            .get(tenant)
+            .and_then(|inner| inner.get(client_id))
+            .cloned()
+        {
             let was_connected = *existing.connected.read();
             if !was_connected {
                 *existing.connected.write() = true;
                 *existing.connected_at_ms.write() = Some(now_ms());
+                *existing.ended_at_ms.write() = None;
                 self.connected_count.fetch_add(1, Ordering::SeqCst);
             }
             existing.set_offline_store(store);
@@ -1821,14 +2455,146 @@ impl SessionManager {
         } else {
             let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
             let session = Arc::new(Session::new(id, client_id.to_string(), clean_start));
+            session.set_tenant_id(tenant.to_string());
             self.apply_qos1_limits(&session);
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(store);
-            map.insert(client_id.to_string(), session.clone());
+            map.entry(tenant.to_string())
+                .or_default()
+                .insert(client_id.to_string(), session.clone());
+            // Bound the maps where sessions are created (MT-03): same
+            // evict-past-the-caps as the clean-start branch above.
+            Self::enforce_session_cap_locked(&mut map, tenant);
+            Self::enforce_tenant_cap_locked(&mut map, tenant);
             drop(map);
             self.connected_count.fetch_add(1, Ordering::SeqCst);
             (session, false)
         }
+    }
+
+    /// Resolve one `(tenant, client id)` v5 session with Session Expiry
+    /// semantics (X1-02, CONNECT event only): `clean_start` still
+    /// discards any previous session at connect time (present=false);
+    /// otherwise a detached session whose stored expiry has elapsed is
+    /// dropped and replaced (present=false), while a live or
+    /// unexpired detached session resumes (present=true) with its
+    /// stored expiry/caps/version refreshed from this CONNECT. New and
+    /// resumed sessions record `version`, `expiry`, `receive_max`
+    /// (floored at 1; a wire 0 must be rejected before this call) and
+    /// `max_packet` via [`Session::apply_v5_connect`]. Version-4
+    /// callers must use [`SessionManager::get_or_create_in_tenant`]
+    /// (3.1.1 behaviour unchanged). The expiry check is O(1) on the
+    /// single session (no scan); the opportunistic bounded sweep runs
+    /// separately in [`SessionManager::prune_expired_bounded`].
+    /// Returns `(session, present, swept)`: `swept` holds the dropped
+    /// session's subscription filters when the expired-drop path ran
+    /// (the caller sweeps the owning tenant's router copies; empty
+    /// otherwise). The dropped session's durable queue file is removed
+    /// here, before the replacement is visible.
+    /// TODO(parity): when a resumed session's stored expiry differs
+    /// from this CONNECT's expiry, the new value wins (the latest
+    /// CONNECT governs retention). The rulebook does not decide the
+    /// update rule; current choice follows the wire property's
+    /// "latest wins" reading and fails to retain, never to drop early.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_v5_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        clean_start: bool,
+        version: u8,
+        expiry: u32,
+        receive_max: u16,
+        max_packet: u32,
+    ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
+        if clean_start {
+            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
+            debug_assert!(!present);
+            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            return (session, false, Vec::new());
+        }
+        let now = now_ms();
+        let expired = self
+            .get_in_tenant(tenant, client_id)
+            .map(|existing| existing.session_expired(now))
+            .unwrap_or(false);
+        if expired {
+            // Drop the elapsed session first so the replacement starts
+            // clean: snapshot its router filters, remove the object
+            // plus its durable queue file, then create fresh
+            // (present=false).
+            let swept = self.subscription_filters_in_tenant(tenant, client_id);
+            if let Some(store) = self.offline_store.read().clone() {
+                store.remove_in_tenant(tenant, client_id);
+            }
+            {
+                let mut map = self.sessions.write();
+                if let Some(inner) = map.get_mut(tenant) {
+                    inner.remove(client_id);
+                }
+            }
+            let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
+            debug_assert!(!present);
+            session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+            return (session, false, swept);
+        }
+        let (session, present) = self.get_or_create_in_tenant(tenant, client_id, false);
+        session.apply_v5_connect(version, expiry, receive_max.max(1), max_packet);
+        (session, present, Vec::new())
+    }
+
+    /// Reap detached expired v5 sessions in `tenant`, scanning at most
+    /// `max_scan` sessions (X1-02 bound enforcement). Returns one
+    /// `(client_id, filters)` row per reaped session so the caller can
+    /// sweep the owning tenant's router copies; the session objects and
+    /// their durable queue files are removed here. Live sessions,
+    /// sessions with `SESSION_EXPIRY_NEVER`, unexpired sessions and
+    /// version-4 sessions are never touched. Detach/bind paths only;
+    /// the publish and delivery paths never scan sessions.
+    pub fn prune_expired_bounded(
+        &self,
+        tenant: &str,
+        max_scan: usize,
+    ) -> Vec<(String, Vec<TopicFilter>)> {
+        let now = now_ms();
+        let victims: Vec<(String, Vec<TopicFilter>)> = {
+            let map = self.sessions.read();
+            let Some(inner) = map.get(tenant) else {
+                return Vec::new();
+            };
+            inner
+                .iter()
+                .take(max_scan.max(1))
+                .filter(|(_, session)| {
+                    session.protocol_version() == 5 && session.session_expired(now)
+                })
+                .map(|(client_id, session)| {
+                    (
+                        client_id.clone(),
+                        session.subscriptions.read().keys().cloned().collect(),
+                    )
+                })
+                .collect()
+        };
+        if victims.is_empty() {
+            return victims;
+        }
+        let store = self.offline_store.read().clone();
+        {
+            let mut map = self.sessions.write();
+            if let Some(inner) = map.get_mut(tenant) {
+                for (client_id, _) in &victims {
+                    inner.remove(client_id);
+                    if let Some(store) = store.as_ref() {
+                        store.remove_in_tenant(tenant, client_id);
+                    }
+                }
+                if inner.is_empty() {
+                    map.remove(tenant);
+                }
+            }
+        }
+        victims
     }
 
     /// Constant-time live-session count for the management count endpoint.
@@ -1841,8 +2607,20 @@ impl SessionManager {
     /// Snapshot the subscription filters of one session, if known.
     /// Used by the kernel to sweep stale router entries on a clean-start
     /// bind (which discards any previous state, even a persistent one).
+    /// Default-tenant snapshot.
     pub fn subscription_filters(&self, client_id: &str) -> Vec<TopicFilter> {
-        match self.get(client_id) {
+        self.subscription_filters_in_tenant(tenant::DEFAULT_TENANT_ID, client_id)
+    }
+
+    /// Snapshot one `(tenant, client id)` session's subscription filters,
+    /// if known. Another tenant's namesake is never consulted, so a
+    /// clean-start sweep prunes only the owning tenant's router copies.
+    pub fn subscription_filters_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+    ) -> Vec<TopicFilter> {
+        match self.get_in_tenant(tenant, client_id) {
             Some(session) => session.subscriptions.read().keys().cloned().collect(),
             None => Vec::new(),
         }
@@ -1852,10 +2630,20 @@ impl SessionManager {
     /// filters. Persistent sessions are untouched (empty return). The
     /// returned list is bounded by that session's own subscription count;
     /// delivery never calls here, so the per-message cost is zero.
+    /// Default-tenant drain.
     pub fn take_clean_subscriptions(&self, client_id: &str) -> Vec<TopicFilter> {
-        match self.get(client_id) {
+        self.take_clean_subscriptions_in_tenant(tenant::DEFAULT_TENANT_ID, client_id)
+    }
+
+    /// Drain one `(tenant, client id)` clean session's subscriptions.
+    pub fn take_clean_subscriptions_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+    ) -> Vec<TopicFilter> {
+        match self.get_in_tenant(tenant, client_id) {
             Some(session) => {
-                if session.clean_start {
+                if session.drops_state_at_disconnect() {
                     session
                         .subscriptions
                         .write()
@@ -1875,28 +2663,50 @@ impl SessionManager {
     /// session yields filters: racing teardowns for a superseded conn_id
     /// and persistent sessions both yield empty (their subscriptions
     /// survive, which is what durable redelivery builds on).
+    /// Default-tenant detach; tenant callers use
+    /// [`SessionManager::unbind_connection_in_tenant`].
     pub fn unbind_connection(&self, client_id: &str, conn_id: u64) -> Vec<TopicFilter> {
+        self.unbind_connection_in_tenant(tenant::DEFAULT_TENANT_ID, client_id, conn_id)
+    }
+
+    /// Detach one edge connection in `tenant`, returning the subscription
+    /// filters to sweep from that tenant's router scope. Ownership is
+    /// verified against the full `(tenant, client id)` key, so a teardown
+    /// for one tenant's connection can never detach another tenant's
+    /// namesake session or prune its index entry, even when the client
+    /// ids are identical.
+    pub fn unbind_connection_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        conn_id: u64,
+    ) -> Vec<TopicFilter> {
+        // Detach path only (never publish/deliver): owned keys are fine.
+        let key = SessionKey::new(tenant, client_id);
         let (username_to_release, swept, did_detach): (Option<String>, Vec<TopicFilter>, bool) = {
             let map = self.sessions.read();
-            match map.get(client_id) {
+            match map.get(tenant).and_then(|inner| inner.get(client_id)) {
                 Some(session) => {
                     let mut current_conn = session.conn_id.write();
                     if *current_conn == Some(conn_id) {
                         let was_connected = *session.connected.read();
                         *current_conn = None;
                         *session.connected.write() = false;
-                        // Clean sessions keep no inflight or QoS 2 state
-                        // across a disconnect (T-31, D1-01); durable
-                        // sessions keep theirs for reconnect replay.
-                        // Alias tables are per-connection either way
-                        // (B4-05): they die with the connection.
+                        // X1-02: version-5 sessions drop state when their
+                        // expiry is 0, version-4 sessions when
+                        // `clean_start` is set (T-31, D1-01). Durable
+                        // sessions keep inflight/QoS 2/subscriptions for
+                        // reconnect replay. Alias tables are
+                        // per-connection either way (B4-05): they die
+                        // with the connection.
                         session.clear_aliases();
-                        if session.clean_start {
+                        let drop_state = session.drops_state_at_disconnect();
+                        if drop_state {
                             session.clear_inflight();
                             session.clear_qos2_inbound();
                             session.clear_qos2_outbound();
                         }
-                        let swept = if session.clean_start {
+                        let swept = if drop_state {
                             session
                                 .subscriptions
                                 .write()
@@ -1906,6 +2716,11 @@ impl SessionManager {
                         } else {
                             Vec::new()
                         };
+                        // Stamp when this session ended: the ended-tenant
+                        // prune below reaps detached stateless sessions
+                        // past [`ENDED_SESSION_TTL_SECS`], so ended
+                        // tenants' entries go away instead of accumulating.
+                        *session.ended_at_ms.write() = Some(now_ms());
                         (session.username.read().clone(), swept, was_connected)
                     } else {
                         (None, Vec::new(), false)
@@ -1924,35 +2739,177 @@ impl SessionManager {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
         if let Some(username) = username_to_release {
-            self.release_connection_slot(&username);
+            self.release_connection_slot_in_tenant(tenant, &username);
         }
         // Every path that clears `session.conn_id` also prunes the index:
-        // remove only entries owned by this client so a racing teardown
-        // for a superseded conn_id never drops the fresh binding.
+        // remove only entries owned by this exact session key so a racing
+        // teardown for a superseded conn_id (or another tenant's namesake
+        // connection) never drops the fresh binding.
         {
             let mut index = self.conn_index.write();
             if index
                 .get(&conn_id)
-                .map(|owner| owner == client_id)
+                .map(|owner| owner == &key)
                 .unwrap_or(false)
             {
                 index.remove(&conn_id);
             }
         }
         // Reconnects start with a full bucket; abandoned entries vanish.
-        self.buckets.write().remove(client_id);
+        // Buckets are per session key, so one tenant's unbind never resets
+        // another tenant's budget. Empty outer entries are removed so the
+        // outer map holds one entry per live tenant at most.
+        {
+            let mut buckets = self.buckets.write();
+            if let Some(outer) = buckets.get_mut(tenant) {
+                outer.remove(client_id);
+                if outer.is_empty() {
+                    buckets.remove(tenant);
+                }
+            }
+        }
+        // Reap this tenant's ended sessions where sessions end, then
+        // prune the now-empty outer entry, if any, so the outer map holds
+        // one entry per tenant that still owns sessions and an ended
+        // tenant's entries go away. Detach paths only; the publish and
+        // deliver paths never touch these locks.
+        self.prune_ended_in_tenant(tenant);
         swept
     }
 
-    /// Admit one connection for `username` under an optional cap
-    /// (`None` = unlimited). Single-lock check-and-increment: at most
-    /// `max` concurrent holders ever observe success.
+    /// Reap one tenant's ended sessions (MT-03 bound enforcement): remove
+    /// detached sessions that hold no replayable state (no subscriptions,
+    /// queued, inflight or QoS 2 entries) and ended longer than
+    /// [`ENDED_SESSION_TTL_SECS`] ago, then prune the tenant's outer entry
+    /// when its last session is gone. Sessions that still own replayable
+    /// state stay for reconnect replay no matter their age; live sessions
+    /// are never touched. A reconnect recreates a reaped session fresh.
+    /// Called where sessions end (`unbind_connection_in_tenant`) and
+    /// before cap enforcement at creation; detach paths only, never
+    /// publish or deliver.
+    pub fn prune_ended_in_tenant(&self, tenant: &str) {
+        // Collect victims under the read guard (a full scan here never
+        // blocks other readers, and writers wait only for the short
+        // removal below), then remove under the write guard.
+        let now = now_ms();
+        let ttl_ms = ENDED_SESSION_TTL_SECS.saturating_mul(1_000);
+        let victims: Vec<String> = {
+            let map = self.sessions.read();
+            let Some(inner) = map.get(tenant) else {
+                return;
+            };
+            inner
+                .iter()
+                .filter(|(_, session)| {
+                    if !is_ended_stateless(session) {
+                        return false;
+                    }
+                    let ended_ago = session
+                        .ended_at_ms
+                        .read()
+                        .map(|ended_at| now.saturating_sub(ended_at))
+                        .unwrap_or(0);
+                    ended_ago >= ttl_ms
+                })
+                .map(|(client_id, _)| client_id.clone())
+                .collect()
+        };
+        if victims.is_empty() {
+            return;
+        }
+        let mut map = self.sessions.write();
+        if let Some(inner) = map.get_mut(tenant) {
+            for victim in victims {
+                inner.remove(&victim);
+            }
+            if inner.is_empty() {
+                map.remove(tenant);
+            }
+        }
+    }
+
+    /// Enforce the per-tenant session cap after inserting into `tenant`
+    /// (MT-03 bound): evict the oldest detached stateless session past the
+    /// cap (a reconnect recreates it; TTL-old husks were already reaped
+    /// where sessions end). Live sessions and sessions that still own
+    /// replayable state are never evicted, so genuine load still connects
+    /// past the cap rather than refusing. Connect path only, under the
+    /// session-map guard; under the cap it pays two integer compares.
+    fn enforce_session_cap_locked(
+        map: &mut HashMap<String, HashMap<String, Arc<Session>>>,
+        tenant: &str,
+    ) {
+        let Some(inner) = map.get(tenant) else {
+            return;
+        };
+        if inner.len() <= MAX_SESSIONS_PER_TENANT {
+            return;
+        }
+        let victim = inner
+            .iter()
+            .filter(|(_, session)| is_ended_stateless(session))
+            .min_by_key(|(_, session)| session.id.0)
+            .map(|(client_id, _)| client_id.clone());
+        if let (Some(inner), Some(victim)) = (map.get_mut(tenant), victim) {
+            inner.remove(&victim);
+        }
+    }
+
+    /// Enforce the tenant cap after a new tenant entry appears (MT-03
+    /// bound): evict one fully-ended tenant (no live sessions and no
+    /// replayable state anywhere inside, so nothing it owns could still
+    /// replay) other than `tenant`. When every tenant still holds live or
+    /// stateful sessions the insert stands, so genuine multi-tenant load
+    /// still connects past the cap rather than refusing. Connect path
+    /// only, under the session-map guard; only runs past the cap, so the
+    /// common path pays two integer compares.
+    fn enforce_tenant_cap_locked(
+        map: &mut HashMap<String, HashMap<String, Arc<Session>>>,
+        tenant: &str,
+    ) {
+        if map.len() <= MAX_TENANTS {
+            return;
+        }
+        let victim = map
+            .iter()
+            .filter(|(name, inner)| {
+                name.as_str() != tenant && inner.values().all(|session| is_ended_stateless(session))
+            })
+            .map(|(name, _)| name.clone())
+            .next();
+        if let Some(victim) = victim {
+            map.remove(&victim);
+        }
+    }
+
+    /// Admit one connection for `username` in the default tenant under an
+    /// optional cap (`None` = unlimited). Default-tenant shim for
+    /// [`acquire_connection_slot_in_tenant`](SessionManager::acquire_connection_slot_in_tenant).
+    /// Single-lock check-and-increment: at most `max` concurrent holders
+    /// ever observe success.
     pub fn acquire_connection_slot(&self, username: &str, max: Option<u32>) -> bool {
+        self.acquire_connection_slot_in_tenant(tenant::DEFAULT_TENANT_ID, username, max)
+    }
+
+    /// Admit one connection for one `(tenant, username)` pair under an
+    /// optional cap (MT-03): the same username in two tenants holds two
+    /// independent budgets, so a cap reached in one tenant never denies
+    /// the other. Single-lock check-and-increment within the tenant's own
+    /// bucket map; the outer map holds one entry per tenant with a live
+    /// count, pruned by release below.
+    pub fn acquire_connection_slot_in_tenant(
+        &self,
+        tenant: &str,
+        username: &str,
+        max: Option<u32>,
+    ) -> bool {
         let Some(max) = max else {
             return true;
         };
         let mut counts = self.conn_counts.write();
         let count = counts
+            .entry(tenant.to_string())
+            .or_default()
             .entry(username.to_string())
             .or_insert_with(|| AtomicU32::new(0));
         if count.load(Ordering::SeqCst) >= max {
@@ -1962,21 +2919,64 @@ impl SessionManager {
         true
     }
 
-    /// Release one previously acquired slot (saturates at zero: double
-    /// releases from racing teardowns can never underflow).
+    /// Release one previously acquired default-tenant slot (saturates at
+    /// zero: double releases from racing teardowns can never underflow).
     pub fn release_connection_slot(&self, username: &str) {
-        if let Some(count) = self.conn_counts.read().get(username) {
-            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        self.release_connection_slot_in_tenant(tenant::DEFAULT_TENANT_ID, username);
+    }
+
+    /// Release one previously acquired slot in `tenant` (MT-03): only the
+    /// owning tenant's budget is touched, so a teardown for one tenant's
+    /// connection never frees another tenant's slot. Saturates at zero.
+    /// Empty inner entries are pruned so the outer map holds one entry
+    /// per tenant with a live count at most.
+    pub fn release_connection_slot_in_tenant(&self, tenant: &str, username: &str) {
+        let mut counts = self.conn_counts.write();
+        let Some(inner) = counts.get(tenant) else {
+            return;
+        };
+        let Some(count) = inner.get(username) else {
+            return;
+        };
+        let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if inner.values().all(|c| c.load(Ordering::SeqCst) == 0) {
+            counts.remove(tenant);
         }
     }
 
     /// Token-bucket gate for one publish by `client_id`. Buckets are
     /// created lazily with the currently configured `(rate, burst)` and
     /// reset when the configuration changes, so quota edits apply to the
-    /// very next publish.
+    /// very next publish. Default-tenant budget.
     pub fn check_publish_budget(&self, client_id: &str, rate: u32, burst: u32) -> bool {
+        self.check_publish_budget_in_tenant(tenant::DEFAULT_TENANT_ID, client_id, rate, burst)
+    }
+
+    /// Token-bucket gate for one publish by one `(tenant, client id)`
+    /// pair (MT-03). One tenant's publishes never consume another
+    /// tenant's budget, even for identical client ids. Hit path resolves
+    /// via borrowed `&str` with no allocation, so a quota-gated publish
+    /// pays no new allocation; only the cold miss (first publish per
+    /// session/config) inserts owned keys on the write path.
+    pub fn check_publish_budget_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        rate: u32,
+        burst: u32,
+    ) -> bool {
         let mut buckets = self.buckets.write();
+        if let Some(outer) = buckets.get_mut(tenant) {
+            if let Some(bucket) = outer.get_mut(client_id) {
+                if bucket.rate_per_sec != rate || bucket.burst != burst {
+                    *bucket = TokenBucket::new(rate, burst);
+                }
+                return bucket.try_consume();
+            }
+        }
         let bucket = buckets
+            .entry(tenant.to_string())
+            .or_default()
             .entry(client_id.to_string())
             .or_insert_with(|| TokenBucket::new(rate, burst));
         if bucket.rate_per_sec != rate || bucket.burst != burst {
@@ -2181,6 +3181,7 @@ mod tests {
         assert!(session.take_last_will().is_none());
 
         session.set_last_will(Some(StoredWill {
+            tenant: crate::tenant::DEFAULT_TENANT_ID.to_string(),
             topic: Topic::new("will/test").unwrap(),
             qos: broker_protocol::QoS::AtLeastOnce,
             retain: true,
@@ -2194,6 +3195,7 @@ mod tests {
 
         // Reconnect without a will clears the previous one.
         session.set_last_will(Some(StoredWill {
+            tenant: crate::tenant::DEFAULT_TENANT_ID.to_string(),
             topic: Topic::new("will/test").unwrap(),
             qos: broker_protocol::QoS::AtMostOnce,
             retain: false,
@@ -2867,12 +3869,56 @@ mod tests {
         assert!(!*session.connected.read());
         // Slot freed by the detach: a fresh bind is admitted again.
         assert!(manager.acquire_connection_slot("capped", Some(100)));
-
         // A racing teardown for a superseded conn_id releases nothing:
         // admission still succeeds exactly as before.
         manager.unbind_connection("bound-client", 999);
         assert!(manager.acquire_connection_slot("capped", Some(100)));
         assert!(!manager.acquire_connection_slot("capped", Some(100)));
+    }
+
+    #[test]
+    fn test_connection_slots_are_per_tenant() {
+        // MT-03: the same username in two tenants holds two independent
+        // connection budgets, so a cap reached in one tenant never denies
+        // the other, and a teardown in one never frees the other's slot.
+        let manager = SessionManager::new();
+
+        // Fill tenant A's budget exactly: the next admission there fails.
+        for _ in 0..2 {
+            assert!(manager.acquire_connection_slot_in_tenant("tenant-a", "sam", Some(2)));
+        }
+        assert!(!manager.acquire_connection_slot_in_tenant("tenant-a", "sam", Some(2)));
+
+        // Tenant B's budget for the same username is untouched.
+        assert!(manager.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(2)));
+        assert!(manager.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(2)));
+        assert!(!manager.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(2)));
+
+        // Releasing in A re-opens exactly one slot there; B stays full.
+        manager.release_connection_slot_in_tenant("tenant-a", "sam");
+        assert!(manager.acquire_connection_slot_in_tenant("tenant-a", "sam", Some(2)));
+        assert!(!manager.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(2)));
+
+        // Unbind releases the owning tenant's slot only. Fresh budgets:
+        // one slot per tenant for the same user, each fully held.
+        let quotas = SessionManager::new();
+        assert!(quotas.acquire_connection_slot_in_tenant("tenant-a", "sam", Some(1)));
+        assert!(quotas.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(1)));
+        let (a, _) = quotas.get_or_create_in_tenant("tenant-a", "c-a", true);
+        quotas.bind_session(&a, 311);
+        *a.username.write() = Some("sam".to_string());
+        let (b, _) = quotas.get_or_create_in_tenant("tenant-b", "c-b", true);
+        quotas.bind_session(&b, 312);
+        *b.username.write() = Some("sam".to_string());
+        // Detach A's connection: only A's budget re-opens.
+        quotas.unbind_connection_in_tenant("tenant-a", "c-a", 311);
+        assert!(quotas.acquire_connection_slot_in_tenant("tenant-a", "sam", Some(1)));
+        assert!(!quotas.acquire_connection_slot_in_tenant("tenant-b", "sam", Some(1)));
+
+        // Releases saturate at zero and unknown pairs are no-ops.
+        quotas.release_connection_slot_in_tenant("tenant-a", "sam");
+        quotas.release_connection_slot_in_tenant("tenant-a", "sam");
+        quotas.release_connection_slot_in_tenant("ghost-tenant", "ghost");
     }
 
     #[test]
@@ -3110,5 +4156,274 @@ mod tests {
         assert!(a.resolve_inbound_alias(1).is_none());
         assert_eq!(a.inbound_alias_len(), 0);
         assert_eq!(b.resolve_inbound_alias(1).unwrap().as_str(), "b/one");
+    }
+
+    #[test]
+    fn test_same_client_id_in_two_tenants_is_two_sessions() {
+        // MT-03: one client id in two tenants resolves to two
+        // independent sessions with independent state.
+        let manager = SessionManager::new();
+        let (a, present_a) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        assert!(!present_a);
+        let (b, present_b) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        assert!(!present_b);
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.tenant_id.read().as_str(), "tenant-a");
+        assert_eq!(b.tenant_id.read().as_str(), "tenant-b");
+
+        // Durable resume returns the same-tenant Arc, never the other's.
+        let (a2, present) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        assert!(present);
+        assert_eq!(a.id, a2.id);
+        let (b2, present) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        assert!(present);
+        assert_eq!(b.id, b2.id);
+
+        // The default-tenant shim still resolves its own session only.
+        let (d, _) = manager.get_or_create("dup", false);
+        assert_ne!(d.id, a.id);
+        assert_ne!(d.id, b.id);
+    }
+
+    #[test]
+    fn test_takeover_in_one_tenant_leaves_other_untouched() {
+        // MT-03: a clean-start takeover in tenant A replaces only A's
+        // session and prunes only A's connection; B stays connected.
+        let manager = SessionManager::new();
+        let (a, _) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        manager.bind_session(&a, 701);
+        let (b, _) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        manager.bind_session(&b, 702);
+        assert_eq!(
+            manager.key_for_conn(701).expect("a bound").tenant,
+            "tenant-a"
+        );
+        assert_eq!(
+            manager.key_for_conn(702).expect("b bound").tenant,
+            "tenant-b"
+        );
+
+        // Takeover in A: new object, rebound, B's binding intact.
+        let (a_fresh, present) = manager.get_or_create_in_tenant("tenant-a", "dup", true);
+        assert!(!present);
+        assert_ne!(a_fresh.id, a.id);
+        assert_eq!(manager.key_for_conn(701), None);
+        assert_eq!(
+            manager.session_for_conn(702).expect("b still bound").id,
+            b.id
+        );
+        manager.bind_session(&a_fresh, 703);
+        assert_eq!(
+            manager.session_for_conn(703).expect("a rebound").id,
+            a_fresh.id
+        );
+        // B's session object survived the takeover in A.
+        let (b2, present) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        assert!(present);
+        assert_eq!(b2.id, b.id);
+    }
+
+    #[test]
+    fn test_durable_resume_and_offline_queue_are_per_tenant() {
+        // MT-03: durable disconnect/reconnect resumes within the same
+        // tenant only, and one tenant's offline queue never returns the
+        // other's messages.
+        use super::QueuedMessage;
+
+        fn queued(payload: u8) -> QueuedMessage {
+            QueuedMessage {
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![payload]),
+                publish_at_ms: None,
+            }
+        }
+
+        let manager = SessionManager::new();
+        let (a, _) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        manager.bind_session(&a, 801);
+        let (b, _) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        manager.bind_session(&b, 802);
+
+        // Detach A only: A disconnects, B stays live.
+        manager.unbind_connection_in_tenant("tenant-a", "dup", 801);
+        assert!(!*a.connected.read());
+        assert!(*b.connected.read());
+        // A's old conn resolves to nothing; B's still resolves to B.
+        assert_eq!(manager.key_for_conn(801), None);
+        assert_eq!(manager.session_for_conn(802).expect("b live").id, b.id);
+
+        // Queue one message per tenant while A is detached.
+        assert!(manager.queue_offline_in_tenant("tenant-a", "dup", queued(0xA1)));
+        assert!(manager.queue_offline_in_tenant("tenant-b", "dup", queued(0xB1)));
+
+        // A's drain returns only A's message.
+        let drained_a = a.drain_offline();
+        assert_eq!(drained_a.len(), 1);
+        assert_eq!(drained_a[0].payload, Bytes::from(vec![0xA1u8]));
+        // B's queue is untouched by A's drain.
+        let drained_b = b.drain_offline();
+        assert_eq!(drained_b.len(), 1);
+        assert_eq!(drained_b[0].payload, Bytes::from(vec![0xB1u8]));
+
+        // Reconnect in A resumes A's durable session object.
+        let (a2, present) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        assert!(present);
+        assert_eq!(a2.id, a.id);
+
+        // Cross-tenant unbind is a no-op: B's connection survives a
+        // teardown addressed at A's key with B's conn id.
+        let swept = manager.unbind_connection_in_tenant("tenant-a", "dup", 802);
+        assert!(swept.is_empty());
+        assert!(*b.connected.read());
+        assert_eq!(
+            manager.session_for_conn(802).expect("b still live").id,
+            b.id
+        );
+
+        // Publish budgets are per tenant too.
+        assert!(manager.check_publish_budget_in_tenant("tenant-a", "dup", 1000, 1));
+        assert!(!manager.check_publish_budget_in_tenant("tenant-a", "dup", 1000, 1));
+        assert!(manager.check_publish_budget_in_tenant("tenant-b", "dup", 1000, 1));
+    }
+
+    #[test]
+    fn test_durable_offline_queue_is_per_tenant() {
+        // MT-03: the same client id in two tenants holds two independent
+        // durable queues — separate memory queues AND separate files — so
+        // a clean start in one tenant never destroys the other's backlog.
+        fn queued(payload: u8) -> QueuedMessage {
+            QueuedMessage {
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![payload]),
+                publish_at_ms: None,
+            }
+        }
+
+        let dir = unique_offline_dir("tenant-queues");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        let manager = SessionManager::new();
+        manager.set_offline_store(store.clone());
+
+        let (a, _) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        let (b, _) = manager.get_or_create_in_tenant("tenant-b", "dup", false);
+        *a.connected.write() = false;
+        *b.connected.write() = false;
+
+        assert!(manager.queue_offline_in_tenant("tenant-a", "dup", queued(0xA1)));
+        assert!(manager.queue_offline_in_tenant("tenant-b", "dup", queued(0xB1)));
+        assert_eq!(a.offline_len(), 1);
+        assert_eq!(b.offline_len(), 1);
+
+        // A's clean start discards only A's queue (memory and file): B's
+        // backlog survives both.
+        manager.get_or_create_in_tenant("tenant-a", "dup", true);
+        let (a_fresh, _) = manager.get_or_create_in_tenant("tenant-a", "dup", false);
+        assert_eq!(a_fresh.offline_len(), 0);
+        assert_eq!(b.offline_len(), 1);
+        let (disk_b, torn) = store.load_in_tenant("tenant-b", "dup");
+        assert_eq!(torn, 0);
+        assert_eq!(disk_b.len(), 1);
+        assert_eq!(disk_b[0].payload, Bytes::from(vec![0xB1u8]));
+        let (disk_a, _) = store.load_in_tenant("tenant-a", "dup");
+        assert!(disk_a.is_empty());
+
+        // A fresh manager on the same directory rebuilds each tenant's
+        // queue into its own session: no cross-tenant replay.
+        let fresh = SessionManager::new();
+        fresh.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&dir).expect("reopen offline store"),
+        ));
+        let stats = fresh.restore_offline_queues();
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.clients, 1);
+        assert!(fresh.get_in_tenant("tenant-a", "dup").is_none());
+        let restored_b = fresh.get_in_tenant("tenant-b", "dup").expect("b restored");
+        assert!(!restored_b.clean_start);
+        assert!(!*restored_b.connected.read());
+        let drained = restored_b.drain_offline();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload, Bytes::from(vec![0xB1u8]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_ended_tenant_entries_go_away() {
+        // MT-03 bound: sessions that end stateless linger only past
+        // ENDED_SESSION_TTL_SECS, then the prune where sessions end reaps
+        // them and the tenant's outer entry goes away with its last
+        // session. Sessions that still own replayable state stay for
+        // reconnect replay no matter their age.
+        let manager = SessionManager::new();
+        let past = now_ms().saturating_sub(ENDED_SESSION_TTL_SECS.saturating_mul(1_000) + 60_000);
+
+        // Tenant A ends two clean sessions; tenant B stays live.
+        let (a1, _) = manager.get_or_create_in_tenant("gone-a", "c1", true);
+        manager.bind_session(&a1, 901);
+        let (a2, _) = manager.get_or_create_in_tenant("gone-a", "c2", true);
+        manager.bind_session(&a2, 902);
+        let (b, _) = manager.get_or_create_in_tenant("stays-b", "c1", true);
+        manager.bind_session(&b, 903);
+        manager.unbind_connection_in_tenant("gone-a", "c1", 901);
+        manager.unbind_connection_in_tenant("gone-a", "c2", 902);
+
+        // Fresh husks stay visible (recently-ended sessions serve
+        // management reads and fast reconnects).
+        assert!(manager.get_in_tenant("gone-a", "c1").is_some());
+        assert!(manager.get_in_tenant("gone-a", "c2").is_some());
+
+        // Age both husks past the TTL, then run the prune where sessions
+        // end: both go away and the tenant's outer entry with them.
+        *a1.ended_at_ms.write() = Some(past);
+        *a2.ended_at_ms.write() = Some(past);
+        manager.prune_ended_in_tenant("gone-a");
+        assert!(manager.get_in_tenant("gone-a", "c1").is_none());
+        assert!(manager.get_in_tenant("gone-a", "c2").is_none());
+        assert!(!manager.sessions.read().contains_key("gone-a"));
+
+        // Tenant B is untouched by A's prune.
+        assert_eq!(manager.session_for_conn(903).expect("b live").id, b.id);
+
+        // A detached durable session that still owns queued state is
+        // never reaped by age: it stays for reconnect replay.
+        let (d, _) = manager.get_or_create_in_tenant("gone-a", "keep", false);
+        manager.bind_session(&d, 904);
+        manager.unbind_connection_in_tenant("gone-a", "keep", 904);
+        assert!(manager.queue_offline_in_tenant(
+            "gone-a",
+            "keep",
+            QueuedMessage {
+                topic: Topic::new("t").unwrap(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: Bytes::from(vec![0xD0u8]),
+                publish_at_ms: None,
+            }
+        ));
+        *d.ended_at_ms.write() = Some(past);
+        manager.prune_ended_in_tenant("gone-a");
+        assert_eq!(
+            manager.get_in_tenant("gone-a", "keep").expect("kept").id,
+            d.id
+        );
+    }
+
+    #[test]
+    fn test_tenant_outer_cap_evicts_ended_tenants() {
+        // MT-03 bound: the outer map stays at MAX_TENANTS entries; past
+        // the cap a new tenant evicts a fully-ended one (no live sessions
+        // and no replayable state inside), never a live tenant.
+        let manager = SessionManager::new();
+        for i in 0..(MAX_TENANTS + 16) {
+            let tenant = format!("cap-t-{i:05}");
+            let (session, _) = manager.get_or_create_in_tenant(&tenant, "c", true);
+            manager.bind_session(&session, 200_000 + i as u64);
+            manager.unbind_connection_in_tenant(&tenant, "c", 200_000 + i as u64);
+        }
+        assert!(manager.sessions.read().len() <= MAX_TENANTS);
     }
 }

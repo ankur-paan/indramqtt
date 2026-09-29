@@ -7,7 +7,9 @@ members = [
     "crates/broker-storage",
     "crates/broker-auth",
     "crates/broker-rules",
+    "crates/broker-rules-enterprise",
     "crates/broker-connectors",
+    "crates/broker-connectors-enterprise",
     "crates/broker-cluster",
     "crates/broker-api",
     "crates/broker-observability",
@@ -69,7 +71,9 @@ broker-session = { path = "crates/broker-session" }
 broker-storage = { path = "crates/broker-storage" }
 broker-auth = { path = "crates/broker-auth" }
 broker-rules = { path = "crates/broker-rules" }
+broker-rules-enterprise = { path = "crates/broker-rules-enterprise" }
 broker-connectors = { path = "crates/broker-connectors" }
+broker-connectors-enterprise = { path = "crates/broker-connectors-enterprise" }
 broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
 broker-observability = { path = "crates/broker-observability" }

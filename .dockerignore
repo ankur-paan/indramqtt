@@ -1,0 +1,34 @@
+# Keep the build context to what the image builds: the Rust workspace
+# (Cargo manifests, the Protobuf contract, all crates), the Erlang edge
+# sources, and the image files themselves. Everything else only costs
+# upload time and risks stale bytes in the build cache.
+#
+# Never ignore: Dockerfile, beam/src, proto, crates, Cargo.toml, Cargo.lock.
+
+# Rust build artefacts (never build inside the tree; the builder stage
+# compiles inside the container only).
+/target/
+
+# Version control and CI.
+/.git/
+.github/
+
+# Compiled edge artefacts (the image compiles the edge from beam/src).
+beam/_build/
+beam/ebin/
+
+# Frontend workspace (not part of the image).
+dashboard/node_modules/
+
+# Private reference material (must never reach any image layer).
+reference/
+
+# Local developer and measurement leftovers.
+*.log
+erl_crash.dump
+.env
+scratch/
+benchmark_suite/benchmark_results_*.json
+
+# Deployment examples ship config text, not build inputs.
+deploy/

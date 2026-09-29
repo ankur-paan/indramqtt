@@ -1,0 +1,2616 @@
+//! Confluent Cloud managed Kafka sink (INDRA-152).
+//!
+//! MQTT events become Kafka records on Confluent Cloud: the destination
+//! topic renders from `topic_template` (`${topic}`,
+//! `${topic_segment_N}`), the partition key derives from
+//! `partition_key_template` (`${client_id}`, `${payload.<path>}`) with
+//! murmur2 partitioning, and values optionally carry the Confluent
+//! Schema Registry wire header (magic `0x00` + big-endian schema id).
+//!
+//! Authentication covers SASL/PLAIN (handshake + authenticate over TCP)
+//! and SASL/SCRAM-SHA-256/512 (full clean-room client conversation:
+//! client-first, proof via PBKDF2, mutual server-signature check).
+//! RecordBatch-v2 encoding, Produce framing and the ApiVersions probe
+//! reuse the shared Kafka framing in [`broker_connectors::kafka`]; error codes
+//! classify per the task contract (58 terminal, 7/19 retryable).
+//!
+//! The production write path runs on the maintained `rdkafka` driver
+//! ([`RdkafkaConfluentTransport`] below): Kafka wire plus SASL/PLAIN
+//! and SASL/SCRAM, delivered through `FutureProducer` futures. The
+//! security protocol is configurable ([`ConfluentSecurityProtocol`]):
+//! `SASL_SSL` (the default) for hosted endpoints, `SASL_PLAINTEXT`
+//! only for local qualification where the broker has no certificate.
+//! Schema Registry attachment runs on the maintained
+//! `schema-registry-client` driver ([`RegistrySchemaClient`] below): schemas register under
+//! `{topic}-value` subjects and values carry the documented wire
+//! header (magic `0x00` + big-endian schema id, see
+//! [`frame_schema_registry`]). The legacy hand-written
+//! `TcpConfluentTransport` is retained for offline unit tests only;
+//! production wiring uses the driver transport.
+
+use async_trait::async_trait;
+use broker_protocol::{QoS, Topic};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as AsyncRwLock;
+
+use broker_connectors::kafka::{
+    decode_api_versions_response, encode_api_versions_request, encode_produce_request,
+    encode_request_header, parse_acks, read_response, send_frame, KafkaRecord,
+};
+use broker_connectors::{now_millis, BackoffState, ConnectorError, Result, Sink};
+
+/// SASL mechanism for Confluent Cloud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SaslMechanism {
+    /// `PLAIN` (`\0key\0secret`), the Confluent Cloud default.
+    #[default]
+    Plain,
+    /// `SCRAM-SHA-256`.
+    #[serde(rename = "scramsha256")]
+    ScramSha256,
+    /// `SCRAM-SHA-512`.
+    #[serde(rename = "scramsha512")]
+    ScramSha512,
+}
+
+impl SaslMechanism {
+    pub fn kafka_name(self) -> &'static str {
+        match self {
+            SaslMechanism::Plain => "PLAIN",
+            SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
+            SaslMechanism::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
+/// Kafka security protocol for the maintained driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ConfluentSecurityProtocol {
+    /// `SASL_SSL`: the hosted default (SASL over TLS). Reason: hosted
+    /// endpoints present TLS certificates, so the driver must encrypt
+    /// and authenticate the transport.
+    #[serde(rename = "SASL_SSL")]
+    #[default]
+    SaslSsl,
+    /// `SASL_PLAINTEXT`: SASL without TLS. Reason: the local
+    /// qualification broker has no certificate, so the driver cannot
+    /// negotiate TLS; used only where the network is already trusted
+    /// (loopback/test). Never the default.
+    #[serde(rename = "SASL_PLAINTEXT")]
+    SaslPlaintext,
+}
+
+impl ConfluentSecurityProtocol {
+    pub fn kafka_name(self) -> &'static str {
+        match self {
+            ConfluentSecurityProtocol::SaslSsl => "SASL_SSL",
+            ConfluentSecurityProtocol::SaslPlaintext => "SASL_PLAINTEXT",
+        }
+    }
+}
+
+/// Confluent Schema Registry attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfluentSchemaRegistryConfig {
+    /// Registry URL, e.g. `https://psrc-xxxx.us-east-1.aws.confluent.cloud`.
+    pub endpoint: String,
+    /// Registry API key (Basic auth).
+    pub api_key: String,
+    /// Registry API secret (Basic auth).
+    pub api_secret: String,
+    /// Registered schema id framed ahead of every value.
+    pub schema_id: u32,
+}
+
+fn default_batch_size() -> Option<usize> {
+    Some(500)
+}
+
+fn default_partitions() -> u32 {
+    12
+}
+
+/// Confluent Cloud Kafka sink configuration. Every depth is
+/// user-configurable with no clamped ceiling (`None` = unbounded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfluentKafkaConfig {
+    /// Confluent Cloud broker endpoints, e.g.
+    /// `["pkc-xxxx.us-east-1.aws.confluent.cloud:9092"]`.
+    pub bootstrap_servers: Vec<String>,
+    /// Confluent Cloud API key (SASL username).
+    pub api_key: String,
+    /// Confluent Cloud API secret (SASL password).
+    pub api_secret: String,
+    /// SASL mechanism (default PLAIN).
+    #[serde(default)]
+    pub auth_mechanism: SaslMechanism,
+    /// Kafka security protocol (default `SASL_SSL` for hosted
+    /// endpoints; `SASL_PLAINTEXT` only for local qualification
+    /// without certificates).
+    #[serde(default)]
+    pub security_protocol: ConfluentSecurityProtocol,
+    /// Destination topic template, e.g. `telemetry-${topic_segment_1}`.
+    pub topic_template: String,
+    /// Message key derivation template (default none = null keys).
+    #[serde(default)]
+    pub partition_key_template: Option<String>,
+    /// Optional Schema Registry framing.
+    #[serde(default)]
+    pub schema_registry: Option<ConfluentSchemaRegistryConfig>,
+    /// Partition count for murmur2 routing (default 12).
+    #[serde(default = "default_partitions")]
+    pub partitions: u32,
+    /// Flush trigger record count (default 500).
+    #[serde(default = "default_batch_size")]
+    pub batch_size: Option<usize>,
+    /// Buffer capacity (`None` = unbounded).
+    #[serde(default)]
+    pub buffer_capacity: Option<usize>,
+    /// Network request / connect timeout in ms (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl ConfluentKafkaConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.bootstrap_servers.is_empty()
+            || self.bootstrap_servers.iter().any(|s| s.trim().is_empty())
+        {
+            return Err(ConnectorError::Dispatch(
+                "confluent bootstrap_servers must not be empty".to_string(),
+            ));
+        }
+        if self.api_key.trim().is_empty() || self.api_secret.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "confluent api_key/api_secret must not be empty".to_string(),
+            ));
+        }
+        if self.topic_template.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "confluent topic_template must not be empty".to_string(),
+            ));
+        }
+        // Strict template check with dummy values (segments 1..=4).
+        // Reason: the dummy topic carries four levels so validation
+        // accepts `${topic_segment_1}` through `${topic_segment_4}`
+        // (e.g. qualification keys on `sensors/qual/{device}` via
+        // `${topic_segment_3}`); deeper real topics still resolve at
+        // send time, shallower ones fail there as dispatch errors.
+        resolve_topic(&self.topic_template, "dummy/seg2/seg3/seg4")?;
+        if let Some(template) = &self.partition_key_template {
+            resolve_key(
+                template,
+                "dummy/seg2/seg3/seg4",
+                "dummy-client",
+                &serde_json::json!({}),
+            )?;
+        }
+        if let Some(registry) = &self.schema_registry {
+            if !registry.endpoint.starts_with("http://")
+                && !registry.endpoint.starts_with("https://")
+            {
+                return Err(ConnectorError::Dispatch(format!(
+                    "confluent schema registry endpoint must be http(s): {:?}",
+                    registry.endpoint
+                )));
+            }
+            if registry.api_key.trim().is_empty() || registry.api_secret.is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "confluent schema registry api_key/api_secret must not be empty".to_string(),
+                ));
+            }
+        }
+        if self.partitions == 0 {
+            return Err(ConnectorError::Dispatch(
+                "confluent partitions must be >= 1".to_string(),
+            ));
+        }
+        if self.batch_size == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "confluent batch_size must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn effective_batch_size(&self) -> usize {
+        self.batch_size.unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn effective_buffer(&self) -> usize {
+        self.buffer_capacity.unwrap_or(usize::MAX)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Topic / key templates.
+// ---------------------------------------------------------------------------
+
+/// Template variables for one event: `${topic}`, `${topic_segment_N}`
+/// (1-based MQTT levels), `${client_id}` and `${payload.<dotted>}`.
+/// Unknown variables are dispatch errors (strict, like the shared
+/// renderer).
+fn template_vars(topic: &str, client_id: &str) -> Vec<(String, String)> {
+    let mut vars = vec![
+        ("topic".to_string(), topic.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+    ];
+    for (index, segment) in topic.split('/').enumerate() {
+        vars.push((format!("topic_segment_{}", index + 1), segment.to_string()));
+    }
+    vars
+}
+
+fn payload_leaf(payload: &serde_json::Value, path: &str) -> Option<String> {
+    let mut current = payload;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    match current {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Render a template with the event variables plus payload leaves.
+/// Implemented on top of manual scanning so `${payload.*}` leaves
+/// resolve without polluting the strict shared renderer.
+pub fn resolve_template(
+    template: &str,
+    topic: &str,
+    client_id: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let vars = template_vars(topic, client_id);
+    let mut out = String::with_capacity(template.len() + 16);
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "unclosed template variable in {template:?}"
+                )));
+            }
+            let name = &template[start..end];
+            if name.is_empty() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "empty template variable in {template:?}"
+                )));
+            }
+            let value = if let Some(leaf) = name.strip_prefix("payload.") {
+                payload_leaf(payload, leaf)
+            } else {
+                vars.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, v)| v.clone())
+            };
+            match value {
+                Some(value) => out.push_str(&value),
+                None => {
+                    return Err(ConnectorError::Dispatch(format!(
+                        "unknown template variable {name:?} in {template:?}"
+                    )))
+                }
+            }
+            i = end + 1;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Render the destination topic for one event.
+pub fn resolve_topic(template: &str, topic: &str) -> Result<String> {
+    let rendered = resolve_template(template, topic, "", &serde_json::Value::Null)?;
+    if rendered.trim().is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "confluent topic_template rendered empty".to_string(),
+        ));
+    }
+    Ok(rendered)
+}
+
+/// Derive the message key for one event (`None` = null key).
+pub fn resolve_key(
+    template: &str,
+    topic: &str,
+    client_id: &str,
+    payload: &serde_json::Value,
+) -> Result<Option<Vec<u8>>> {
+    let rendered = resolve_template(template, topic, client_id, payload)?;
+    if rendered.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(rendered.into_bytes()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema Registry wire format + auth.
+// ---------------------------------------------------------------------------
+
+/// Confluent Schema Registry wire framing: magic `0x00`, big-endian
+/// schema id, then the payload body.
+pub fn frame_schema_registry(schema_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(0x00);
+    out.extend_from_slice(&schema_id.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Split a framed value back into (schema_id, body).
+pub fn split_schema_registry(frame: &[u8]) -> Result<(u32, &[u8])> {
+    if frame.len() < 5 {
+        return Err(ConnectorError::Dispatch(
+            "confluent frame shorter than the 5-byte prefix".to_string(),
+        ));
+    }
+    if frame[0] != 0x00 {
+        return Err(ConnectorError::Dispatch(format!(
+            "confluent frame has bad magic byte {:#04x}",
+            frame[0]
+        )));
+    }
+    Ok((
+        u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]),
+        &frame[5..],
+    ))
+}
+
+/// `Authorization: Basic {Base64(api_key:api_secret)}` for the Schema
+/// Registry client.
+pub fn schema_registry_basic_auth(api_key: &str, api_secret: &str) -> String {
+    use base64::Engine;
+    let credentials = format!("{api_key}:{api_secret}");
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
+    )
+}
+
+/// SASL/PLAIN client payload: `\0{api_key}\0{api_secret}`.
+pub fn sasl_plain_payload(api_key: &str, api_secret: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(api_key.len() + api_secret.len() + 2);
+    out.push(0x00);
+    out.extend_from_slice(api_key.as_bytes());
+    out.push(0x00);
+    out.extend_from_slice(api_secret.as_bytes());
+    out
+}
+
+// ---------------------------------------------------------------------------
+// SCRAM-SHA-256 / SCRAM-SHA-512 client (RFC 5802, clean-room).
+// ---------------------------------------------------------------------------
+
+/// SCRAM hash function selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScramHash {
+    Sha256,
+    Sha512,
+}
+
+fn hmac_with(hash: ScramHash, key: &[u8], message: &[u8]) -> Vec<u8> {
+    match hash {
+        ScramHash::Sha256 => broker_connectors::hmac_sha256(key, message),
+        ScramHash::Sha512 => {
+            const BLOCK: usize = 128;
+            let mut key_block = [0u8; BLOCK];
+            if key.len() > BLOCK {
+                let digest = sha2::Sha512::digest(key);
+                key_block[..digest.len()].copy_from_slice(&digest);
+            } else {
+                key_block[..key.len()].copy_from_slice(key);
+            }
+            let mut ipad = [0x36u8; BLOCK];
+            let mut opad = [0x5cu8; BLOCK];
+            for i in 0..BLOCK {
+                ipad[i] ^= key_block[i];
+                opad[i] ^= key_block[i];
+            }
+            use sha2::Digest;
+            let mut inner = sha2::Sha512::new();
+            inner.update(ipad);
+            inner.update(message);
+            let inner_digest = inner.finalize();
+            let mut outer = sha2::Sha512::new();
+            outer.update(opad);
+            outer.update(inner_digest);
+            outer.finalize().to_vec()
+        }
+    }
+}
+
+fn hash_with(hash: ScramHash, data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    match hash {
+        ScramHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+        ScramHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+    }
+}
+
+/// PBKDF2 `Hi` (RFC 5802 §2.2): `U1 ^ U2 ^ ... ^ Ui`.
+pub fn scram_hi(hash: ScramHash, password: &[u8], salt: &[u8], iterations: u32) -> Result<Vec<u8>> {
+    if iterations == 0 {
+        return Err(ConnectorError::Dispatch(
+            "confluent scram iterations must be >= 1".to_string(),
+        ));
+    }
+    let mut block = Vec::with_capacity(salt.len() + 4);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_with(hash, password, &block);
+    let mut hi = u.clone();
+    for _ in 1..iterations {
+        u = hmac_with(hash, password, &u);
+        for (h, b) in hi.iter_mut().zip(u.iter()) {
+            *h ^= *b;
+        }
+    }
+    Ok(hi)
+}
+
+/// `n,,n={username},r={nonce}` (gs2 header `n,,` = no channel binding).
+pub fn scram_client_first_message(username: &str, nonce: &str) -> String {
+    format!("n,,n={username},r={nonce}")
+}
+
+/// Generate a printable SASL nonce (18 random bytes, base64).
+pub fn scram_nonce() -> String {
+    use base64::Engine;
+    use rand::Rng;
+    let mut bytes = [0u8; 18];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Parsed SCRAM server-first message (`r=...,s=...,i=...`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScramServerFirst {
+    pub nonce: String,
+    pub salt_b64: String,
+    pub iterations: u32,
+}
+
+pub fn parse_scram_server_first(message: &str) -> Result<ScramServerFirst> {
+    let mut nonce = None;
+    let mut salt_b64 = None;
+    let mut iterations = None;
+    for part in message.split(',') {
+        if let Some(value) = part.strip_prefix("r=") {
+            nonce = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("s=") {
+            salt_b64 = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("i=") {
+            iterations = Some(value.parse::<u32>().map_err(|_| {
+                ConnectorError::Dispatch(format!(
+                    "confluent scram server-first has a bad iteration count: {message:?}"
+                ))
+            })?);
+        }
+    }
+    match (nonce, salt_b64, iterations) {
+        (Some(nonce), Some(salt_b64), Some(iterations)) => Ok(ScramServerFirst {
+            nonce,
+            salt_b64,
+            iterations,
+        }),
+        _ => Err(ConnectorError::Dispatch(format!(
+            "confluent scram server-first is malformed: {message:?}"
+        ))),
+    }
+}
+
+/// Compute the base64 client proof for the full SCRAM `AuthMessage`
+/// (`client-first-bare,server-first,client-final-without-proof`).
+pub fn scram_client_proof(
+    hash: ScramHash,
+    password: &[u8],
+    salt_b64: &str,
+    iterations: u32,
+    auth_message: &[u8],
+) -> Result<String> {
+    use base64::Engine;
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(salt_b64)
+        .map_err(|e| {
+            ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}"))
+        })?;
+    let salted = scram_hi(hash, password, &salt, iterations)?;
+    let client_key = hmac_with(hash, &salted, b"Client Key");
+    let stored_key = hash_with(hash, &client_key);
+    let signature = hmac_with(hash, &stored_key, auth_message);
+    let proof: Vec<u8> = client_key
+        .iter()
+        .zip(signature.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    Ok(base64::engine::general_purpose::STANDARD.encode(proof))
+}
+
+/// Expected base64 server signature (`v=...`) for mutual
+/// authentication of the server-final message.
+pub fn scram_server_signature(
+    hash: ScramHash,
+    password: &[u8],
+    salt_b64: &str,
+    iterations: u32,
+    auth_message: &[u8],
+) -> Result<String> {
+    use base64::Engine;
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(salt_b64)
+        .map_err(|e| {
+            ConnectorError::Dispatch(format!("confluent scram salt is not base64: {e}"))
+        })?;
+    let salted = scram_hi(hash, password, &salt, iterations)?;
+    let server_key = hmac_with(hash, &salted, b"Server Key");
+    Ok(
+        base64::engine::general_purpose::STANDARD.encode(hmac_with(
+            hash,
+            &server_key,
+            auth_message,
+        )),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Produce error classification.
+// ---------------------------------------------------------------------------
+
+/// Classified Produce partition error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfluentOutcome {
+    Success,
+    Retryable,
+    Terminal,
+}
+
+/// `SASL_AUTHENTICATION_FAILED` (58) is terminal; `REQUEST_TIMED_OUT`
+/// (7) and `NOT_ENOUGH_REPLICAS` (19) are retryable with backoff;
+/// unknown codes retry conservatively (terminal is reserved for
+/// authentication: retries with backoff never corrupt data).
+pub fn classify_kafka_error(code: i16) -> ConfluentOutcome {
+    match code {
+        0 => ConfluentOutcome::Success,
+        58 => ConfluentOutcome::Terminal,
+        7 | 19 => ConfluentOutcome::Retryable,
+        _ => ConfluentOutcome::Retryable,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport.
+// ---------------------------------------------------------------------------
+
+/// One produced record: topic, partition, key, framed value, headers.
+#[derive(Debug, Clone)]
+pub struct ConfluentRecord {
+    pub topic: String,
+    pub partition: i32,
+    pub key: Option<Bytes>,
+    pub value: Bytes,
+    pub headers: Vec<(String, Bytes)>,
+}
+
+#[async_trait]
+pub trait ConfluentTransport: Send + Sync {
+    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()>;
+}
+
+/// In-memory transport recording every flushed batch (tests, dry runs).
+#[derive(Debug, Default)]
+pub struct MemoryConfluentTransport {
+    batches: parking_lot::Mutex<Vec<Vec<ConfluentRecord>>>,
+    failures_left: parking_lot::Mutex<usize>,
+    calls: AtomicU64,
+}
+
+impl MemoryConfluentTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail the next `n` publishes with a transport error (backoff tests).
+    pub fn fail_next(&self, n: usize) {
+        *self.failures_left.lock() = n;
+    }
+
+    pub fn batches(&self) -> Vec<Vec<ConfluentRecord>> {
+        self.batches.lock().clone()
+    }
+
+    pub fn records_flat(&self) -> Vec<ConfluentRecord> {
+        self.batches.lock().iter().flatten().cloned().collect()
+    }
+
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ConfluentTransport for MemoryConfluentTransport {
+    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut failures = self.failures_left.lock();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(ConnectorError::Connection(
+                "mock confluent down".to_string(),
+            ));
+        }
+        self.batches.lock().push(records.to_vec());
+        Ok(())
+    }
+}
+
+/// TCP transport: SASL handshake (PLAIN or full SCRAM conversation)
+/// after the ApiVersions probe, then Produce v3 with RecordBatch-v2.
+/// One in-flight exchange at a time; dropped connections redial once.
+pub struct TcpConfluentTransport {
+    endpoint: String,
+    client_id: String,
+    acks: i16,
+    mechanism: SaslMechanism,
+    username: String,
+    password: String,
+    timeout: Duration,
+    conn: AsyncMutex<Option<TcpConfluentConn>>,
+}
+
+struct TcpConfluentConn {
+    stream: TcpStream,
+    correlation: i32,
+}
+
+impl TcpConfluentTransport {
+    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            endpoint: config.bootstrap_servers[0].clone(),
+            client_id: format!("indra-confluent-{}", config.api_key),
+            acks: parse_acks("all")?,
+            mechanism: config.auth_mechanism,
+            username: config.api_key.clone(),
+            password: config.api_secret.clone(),
+            timeout: config.timeout(),
+            conn: AsyncMutex::new(None),
+        })
+    }
+
+    async fn roundtrip(&self, api_key: i16, api_version: i16, body: Vec<u8>) -> Result<Vec<u8>> {
+        let mut guard = self.conn.lock().await;
+        for attempt in 0..2 {
+            if guard.is_none() {
+                *guard = Some(self.dial().await?);
+            }
+            let conn = guard.as_mut().expect("connected");
+            let correlation = conn.correlation;
+            conn.correlation = conn.correlation.wrapping_add(1);
+            let mut frame =
+                encode_request_header(api_key, api_version, correlation, &self.client_id);
+            frame.extend_from_slice(&body);
+            let exchange = async {
+                send_frame(&mut conn.stream, frame).await?;
+                read_response(&mut conn.stream).await
+            };
+            match tokio::time::timeout(self.timeout, exchange).await {
+                Ok(Ok(mut response)) => {
+                    if response.len() < 4 {
+                        *guard = None;
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(ConnectorError::Connection(
+                            "truncated confluent response".to_string(),
+                        ));
+                    }
+                    let echoed =
+                        i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+                    if echoed != correlation {
+                        *guard = None;
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(ConnectorError::Connection(format!(
+                            "confluent correlation mismatch: {echoed} != {correlation}"
+                        )));
+                    }
+                    response.drain(..4);
+                    return Ok(response);
+                }
+                Ok(Err(_)) | Err(_) if attempt == 0 => {
+                    *guard = None;
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    *guard = None;
+                    return Err(e);
+                }
+                Err(_) => {
+                    *guard = None;
+                    return Err(ConnectorError::Connection(
+                        "confluent exchange timed out".to_string(),
+                    ));
+                }
+            }
+        }
+        Err(ConnectorError::Connection(
+            "confluent exchange failed".to_string(),
+        ))
+    }
+
+    async fn dial(&self) -> Result<TcpConfluentConn> {
+        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!("confluent connect timeout: {}", self.endpoint))
+            })?
+            .map_err(|e| {
+                ConnectorError::Connection(format!(
+                    "confluent connect to {} failed: {e}",
+                    self.endpoint
+                ))
+            })?;
+        let mut conn = TcpConfluentConn {
+            stream,
+            correlation: 1,
+        };
+        // Prove framing before authenticating.
+        let frame = encode_api_versions_request(0, &self.client_id);
+        send_frame(&mut conn.stream, frame).await?;
+        let response = read_response(&mut conn.stream).await?;
+        decode_api_versions_response(&response, 0)?;
+        self.sasl_authenticate(&mut conn).await?;
+        conn.correlation = 1;
+        Ok(conn)
+    }
+
+    async fn sasl_authenticate(&self, conn: &mut TcpConfluentConn) -> Result<()> {
+        // SaslHandshake v1: mechanism STRING.
+        let mut body = Vec::new();
+        encode_kafka_string(self.mechanism.kafka_name(), &mut body);
+        let correlation = conn.correlation;
+        conn.correlation = conn.correlation.wrapping_add(1);
+        let mut frame = encode_request_header(17, 1, correlation, &self.client_id);
+        frame.extend_from_slice(&body);
+        send_frame(&mut conn.stream, frame).await?;
+        let response = read_response(&mut conn.stream).await?;
+        let error = read_response_error(&response, correlation)?;
+        if error != 0 {
+            return Err(ConnectorError::Dispatch(format!(
+                "confluent sasl handshake for {} failed with error {error}",
+                self.mechanism.kafka_name()
+            )));
+        }
+        match self.mechanism {
+            SaslMechanism::Plain => self
+                .sasl_authenticate_bytes(conn, &sasl_plain_payload(&self.username, &self.password))
+                .await
+                .map(|_| ()),
+            SaslMechanism::ScramSha256 => self.scram_conversation(conn, ScramHash::Sha256).await,
+            SaslMechanism::ScramSha512 => self.scram_conversation(conn, ScramHash::Sha512).await,
+        }
+    }
+
+    /// One SaslAuthenticate v1 exchange; returns the server bytes.
+    async fn sasl_authenticate_bytes(
+        &self,
+        conn: &mut TcpConfluentConn,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        body.extend_from_slice(payload);
+        let correlation = conn.correlation;
+        conn.correlation = conn.correlation.wrapping_add(1);
+        let mut frame = encode_request_header(36, 1, correlation, &self.client_id);
+        frame.extend_from_slice(&body);
+        send_frame(&mut conn.stream, frame).await?;
+        let response = read_response(&mut conn.stream).await?;
+        let error = read_response_error(&response, correlation)?;
+        if error != 0 {
+            let code = if error == 58 {
+                "SASL_AUTHENTICATION_FAILED"
+            } else {
+                "sasl"
+            };
+            return Err(ConnectorError::Dispatch(format!(
+                "confluent sasl authenticate failed ({code}) with error {error}"
+            )));
+        }
+        // Response: error(2) + message(NULLABLE_STRING) + lifetime(8) +
+        // sasl_auth_bytes(BYTES). Skip to the trailing bytes.
+        let mut cursor = &response[4..];
+        let message_len = read_i16(&mut cursor)?;
+        if message_len > 0 {
+            if cursor.len() < message_len as usize {
+                return Err(ConnectorError::Connection(
+                    "truncated confluent sasl response".to_string(),
+                ));
+            }
+            cursor = &cursor[message_len as usize..];
+        }
+        if cursor.len() < 8 {
+            return Err(ConnectorError::Connection(
+                "truncated confluent sasl response".to_string(),
+            ));
+        }
+        cursor = &cursor[8..];
+        if cursor.len() < 4 {
+            return Err(ConnectorError::Connection(
+                "truncated confluent sasl response".to_string(),
+            ));
+        }
+        let bytes_len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+        if bytes_len < 0 || cursor.len() < 4 + bytes_len as usize {
+            return Err(ConnectorError::Connection(
+                "truncated confluent sasl response".to_string(),
+            ));
+        }
+        Ok(cursor[4..4 + bytes_len as usize].to_vec())
+    }
+
+    /// Full SCRAM client conversation: client-first, server-first
+    /// proof, mutual server-signature check.
+    async fn scram_conversation(&self, conn: &mut TcpConfluentConn, hash: ScramHash) -> Result<()> {
+        let nonce = scram_nonce();
+        let client_first_bare = format!("n={},r={}", self.username, nonce);
+        let client_first = format!("n,,{client_first_bare}");
+        let server_first = String::from_utf8(
+            self.sasl_authenticate_bytes(conn, client_first.as_bytes())
+                .await?,
+        )
+        .map_err(|_| {
+            ConnectorError::Connection("confluent scram server-first is not UTF-8".to_string())
+        })?;
+        let parsed = parse_scram_server_first(&server_first)?;
+        if !parsed.nonce.starts_with(&nonce) {
+            return Err(ConnectorError::Dispatch(
+                "confluent scram server nonce does not extend the client nonce".to_string(),
+            ));
+        }
+        let client_final_wo = format!("c=biws,r={}", parsed.nonce);
+        let auth_message = format!("{client_first_bare},{server_first},{client_final_wo}");
+        let proof = scram_client_proof(
+            hash,
+            self.password.as_bytes(),
+            &parsed.salt_b64,
+            parsed.iterations,
+            auth_message.as_bytes(),
+        )?;
+        let client_final = format!("{client_final_wo},p={proof}");
+        let server_final = String::from_utf8(
+            self.sasl_authenticate_bytes(conn, client_final.as_bytes())
+                .await?,
+        )
+        .map_err(|_| {
+            ConnectorError::Connection("confluent scram server-final is not UTF-8".to_string())
+        })?;
+        let signature = server_final.strip_prefix("v=").ok_or_else(|| {
+            ConnectorError::Dispatch(format!(
+                "confluent scram server-final is malformed: {server_final:?}"
+            ))
+        })?;
+        let expected = scram_server_signature(
+            hash,
+            self.password.as_bytes(),
+            &parsed.salt_b64,
+            parsed.iterations,
+            auth_message.as_bytes(),
+        )?;
+        if signature != expected {
+            return Err(ConnectorError::Dispatch(
+                "confluent scram server signature mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn produce_grouped(
+        &self,
+        grouped: &BTreeMap<(String, i32), Vec<KafkaRecord>>,
+    ) -> Result<()> {
+        if grouped.is_empty() {
+            return Ok(());
+        }
+        let framed = encode_produce_request(0, &self.client_id, self.acks, grouped);
+        // encode_produce_request frames header+body; the shared
+        // roundtrip re-adds its own header, so strip to the body.
+        let header_len = 2 + 2 + 4 + 2 + self.client_id.len();
+        let body = framed[header_len..].to_vec();
+        let response = self.roundtrip(0, 3, body).await?;
+        let mut cursor = response.as_slice();
+        let topics = read_i32(&mut cursor)?;
+        for _ in 0..topics {
+            let name_len = read_i16(&mut cursor)? as usize;
+            if cursor.len() < name_len {
+                return Err(ConnectorError::Connection(
+                    "truncated confluent produce response".to_string(),
+                ));
+            }
+            let name = String::from_utf8_lossy(&cursor[..name_len]).to_string();
+            cursor = &cursor[name_len..];
+            let partitions = read_i32(&mut cursor)?;
+            for _ in 0..partitions {
+                let index = read_i32(&mut cursor)?;
+                let error = read_i16(&mut cursor)?;
+                match classify_kafka_error(error) {
+                    ConfluentOutcome::Success => {}
+                    ConfluentOutcome::Retryable => {
+                        return Err(ConnectorError::Connection(format!(
+                            "confluent produce to {name}[{index}] failed retryably with error {error}"
+                        )))
+                    }
+                    ConfluentOutcome::Terminal => {
+                        return Err(ConnectorError::Dispatch(format!(
+                            "confluent produce to {name}[{index}] failed terminally with error {error}"
+                        )))
+                    }
+                }
+                if cursor.len() < 8 + 8 + 8 + 4 {
+                    return Err(ConnectorError::Connection(
+                        "truncated confluent produce response".to_string(),
+                    ));
+                }
+                cursor = &cursor[8 + 8 + 8 + 4..];
+            }
+        }
+        Ok(())
+    }
+}
+
+fn encode_kafka_string(s: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(s.len() as i16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn read_i16(cursor: &mut &[u8]) -> Result<i16> {
+    if cursor.len() < 2 {
+        return Err(ConnectorError::Connection(
+            "truncated confluent response".to_string(),
+        ));
+    }
+    let value = i16::from_be_bytes([cursor[0], cursor[1]]);
+    *cursor = &cursor[2..];
+    Ok(value)
+}
+
+fn read_i32(cursor: &mut &[u8]) -> Result<i32> {
+    if cursor.len() < 4 {
+        return Err(ConnectorError::Connection(
+            "truncated confluent response".to_string(),
+        ));
+    }
+    let value = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+    *cursor = &cursor[4..];
+    Ok(value)
+}
+
+/// Check the echoed correlation and return the error code that opens
+/// SaslHandshake / SaslAuthenticate v1 responses.
+fn read_response_error(response: &[u8], correlation: i32) -> Result<i16> {
+    if response.len() < 6 {
+        return Err(ConnectorError::Connection(
+            "truncated confluent sasl response".to_string(),
+        ));
+    }
+    let echoed = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+    if echoed != correlation {
+        return Err(ConnectorError::Connection(format!(
+            "confluent correlation mismatch: {echoed} != {correlation}"
+        )));
+    }
+    Ok(i16::from_be_bytes([response[4], response[5]]))
+}
+
+#[async_trait]
+impl ConfluentTransport for TcpConfluentTransport {
+    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
+        let mut grouped: BTreeMap<(String, i32), Vec<KafkaRecord>> = BTreeMap::new();
+        for record in records {
+            grouped
+                .entry((record.topic.clone(), record.partition))
+                .or_default()
+                .push(KafkaRecord {
+                    topic: record.topic.clone(),
+                    partition: record.partition,
+                    key: record.key.clone(),
+                    value: record.value.clone(),
+                    headers: record.headers.clone(),
+                    timestamp_ms: broker_connectors::now_millis(),
+                });
+        }
+        self.produce_grouped(&grouped).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Maintained-driver transport (production write path).
+// ---------------------------------------------------------------------------
+
+/// Build the maintained `rdkafka` client configuration for Confluent
+/// endpoints: the configured security protocol (`SASL_SSL` by default,
+/// `SASL_PLAINTEXT` for local qualification without certificates) with
+/// the configured SASL mechanism (PLAIN by default, SCRAM-SHA-256/512),
+/// the API key/secret as the SASL credentials,
+/// `request.required.acks=all` and the configured timeout
+/// as `message.timeout.ms`.
+///
+/// Building the config opens no socket and spawns no thread; the
+/// driver connects lazily on first publish (see
+/// [`RdkafkaConfluentTransport`]). Management-plane validation therefore
+/// stays offline-safe: creating the sink never touches the network.
+pub fn rdkafka_client_config(config: &ConfluentKafkaConfig) -> rdkafka::config::ClientConfig {
+    let mut client = rdkafka::config::ClientConfig::new();
+    client
+        .set("bootstrap.servers", config.bootstrap_servers.join(","))
+        .set("security.protocol", config.security_protocol.kafka_name())
+        .set(
+            "sasl.mechanisms",
+            match config.auth_mechanism {
+                SaslMechanism::Plain => "PLAIN",
+                SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
+                SaslMechanism::ScramSha512 => "SCRAM-SHA-512",
+            },
+        )
+        .set("sasl.username", config.api_key.clone())
+        .set("sasl.password", config.api_secret.clone())
+        .set("client.id", format!("indra-confluent-{}", config.api_key))
+        .set("request.required.acks", "all")
+        .set(
+            "message.timeout.ms",
+            config.timeout().as_millis().to_string(),
+        )
+        .set(
+            "socket.timeout.ms",
+            config.timeout().as_millis().to_string(),
+        );
+    client
+}
+
+/// Whether a driver failure message is terminal (`true`) or retryable
+/// (`false`). Authentication/authorisation failures and oversize
+/// records can never succeed on retry, so they are terminal; timeouts,
+/// transport loss, unknown topics and queue pressure retry with
+/// backoff through the sink.
+///
+/// TODO(parity): librdkafka reports a wider taxonomy than these
+/// substrings; which further codes must be terminal versus retryable
+/// for exactly-once billing on Confluent Cloud?
+pub fn is_terminal_driver_message(message: &str) -> bool {
+    let text = message.to_lowercase();
+    text.contains("sasl")
+        || text.contains("auth")
+        || text.contains("ssl")
+        || text.contains("message too large")
+        || text.contains("msg_size_too_large")
+}
+
+/// Classify a driver delivery failure into the sink's error contract:
+/// terminal failures become `Dispatch` (drop, never retry), everything
+/// else becomes `Connection` (restore the batch, back off, retry).
+pub fn classify_driver_error(error: &rdkafka::error::KafkaError) -> ConnectorError {
+    if is_terminal_driver_message(&format!("{error:?}")) {
+        ConnectorError::Dispatch(format!(
+            "confluent driver delivery failed terminally: {error}"
+        ))
+    } else {
+        ConnectorError::Connection(format!(
+            "confluent driver delivery failed retryably: {error}"
+        ))
+    }
+}
+
+/// Production transport on the maintained `rdkafka` driver.
+///
+/// The `FutureProducer` is created lazily on first publish and cached;
+/// creation validates the librdkafka keys without opening any socket,
+/// and the driver dials on first delivery. Records publish
+/// sequentially, one delivery future at a time, so the driver queue
+/// holds at most one flush in flight: no new unbounded buffer on the
+/// publish path, no lock held across I/O (the producer handle is
+/// cloned under a short read lock, then used lock-free).
+pub struct RdkafkaConfluentTransport {
+    config: ConfluentKafkaConfig,
+    producer: AsyncRwLock<Option<rdkafka::producer::FutureProducer>>,
+}
+
+impl RdkafkaConfluentTransport {
+    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            producer: AsyncRwLock::new(None),
+        })
+    }
+
+    pub fn config(&self) -> &ConfluentKafkaConfig {
+        &self.config
+    }
+
+    async fn producer(&self) -> Result<rdkafka::producer::FutureProducer> {
+        if let Some(producer) = self.producer.read().await.clone() {
+            return Ok(producer);
+        }
+        let mut guard = self.producer.write().await;
+        if let Some(producer) = guard.clone() {
+            return Ok(producer);
+        }
+        // PERF(parity): one driver producer per transport, created once
+        // and shared by every flush. A pooled producer set would be the
+        // fast version under very high partition fan-out; kept singular
+        // so a kernel restart never inherits half-open broker sessions.
+        // Hot-path numbers (per publish of R records): before (legacy
+        // TCP): R framed copies into one Produce body + 1 socket write;
+        // after (driver): R queue copies + R delivery futures, no new
+        // locks (the handle clones under a short read lock, then runs
+        // lock-free) and at most one flush in flight.
+        let producer: rdkafka::producer::FutureProducer = rdkafka_client_config(&self.config)
+            .create()
+            .map_err(|error: rdkafka::error::KafkaError| {
+                ConnectorError::Dispatch(format!("confluent driver config rejected: {error}"))
+            })?;
+        *guard = Some(producer.clone());
+        Ok(producer)
+    }
+
+    /// Drop the cached driver producer so the next publish redials with
+    /// the current configuration. Used by qualification to prove the
+    /// driver recovers after a credential rotation.
+    pub async fn reconnect(&self) -> Result<()> {
+        *self.producer.write().await = None;
+        self.producer().await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl ConfluentTransport for RdkafkaConfluentTransport {
+    async fn publish(&self, records: &[ConfluentRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let producer = self.producer().await?;
+        let timeout = self.config.timeout();
+        for record in records {
+            // `&[u8]` bindings: the driver converts `&[u8]` with no
+            // copy (`ToBytes for [u8]`), so framing stays zero-copy.
+            let payload: &[u8] = record.value.as_ref();
+            let mut headers = rdkafka::message::OwnedHeaders::new();
+            for (name, value) in &record.headers {
+                let content: &[u8] = value.as_ref();
+                headers = headers.insert(rdkafka::message::Header {
+                    key: name.as_str(),
+                    value: Some(content),
+                });
+            }
+            let mut wire: rdkafka::producer::FutureRecord<'_, [u8], [u8]> =
+                rdkafka::producer::FutureRecord::to(record.topic.as_str())
+                    .partition(record.partition)
+                    .payload(payload)
+                    .headers(headers);
+            if let Some(key) = record.key.as_ref() {
+                let key_bytes: &[u8] = key.as_ref();
+                wire = wire.key(key_bytes);
+            }
+            producer
+                .send(wire, rdkafka::util::Timeout::After(timeout))
+                .await
+                .map_err(|(error, _)| classify_driver_error(&error))?;
+        }
+        Ok(())
+    }
+}
+
+/// Default `{topic}-value` subject name (the documented
+/// TopicNameStrategy default) for a destination topic.
+pub fn registry_subject_for_topic(topic: &str) -> String {
+    format!("{topic}-value")
+}
+
+/// Schema Registry client on the maintained `schema-registry-client`
+/// driver: registers Avro/JSON schemas under `{topic}-value` subjects
+/// with Basic auth and resolves the schema ids the sink frames ahead
+/// of every value (see [`frame_schema_registry`]).
+///
+/// The client holds the driver's bounded caches only (capacity from
+/// the driver defaults); it keeps no per-message state, so nothing
+/// accumulates on the publish path. Registry I/O happens at
+/// registration/rotation time, never per record.
+pub struct RegistrySchemaClient {
+    client: schema_registry_client::rest::schema_registry_client::SchemaRegistryClient,
+}
+
+impl RegistrySchemaClient {
+    pub fn new(config: &ConfluentKafkaConfig) -> Result<Self> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let registry = config.schema_registry.as_ref().ok_or_else(|| {
+            ConnectorError::Dispatch("confluent schema registry is not configured".to_string())
+        })?;
+        let mut client_config =
+            schema_registry_client::rest::client_config::ClientConfig::new(vec![registry
+                .endpoint
+                .clone()]);
+        client_config.basic_auth =
+            Some((registry.api_key.clone(), Some(registry.api_secret.clone())));
+        Ok(Self {
+            client: schema_registry_client::rest::schema_registry_client::SchemaRegistryClient::new(
+                client_config,
+            ),
+        })
+    }
+
+    /// Register `schema_json` (schema type `AVRO` or `JSON`) under
+    /// `subject` and return the schema id to frame values with.
+    /// Re-registering identical content returns the same id.
+    pub async fn register(
+        &self,
+        subject: &str,
+        schema_type: &str,
+        schema_json: &str,
+    ) -> Result<u32> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let schema = schema_registry_client::rest::models::schema::Schema::new(
+            Some(schema_type.to_string()),
+            schema_json.to_string(),
+        );
+        let registered = self
+            .client
+            .register_schema(subject, &schema, false)
+            .await
+            .map_err(|error| {
+                ConnectorError::Connection(format!(
+                    "confluent schema registry register failed: {error:?}"
+                ))
+            })?;
+        registered
+            .id
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| {
+                ConnectorError::Connection(
+                    "confluent schema registry returned no schema id".to_string(),
+                )
+            })
+    }
+
+    /// Look up the id of an already-registered schema without creating
+    /// a new version.
+    pub async fn schema_id(
+        &self,
+        subject: &str,
+        schema_type: &str,
+        schema_json: &str,
+    ) -> Result<u32> {
+        use schema_registry_client::rest::schema_registry_client::Client as _;
+        let schema = schema_registry_client::rest::models::schema::Schema::new(
+            Some(schema_type.to_string()),
+            schema_json.to_string(),
+        );
+        let registered = self
+            .client
+            .get_by_schema(subject, &schema, false, false)
+            .await
+            .map_err(|error| {
+                ConnectorError::Connection(format!(
+                    "confluent schema registry lookup failed: {error:?}"
+                ))
+            })?;
+        registered
+            .id
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| {
+                ConnectorError::Connection(
+                    "confluent schema registry returned no schema id".to_string(),
+                )
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink.
+// ---------------------------------------------------------------------------
+
+struct ConfluentBuffer {
+    records: Vec<ConfluentRecord>,
+    bytes: usize,
+}
+
+/// Confluent Cloud sink: renders topics/keys, frames Schema Registry
+/// values, batches records and dispatches through the transport with
+/// restore-on-retryable-failure and backoff.
+pub struct ConfluentKafkaSink {
+    config: ConfluentKafkaConfig,
+    transport: Arc<dyn ConfluentTransport>,
+    buffer: parking_lot::Mutex<ConfluentBuffer>,
+    backoff: parking_lot::Mutex<BackoffState>,
+    sent_batches: AtomicU64,
+    sent_records: AtomicU64,
+}
+
+impl ConfluentKafkaSink {
+    pub fn new(
+        config: ConfluentKafkaConfig,
+        transport: Arc<dyn ConfluentTransport>,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            transport,
+            buffer: parking_lot::Mutex::new(ConfluentBuffer {
+                records: Vec::new(),
+                bytes: 0,
+            }),
+            backoff: parking_lot::Mutex::new(BackoffState::default()),
+            sent_batches: AtomicU64::new(0),
+            sent_records: AtomicU64::new(0),
+        })
+    }
+
+    pub fn config(&self) -> &ConfluentKafkaConfig {
+        &self.config
+    }
+
+    pub fn sent_batches(&self) -> u64 {
+        self.sent_batches.load(Ordering::Relaxed)
+    }
+
+    pub fn sent_records(&self) -> u64 {
+        self.sent_records.load(Ordering::Relaxed)
+    }
+
+    pub fn buffered_records(&self) -> usize {
+        self.buffer.lock().records.len()
+    }
+
+    fn build_record(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<ConfluentRecord> {
+        let parsed: serde_json::Value =
+            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+        let client_id = parsed
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let rendered_topic = resolve_topic(&self.config.topic_template, topic.as_str())?;
+        let key = match &self.config.partition_key_template {
+            Some(template) => {
+                resolve_key(template, topic.as_str(), client_id, &parsed)?.map(Bytes::from)
+            }
+            None => None,
+        };
+        let mut value = payload.clone();
+        if let Some(registry) = &self.config.schema_registry {
+            value = Bytes::from(frame_schema_registry(registry.schema_id, payload));
+        }
+        let partition =
+            broker_connectors::kafka::partition_for_key(key.as_deref(), self.config.partitions);
+        Ok(ConfluentRecord {
+            topic: rendered_topic,
+            partition,
+            key,
+            value,
+            headers: vec![
+                (
+                    "mqtt.topic".to_string(),
+                    Bytes::from(topic.as_str().to_string()),
+                ),
+                (
+                    "mqtt.qos".to_string(),
+                    Bytes::from(u8::from(qos).to_string()),
+                ),
+                (
+                    "mqtt.timestamp".to_string(),
+                    Bytes::from(now_millis().to_string()),
+                ),
+            ],
+        })
+    }
+
+    /// Flush buffered records (no-op when empty). Retryable failures
+    /// restore the batch at the front, engage backoff and propagate.
+    pub async fn flush(&self) -> Result<()> {
+        self.backoff.lock().check()?;
+        let batch = {
+            let mut buffer = self.buffer.lock();
+            buffer.bytes = 0;
+            std::mem::take(&mut buffer.records)
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let count = batch.len() as u64;
+        match self.transport.publish(&batch).await {
+            Ok(()) => {
+                self.backoff.lock().success();
+                self.sent_batches.fetch_add(1, Ordering::Relaxed);
+                self.sent_records.fetch_add(count, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(ConnectorError::Connection(message)) => {
+                // Restore the failed batch at the front, preserving
+                // order, and engage backoff.
+                let mut buffer = self.buffer.lock();
+                let mut restored = batch;
+                restored.append(&mut buffer.records);
+                buffer.records = restored;
+                buffer.bytes = buffer
+                    .records
+                    .iter()
+                    .map(|r| r.value.len() + r.key.as_ref().map(|k| k.len()).unwrap_or(0))
+                    .sum();
+                self.backoff.lock().failure();
+                Err(ConnectorError::Connection(message))
+            }
+            Err(e) => {
+                self.backoff.lock().failure();
+                Err(e)
+            }
+        }
+    }
+
+    /// Buffer one event. Returns true when the batch is full (caller
+    /// flushes).
+    fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<bool> {
+        if topic.as_str().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "confluent row requires a non-empty topic".to_string(),
+            ));
+        }
+        if self.buffer.lock().records.len() >= self.config.effective_buffer() {
+            return Err(ConnectorError::Connection(
+                "confluent buffer limit reached".to_string(),
+            ));
+        }
+        let record = self.build_record(topic, payload, qos)?;
+        let mut buffer = self.buffer.lock();
+        buffer.bytes += record.value.len() + record.key.as_ref().map(|k| k.len()).unwrap_or(0);
+        buffer.records.push(record);
+        Ok(buffer.records.len() >= self.config.effective_batch_size())
+    }
+}
+
+#[async_trait]
+impl Sink for ConfluentKafkaSink {
+    async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        if self.buffer_row(topic, payload, qos)? {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        "confluent"
+    }
+}
+
+/// Management connector handle pairing an id with a Confluent sink.
+pub struct ConfluentKafkaConnector {
+    id: String,
+    sink: Arc<ConfluentKafkaSink>,
+}
+
+impl ConfluentKafkaConnector {
+    pub fn new(id: impl Into<String>, sink: Arc<ConfluentKafkaSink>) -> Self {
+        Self {
+            id: id.into(),
+            sink,
+        }
+    }
+}
+
+impl broker_connectors::Connector for ConfluentKafkaConnector {
+    fn connector_id(&self) -> &str {
+        &self.id
+    }
+
+    fn kind(&self) -> &'static str {
+        self.sink.kind()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broker_connectors::Sink;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_config() -> ConfluentKafkaConfig {
+        ConfluentKafkaConfig {
+            bootstrap_servers: vec!["pkc-test.us-east-1.aws.confluent.cloud:9092".to_string()],
+            api_key: "confluent-key".to_string(),
+            api_secret: "confluent-secret".to_string(),
+            auth_mechanism: SaslMechanism::Plain,
+            security_protocol: ConfluentSecurityProtocol::SaslSsl,
+            topic_template: "telemetry-${topic_segment_1}".to_string(),
+            partition_key_template: Some("${client_id}".to_string()),
+            schema_registry: Some(ConfluentSchemaRegistryConfig {
+                endpoint: "https://psrc-test.us-east-1.aws.confluent.cloud".to_string(),
+                api_key: "registry-key".to_string(),
+                api_secret: "registry-secret".to_string(),
+                schema_id: 1001,
+            }),
+            partitions: 12,
+            batch_size: Some(500),
+            buffer_capacity: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut config = test_config();
+        assert!(config.validate().is_ok());
+
+        config.bootstrap_servers.clear();
+        assert!(config.validate().is_err());
+        config.bootstrap_servers = vec!["  ".to_string()];
+        assert!(config.validate().is_err());
+        config.bootstrap_servers = test_config().bootstrap_servers;
+
+        config.topic_template = "t-${nope}".to_string();
+        assert!(config.validate().is_err());
+        config.topic_template = "t-${topic".to_string();
+        assert!(config.validate().is_err());
+        config.topic_template = test_config().topic_template;
+
+        config.partitions = 0;
+        assert!(config.validate().is_err());
+        config.partitions = 12;
+
+        config.batch_size = Some(0);
+        assert!(config.validate().is_err());
+        config.batch_size = Some(10_000_000);
+
+        config.schema_registry.as_mut().unwrap().endpoint = "psrc-test".to_string();
+        assert!(config.validate().is_err());
+
+        // Zero clamped ceilings: huge depths are accepted.
+        assert!(test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_wire_format_prefix() {
+        let framed = frame_schema_registry(1001, b"hello");
+        assert_eq!(&framed[..5], &[0x00, 0x00, 0x00, 0x03, 0xE9]);
+        assert_eq!(&framed[5..], b"hello");
+        let (id, body) = split_schema_registry(&framed).unwrap();
+        assert_eq!(id, 1001);
+        assert_eq!(body, b"hello");
+        assert!(split_schema_registry(&[0x00, 0x01]).is_err());
+        assert!(split_schema_registry(&[0x01, 0x00, 0x00, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_sasl_plain_payload() {
+        assert_eq!(
+            sasl_plain_payload("confluent-key", "confluent-secret"),
+            b"\0confluent-key\0confluent-secret".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_scram_sha256_exchange_vector() {
+        // Full SCRAM exchange shape (client-first, server-first with
+        // salt/iterations, channel-binding `biws`): the proof and the
+        // mutual server signature below are the independent Python
+        // (hashlib.pbkdf2_hmac/hmac) values for password "pencil".
+        let client_first = scram_client_first_message("user", "fyko+d2lbbFgONRv9qkxdawU");
+        assert_eq!(client_first, "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawU");
+        let server_first = "r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
+        let parsed = parse_scram_server_first(server_first).unwrap();
+        assert_eq!(parsed.iterations, 4096);
+        let client_final_wo = "c=biws,r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j";
+        let auth_message =
+            format!("n=user,r=fyko+d2lbbFgONRv9qkxdawU,{server_first},{client_final_wo}");
+        let proof = scram_client_proof(
+            ScramHash::Sha256,
+            b"pencil",
+            "QSXCR+Q6sek8bf92",
+            4096,
+            auth_message.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(proof, "3uDt9BgJfPo0D/HJXhOiKkpNRc9C404y+qtd4VAsjqk=");
+        // Mutual auth: the server signature verifies.
+        let server_sig = scram_server_signature(
+            ScramHash::Sha256,
+            b"pencil",
+            "QSXCR+Q6sek8bf92",
+            4096,
+            auth_message.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(server_sig, "XUGiWvCdv6rmpBam6tzoioopDmHgyUkUaINh93MRI9c=");
+        assert!(parse_scram_server_first("r=only").is_err());
+        assert!(scram_hi(ScramHash::Sha256, b"p", &[0u8; 8], 0).is_err());
+    }
+
+    #[test]
+    fn test_scram_sha512_proof_vector() {
+        // Same exchange shape under SHA-512 (independent Python vector).
+        let auth_message = "n=user,r=fyko+d2lbbFgONRv9qkxdawU,\
+             r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j,\
+             s=QSXCR+Q6sek8bf92,i=4096,\
+             c=biws,r=fyko+d2lbbFgONRv9qkxdawU3rfcNHYJY1ZVvWVs7j";
+        let proof = scram_client_proof(
+            ScramHash::Sha512,
+            b"pencil",
+            "QSXCR+Q6sek8bf92",
+            4096,
+            auth_message.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            proof,
+            "D1Hi1GzCebi+OTXKG+c/MCn91FFkgfRNFSJ1XVu/k4D0Tj98eZKcrtAwRtKlwPWe5LUq2sqinfnb30AhwWSVoQ=="
+        );
+    }
+
+    #[test]
+    fn test_topic_and_key_templates() {
+        assert_eq!(
+            resolve_topic("telemetry-${topic_segment_1}", "sensors/kitchen").unwrap(),
+            "telemetry-sensors"
+        );
+        assert_eq!(resolve_topic("all-${topic}", "a/b/c").unwrap(), "all-a/b/c");
+        assert_eq!(
+            resolve_template(
+                "k-${topic_segment_3}",
+                "a/b/c",
+                "",
+                &serde_json::Value::Null
+            )
+            .unwrap(),
+            "k-c"
+        );
+        let payload = serde_json::json!({"client_id": "d7", "device": {"id": "x1"}});
+        assert_eq!(
+            resolve_template("${client_id}-${payload.device.id}", "t", "d7", &payload).unwrap(),
+            "d7-x1"
+        );
+        assert!(resolve_topic("t-${nope}", "a").is_err());
+        assert!(resolve_topic("t-${topic", "a").is_err());
+        assert!(resolve_topic("  ", "a").is_err());
+        assert_eq!(
+            resolve_key("${client_id}", "t", "d7", &payload).unwrap(),
+            Some(b"d7".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_schema_registry_basic_auth() {
+        use base64::Engine;
+        let header = schema_registry_basic_auth("registry-key", "registry-secret");
+        let encoded = header.strip_prefix("Basic ").unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            b"registry-key:registry-secret"
+        );
+    }
+
+    #[test]
+    fn test_error_code_classification() {
+        assert_eq!(classify_kafka_error(0), ConfluentOutcome::Success);
+        assert_eq!(classify_kafka_error(58), ConfluentOutcome::Terminal);
+        assert_eq!(classify_kafka_error(7), ConfluentOutcome::Retryable);
+        assert_eq!(classify_kafka_error(19), ConfluentOutcome::Retryable);
+    }
+
+    #[tokio::test]
+    async fn test_record_batch_framing_and_flow() {
+        use broker_connectors::kafka::{encode_record_batch_v2, partition_for_key};
+
+        let transport = Arc::new(MemoryConfluentTransport::new());
+        let mut config = test_config();
+        config.batch_size = Some(2);
+        let sink = ConfluentKafkaSink::new(config, transport.clone()).unwrap();
+
+        let topic = Topic::new("sensors/kitchen").unwrap();
+        let payload = Bytes::from_static(br#"{ "client_id": "d7", "v": 1 }"#);
+        sink.send(&topic, &payload, QoS::AtMostOnce).await.unwrap();
+        sink.send(&topic, &payload, QoS::AtMostOnce).await.unwrap();
+        assert_eq!(sink.sent_batches(), 1);
+        assert_eq!(sink.sent_records(), 2);
+
+        let records = transport.records_flat();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].topic, "telemetry-sensors");
+        assert_eq!(records[0].key, Some(Bytes::from_static(b"d7")));
+        assert_eq!(records[0].partition, partition_for_key(Some(b"d7"), 12));
+        // Registry framing wraps the raw payload.
+        let (id, body) = split_schema_registry(&records[0].value).unwrap();
+        assert_eq!(id, 1001);
+        assert_eq!(body, payload.as_ref());
+
+        // Shared RecordBatch-v2 framing carries the batch with CRC-32C.
+        let kafka_records: Vec<KafkaRecord> = records
+            .iter()
+            .map(|r| KafkaRecord {
+                topic: r.topic.clone(),
+                partition: r.partition,
+                key: r.key.clone(),
+                value: r.value.clone(),
+                headers: r.headers.clone(),
+                timestamp_ms: r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "mqtt.timestamp")
+                    .map(|(_, v)| String::from_utf8_lossy(v).parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0),
+            })
+            .collect();
+        let batch = encode_record_batch_v2(&kafka_records);
+        assert!(batch.len() > 8 + 4 + 4 + 1 + 4);
+        let batch_len = i32::from_be_bytes([batch[8], batch[9], batch[10], batch[11]]) as usize;
+        assert_eq!(8 + 4 + batch_len, batch.len());
+        assert_eq!(batch[8 + 4 + 4], 2u8, "magic must be 2");
+
+        // Retryable failures propagate as connection errors.
+        transport.fail_next(10);
+        sink.send(&topic, &payload, QoS::AtMostOnce).await.unwrap();
+        sink.flush().await.expect_err("mock down must fail");
+    }
+
+    /// Fake Confluent broker: ApiVersions + SASL/PLAIN handshake +
+    /// authenticate + Produce v3 over raw TCP, capturing the produce.
+    #[tokio::test]
+    async fn test_tcp_plain_produce_against_fake_broker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let captured_rx = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            // 1) ApiVersions v0 -> success.
+            let frame = read_tcp_frame(&mut stream).await;
+            assert_eq!(&frame[..6], &[0, 18, 0, 0, 0, 0]);
+            write_tcp_frame(&mut stream, &[0, 0, 0, 0, 0, 0, 0, 0]).await;
+            // 2) SaslHandshake v1 PLAIN -> success, no mechanisms listed.
+            let frame = read_tcp_frame(&mut stream).await;
+            assert_eq!(&frame[..4], &[0, 17, 0, 1]);
+            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
+            let mechanism = read_kafka_string(&frame[8 + 2 + client_len..]);
+            assert_eq!(mechanism, "PLAIN");
+            let mut response = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            response[0..4].copy_from_slice(&frame[4..8]);
+            write_tcp_frame(&mut stream, &response).await;
+            // 3) SaslAuthenticate v1 -> check the PLAIN payload, success.
+            let frame = read_tcp_frame(&mut stream).await;
+            assert_eq!(&frame[..4], &[0, 36, 0, 1]);
+            let client_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
+            let body = &frame[8 + 2 + client_len..];
+            let auth_len = i32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+            assert_eq!(&body[4..4 + auth_len], b"\0confluent-key\0confluent-secret");
+            let mut response = vec![0u8; 4 + 2 + 2 + 8 + 4];
+            response[0..4].copy_from_slice(&frame[4..8]);
+            write_tcp_frame(&mut stream, &response).await;
+            // 4) Produce v3 -> capture, canned success.
+            let frame = read_tcp_frame(&mut stream).await;
+            assert_eq!(&frame[..4], &[0, 0, 0, 3]);
+            captured_rx.lock().extend_from_slice(&frame);
+            let mut response = vec![0, 0, 0, 0];
+            response.extend_from_slice(&[0, 0, 0, 1]);
+            response.extend_from_slice(&[0, 4]);
+            response.extend_from_slice(b"test");
+            response.extend_from_slice(&[0, 0, 0, 1]);
+            response.extend_from_slice(&[0, 0, 0, 0]);
+            response.extend_from_slice(&[0, 0]);
+            response.extend_from_slice(&[0u8; 8 + 8 + 8]);
+            response.extend_from_slice(&[0, 0, 0, 0]);
+            response[0..4].copy_from_slice(&frame[4..8]);
+            write_tcp_frame(&mut stream, &response).await;
+        });
+
+        let mut config = test_config();
+        config.bootstrap_servers = vec![format!("127.0.0.1:{port}")];
+        config.batch_size = Some(1);
+        let sink = ConfluentKafkaSink::new(
+            config,
+            Arc::new(TcpConfluentTransport::new(&test_config_with_port(port)).unwrap()),
+        )
+        .expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{ "client_id": "d7" }"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .expect("produce over TCP");
+        assert_eq!(sink.sent_batches(), 1);
+
+        let mut finished = false;
+        for _ in 0..500 {
+            if server.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(finished, "fake broker never consumed the produce");
+        server.await.expect("fake broker task");
+        let wire = captured.lock().clone();
+        let topic_bytes = b"telemetry-sensors";
+        assert!(
+            wire.windows(topic_bytes.len()).any(|w| w == topic_bytes),
+            "topic on the wire"
+        );
+        assert!(wire.windows(2).any(|w| w == b"d7"), "key on the wire");
+        // Schema-registry magic + id ride inside the record value.
+        assert!(
+            wire.windows(5)
+                .any(|w| *w == [0x00, 0x00, 0x00, 0x03, 0xE9]),
+            "registry prefix on the wire"
+        );
+    }
+
+    fn test_config_with_port(port: u16) -> ConfluentKafkaConfig {
+        let mut config = test_config();
+        config.bootstrap_servers = vec![format!("127.0.0.1:{port}")];
+        config
+    }
+
+    async fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).await.expect("read frame");
+        frame
+    }
+
+    async fn write_tcp_frame(stream: &mut TcpStream, body: &[u8]) {
+        let mut prefixed = (body.len() as i32).to_be_bytes().to_vec();
+        prefixed.extend_from_slice(body);
+        stream.write_all(&prefixed).await.expect("write frame");
+    }
+
+    fn read_kafka_string(frame: &[u8]) -> String {
+        let len = i16::from_be_bytes([frame[0], frame[1]]) as usize;
+        String::from_utf8_lossy(&frame[2..2 + len]).to_string()
+    }
+
+    #[test]
+    fn test_driver_config_mapping() {
+        // The driver config must accept every SASL mechanism we
+        // advertise, on both security protocols we support: `create`
+        // validates the librdkafka keys without opening any socket,
+        // so this stays offline.
+        for mechanism in [
+            SaslMechanism::Plain,
+            SaslMechanism::ScramSha256,
+            SaslMechanism::ScramSha512,
+        ] {
+            for protocol in [
+                ConfluentSecurityProtocol::SaslSsl,
+                ConfluentSecurityProtocol::SaslPlaintext,
+            ] {
+                let mut config = test_config();
+                config.auth_mechanism = mechanism;
+                config.security_protocol = protocol;
+                let client = rdkafka_client_config(&config);
+                let producer: std::result::Result<
+                    rdkafka::producer::FutureProducer,
+                    rdkafka::error::KafkaError,
+                > = client.create();
+                assert!(
+                    producer.is_ok(),
+                    "driver must accept {mechanism:?}/{protocol:?} without I/O"
+                );
+            }
+        }
+        // The hosted default stays `SASL_SSL` so stored configuration
+        // keeps working; local qualification opts into `SASL_PLAINTEXT`
+        // explicitly (see the qualification test).
+        assert_eq!(
+            test_config().security_protocol,
+            ConfluentSecurityProtocol::SaslSsl
+        );
+    }
+
+    #[test]
+    fn test_driver_error_classification() {
+        // Terminal: authentication/authorisation and oversize records.
+        for message in [
+            "SASL authentication failed: bad credentials",
+            "SaslAuthFailedError: invalid username",
+            "ssl handshake failed: certificate verify",
+            "Message production error: MessageTooLarge (MSG_SIZE_TOO_LARGE)",
+            "msg_size_too_large: record exceeds the limit",
+        ] {
+            assert!(
+                is_terminal_driver_message(message),
+                "{message:?} must be terminal"
+            );
+        }
+        // Retryable: timeouts, transport loss, unknown topics, pressure.
+        for message in [
+            "Message timed out (MSG_TIMED_OUT)",
+            "Broker transport failure: connection reset",
+            "Unknown topic or partition",
+            "Queue full: would block",
+            "success",
+        ] {
+            assert!(
+                !is_terminal_driver_message(message),
+                "{message:?} must be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_subject_naming() {
+        assert_eq!(
+            registry_subject_for_topic("telemetry-sensors"),
+            "telemetry-sensors-value"
+        );
+    }
+
+    #[test]
+    fn test_registry_client_construction_offline() {
+        // Construction only stores endpoint + Basic auth: no I/O, so
+        // this stays offline. The failure case is fail-closed.
+        assert!(RegistrySchemaClient::new(&test_config()).is_ok());
+        let mut bare = test_config();
+        bare.schema_registry = None;
+        assert!(RegistrySchemaClient::new(&bare).is_err());
+    }
+
+    #[test]
+    fn test_avro_datum_framing_roundtrip() {
+        // Honest Avro binary (maintained `apache-avro` encoder) framed
+        // with a registry id must split back to the same id and the
+        // same bytes, with the device id embedded as length-prefixed
+        // UTF-8 per the Avro string encoding.
+        const SCHEMA: &str = r#"{"type":"record","name":"QualReading","namespace":"indra.qual","fields":[{"name":"client_id","type":"string"},{"name":"seq","type":"long"},{"name":"temp","type":"double"}]}"#;
+        let schema = apache_avro::Schema::parse_str(SCHEMA).expect("schema parses");
+        let value = apache_avro::types::Value::Record(vec![
+            (
+                "client_id".to_string(),
+                apache_avro::types::Value::String("dev-0007".to_string()),
+            ),
+            ("seq".to_string(), apache_avro::types::Value::Long(7)),
+            ("temp".to_string(), apache_avro::types::Value::Double(21.5)),
+        ]);
+        let datum = apache_avro::to_avro_datum(&schema, value).expect("avro encode");
+        assert!(
+            datum.windows(b"dev-0007".len()).any(|w| w == b"dev-0007"),
+            "avro string bytes embedded"
+        );
+        let framed = frame_schema_registry(1001, &datum);
+        let (id, body) = split_schema_registry(&framed).expect("framing splits");
+        assert_eq!(id, 1001);
+        assert_eq!(body, datum.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_driver_transport_validates_without_io() {
+        // `new` validates our config only; `reconnect` builds (and
+        // caches) the driver producer, which dials lazily, so neither
+        // touches the network.
+        let transport =
+            RdkafkaConfluentTransport::new(&test_config()).expect("valid driver transport");
+        transport
+            .reconnect()
+            .await
+            .expect("reconnect builds the producer offline");
+        let mut bad = test_config();
+        bad.bootstrap_servers.clear();
+        assert!(RdkafkaConfluentTransport::new(&bad).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_required(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must point at a real server for qualification; \
+                 failing closed instead of passing vacuously"
+            )
+        })
+    }
+
+    /// Qualification against a real Kafka + Schema Registry pair via the
+    /// maintained `rdkafka` + `schema-registry-client` drivers.
+    ///
+    /// Run with e.g.:
+    /// `CONFLUENT_BOOTSTRAP_SERVERS=127.0.0.1:9092 \
+    ///  CONFLUENT_SECURITY_PROTOCOL=SASL_PLAINTEXT \
+    ///  CONFLUENT_API_KEY=qual CONFLUENT_API_SECRET=qualpass1 \
+    ///  CONFLUENT_SCHEMA_REGISTRY_URL=http://127.0.0.1:8081 \
+    ///  CONFLUENT_SCHEMA_REGISTRY_KEY=qual \
+    ///  CONFLUENT_SCHEMA_REGISTRY_SECRET=qualpass1 \
+    ///  CONFLUENT_TOPIC=qual-b310 \
+    ///  cargo test -p broker-connectors-enterprise --lib confluent::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates two topics (`<base>-avro`, `<base>-json`, 6 partitions,
+    /// replication 1: the local broker is a single node), registers an
+    /// Avro and a JSON schema under their `-value` subjects, streams
+    /// 2000 keyed records through [`ConfluentKafkaSink`] on
+    /// [`RdkafkaConfluentTransport`] (SASL/PLAIN, via the shared
+    /// [`broker_connectors::ConnectorManager`] path the broker's `ForwardConnector`
+    /// action sends through, never `sink.send` directly), reads all 2000
+    /// back with a driver consumer asserting exact per-key counts and
+    /// schema-id framing, rotates to a wrong secret and asserts the
+    /// driver fails closed, then reconnects with the right secret and
+    /// asserts writes resume. Deletes both topics afterwards; registry
+    /// subjects are retained (the registry keeps no cheap hard-delete
+    /// in the qualification window) and named in the report.
+    ///
+    /// Local transport is `SASL_PLAINTEXT` because the local broker has
+    /// no certificate; `SASL_SSL` against the hosted cloud stays
+    /// unqualified. The registry runs without basic auth, so the
+    /// registry credentials are sent and not checked.
+    ///
+    /// TODO(parity): hosted `SASL_SSL` against the cloud, SCRAM
+    /// mechanisms, and authenticated-registry qualification stay open;
+    /// which further driver codes must be terminal versus retryable for
+    /// hosted billing is the open question on
+    /// [`is_terminal_driver_message`].
+    #[tokio::test]
+    #[ignore = "needs a real Kafka + Schema Registry pair (see CONFLUENT_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use rdkafka::consumer::Consumer as _;
+        use rdkafka::message::Message as _;
+        use std::collections::{HashMap, HashSet};
+
+        const AVRO_SCHEMA: &str = r#"{"type":"record","name":"QualReading","namespace":"indra.qual","fields":[{"name":"client_id","type":"string"},{"name":"seq","type":"long"},{"name":"temp","type":"double"}]}"#;
+        const JSON_SCHEMA: &str = r#"{"type":"object","properties":{"client_id":{"type":"string"},"seq":{"type":"integer"},"temp":{"type":"number"}},"required":["client_id","seq"]}"#;
+        // The qualification setup creates the base topic with 6
+        // partitions; the test's own topics match it. Reason: the
+        // murmur2 placement assertions below divide by this count.
+        const PARTITIONS: i32 = 6;
+
+        let bootstrap = qual_required("CONFLUENT_BOOTSTRAP_SERVERS");
+        let security_protocol = qual_required("CONFLUENT_SECURITY_PROTOCOL");
+        let api_key = qual_required("CONFLUENT_API_KEY");
+        let api_secret = qual_required("CONFLUENT_API_SECRET");
+        let registry_url = qual_required("CONFLUENT_SCHEMA_REGISTRY_URL");
+        let registry_key = qual_required("CONFLUENT_SCHEMA_REGISTRY_KEY");
+        let registry_secret = qual_required("CONFLUENT_SCHEMA_REGISTRY_SECRET");
+        let base = qual_required("CONFLUENT_TOPIC");
+        let security_protocol = match security_protocol.as_str() {
+            "SASL_SSL" => ConfluentSecurityProtocol::SaslSsl,
+            "SASL_PLAINTEXT" => ConfluentSecurityProtocol::SaslPlaintext,
+            other => panic!(
+                "CONFLUENT_SECURITY_PROTOCOL must be SASL_SSL or SASL_PLAINTEXT, got {other:?}; failing closed"
+            ),
+        };
+        let avro_topic = format!("{base}-avro");
+        let json_topic = format!("{base}-json");
+        // The measured endpoint, never a substitute version string: the
+        // driver exposes no broker-version RPC here.
+        eprintln!(
+            "qual server: bootstrap={bootstrap} security={} registry={registry_url} base={base}",
+            security_protocol.kafka_name()
+        );
+
+        // Best-effort server version line for the report: print it only
+        // when the server reports one, otherwise omit it entirely (never
+        // a constant standing in for a measurement).
+        match reqwest::Client::new()
+            .get(format!("{registry_url}/subjects"))
+            .basic_auth(&registry_key, Some(&registry_secret))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let headers = response.headers().clone();
+                let body: serde_json::Value =
+                    response.json().await.unwrap_or(serde_json::Value::Null);
+                if let Some(version) = body
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    eprintln!("qual registry version: {version}");
+                } else if let Some(version) = headers
+                    .get("x-registry-version")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    eprintln!("qual registry version: {version}");
+                }
+                // Otherwise the server reported no version: omit it.
+            }
+            Err(_) => {
+                // Unreachable registry is a connection failure, surfaced
+                // below at register time; no version line to print.
+            }
+        }
+
+        let admin_config = ConfluentKafkaConfig {
+            bootstrap_servers: vec![bootstrap],
+            api_key,
+            api_secret,
+            auth_mechanism: SaslMechanism::Plain,
+            security_protocol,
+            topic_template: base.clone(),
+            partition_key_template: Some("${client_id}".to_string()),
+            schema_registry: Some(ConfluentSchemaRegistryConfig {
+                endpoint: registry_url,
+                api_key: registry_key,
+                api_secret: registry_secret,
+                schema_id: 0,
+            }),
+            partitions: PARTITIONS.max(1) as u32,
+            batch_size: Some(100),
+            buffer_capacity: None,
+            timeout_ms: Some(30_000),
+        };
+        admin_config.validate().expect("qual config validates");
+
+        // Create both topics (idempotent: already-exists is fine).
+        // Replication 1: the qualification broker is a single node, so
+        // a higher factor can never be satisfied. Reason written here
+        // per the constants rule.
+        let admin: rdkafka::admin::AdminClient<rdkafka::client::DefaultClientContext> =
+            rdkafka_client_config(&admin_config)
+                .create()
+                .expect("qual admin client");
+        let new_avro = rdkafka::admin::NewTopic::new(
+            &avro_topic,
+            PARTITIONS,
+            rdkafka::admin::TopicReplication::Fixed(1),
+        );
+        let new_json = rdkafka::admin::NewTopic::new(
+            &json_topic,
+            PARTITIONS,
+            rdkafka::admin::TopicReplication::Fixed(1),
+        );
+        let created = admin
+            .create_topics(
+                [&new_avro, &new_json],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+            .expect("qual create topics rpc");
+        for result in created {
+            if let Err(error) = result {
+                let text = format!("{error:?}");
+                if !text.contains("AlreadyExists")
+                    && !text.contains("already exists")
+                    && !text.contains("ALREADY_EXISTS")
+                {
+                    panic!("qual create topic failed: {error:?}");
+                }
+            }
+        }
+
+        // Register both schemas; re-registration returns the same id.
+        let registry = RegistrySchemaClient::new(&admin_config).expect("qual registry client");
+        let avro_subject = registry_subject_for_topic(&avro_topic);
+        let json_subject = registry_subject_for_topic(&json_topic);
+        let avro_id = registry
+            .register(&avro_subject, "AVRO", AVRO_SCHEMA)
+            .await
+            .expect("qual register avro");
+        let json_id = registry
+            .register(&json_subject, "JSON", JSON_SCHEMA)
+            .await
+            .expect("qual register json");
+        assert!(avro_id > 0 && json_id > 0, "registry must return ids");
+        assert_eq!(
+            registry
+                .register(&avro_subject, "AVRO", AVRO_SCHEMA)
+                .await
+                .expect("qual re-register avro"),
+            avro_id,
+            "re-registration must be idempotent"
+        );
+        eprintln!(
+            "qual schemas: avro {avro_subject} id={avro_id}, json {json_subject} id={json_id}"
+        );
+
+        // One sink per encoding. Avro payloads are binary, so the key
+        // derives from the device MQTT subtopic; JSON payloads carry
+        // `client_id` for the key template.
+        let mut avro_config = admin_config.clone();
+        avro_config.topic_template = avro_topic.clone();
+        avro_config.partition_key_template = Some("${topic_segment_3}".to_string());
+        avro_config
+            .schema_registry
+            .as_mut()
+            .expect("registry")
+            .schema_id = avro_id;
+        let avro_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&avro_config).expect("qual avro transport"));
+        let avro_sink = Arc::new(
+            ConfluentKafkaSink::new(avro_config, avro_transport.clone()).expect("qual avro sink"),
+        );
+        assert_eq!(avro_sink.kind(), "confluent");
+
+        let mut json_config = admin_config.clone();
+        json_config.topic_template = json_topic.clone();
+        json_config
+            .schema_registry
+            .as_mut()
+            .expect("registry")
+            .schema_id = json_id;
+        let json_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&json_config).expect("qual json transport"));
+        let json_sink =
+            Arc::new(ConfluentKafkaSink::new(json_config, json_transport).expect("qual json sink"));
+        assert_eq!(json_sink.kind(), "confluent");
+
+        // The broker's path: rule actions deliver through the shared
+        // connector manager (this is what `register_live_sink` fills
+        // and what `ForwardConnector` sends through), so the
+        // qualification registers the rule's connectors there — under
+        // both the plain and the `confluent:`-prefixed names the live
+        // path uses — and sends through it, never `sink.send` directly.
+        let manager = broker_connectors::ConnectorManager::new();
+        manager.register("qual-avro", avro_sink.clone());
+        manager.register("confluent:qual-avro", avro_sink.clone());
+        manager.register("qual-json", json_sink.clone());
+        manager.register("confluent:qual-json", json_sink.clone());
+
+        async fn qual_send(
+            manager: &broker_connectors::ConnectorManager,
+            id: &str,
+            topic: &Topic,
+            payload: &Bytes,
+        ) {
+            // Retry transient connection failures per record so a
+            // mid-batch server restart (QUAL-FAULT-TARGET) never loses
+            // a sequence number; terminal failures panic immediately
+            // (fail closed).
+            let mut attempts = 0usize;
+            loop {
+                match manager.send(id, topic, payload, QoS::AtLeastOnce).await {
+                    Ok(()) => break,
+                    Err(ConnectorError::Connection(message)) => {
+                        attempts += 1;
+                        if attempts >= 240 {
+                            panic!("qual send {id} never recovered: {message}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => panic!("qual send {id} terminal: {error:?}"),
+                }
+            }
+        }
+
+        async fn qual_flush(sink: &ConfluentKafkaSink, what: &str) {
+            let mut flushed = false;
+            for _ in 0..10 {
+                match sink.flush().await {
+                    Ok(()) => {
+                        flushed = true;
+                        break;
+                    }
+                    Err(ConnectorError::Connection(message)) => {
+                        eprintln!("qual flush {what} retryable: {message}");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(error) => panic!("qual flush {what} terminal: {error:?}"),
+                }
+            }
+            assert!(flushed, "qual flush {what} never recovered");
+        }
+
+        let parsed_avro =
+            apache_avro::Schema::parse_str(AVRO_SCHEMA).expect("qual avro schema parses");
+        let fault_file = qual_env("QUAL_FAULT_FILE");
+        for seq in 0..1000i32 {
+            let device = format!("dev-{seq:04}");
+            let temp = 20.0 + f64::from(seq) * 0.01;
+            let value = apache_avro::types::Value::Record(vec![
+                (
+                    "client_id".to_string(),
+                    apache_avro::types::Value::String(device.clone()),
+                ),
+                (
+                    "seq".to_string(),
+                    apache_avro::types::Value::Long(i64::from(seq)),
+                ),
+                ("temp".to_string(), apache_avro::types::Value::Double(temp)),
+            ]);
+            let datum = apache_avro::to_avro_datum(&parsed_avro, value).expect("qual avro encode");
+            let mqtt_topic = Topic::new(format!("sensors/qual/{device}")).expect("qual topic");
+            qual_send(&manager, "qual-avro", &mqtt_topic, &Bytes::from(datum)).await;
+
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"{device}","seq":{seq},"temp":{temp}}}"#
+            ));
+            qual_send(
+                &manager,
+                "qual-json",
+                &Topic::new("sensors/qual").expect("qual topic"),
+                &payload,
+            )
+            .await;
+
+            if seq == 500 {
+                if let Some(path) = fault_file.clone() {
+                    eprintln!("qual fault: requesting server restart via {path}");
+                    std::fs::write(&path, b"restart").expect("qual fault file write");
+                    tokio::time::timeout(Duration::from_secs(600), async {
+                        while std::path::Path::new(&path).exists() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .await
+                    .expect("qual server never came back after restart");
+                    eprintln!("qual fault: server back, continuing writes");
+                }
+            }
+        }
+        qual_flush(&avro_sink, "avro").await;
+        qual_flush(&json_sink, "json").await;
+        assert_eq!(avro_sink.sent_records(), 1000);
+        assert_eq!(json_sink.sent_records(), 1000);
+
+        // Read everything back: exact per-key counts (at-least-once
+        // permits duplicates, never loss), schema-id framing,
+        // murmur2 placement and payload seq agreement.
+        let mut consumer_config = rdkafka_client_config(&admin_config);
+        consumer_config.set(
+            "group.id",
+            format!("indra-qual-b310-{}", broker_connectors::now_millis()),
+        );
+        consumer_config.set("enable.auto.commit", "false");
+        consumer_config.set("auto.offset.reset", "earliest");
+        let consumer: rdkafka::consumer::StreamConsumer =
+            consumer_config.create().expect("qual consumer");
+        consumer
+            .subscribe(&[avro_topic.as_str(), json_topic.as_str()])
+            .expect("qual subscribe");
+        let mut avro_seen: HashSet<String> = HashSet::new();
+        let mut json_seen: HashSet<String> = HashSet::new();
+        let mut avro_seq: HashMap<String, i64> = HashMap::new();
+        let mut json_seq: HashMap<String, i64> = HashMap::new();
+        let mut total = 0usize;
+        let mut duplicates = 0usize;
+        while avro_seen.len() < 1000 || json_seen.len() < 1000 {
+            let message = tokio::time::timeout(Duration::from_secs(180), consumer.recv())
+                .await
+                .expect("qual recv timeout")
+                .expect("qual recv");
+            let payload = message.payload().expect("qual payload");
+            let (id, body) = split_schema_registry(payload).expect("qual framing");
+            let key_bytes = message.key().expect("qual records are keyed");
+            let key = String::from_utf8(key_bytes.to_vec()).expect("qual key is UTF-8");
+            total += 1;
+            if message.topic() == avro_topic.as_str() {
+                assert_eq!(id, avro_id, "avro record carries the avro id");
+                assert_eq!(
+                    message.partition(),
+                    broker_connectors::kafka::partition_for_key(Some(key_bytes), PARTITIONS as u32),
+                    "murmur2 placement must match for avro key {key}"
+                );
+                let mut body_ref = body;
+                let decoded = apache_avro::from_avro_datum(&parsed_avro, &mut body_ref, None)
+                    .unwrap_or_else(|e| panic!("qual avro datum decodes for {key}: {e}"));
+                let (got_client, got_seq) = match decoded {
+                    apache_avro::types::Value::Record(fields) => {
+                        let client = fields
+                            .iter()
+                            .find(|(name, _)| name == "client_id")
+                            .and_then(|(_, v)| match v {
+                                apache_avro::types::Value::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| panic!("qual avro carries client_id for {key}"));
+                        let seq = fields
+                            .iter()
+                            .find(|(name, _)| name == "seq")
+                            .and_then(|(_, v)| match v {
+                                apache_avro::types::Value::Long(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| panic!("qual avro carries seq for {key}"));
+                        (client, seq)
+                    }
+                    other => panic!("qual avro is a record for {key}, got {other:?}"),
+                };
+                assert_eq!(got_client, key, "avro datum client must match key {key}");
+                if !avro_seen.insert(key.clone()) {
+                    duplicates += 1;
+                    assert_eq!(
+                        avro_seq.get(&key),
+                        Some(&got_seq),
+                        "duplicate delivery must carry the same seq for {key}"
+                    );
+                    continue;
+                }
+                avro_seq.insert(key, got_seq);
+            } else if message.topic() == json_topic.as_str() {
+                assert_eq!(id, json_id, "json record carries the json id");
+                assert_eq!(
+                    message.partition(),
+                    broker_connectors::kafka::partition_for_key(Some(key_bytes), PARTITIONS as u32),
+                    "murmur2 placement must match for json key {key}"
+                );
+                let value: serde_json::Value =
+                    serde_json::from_slice(body).expect("qual json body is JSON");
+                let got_client = value
+                    .get("client_id")
+                    .and_then(|v| v.as_str())
+                    .expect("qual json carries client_id");
+                let got_seq = value
+                    .get("seq")
+                    .and_then(|v| v.as_i64())
+                    .expect("qual json carries seq");
+                assert_eq!(got_client, key, "json client must match key {key}");
+                if !json_seen.insert(key.clone()) {
+                    duplicates += 1;
+                    assert_eq!(
+                        json_seq.get(&key),
+                        Some(&got_seq),
+                        "duplicate delivery must carry the same seq for {key}"
+                    );
+                    continue;
+                }
+                json_seq.insert(key, got_seq);
+            } else {
+                panic!("qual unexpected topic {}", message.topic());
+            }
+            if total.is_multiple_of(1000) || (avro_seen.len() == 1000 && json_seen.len() == 1000) {
+                eprintln!(
+                    "qual progress: avro-distinct={} json-distinct={} total={} duplicates={}",
+                    avro_seen.len(),
+                    json_seen.len(),
+                    total,
+                    duplicates
+                );
+            }
+        }
+        assert_eq!(avro_seen.len(), 1000);
+        assert_eq!(json_seen.len(), 1000);
+        for seq in 0..1000i32 {
+            let device = format!("dev-{seq:04}");
+            assert!(
+                avro_seen.contains(&device),
+                "qual missing avro key {device}"
+            );
+            assert_eq!(
+                avro_seq.get(&device),
+                Some(&i64::from(seq)),
+                "qual avro seq must match for {device}"
+            );
+            assert!(
+                json_seen.contains(&device),
+                "qual missing json key {device}"
+            );
+            assert_eq!(
+                json_seq.get(&device),
+                Some(&i64::from(seq)),
+                "qual json seq must match for {device}"
+            );
+        }
+        eprintln!(
+            "qual delivery: avro-distinct=1000 json-distinct=1000 total={total} duplicates={duplicates}"
+        );
+
+        // Rotate to a wrong secret: the driver must fail closed, never
+        // deliver.
+        let mut bad_config = admin_config.clone();
+        bad_config.api_secret = "rotated-wrong-secret".to_string();
+        let bad_transport =
+            Arc::new(RdkafkaConfluentTransport::new(&bad_config).expect("qual bad transport"));
+        let bad_result = bad_transport
+            .publish(&[ConfluentRecord {
+                topic: avro_topic.clone(),
+                partition: 0,
+                key: None,
+                value: Bytes::from_static(b"probe"),
+                headers: Vec::new(),
+            }])
+            .await;
+        assert!(bad_result.is_err(), "wrong secret must fail, got ok");
+        eprintln!("qual rotation: wrong secret refused as expected");
+
+        // Reconnect with the right secret: writes resume.
+        avro_transport.reconnect().await.expect("qual reconnect");
+        let device = "dev-0000".to_string();
+        let resume_value = apache_avro::types::Value::Record(vec![
+            (
+                "client_id".to_string(),
+                apache_avro::types::Value::String(device.clone()),
+            ),
+            ("seq".to_string(), apache_avro::types::Value::Long(1000)),
+            ("temp".to_string(), apache_avro::types::Value::Double(30.0)),
+        ]);
+        let resume_datum =
+            apache_avro::to_avro_datum(&parsed_avro, resume_value).expect("qual resume encode");
+        qual_send(
+            &manager,
+            "qual-avro",
+            &Topic::new(format!("sensors/qual/{device}")).expect("qual topic"),
+            &Bytes::from(resume_datum),
+        )
+        .await;
+        qual_flush(&avro_sink, "avro-resume").await;
+        assert_eq!(avro_sink.sent_records(), 1001);
+        let resumed = loop {
+            let candidate = tokio::time::timeout(Duration::from_secs(180), consumer.recv())
+                .await
+                .expect("qual resume recv timeout")
+                .expect("qual resume recv");
+            if candidate.topic() == avro_topic.as_str() {
+                let (candidate_id, candidate_body) =
+                    split_schema_registry(candidate.payload().expect("qual resume payload"))
+                        .expect("qual resume framing");
+                assert_eq!(candidate_id, avro_id);
+                let mut body_ref = candidate_body;
+                let decoded = apache_avro::from_avro_datum(&parsed_avro, &mut body_ref, None)
+                    .expect("qual resume datum decodes");
+                let resume_seq = match decoded {
+                    apache_avro::types::Value::Record(fields) => fields
+                        .iter()
+                        .find(|(name, _)| name == "seq")
+                        .and_then(|(_, v)| match v {
+                            apache_avro::types::Value::Long(n) => Some(*n),
+                            _ => None,
+                        })
+                        .expect("qual resume carries seq"),
+                    other => panic!("qual resume is a record, got {other:?}"),
+                };
+                if resume_seq == 1000 {
+                    break candidate;
+                }
+                // A redelivered pre-resume record: keep waiting for the
+                // resume seq instead of asserting on a duplicate.
+                continue;
+            }
+        };
+        assert_eq!(resumed.topic(), avro_topic.as_str());
+        eprintln!("qual rotation: reconnect resumed delivery");
+
+        // Cleanup: delete both topics; subjects stay registered.
+        match admin
+            .delete_topics(
+                &[avro_topic.as_str(), json_topic.as_str()],
+                &rdkafka::admin::AdminOptions::new().operation_timeout(Some(
+                    rdkafka::util::Timeout::After(Duration::from_secs(120)),
+                )),
+            )
+            .await
+        {
+            Ok(results) => {
+                for result in results {
+                    if let Err(error) = result {
+                        eprintln!("qual delete topic note: {error:?}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("qual delete topics rpc failed: {error}"),
+        }
+        eprintln!(
+            "qual cleanup: deleted topics {avro_topic}, {json_topic}; \
+             registry subjects {avro_subject}, {json_subject} retained"
+        );
+    }
+}

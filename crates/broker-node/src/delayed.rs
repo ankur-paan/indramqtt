@@ -112,6 +112,10 @@ pub struct DelayedEntry {
     /// Publishing client id, kept so shared-subscription hashing stays
     /// stable across the defer. `None` when the session is gone.
     pub publisher: Option<String>,
+    /// Publishing tenant id, kept so fan-out after the timer stays inside
+    /// the same tenant the entry was scheduled in (MT-02). Defaults to
+    /// the default tenant for entries persisted before tenancy.
+    pub publisher_tenant: String,
 }
 
 /// Why a schedule request was refused. Counters for every variant live
@@ -275,6 +279,7 @@ fn encode_entry(entry: &DelayedEntry) -> String {
         "retain": entry.retain,
         "payload": payload_b64,
         "publisher": entry.publisher,
+        "publisher_tenant": entry.publisher_tenant,
     });
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
@@ -326,6 +331,15 @@ fn decode_entry(value: &serde_json::Value) -> Option<DelayedEntry> {
         Some(serde_json::Value::String(name)) => Some(name.clone()),
         Some(_) => return None,
     };
+    // Entries persisted before tenancy carry no tenant: fail closed to
+    // the default tenant, never to another tenant's space.
+    let publisher_tenant = match value.get("publisher_tenant") {
+        None | Some(serde_json::Value::Null) => {
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string()
+        }
+        Some(serde_json::Value::String(tenant)) => tenant.clone(),
+        Some(_) => return None,
+    };
     Some(DelayedEntry {
         id,
         deliver_at_ms,
@@ -334,6 +348,7 @@ fn decode_entry(value: &serde_json::Value) -> Option<DelayedEntry> {
         retain,
         payload,
         publisher,
+        publisher_tenant,
     })
 }
 
@@ -727,6 +742,7 @@ mod tests {
             retain: false,
             payload: b"v".to_vec(),
             publisher: None,
+            publisher_tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         }
     }
 

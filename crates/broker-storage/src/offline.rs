@@ -3,7 +3,13 @@
 //! Each detached durable session buffers never-routed messages in memory
 //! (see `broker-session`). This store keeps the same queue on disk so a
 //! restart replays it in order instead of losing it. One append-only file
-//! per client id lives under `<dir>/<encoded-client>.log`.
+//! per `(tenant, client id)` pair lives under
+//! `<dir>/<encoded-client>.log` for default-tenant queues (the pre-tenancy
+//! layout, preserved so existing files keep loading) and
+//! `<dir>/<encoded-tenant>+<encoded-client>.log` otherwise, so two
+//! tenants sharing a client id never share or clobber one file. The `+`
+//! separator is unambiguous because the encoder never emits a raw `+`
+//! (a literal `+` encodes as `%2B`).
 //!
 //! # Durability contract (read this before relying on it)
 //!
@@ -73,6 +79,13 @@ use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Tenant id whose queues keep the pre-tenancy bare file layout. Matches
+/// `broker-session`'s default tenant so the default queue and its file
+/// resolve through the same name on both sides of the store boundary.
+/// Reason for the literal here instead of a dependency: storage must not
+/// depend on the session crate (the session crate depends on storage).
+const DEFAULT_TENANT_ID: &str = "default";
 
 /// Largest single frame accepted on recovery (`len` field plus slack).
 ///
@@ -197,7 +210,11 @@ impl OfflineQueueStore {
         self.persist_failed.load(Ordering::Relaxed)
     }
 
-    /// Client ids with a queue file on disk, in sorted order. Files whose
+    /// Client ids with a legacy bare-layout queue file on disk, in sorted
+    /// order: the default tenant's queues (written before tenancy or via
+    /// the default-tenant shims below). Tenant-qualified files (stems
+    /// containing the raw `+` separator) are skipped here and listed via
+    /// [`queue_keys`](OfflineQueueStore::queue_keys) instead. Files whose
     /// names do not decode are skipped (never served, never counted: they
     /// were not written by this store).
     pub fn client_ids(&self) -> Vec<String> {
@@ -213,6 +230,9 @@ impl OfflineQueueStore {
             let Some(stem) = name.strip_suffix(".log") else {
                 continue;
             };
+            if stem.contains('+') {
+                continue;
+            }
             if let Some(id) = decode_client(stem) {
                 ids.push(id);
             }
@@ -221,12 +241,54 @@ impl OfflineQueueStore {
         ids
     }
 
-    /// Append one record for `client_id`, flushing (and fsyncing under
-    /// `EveryWrite`) before returning. Returns
+    /// Every `(tenant, client id)` pair with a queue file on disk, in
+    /// sorted order (MT-03): legacy bare-layout files decode to the
+    /// default tenant, tenant-qualified files to their own tenant, so a
+    /// restart rebuilds each tenant's sessions independently. Files whose
+    /// names do not decode are skipped (never served, never counted).
+    pub fn queue_keys(&self) -> Vec<(String, String)> {
+        let mut keys = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return keys;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".log") else {
+                continue;
+            };
+            if let Some(key) = decode_key(stem) {
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        keys
+    }
+
+    /// Append one record for `client_id` in the default tenant, flushing
+    /// (and fsyncing under `EveryWrite`) before returning. Default-tenant
+    /// shim for [`append_in_tenant`](OfflineQueueStore::append_in_tenant);
+    /// keeps the pre-tenancy bare file layout. Returns
     /// [`StorageError::Engine`] on I/O failure with nothing acknowledged.
     pub fn append(&self, client_id: &str, record: &OfflineRecord) -> Result<()> {
+        self.append_in_tenant(DEFAULT_TENANT_ID, client_id, record)
+    }
+
+    /// Append one record for one `(tenant, client id)` pair (MT-03): the
+    /// same client id in two tenants appends to two independent files, so
+    /// one tenant's backlog never lands in another's. Flushes (and fsyncs
+    /// under `EveryWrite`) before returning; I/O failure acknowledges
+    /// nothing.
+    pub fn append_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        record: &OfflineRecord,
+    ) -> Result<()> {
         use std::io::Write as _;
-        let path = self.log_path(client_id)?;
+        let path = self.log_path_for(tenant, client_id)?;
         let frame = encode_frame(&encode_record(record));
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -260,12 +322,21 @@ impl OfflineQueueStore {
         Ok(())
     }
 
-    /// Load the queue for `client_id` in order. A torn tail is truncated
-    /// at the last good frame, counted once per file that needed it, and
-    /// never served. Missing files load as empty with no tear. Returns
-    /// `(records, torn)` where `torn` is 0 or 1.
+    /// Load the default-tenant queue for `client_id` in order. Shim for
+    /// [`load_in_tenant`](OfflineQueueStore::load_in_tenant). A torn tail
+    /// is truncated at the last good frame, counted once per file that
+    /// needed it, and never served. Missing files load as empty with no
+    /// tear. Returns `(records, torn)` where `torn` is 0 or 1.
     pub fn load(&self, client_id: &str) -> (Vec<OfflineRecord>, u64) {
-        let Ok(path) = self.log_path(client_id) else {
+        self.load_in_tenant(DEFAULT_TENANT_ID, client_id)
+    }
+
+    /// Load one `(tenant, client id)` queue in order (MT-03): another
+    /// tenant's namesake file is never consulted, so post-restart replay
+    /// serves only the owning tenant's backlog. Same torn-tail contract
+    /// as the default-tenant shim.
+    pub fn load_in_tenant(&self, tenant: &str, client_id: &str) -> (Vec<OfflineRecord>, u64) {
+        let Ok(path) = self.log_path_for(tenant, client_id) else {
             return (Vec::new(), 0);
         };
         let bytes = match std::fs::read(&path) {
@@ -285,8 +356,10 @@ impl OfflineQueueStore {
         (records, 0)
     }
 
-    /// Rewrite the file for `client_id` from `records` (already in queue
-    /// order). Used after evictions past the cap so the file follows the
+    /// Rewrite the default-tenant file for `client_id` from `records`
+    /// (already in queue order). Shim for
+    /// [`rewrite_in_tenant`](OfflineQueueStore::rewrite_in_tenant).
+    /// Used after evictions past the cap so the file follows the
     /// memory queue, and after drains when the caller prefers a rewrite
     /// over a delete. An empty slice deletes the file instead. Atomic via
     /// temp plus rename; failures return [`StorageError::Engine`] and count
@@ -296,11 +369,24 @@ impl OfflineQueueStore {
     /// queue; current cost is bounded by the cap and runs only on the
     /// detached-buffer path.
     pub fn rewrite(&self, client_id: &str, records: &[OfflineRecord]) -> Result<()> {
+        self.rewrite_in_tenant(DEFAULT_TENANT_ID, client_id, records)
+    }
+
+    /// Rewrite one `(tenant, client id)` file from `records` (MT-03):
+    /// evictions and confirms rewrite only the owning tenant's file, so
+    /// one tenant's cap enforcement never touches another tenant's
+    /// backlog. Same atomic temp-plus-rename contract as the shim.
+    pub fn rewrite_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        records: &[OfflineRecord],
+    ) -> Result<()> {
         if records.is_empty() {
-            self.remove(client_id);
+            self.remove_in_tenant(tenant, client_id);
             return Ok(());
         }
-        let Ok(path) = self.log_path(client_id) else {
+        let Ok(path) = self.log_path_for(tenant, client_id) else {
             self.persist_failed.fetch_add(1, Ordering::Relaxed);
             return Err(StorageError::Engine(
                 "cannot encode offline log name".to_string(),
@@ -320,7 +406,8 @@ impl OfflineQueueStore {
         // `sweep_orphan_tmps`), so orphans cannot accumulate.
         let seq = self.tmp_seq.fetch_add(1, Ordering::SeqCst);
         let tmp = self.dir.join(format!(
-            ".{}.{}.{}.tmp",
+            ".{}.{}.{}.{}.tmp",
+            encode_client(tenant),
             encode_client(client_id),
             std::process::id(),
             seq
@@ -352,12 +439,21 @@ impl OfflineQueueStore {
         Ok(())
     }
 
-    /// Delete the queue file for `client_id`. Missing files are a no-op.
+    /// Delete the default-tenant queue file for `client_id`. Shim for
+    /// [`remove_in_tenant`](OfflineQueueStore::remove_in_tenant).
+    /// Missing files are a no-op.
     /// Called on reconnect drains (the memory queue was handed to the new
     /// connection) and on clean-start replacement (previous durable state
     /// is discarded by definition).
     pub fn remove(&self, client_id: &str) {
-        let Ok(path) = self.log_path(client_id) else {
+        self.remove_in_tenant(DEFAULT_TENANT_ID, client_id);
+    }
+
+    /// Delete one `(tenant, client id)` queue file (MT-03): a drain or a
+    /// clean start in one tenant deletes only its own file, never
+    /// another tenant's namesake backlog.
+    pub fn remove_in_tenant(&self, tenant: &str, client_id: &str) {
+        let Ok(path) = self.log_path_for(tenant, client_id) else {
             return;
         };
         if let Err(e) = std::fs::remove_file(&path) {
@@ -365,6 +461,32 @@ impl OfflineQueueStore {
                 self.persist_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Tenant-scoped file layout (MT-03): default-tenant queues keep the
+    /// pre-tenancy bare `<encoded-client>.log` name so existing files keep
+    /// loading without a migration; any other tenant uses
+    /// `<encoded-tenant>+<encoded-client>.log`. The `+` separator is
+    /// unambiguous because `encode_client` never emits a raw `+`.
+    fn log_path_for(&self, tenant: &str, client_id: &str) -> Result<PathBuf> {
+        if client_id.is_empty() {
+            return Err(StorageError::Engine(
+                "client id must not be empty".to_string(),
+            ));
+        }
+        if tenant.is_empty() {
+            return Err(StorageError::Engine(
+                "tenant id must not be empty".to_string(),
+            ));
+        }
+        if tenant == DEFAULT_TENANT_ID {
+            return self.log_path(client_id);
+        }
+        Ok(self.dir.join(format!(
+            "{}+{}.log",
+            encode_client(tenant),
+            encode_client(client_id)
+        )))
     }
 
     fn log_path(&self, client_id: &str) -> Result<PathBuf> {
@@ -408,6 +530,32 @@ fn decode_client(encoded: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Decode one queue-file stem into its `(tenant, client id)` pair
+/// (MT-03): a bare stem is a legacy default-tenant queue, a stem with
+/// one raw `+` is `<encoded-tenant>+<encoded-client>`. Returns `None`
+/// for names this store never wrote (undecodable halves, extra `+`
+/// separators). Each half must be non-empty and must itself decode, so
+/// a separator-only or corrupt name is never served.
+fn decode_key(stem: &str) -> Option<(String, String)> {
+    match stem.split_once('+') {
+        None => decode_client(stem).map(|client_id| (DEFAULT_TENANT_ID.to_string(), client_id)),
+        Some((tenant_enc, client_enc)) => {
+            if tenant_enc.is_empty() || client_enc.is_empty() {
+                return None;
+            }
+            if client_enc.contains('+') {
+                return None;
+            }
+            let tenant = decode_client(tenant_enc)?;
+            let client_id = decode_client(client_enc)?;
+            if tenant.is_empty() || client_id.is_empty() {
+                return None;
+            }
+            Some((tenant, client_id))
+        }
+    }
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -658,6 +806,60 @@ mod tests {
         assert!(store.client_ids().is_empty());
         let (loaded, _) = store.load("device-2");
         assert!(loaded.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offline_tenant_files_are_independent_per_client_pair() {
+        // MT-03: the same client id in two tenants holds two independent
+        // files. The default tenant keeps the bare layout; a named tenant
+        // uses the `<tenant>+<client>` stem.
+        let dir = unique_dir("tenant-keys");
+        let store = OfflineQueueStore::open(&dir).unwrap();
+        store
+            .append_in_tenant("tenant-a", "dup", &record(1))
+            .unwrap();
+        store
+            .append_in_tenant("tenant-b", "dup", &record(2))
+            .unwrap();
+        store.append("plain", &record(3)).unwrap();
+
+        // Each pair loads only its own record.
+        let (a, torn) = store.load_in_tenant("tenant-a", "dup");
+        assert_eq!(torn, 0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].payload, Bytes::from(vec![1u8]));
+        let (b, torn) = store.load_in_tenant("tenant-b", "dup");
+        assert_eq!(torn, 0);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].payload, Bytes::from(vec![2u8]));
+        let (plain, _) = store.load("plain");
+        assert_eq!(plain.len(), 1);
+
+        // The listing carries every pair; the bare listing carries only
+        // the legacy default-tenant files.
+        assert_eq!(
+            store.queue_keys(),
+            vec![
+                ("default".to_string(), "plain".to_string()),
+                ("tenant-a".to_string(), "dup".to_string()),
+                ("tenant-b".to_string(), "dup".to_string()),
+            ]
+        );
+        assert_eq!(store.client_ids(), vec!["plain".to_string()]);
+
+        // Removal in one tenant leaves the namesake file alone.
+        store.remove_in_tenant("tenant-a", "dup");
+        assert!(store.load_in_tenant("tenant-a", "dup").0.is_empty());
+        let (b, _) = store.load_in_tenant("tenant-b", "dup");
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            store.queue_keys(),
+            vec![
+                ("default".to_string(), "plain".to_string()),
+                ("tenant-b".to_string(), "dup".to_string()),
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

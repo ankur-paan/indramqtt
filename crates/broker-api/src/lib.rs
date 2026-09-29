@@ -23,6 +23,8 @@ use crate::v5::auth::ApiTokens;
 
 pub mod admin_users;
 pub mod api_auth;
+pub mod api_keys;
+pub mod config_runtime;
 pub mod dashboard;
 pub mod errors;
 pub mod licence;
@@ -152,6 +154,24 @@ pub struct ApiState {
     /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
     /// deliver never touch it.
     pub authn_settings: Arc<crate::v5::authn_settings::AuthnSettingsStore>,
+    /// Operator API-key store for `indra ctl` (M1-06): bounded set of
+    /// opaque keys seeded once from `INDRA_API_KEYS`. Consulted by
+    /// [`api_auth::resolve_credentials`] when a Bearer token is not a
+    /// dashboard token; management-plane only, never on the delivery path.
+    pub api_keys: Arc<crate::api_keys::ApiKeyStore>,
+    /// Configured network listeners captured at kernel boot (M1-06):
+    /// the same `listeners.*` section the kernel binds from, shared here
+    /// so `GET /api/v5/listeners` reports the running configuration.
+    /// One `Arc` clone at boot; handlers clone at most five small rows per
+    /// request. Management-plane only, never on the delivery path.
+    pub listeners: Arc<broker_config::schema::ListenersConf>,
+    /// Startup layer provenance for M1-05 `explain` (defaults, `indra.toml`,
+    /// `conf.d` fragment, environment variable, flag). Set by the kernel
+    /// boot path from the resolved [`broker_config::layers::LayeredConfig`];
+    /// `None` in tests and tools, where every schema key reports built-in
+    /// defaults. One short read lock per explain request; never touched on
+    /// the per-message path.
+    pub startup_config: Arc<std::sync::RwLock<Option<Arc<broker_config::layers::LayeredConfig>>>>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -175,7 +195,9 @@ impl ApiState {
         // very instance the caller shares (the kernel passes its BrokerLink
         // `MemoryAuth` here), so no second copy can diverge. An empty
         // snapshot is a no-op (today's empty behaviour).
-        auth.seed_from_registry(&config);
+        if let Err(error) = auth.seed_from_registry(&config) {
+            panic!("invalid stored mqtt_users snapshot: {error}");
+        }
         // Boot replay (W0-22): route the loaded rules into the very engine
         // instance the caller shares, through the same validated create
         // path as `RuleEngine::create_rule`. An empty snapshot is a no-op
@@ -253,6 +275,9 @@ impl ApiState {
             authn_chain,
             authn_node_cache,
             authn_settings,
+            api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
+            listeners: Arc::new(broker_config::schema::ListenersConf::default()),
+            startup_config: Arc::new(std::sync::RwLock::new(None)),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -308,6 +333,9 @@ impl ApiState {
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
             authn_node_cache,
             authn_settings,
+            api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
+            listeners: Arc::new(broker_config::schema::ListenersConf::default()),
+            startup_config: Arc::new(std::sync::RwLock::new(None)),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -362,6 +390,25 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
         .route("/api/v1/rules/:id", get(get_rule).delete(delete_rule))
+        .route(
+            "/api/v1/config/validate",
+            post(config_runtime::validate_config),
+        )
+        .route("/api/v1/config/diff", post(config_runtime::diff_config))
+        .route("/api/v1/config/reload", post(config_runtime::reload_config))
+        .route("/api/v1/config/history", get(config_runtime::list_history))
+        .route(
+            "/api/v1/config/history/:id",
+            get(config_runtime::get_history_version),
+        )
+        .route(
+            "/api/v1/config/history/:id/restore",
+            post(config_runtime::restore_history_version),
+        )
+        .route(
+            "/api/v1/config/explain",
+            get(config_runtime::explain_config),
+        )
         .route("/api/v1/licence/request", get(licence::get_request))
         .route("/api/v1/licence/install", post(licence::install_licence))
         .route("/api/v1/licence/status", get(licence::get_status))
@@ -1175,7 +1222,7 @@ async fn build_connector(
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "sparkplug_b" | "sparkplug" | "spb" => {
-                let config: broker_connectors::SparkplugSinkConfig =
+                let config: broker_connectors_enterprise::SparkplugSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
                 config
@@ -1184,411 +1231,411 @@ async fn build_connector(
                 // Frames are captured in-process; production MQTT
                 // delivery rides the mqtt_bridge connector.
                 let transport = std::sync::Arc::new(
-                    broker_connectors::MemorySparkplugTransport::new(),
+                    broker_connectors_enterprise::MemorySparkplugTransport::new(),
                 );
-                let sink = broker_connectors::SparkplugBSink::new(config, transport)
+                let sink = broker_connectors_enterprise::SparkplugBSink::new(config, transport)
                     .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?;
                 Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "kinesis" | "aws_kinesis" => {
-                let config: broker_connectors::KinesisSinkConfig =
+                let config: broker_connectors_enterprise::KinesisSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid kinesis config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid kinesis config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpKinesisTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpKinesisTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid kinesis transport: {e}"))?,
                 );
-                let sink = broker_connectors::KinesisSink::new(config, transport)
+                let sink = broker_connectors_enterprise::KinesisSink::new(config, transport)
                     .map_err(|e| format!("invalid kinesis sink: {e}"))?;
                 Ok(("kinesis".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "gcp_pubsub" | "gcp" | "pubsub" => {
-                let config: broker_connectors::GcpPubSubSinkConfig =
+                let config: broker_connectors_enterprise::GcpPubSubSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid gcp_pubsub config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid gcp_pubsub config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::SdkGcpPubSubTransport::new(&config)
+                    broker_connectors_enterprise::SdkGcpPubSubTransport::new(&config)
                         .map_err(|e| format!("invalid gcp_pubsub transport: {e}"))?,
                 );
-                let sink = broker_connectors::GcpPubSubSink::new(config, transport)
+                let sink = broker_connectors_enterprise::GcpPubSubSink::new(config, transport)
                     .map_err(|e| format!("invalid gcp_pubsub sink: {e}"))?;
                 Ok(("gcp_pubsub".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "azure_eventhubs" | "azure" | "eventhubs" => {
-                let config: broker_connectors::AzureEventHubsSinkConfig =
+                let config: broker_connectors_enterprise::AzureEventHubsSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid azure_eventhubs config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid azure_eventhubs config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpAzureEventHubsTransport::new(
+                    broker_connectors_enterprise::HttpAzureEventHubsTransport::new(
                         &config,
                         reqwest::Client::new(),
                     )
                     .map_err(|e| format!("invalid azure_eventhubs transport: {e}"))?,
                 );
-                let sink = broker_connectors::AzureEventHubsSink::new(config, transport)
+                let sink = broker_connectors_enterprise::AzureEventHubsSink::new(config, transport)
                     .map_err(|e| format!("invalid azure_eventhubs sink: {e}"))?;
                 Ok(("azure_eventhubs".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "pulsar" => {
-                let config: broker_connectors::PulsarSinkConfig =
+                let config: broker_connectors_enterprise::PulsarSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid pulsar config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid pulsar config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpPulsarTransport::new(&config)
+                    broker_connectors_enterprise::TcpPulsarTransport::new(&config)
                         .map_err(|e| format!("invalid pulsar transport: {e}"))?,
                 );
-                let sink = broker_connectors::PulsarSink::new(config, transport)
+                let sink = broker_connectors_enterprise::PulsarSink::new(config, transport)
                     .map_err(|e| format!("invalid pulsar sink: {e}"))?;
                 Ok(("pulsar".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "oci_streaming" | "oci" | "oracle_streaming" => {
-                let config: broker_connectors::OciStreamingSinkConfig =
+                let config: broker_connectors_enterprise::OciStreamingSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid oci_streaming config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid oci_streaming config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpOciStreamingTransport::new(
+                    broker_connectors_enterprise::HttpOciStreamingTransport::new(
                         &config,
                         reqwest::Client::new(),
                     )
                     .map_err(|e| format!("invalid oci_streaming transport: {e}"))?,
                 );
-                let sink = broker_connectors::OciStreamingSink::new(config, transport)
+                let sink = broker_connectors_enterprise::OciStreamingSink::new(config, transport)
                     .map_err(|e| format!("invalid oci_streaming sink: {e}"))?;
                 Ok(("oci_streaming".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "aws_iot" | "aws_iot_core" => {
-                let config: broker_connectors::AwsIotConfig =
+                let config: broker_connectors_enterprise::AwsIotConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid aws_iot config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid aws_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TlsAwsIotTransport::new(&config)
+                    broker_connectors_enterprise::TlsAwsIotTransport::new(&config)
                         .map_err(|e| format!("invalid aws_iot transport: {e}"))?,
                 );
-                let sink = broker_connectors::AwsIotSink::new(config, transport)
+                let sink = broker_connectors_enterprise::AwsIotSink::new(config, transport)
                     .map_err(|e| format!("invalid aws_iot sink: {e}"))?;
                 Ok(("aws_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "azure_iot" | "azure_iothub" | "iothub" => {
-                let config: broker_connectors::AzureIotConfig =
+                let config: broker_connectors_enterprise::AzureIotConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid azure_iot config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid azure_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TlsAzureIotTransport::new(&config)
+                    broker_connectors_enterprise::TlsAzureIotTransport::new(&config)
                         .map_err(|e| format!("invalid azure_iot transport: {e}"))?,
                 );
-                let sink = broker_connectors::AzureIotSink::new(config, transport)
+                let sink = broker_connectors_enterprise::AzureIotSink::new(config, transport)
                     .map_err(|e| format!("invalid azure_iot sink: {e}"))?;
                 Ok(("azure_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
-                let config: broker_connectors::GcpIotConfig =
+                let config: broker_connectors_enterprise::GcpIotConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid gcp_iot config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid gcp_iot config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TlsGcpIotTransport::new(&config)
+                    broker_connectors_enterprise::TlsGcpIotTransport::new(&config)
                         .map_err(|e| format!("invalid gcp_iot transport: {e}"))?,
                 );
-                let sink = broker_connectors::GcpIotSink::new(config, transport)
+                let sink = broker_connectors_enterprise::GcpIotSink::new(config, transport)
                     .map_err(|e| format!("invalid gcp_iot sink: {e}"))?;
                 Ok(("gcp_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "opc_ua" | "opcua" => {
-                let config: broker_connectors::OpcUaSinkConfig =
+                let config: broker_connectors_enterprise::OpcUaSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid opc_ua config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid opc_ua config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpOpcUaTransport::new(&config)
+                    broker_connectors_enterprise::TcpOpcUaTransport::new(&config)
                         .map_err(|e| format!("invalid opc_ua transport: {e}"))?,
                 );
-                let sink = broker_connectors::OpcUaSink::new(config, transport)
+                let sink = broker_connectors_enterprise::OpcUaSink::new(config, transport)
                     .map_err(|e| format!("invalid opc_ua sink: {e}"))?;
                 Ok(("opc_ua".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "azure_blob" | "azureblob" | "azblob" => {
-                let config: broker_connectors::AzureBlobSinkConfig =
+                let config: broker_connectors_enterprise::AzureBlobSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid azure_blob config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid azure_blob config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpAzureBlobTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpAzureBlobTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid azure_blob transport: {e}"))?,
                 );
-                let sink = broker_connectors::AzureBlobSink::new(config, transport)
+                let sink = broker_connectors_enterprise::AzureBlobSink::new(config, transport)
                     .map_err(|e| format!("invalid azure_blob sink: {e}"))?;
                 Ok(("azure_blob".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "tablestore" | "ots" | "alibaba_tablestore" => {
-                let config: broker_connectors::TablestoreSinkConfig =
+                let config: broker_connectors_enterprise::TablestoreSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid tablestore config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid tablestore config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpTablestoreTransport::new(
+                    broker_connectors_enterprise::HttpTablestoreTransport::new(
                         &config,
                         reqwest::Client::new(),
                     )
                     .map_err(|e| format!("invalid tablestore transport: {e}"))?,
                 );
-                let sink = broker_connectors::TablestoreSink::new(config, transport)
+                let sink = broker_connectors_enterprise::TablestoreSink::new(config, transport)
                     .map_err(|e| format!("invalid tablestore sink: {e}"))?;
                 Ok(("tablestore".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "s3_tables" | "s3tables" | "iceberg" => {
-                let config: broker_connectors::S3TablesSinkConfig =
+                let config: broker_connectors_enterprise::S3TablesSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid s3_tables config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid s3_tables config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpS3TablesTransport::new(
+                    broker_connectors_enterprise::HttpS3TablesTransport::new(
                         &config,
                         reqwest::Client::new(),
                     )
                     .map_err(|e| format!("invalid s3_tables transport: {e}"))?,
                 );
-                let sink = broker_connectors::S3TablesSink::new(config, transport)
+                let sink = broker_connectors_enterprise::S3TablesSink::new(config, transport)
                     .map_err(|e| format!("invalid s3_tables sink: {e}"))?;
                 Ok(("s3_tables".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "confluent" | "confluent_kafka" | "confluent_cloud" => {
-                let config: broker_connectors::ConfluentKafkaConfig =
+                let config: broker_connectors_enterprise::ConfluentKafkaConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid confluent config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid confluent config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::RdkafkaConfluentTransport::new(&config)
+                    broker_connectors_enterprise::RdkafkaConfluentTransport::new(&config)
                         .map_err(|e| format!("invalid confluent transport: {e}"))?,
                 );
-                let sink = broker_connectors::ConfluentKafkaSink::new(config, transport)
+                let sink = broker_connectors_enterprise::ConfluentKafkaSink::new(config, transport)
                     .map_err(|e| format!("invalid confluent sink: {e}"))?;
                 Ok(("confluent".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "rocketmq" | "rocket_mq" | "apache_rocketmq" => {
-                let config: broker_connectors::RocketMqSinkConfig =
+                let config: broker_connectors_enterprise::RocketMqSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid rocketmq config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid rocketmq config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::TcpRocketMqTransport::new(&config)
+                    broker_connectors_enterprise::TcpRocketMqTransport::new(&config)
                         .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
                 );
-                let sink = broker_connectors::RocketMqSink::new(config, transport)
+                let sink = broker_connectors_enterprise::RocketMqSink::new(config, transport)
                     .map_err(|e| format!("invalid rocketmq sink: {e}"))?;
                 Ok(("rocketmq".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "mongodb" | "mongo" | "documentdb" => {
-                let config: broker_connectors::MongoDbSinkConfig =
+                let config: broker_connectors_enterprise::MongoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid mongodb config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid mongodb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::NativeMongoDbTransport::new(&config)
+                    broker_connectors_enterprise::DriverMongoDbTransport::new(&config)
                         .map_err(|e| format!("invalid mongodb transport: {e}"))?,
                 );
-                let sink = broker_connectors::MongoDbSink::new(config, transport)
+                let sink = broker_connectors_enterprise::MongoDbSink::new(config, transport)
                     .map_err(|e| format!("invalid mongodb sink: {e}"))?;
                 Ok(("mongodb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "mssql" | "sqlserver" | "azuresql" => {
-                let config: broker_connectors::MssqlSinkConfig =
+                let config: broker_connectors_enterprise::MssqlSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid mssql config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid mssql config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::NativeMssqlTransport::new(&config)
+                    broker_connectors_enterprise::NativeMssqlTransport::new(&config)
                         .map_err(|e| format!("invalid mssql transport: {e}"))?,
                 );
-                let sink = broker_connectors::MssqlSink::new(config, transport)
+                let sink = broker_connectors_enterprise::MssqlSink::new(config, transport)
                     .map_err(|e| format!("invalid mssql sink: {e}"))?;
                 Ok(("mssql".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "cassandra" | "scylla" | "cql" => {
-                let config: broker_connectors::CassandraSinkConfig =
+                let config: broker_connectors_enterprise::CassandraSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid cassandra config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid cassandra config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::ScyllaCassandraTransport::new(&config)
+                    broker_connectors_enterprise::ScyllaCassandraTransport::new(&config)
                         .map_err(|e| format!("invalid cassandra transport: {e}"))?,
                 );
-                let sink = broker_connectors::CassandraSink::new(config, transport)
+                let sink = broker_connectors_enterprise::CassandraSink::new(config, transport)
                     .map_err(|e| format!("invalid cassandra sink: {e}"))?;
                 Ok(("cassandra".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "couchbase" | "couch" | "cb" => {
-                let config: broker_connectors::CouchbaseSinkConfig =
+                let config: broker_connectors_enterprise::CouchbaseSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid couchbase config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid couchbase config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::DriverCouchbaseTransport::new(&config)
+                    broker_connectors_enterprise::DriverCouchbaseTransport::new(&config)
                         .map_err(|e| format!("invalid couchbase transport: {e}"))?,
                 );
-                let sink = broker_connectors::CouchbaseSink::new(config, transport)
+                let sink = broker_connectors_enterprise::CouchbaseSink::new(config, transport)
                     .map_err(|e| format!("invalid couchbase sink: {e}"))?;
                 Ok(("couchbase".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "tdengine" | "td" | "taos" => {
-                let config: broker_connectors::TdengineSinkConfig =
+                let config: broker_connectors_enterprise::TdengineSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid tdengine config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid tdengine config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpTdengineTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpTdengineTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid tdengine transport: {e}"))?,
                 );
-                let sink = broker_connectors::TdengineSink::new(config, transport)
+                let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
                     .map_err(|e| format!("invalid tdengine sink: {e}"))?;
                 Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "iotdb" | "iot_db" => {
-                let config: broker_connectors::IotDbSinkConfig =
+                let config: broker_connectors_enterprise::IotDbSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid iotdb config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid iotdb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpIotDbTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpIotDbTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid iotdb transport: {e}"))?,
                 );
-                let sink = broker_connectors::IotDbSink::new(config, transport)
+                let sink = broker_connectors_enterprise::IotDbSink::new(config, transport)
                     .map_err(|e| format!("invalid iotdb sink: {e}"))?;
                 Ok(("iotdb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "timestream" | "ts" | "aws_timestream" => {
-                let config: broker_connectors::TimestreamSinkConfig =
+                let config: broker_connectors_enterprise::TimestreamSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid timestream config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid timestream config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpTimestreamTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpTimestreamTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid timestream transport: {e}"))?,
                 );
-                let sink = broker_connectors::TimestreamSink::new(config, transport)
+                let sink = broker_connectors_enterprise::TimestreamSink::new(config, transport)
                     .map_err(|e| format!("invalid timestream sink: {e}"))?;
                 Ok(("timestream".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "dynamodb" | "dynamo" | "ddb" => {
-                let config: broker_connectors::DynamoDbSinkConfig =
+                let config: broker_connectors_enterprise::DynamoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid dynamodb config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid dynamodb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::SdkDynamoDbTransport::new(&config)
+                    broker_connectors_enterprise::SdkDynamoDbTransport::new(&config)
                         .map_err(|e| format!("invalid dynamodb transport: {e}"))?,
                 );
-                let sink = broker_connectors::DynamoDbSink::new(config, transport)
+                let sink = broker_connectors_enterprise::DynamoDbSink::new(config, transport)
                     .map_err(|e| format!("invalid dynamodb sink: {e}"))?;
                 Ok(("dynamodb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "snowflake" | "snow" | "sf" => {
-                let config: broker_connectors::SnowflakeSinkConfig =
+                let config: broker_connectors_enterprise::SnowflakeSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid snowflake config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid snowflake config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpSnowflakeTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpSnowflakeTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid snowflake transport: {e}"))?,
                 );
-                let sink = broker_connectors::SnowflakeSink::new(config, transport)
+                let sink = broker_connectors_enterprise::SnowflakeSink::new(config, transport)
                     .map_err(|e| format!("invalid snowflake sink: {e}"))?;
                 Ok(("snowflake".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "databricks" | "databricks_sql" | "delta" => {
-                let config: broker_connectors::DatabricksSinkConfig =
+                let config: broker_connectors_enterprise::DatabricksSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid databricks config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid databricks config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpDatabricksTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpDatabricksTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid databricks transport: {e}"))?,
                 );
-                let sink = broker_connectors::DatabricksSink::new(config, transport)
+                let sink = broker_connectors_enterprise::DatabricksSink::new(config, transport)
                     .map_err(|e| format!("invalid databricks sink: {e}"))?;
                 Ok(("databricks".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "doris" => {
-                let config: broker_connectors::DorisSinkConfig =
+                let config: broker_connectors_enterprise::DorisSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid doris config: {e}"))?;
                 config
@@ -1598,90 +1645,90 @@ async fn build_connector(
                 // itself on the FE 307 -> BE hop (a stock client strips
                 // Authorization when the BE is a different origin).
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpDorisTransport::new(
+                    broker_connectors_enterprise::HttpDorisTransport::new(
                         &config,
-                        broker_connectors::doris_http_client(config.timeout()),
+                        broker_connectors_enterprise::doris_http_client(config.timeout()),
                     )
                     .map_err(|e| format!("invalid doris transport: {e}"))?,
                 );
-                let sink = broker_connectors::DorisSink::new(config, transport)
+                let sink = broker_connectors_enterprise::DorisSink::new(config, transport)
                     .map_err(|e| format!("invalid doris sink: {e}"))?;
                 Ok(("doris".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "bigquery" | "bq" | "gbq" => {
-                let config: broker_connectors::BigQuerySinkConfig =
+                let config: broker_connectors_enterprise::BigQuerySinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid bigquery config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid bigquery config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::SdkBigQueryTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::SdkBigQueryTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid bigquery transport: {e}"))?,
                 );
-                let sink = broker_connectors::BigQuerySink::new(config, transport)
+                let sink = broker_connectors_enterprise::BigQuerySink::new(config, transport)
                     .map_err(|e| format!("invalid bigquery sink: {e}"))?;
                 Ok(("bigquery".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "redshift" | "rs" | "aws_redshift" => {
-                let config: broker_connectors::RedshiftSinkConfig =
+                let config: broker_connectors_enterprise::RedshiftSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid redshift config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid redshift config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpRedshiftTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::HttpRedshiftTransport::new(&config, reqwest::Client::new())
                         .map_err(|e| format!("invalid redshift transport: {e}"))?,
                 );
-                let sink = broker_connectors::RedshiftSink::new(config, transport)
+                let sink = broker_connectors_enterprise::RedshiftSink::new(config, transport)
                     .map_err(|e| format!("invalid redshift sink: {e}"))?;
                 Ok(("redshift".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "oracle" | "oracle_db" | "ords" => {
-                let config: broker_connectors::OracleSinkConfig =
+                let config: broker_connectors_enterprise::OracleSinkConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid oracle config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid oracle config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpOracleTransport::new(&config),
+                    broker_connectors_enterprise::HttpOracleTransport::new(&config),
                 );
-                let sink = broker_connectors::OracleSink::new(config, transport)
+                let sink = broker_connectors_enterprise::OracleSink::new(config, transport)
                     .map_err(|e| format!("invalid oracle sink: {e}"))?;
                 Ok(("oracle".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "cockroachdb" | "cockroach" | "crdb" => {
-                let config: broker_connectors::CockroachDbConfig =
+                let config: broker_connectors_enterprise::CockroachDbConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid cockroachdb config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid cockroachdb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::PgDriverCockroachDbTransport::new(&config),
+                    broker_connectors_enterprise::PgDriverCockroachDbTransport::new(&config),
                 );
-                let sink = broker_connectors::CockroachDbSink::new(config, transport)
+                let sink = broker_connectors_enterprise::CockroachDbSink::new(config, transport)
                     .map_err(|e| format!("invalid cockroachdb sink: {e}"))?;
                 Ok(("cockroachdb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "alloydb" | "google_alloydb" | "alloy_db" => {
-                let config: broker_connectors::AlloydbConfig =
+                let config: broker_connectors_enterprise::AlloydbConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid alloydb config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid alloydb config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::PgDriverAlloydbTransport::new(&config),
+                    broker_connectors_enterprise::PgDriverAlloydbTransport::new(&config),
                 );
-                let sink = broker_connectors::AlloydbSink::new(config, transport)
+                let sink = broker_connectors_enterprise::AlloydbSink::new(config, transport)
                     .map_err(|e| format!("invalid alloydb sink: {e}"))?;
                 Ok(("alloydb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
@@ -1717,16 +1764,16 @@ async fn build_connector(
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "datalayers" | "data_layers" | "datalayers_db" => {
-                let config: broker_connectors::DatalayersConfig =
+                let config: broker_connectors_enterprise::DatalayersConfig =
                     serde_json::from_value(req.config.clone())
                         .map_err(|e| format!("invalid datalayers config: {e}"))?;
                 config
                     .validate()
                     .map_err(|e| format!("invalid datalayers config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors::HttpDatalayersTransport::new(&config),
+                    broker_connectors_enterprise::HttpDatalayersTransport::new(&config),
                 );
-                let sink = broker_connectors::DatalayersSink::new(config, transport)
+                let sink = broker_connectors_enterprise::DatalayersSink::new(config, transport)
                     .map_err(|e| format!("invalid datalayers sink: {e}"))?;
                 Ok(("datalayers".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
@@ -6475,9 +6522,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                                   "region": "us-east-1",
                                   "client_id": "indra-bridge-1",
                                   "auth": {"type": "mtls",
-                                            "ca_cert_pem": include_str!("../../broker-connectors/testdata/ca-cert.pem"),
-                                            "client_cert_pem": include_str!("../../broker-connectors/testdata/client-cert.pem"),
-                                            "client_key_pem": include_str!("../../broker-connectors/testdata/client-key.pem")},
+                                            "ca_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/ca-cert.pem"),
+                                            "client_cert_pem": include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem"),
+                                            "client_key_pem": include_str!("../../broker-connectors-enterprise/testdata/client-key.pem")},
                                   "topic_mappings": [{"local_topic": "sensors/+",
                                                       "remote_topic": "indra/up",
                                                       "direction": "localtoremote"}],
@@ -7975,13 +8022,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_listeners_routes_return_404() {
-        // W1-01 restores `/api/v5/banned` on the real store, so only the
-        // listener routes stay removed here; banned coverage lives with
-        // the ban store tests below.
+        // M1-06 restores `GET /api/v5/listeners` on the real boot-captured
+        // listener configuration, so only the per-listener detail and
+        // stop routes stay removed here; list coverage lives with the
+        // listeners store tests.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/listeners", &token).await;
+        assert_eq!(status, 200, "kept route GET /api/v5/listeners must be 200");
+        assert!(body.is_array(), "listeners list is an array: {body}");
         for raw in [
-            "GET /api/v5/listeners HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
             "GET /api/v5/listeners/tcp:default HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
             "POST /api/v5/listeners/x/stop HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
         ] {

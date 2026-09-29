@@ -292,6 +292,77 @@ bind_meta_malformed_rejected_test() ->
     ?assertEqual({error, malformed_bind_meta},
                  indra_brokerlink:decode_bind_meta(<<0, 9, "short">>)).
 
+bind_meta_cert_will_roundtrip_test() ->
+    %% Credentials plus peer plus certificate plus will decode together.
+    Meta = indra_brokerlink:encode_bind_meta(
+             <<"dev-w">>, true, 60,
+             {<<"alice">>, <<"s3cret">>},
+             <<"192.0.2.10">>,
+             #{cn => <<"sensor-9">>, subject => undefined, sans => []},
+             #{topic => <<"will/t">>, qos => 1,
+               retain => true, payload => <<"bye">>}),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-w">>, maps:get(client_id, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, Dec)),
+    ?assertEqual(<<"sensor-9">>, maps:get(cert_cn, Dec)),
+    ?assertEqual(<<"will/t">>, maps:get(will_topic, Dec)),
+    ?assertEqual(<<"bye">>, maps:get(will_payload, Dec)),
+    ?assertEqual(1, maps:get(will_qos, Dec)),
+    ?assertEqual(true, maps:get(will_retain, Dec)),
+    %% Undefined will encodes exactly like /6.
+    ?assertEqual(indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 60,
+                                                  {<<"alice">>, <<"s3cret">>},
+                                                  <<"192.0.2.10">>,
+                                                  #{cn => <<"sensor-9">>,
+                                                    subject => undefined,
+                                                    sans => []}),
+                 indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 60,
+                                                  {<<"alice">>, <<"s3cret">>},
+                                                  <<"192.0.2.10">>,
+                                                  #{cn => <<"sensor-9">>,
+                                                    subject => undefined,
+                                                    sans => []},
+                                                  undefined)).
+
+bind_meta_will_without_cert_roundtrip_test() ->
+    %% A will section without any certificate section decodes
+    %% (will-only tail), with an empty payload.
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-w">>, false, 30,
+                                            {undefined, undefined},
+                                            undefined,
+                                            undefined,
+                                            #{topic => <<"w">>, qos => 0,
+                                              retain => false, payload => <<>>}),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"w">>, maps:get(will_topic, Dec)),
+    ?assertEqual(<<>>, maps:get(will_payload, Dec)),
+    ?assertEqual(0, maps:get(will_qos, Dec)),
+    ?assertEqual(false, maps:get(will_retain, Dec)).
+
+bind_meta_no_will_decodes_absent_test() ->
+    %% Binds without a will section decode with absent will fields.
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 60)),
+    ?assertEqual(undefined, maps:get(will_topic, Dec)),
+    ?assertEqual(undefined, maps:get(will_payload, Dec)),
+    ?assertEqual(0, maps:get(will_qos, Dec)),
+    ?assertEqual(false, maps:get(will_retain, Dec)).
+
+bind_meta_bad_will_rejected_test() ->
+    %% Empty topic rejected at encode time.
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {undefined, undefined},
+                                                  undefined,
+                                                  undefined,
+                                                  #{topic => <<>>, qos => 0,
+                                                    retain => false, payload => <<>>})),
+    %% Truncated will tail rejected at decode time.
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(
+                   <<0, 1, "a", 1, 0, 60, 0, 5, "hello">>)).
+
 session_binding_meta_roundtrip_test() ->
     Meta = indra_brokerlink:encode_session_binding_meta(16#0102030405060708, true, 0),
     ?assertEqual(<<16#01, 16#02, 16#03, 16#04, 16#05, 16#06, 16#07, 16#08, 1, 0>>,
@@ -570,6 +641,77 @@ disconnect_meta_roundtrip_test() ->
     ?assertEqual({error, malformed_unbind_meta},
                  indra_brokerlink:decode_disconnect_meta(<<0, 4, "ab">>)).
 
+%%====================================================================
+%% Version-5 bind section (X1-01: framing + transport of properties)
+%%====================================================================
+
+bind_meta_v5_roundtrip_test() ->
+    %% Credentials plus peer plus the v5 section decode together; the
+    %% alias maximum still trails in its own section.
+    V5 = #{version => 5, session_expiry => 3600, receive_max => 100,
+           max_packet_size => 65536, user_properties => [{<<"k">>, <<"v">>}]},
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-v5">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 10,
+                                            undefined, undefined, V5),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-v5">>, maps:get(client_id, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, Dec)),
+    ?assertEqual(10, maps:get(client_alias_max, Dec)),
+    ?assertEqual(5, maps:get(protocol_version, Dec)),
+    ?assertEqual(3600, maps:get(session_expiry, Dec)),
+    ?assertEqual(100, maps:get(receive_maximum, Dec)),
+    ?assertEqual(65536, maps:get(max_packet_size, Dec)),
+    ?assertEqual([{<<"k">>, <<"v">>}], maps:get(user_properties, Dec)).
+
+bind_meta_v5_undefined_is_byte_identical_to_v8_test() ->
+    %% The /9 encoding without a v5 section is exactly the /8 encoding,
+    %% so version-4 binds are byte-identical to before.
+    V8 = indra_brokerlink:encode_bind_meta(<<"dev-4">>, true, 60,
+                                          {<<"alice">>, <<"s3cret">>},
+                                          <<"192.0.2.10">>, 7,
+                                          #{cn => undefined, subject => undefined,
+                                            sans => []},
+                                          #{topic => <<"w">>, payload => <<"bye">>,
+                                            qos => 0, retain => false}),
+    V9 = indra_brokerlink:encode_bind_meta(<<"dev-4">>, true, 60,
+                                          {<<"alice">>, <<"s3cret">>},
+                                          <<"192.0.2.10">>, 7,
+                                          #{cn => undefined, subject => undefined,
+                                            sans => []},
+                                          #{topic => <<"w">>, payload => <<"bye">>,
+                                            qos => 0, retain => false},
+                                          undefined),
+    ?assertEqual(V8, V9),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(V9),
+    ?assertEqual(4, maps:get(protocol_version, Dec)),
+    ?assertEqual(0, maps:get(session_expiry, Dec)),
+    ?assertEqual(65535, maps:get(receive_maximum, Dec)),
+    ?assertEqual(0, maps:get(max_packet_size, Dec)),
+    ?assertEqual([], maps:get(user_properties, Dec)).
+
+bind_meta_v5_malformed_rejected_test() ->
+    %% Truncated v5 section (declared length beyond the bytes present).
+    V5 = #{version => 5, session_expiry => 0, receive_max => 10,
+           max_packet_size => 0, user_properties => []},
+    Good = indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                            {undefined, undefined},
+                                            undefined, 0,
+                                            undefined, undefined, V5),
+    ?assert(byte_size(Good) > 4),
+    Truncated = binary:part(Good, 0, byte_size(Good) - 3),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(Truncated)),
+    %% Too many user properties rejected at encode time (fail closed).
+    Many = [{integer_to_binary(N), <<"v">>} || N <- lists:seq(1, 17)],
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {undefined, undefined},
+                                                  undefined, 0,
+                                                  undefined, undefined,
+                                                  V5#{user_properties => Many})).
+
 session_binding_alias_roundtrip_test() ->
     %% The /4 form carries the kernel inbound bound for CONNACK
     %% negotiation; the /3 form decodes with maximum 0.
@@ -583,6 +725,32 @@ session_binding_alias_roundtrip_test() ->
     Legacy = indra_brokerlink:encode_session_binding_meta(99, false, 2),
     {ok, LDec} = indra_brokerlink:decode_session_binding_meta(Legacy),
     ?assertEqual(0, maps:get(alias_max, LDec)).
+
+session_binding_v5_roundtrip_test() ->
+    %% The /5 form appends the X1-02 v5 section (granted expiry,
+    %% server limits, reason string, echoed user properties);
+    %% `undefined' encodes exactly like /4 (v4 byte-identical).
+    V5 = #{server_recv_max => 100, server_max_pkt => 65536,
+           session_expiry => 3600,
+           reason_string => <<"Bad username or password">>,
+           user_properties => [{<<"trace">>, <<"abc">>}]},
+    Meta = indra_brokerlink:encode_session_binding_meta(7, false, 16#86, 10, V5),
+    {ok, Dec} = indra_brokerlink:decode_session_binding_meta(Meta),
+    ?assertEqual(7, maps:get(session_id, Dec)),
+    ?assertEqual(false, maps:get(session_present, Dec)),
+    ?assertEqual(16#86, maps:get(return_code, Dec)),
+    ?assertEqual(10, maps:get(alias_max, Dec)),
+    ?assertEqual(100, maps:get(server_recv_max, Dec)),
+    ?assertEqual(65536, maps:get(server_max_pkt, Dec)),
+    ?assertEqual(3600, maps:get(session_expiry, Dec)),
+    ?assertEqual(<<"Bad username or password">>, maps:get(reason_string, Dec)),
+    ?assertEqual([{<<"trace">>, <<"abc">>}], maps:get(user_properties, Dec)),
+    Plain = indra_brokerlink:encode_session_binding_meta(7, false, 16#86, 10, undefined),
+    ?assertEqual(indra_brokerlink:encode_session_binding_meta(7, false, 16#86, 10), Plain),
+    %% Trailing garbage after the section fails closed (never a
+    %% guessed session).
+    ?assertEqual({error, malformed_session_binding_meta},
+                 indra_brokerlink:decode_session_binding_meta(<<Meta/binary, 0>>)).
 
 publish_meta_alias_roundtrip_test() ->
     %% The /6 form appends the alias; the /5 form decodes with alias 0.

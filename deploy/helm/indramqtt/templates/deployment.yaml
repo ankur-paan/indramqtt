@@ -1,0 +1,106 @@
+# Single-node broker Deployment (M1-09).
+#
+# Minimal means one replica with no clustering: replicas is hard-coded to
+# 1, not a value, because a second replica without cluster seed
+# configuration would split-brain rather than scale. Clustering, TLS
+# termination at ingress and production hardening are non-goals (see
+# README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-indramqtt
+  labels:
+    app.kubernetes.io/name: indramqtt
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: indramqtt
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: indramqtt
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      # The image runs as the non-root `indra` user by build; spelling the
+      # ids out keeps the pod compliant with restricted pod security even
+      # if the image default ever changes. 65534 (`nobody`) is the
+      # conventional unprivileged id and owns nothing here; the image's
+      # own `indra` user owns the data and config mounts.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: indramqtt
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image bakes `CMD ["--api-bind", "0.0.0.0:18083"]`
+          # (Dockerfile) and a passed flag wins over files and the
+          # environment (`crates/broker-node/src/main.rs`), so without an
+          # override a non-default `service.apiPort` would leave the
+          # effective API bind at 18083 while the Service and indra.toml
+          # moved. These args keep the effective bind on the same value.
+          args:
+            - "--api-bind=0.0.0.0:{{ .Values.service.apiPort }}"
+          ports:
+            - name: mqtt
+              containerPort: {{ .Values.service.mqttPort }}
+            - name: ws
+              containerPort: {{ .Values.service.wsPort }}
+            - name: api
+              containerPort: {{ .Values.service.apiPort }}
+          env:
+            - name: RUST_LOG
+              value: info
+{{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+{{- end }}
+          volumeMounts:
+            # The operator's main config file, read-only: the loader reads
+            # only `<config-dir>/indra.toml`, and the broker never rewrites
+            # files under the config directory.
+            - name: config
+              mountPath: /etc/indramqtt/indra.toml
+              subPath: indra.toml
+              readOnly: true
+            # The broker's one data root: every byte it mutates
+            # (`node.data_dir`, `state.toml` beside it, the stream journal
+            # when configured) lives under /var/lib/indramqtt.
+            - name: data
+              mountPath: /var/lib/indramqtt
+          # Settled probes: the public unauthenticated `/healthz` route
+          # answering `OK` (the only readiness route the kernel
+          # implements). `/api/v1/health` does not exist; a probe against
+          # it fails closed with a 404 and must not be used here.
+          # initialDelay 30 s covers a cold boot replaying state.toml on a
+          # fresh volume; period 10 s bounds detection delay while keeping
+          # probe load off the publish path; 3 failures ride out a slow
+          # start before the orchestrator restarts the pod.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-indramqtt-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-indramqtt-data
