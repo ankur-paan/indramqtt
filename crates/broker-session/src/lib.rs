@@ -2734,6 +2734,10 @@ impl SessionManager {
             // session. Racing teardowns (wrong conn_id, unknown client)
             // and detaches of an already-disconnected session change
             // nothing, so the counter never underflows.
+            // A new Rust release renames `fetch_update` to `try_update`.
+            // The toolchains that build this crate do not all have the
+            // new name, thus the old name stays.
+            #[allow(deprecated)]
             let _ = self
                 .connected_count
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
@@ -2938,6 +2942,9 @@ impl SessionManager {
         let Some(count) = inner.get(username) else {
             return;
         };
+        // The old name stays for the toolchains that do not have
+        // `try_update` (see `connected_count` above).
+        #[allow(deprecated)]
         let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         if inner.values().all(|c| c.load(Ordering::SeqCst) == 0) {
             counts.remove(tenant);
