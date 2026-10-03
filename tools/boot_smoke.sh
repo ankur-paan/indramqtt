@@ -19,6 +19,10 @@ set -u
 
 BIN_DIR=${1:?give the directory that contains indramqtt and indra}
 EBIN=${2:?give the ebin directory of the edge}
+# The script starts the edge from a different directory. Thus it needs
+# absolute paths.
+BIN_DIR=$(cd "$BIN_DIR" 2>/dev/null && pwd) || { echo "FAIL: $1 is not a directory"; exit 2; }
+EBIN=$(cd "$EBIN" 2>/dev/null && pwd) || { echo "FAIL: $2 is not a directory"; exit 2; }
 KERNEL=$BIN_DIR/indramqtt
 CTL=$BIN_DIR/indra
 
