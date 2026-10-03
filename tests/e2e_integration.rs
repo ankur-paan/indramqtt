@@ -3232,3 +3232,194 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+/// MT-07: the same client id in two tenants holds two connections.
+///
+/// The kernel boots with one tenant rule from `indra.toml`. Two real
+/// MQTT clients connect with the same client id but different
+/// usernames. Both CONNACKs succeed and both sockets stay open. A
+/// publish in each tenant reaches only its own tenant. The test uses
+/// the file entry and client sockets only.
+#[tokio::test]
+async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
+    use tokio::io::AsyncWriteExt;
+    let tag = format!(
+        "mt07-dup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        "[[tenants.rules]]\nexpression = \"t-${username}\"\n",
+    )
+    .expect("write indra.toml");
+    let bl_port = shard_ephemeral_port();
+    let config_arg = format!("--config-dir={}", config_dir.display());
+    let (mut child, _addr) = shard_spawn_kernel(&[config_arg.as_str()], &scratch, bl_port).await;
+    let edge = match sy02_spawn_edge(bl_port).await {
+        Some(edge) => edge,
+        None => {
+            // SKIP already logged.
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return;
+        }
+    };
+    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+
+    // Two sockets share one client id. Each carries its own username,
+    // so each lands in its own tenant.
+    let mut a_sock = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("dial A in time")
+    .expect("dial A");
+    let mut b_sock = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("dial B in time")
+    .expect("dial B");
+    for (sock, user) in [(&mut a_sock, "alpha"), (&mut b_sock, "beta")] {
+        let connect = sy02_connect311("mt07-dup", true, 60, Some((user, b"pw")));
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+            .await
+            .expect("CONNECT in time")
+            .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "edge answers {user} with CONNACK");
+        assert_eq!(
+            sy02_parse_connack311(&body),
+            (false, 0),
+            "first CONNECT of {user} is accepted"
+        );
+    }
+    // Both tenants subscribe to the same topic string.
+    for sock in [&mut a_sock, &mut b_sock] {
+        let subscribe = sy02_subscribe(1, &[("mt07/dup", 1)]);
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&subscribe))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head, 0x90, "edge answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    // One publisher per tenant.
+    let mut a_pub = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("dial A pub in time")
+    .expect("dial A pub");
+    let mut b_pub = tokio::time::timeout(
+        SHARD_E2E_STEP,
+        tokio::net::TcpStream::connect((edge.host(), edge.mqtt_port)),
+    )
+    .await
+    .expect("dial B pub in time")
+    .expect("dial B pub");
+    for (sock, id, user) in [
+        (&mut a_pub, "mt07-a-pub", "alpha"),
+        (&mut b_pub, "mt07-b-pub", "beta"),
+    ] {
+        let connect = sy02_connect311(id, true, 60, Some((user, b"pw")));
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&connect))
+            .await
+            .expect("pub CONNECT in time")
+            .expect("pub CONNECT send");
+        let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("pub CONNACK in time")
+            .expect("pub CONNACK");
+        assert_eq!(head, 0x20, "edge answers the publisher with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    }
+    // A publish in tenant A reaches A only. B stays silent.
+    let publish = sy02_publish311("mt07/dup", 1, 1, false, b"from-a");
+    tokio::time::timeout(SHARD_E2E_STEP, a_pub.write_all(&publish))
+        .await
+        .expect("publish in time")
+        .expect("publish send");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut a_pub))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK");
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    assert_eq!(body, vec![0, 1], "PUBACK mirrors its packet id");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut a_sock))
+        .await
+        .expect("A downlink in time")
+        .expect("A downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "mt07/dup");
+    assert_eq!(downlink.payload, b"from-a");
+    tokio::time::timeout(
+        SHARD_E2E_STEP,
+        a_sock.write_all(&sy02_puback(downlink.packet_id)),
+    )
+    .await
+    .expect("PUBACK in time")
+    .expect("PUBACK send");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A's publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    let publish = sy02_publish311("mt07/dup", 2, 1, false, b"from-b");
+    tokio::time::timeout(SHARD_E2E_STEP, b_pub.write_all(&publish))
+        .await
+        .expect("publish in time")
+        .expect("publish send");
+    let (head, _) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut b_pub))
+        .await
+        .expect("PUBACK in time")
+        .expect("PUBACK");
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(&mut b_sock))
+        .await
+        .expect("B downlink in time")
+        .expect("B downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "mt07/dup");
+    assert_eq!(downlink.payload, b"from-b");
+    tokio::time::timeout(
+        SHARD_E2E_STEP,
+        b_sock.write_all(&sy02_puback(downlink.packet_id)),
+    )
+    .await
+    .expect("PUBACK in time")
+    .expect("PUBACK send");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B's publish");
+
+    edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
+}

@@ -4558,6 +4558,17 @@ where
                         .sessions
                         .key_for_conn(frame.header.conn_id)
                         .unwrap_or_else(|| SessionKey::default_tenant(&req.client_id));
+                    // Connection-table tenant label (MT-07): the owning
+                    // tenant from the session record just stamped above
+                    // (single source of truth, never re-rendered here),
+                    // so tenant-filtered connection queries observe the
+                    // same tenant the session carries. Swept with the
+                    // slot by `unregister` on disconnect. One short
+                    // shard write on bind only; the publish and deliver
+                    // paths never touch it.
+                    shared
+                        .conns
+                        .set_tenant_label(frame.header.conn_id, &key.tenant);
                     bound.push((key, frame.header.conn_id));
                     // Auto-subscribe hook (W1-39): only on accepted binds.
                     // Per-connect cost only; fan-out takes no new lock.
@@ -16672,6 +16683,199 @@ mod tests {
         }
         assert_eq!(session_a.offline_len(), 0);
         assert_eq!(session_b.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mt07_kernel_records_tenant_on_clients_and_sessions_through_broker() {
+        // MT-07 through the real broker path (connect, publish,
+        // deliver): the same client id in tenant A and tenant B holds
+        // two records with the two tenant ids (session record,
+        // connection-table label and mirrored subscription row);
+        // publishes in each tenant still deliver only within that
+        // tenant (recording did not leak isolation); existing
+        // client/subscription reads keep serving both tenants without
+        // cross-tenant delivery.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+
+        // Same client id, two tenants, through the kernel bind hook.
+        for (conn, user) in [(401u64, "alice"), (402u64, "bob")] {
+            let meta = encode_bind_meta_creds("mt7-dup", true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+            // Mirror of the transport loop's bind hook
+            // (`serve_brokerlink`): register the mailbox, then stamp the
+            // client label and the tenant label from the session record
+            // the bind just wrote.
+            let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+            shared.conns.register(conn, tx);
+            shared.conns.set_client_label(conn, "mt7-dup");
+            let key = shared
+                .sessions
+                .key_for_conn(conn)
+                .expect("fresh bind is indexed");
+            shared.conns.set_tenant_label(conn, &key.tenant);
+        }
+
+        // The kernel holds two records with the two tenant ids.
+        let tenant_a = shared
+            .sessions
+            .get_in_tenant("u-alice", "mt7-dup")
+            .expect("A session")
+            .tenant_id
+            .read()
+            .clone();
+        let tenant_b = shared
+            .sessions
+            .get_in_tenant("u-bob", "mt7-dup")
+            .expect("B session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant_a, "u-alice");
+        assert_eq!(tenant_b, "u-bob");
+
+        // Connection-table labels carry the owning tenant.
+        assert_eq!(
+            shared.conns.tenant_for(401).as_deref(),
+            Some("u-alice"),
+            "conn label carries the owning tenant"
+        );
+        assert_eq!(shared.conns.tenant_for(402).as_deref(), Some("u-bob"));
+        assert_eq!(shared.conns.conns_in_tenant("u-alice"), vec![401]);
+        assert_eq!(shared.conns.conns_in_tenant("u-bob"), vec![402]);
+
+        // Tenant-tagged client records are distinct per tenant.
+        let info_a = shared
+            .sessions
+            .client_info_in_tenant("u-alice", "mt7-dup")
+            .expect("A record");
+        let info_b = shared
+            .sessions
+            .client_info_in_tenant("u-bob", "mt7-dup")
+            .expect("B record");
+        assert_eq!(info_a.tenant_id, "u-alice");
+        assert_eq!(info_b.tenant_id, "u-bob");
+        assert_ne!(info_a.session_id, info_b.session_id);
+
+        // Same filter in both tenants, via each connection's own
+        // session (the subscribe path resolves the tenant from the
+        // bound connection, never from the bare client id).
+        for (conn, client) in [(401u64, "mt7-dup"), (402u64, "mt7-dup")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("mt7/shared", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        // The mirrored subscription rows carry the owning tenant each.
+        let rows_a = shared.sessions.global_subscriptions_in_tenant("u-alice");
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(rows_a[0].tenant, "u-alice");
+        let rows_b = shared.sessions.global_subscriptions_in_tenant("u-bob");
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].tenant, "u-bob");
+
+        // A publish in A delivers only in A; a publish in B only in B.
+        let (meta, payload) = encode_publish_meta("mt7/shared", 0, 0, false, b"from-a");
+        let (_, deliveries) = apply_publish(&publish_frame(401, 2, meta, payload), &shared).await;
+        let conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert_eq!(conns, vec![401], "A's publish stays in A");
+        let (meta, payload) = encode_publish_meta("mt7/shared", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(402, 3, meta, payload), &shared).await;
+        let conns: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert_eq!(conns, vec![402], "B's publish stays in B");
+
+        // Existing reads keep serving both tenants: the global client
+        // list and the global subscription index still cover both
+        // records with today's shapes, and the per-tenant queries split
+        // them exactly.
+        let mut global_ids = shared.sessions.active_client_ids();
+        global_ids.sort();
+        assert_eq!(global_ids, vec!["mt7-dup", "mt7-dup"]);
+        assert_eq!(
+            shared.sessions.active_client_ids_in_tenant("u-alice"),
+            vec!["mt7-dup"]
+        );
+        assert_eq!(
+            shared.sessions.active_client_ids_in_tenant("u-bob"),
+            vec!["mt7-dup"]
+        );
+        assert_eq!(shared.sessions.global_subscriptions().len(), 2);
+        assert_eq!(shared.sessions.connected_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn mt07_default_tenant_reads_keep_todays_shapes_through_broker() {
+        // MT-07 default tenant through the real broker path: the
+        // client, subscription, topic and session-count reads return
+        // today's shapes unchanged (no tenant field on the wire), while
+        // the records underneath already carry the default tenant tag.
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        let frame = bind_frame(403, 1, encode_bind_meta("mt7-default-1", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(403, tx);
+        shared.conns.set_client_label(403, "mt7-default-1");
+        let key = shared
+            .sessions
+            .key_for_conn(403)
+            .expect("fresh bind is indexed");
+        shared.conns.set_tenant_label(403, &key.tenant);
+
+        let sub = subscribe_frame(
+            403,
+            1,
+            encode_subscribe_meta(1, "mt7-default-1", &[("mt7/plain", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("mt7/plain", 0, 0, false, b"ping");
+        let (_, deliveries) = apply_publish(&publish_frame(403, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 403);
+
+        // Records underneath carry the default tenant tag.
+        let info = shared
+            .sessions
+            .client_info("mt7-default-1")
+            .expect("default record");
+        assert_eq!(info.tenant_id, broker_session::tenant::DEFAULT_TENANT_ID);
+        assert_eq!(
+            shared.conns.tenant_for(403).as_deref(),
+            Some(broker_session::tenant::DEFAULT_TENANT_ID)
+        );
+        // ... while the management shapes stay exactly as before: no
+        // tenant field on the wire, bare client-id list, exact session
+        // count.
+        let wire = serde_json::to_value(&info).expect("serializes");
+        assert!(wire.get("tenant_id").is_none());
+        assert!(wire.get("tenant").is_none());
+        assert_eq!(
+            wire.get("client_id").and_then(|v| v.as_str()),
+            Some("mt7-default-1")
+        );
+        assert_eq!(shared.sessions.active_client_ids(), vec!["mt7-default-1"]);
+        assert_eq!(
+            shared
+                .sessions
+                .active_client_ids_in_tenant(broker_session::tenant::DEFAULT_TENANT_ID),
+            vec!["mt7-default-1"]
+        );
+        assert_eq!(shared.sessions.global_subscriptions().len(), 1);
+        assert_eq!(shared.sessions.connected_count(), 1);
     }
 
     #[tokio::test]

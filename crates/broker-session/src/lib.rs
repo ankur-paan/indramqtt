@@ -622,18 +622,28 @@ pub const ENDED_SESSION_TTL_SECS: u64 = 24 * 3_600;
 
 /// One row of the global subscription index: owner plus the granted
 /// filter and its options, as mirrored on the session by the subscribe
-/// routes (same state the per-client list reads).
+/// routes (same state the per-client list reads). `tenant` is the
+/// owning tenant recorded where the session is already being written
+/// (MT-07 readiness for the later management API): the management list
+/// renders today's shape unchanged and omits it, so filtering by tenant
+/// stays internal until the management API arrives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSubscription {
+    pub tenant: String,
     pub client_id: String,
     pub filter: TopicFilter,
     pub options: SubscriptionOptions,
 }
 
-/// Management-API detail row for one client session.
+/// Management-API detail row for one client session. `tenant_id` is the
+/// owning tenant recorded where the session is already written. It is
+/// skipped in serialization so the output keeps today's shape. The
+/// later management wave decides the response shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientInfo {
     pub client_id: String,
+    #[serde(default, skip_serializing)]
+    pub tenant_id: String,
     pub session_id: u64,
     pub conn_id: Option<u64>,
     pub keepalive_secs: u16,
@@ -2154,9 +2164,10 @@ impl SessionManager {
     }
 
     /// Sorted ids of currently connected clients (for the management API).
-    /// TODO(parity): the list is global across tenants until MT-07
-    /// (management-output changes) scopes it; two tenants sharing a
-    /// client id appear twice, once per session.
+    /// Global across tenants (today's shape: bare client ids, unchanged
+    /// in this wave); two tenants sharing a client id appear once per
+    /// live session. Tenant callers use
+    /// [`SessionManager::active_client_ids_in_tenant`].
     pub fn active_client_ids(&self) -> Vec<String> {
         let sessions = self.sessions.read();
         let mut ids: Vec<String> = sessions
@@ -2165,6 +2176,28 @@ impl SessionManager {
             .filter(|session| *session.connected.read())
             .map(|session| session.client_id.clone())
             .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Sorted ids of currently connected clients in `tenant` (MT-07
+    /// readiness for the later management API): only the owning
+    /// tenant's live sessions, so one tenant's listing never observes
+    /// another tenant's namesake. One short map read plus one short
+    /// flag read per session in that tenant; management-plane only,
+    /// never on the publish or deliver path.
+    pub fn active_client_ids_in_tenant(&self, tenant: &str) -> Vec<String> {
+        let sessions = self.sessions.read();
+        let mut ids: Vec<String> = sessions
+            .get(tenant)
+            .map(|inner| {
+                inner
+                    .values()
+                    .filter(|session| *session.connected.read())
+                    .map(|session| session.client_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         ids.sort();
         ids
     }
@@ -2190,19 +2223,65 @@ impl SessionManager {
     /// routing path: one short read per session plus one short map read,
     /// no router lock, no work on fan-out or fan-in. Covers connected
     /// and detached durable sessions (clean disconnects already drain
-    /// their rows). Sorted by `(client_id, filter)` for a deterministic
+    /// their rows). Each row carries its owning tenant (MT-07 readiness;
+    /// the management list renders today's shape unchanged and omits
+    /// it). Sorted by `(tenant, client_id, filter)` for a deterministic
     /// page order and truncated to [`MAX_GLOBAL_SUBSCRIPTIONS`] so one
     /// list call cannot balloon the node. Management-plane only.
     pub fn global_subscriptions(&self) -> Vec<GlobalSubscription> {
         let sessions = self.sessions.read();
         let mut rows: Vec<GlobalSubscription> = Vec::new();
-        for inner in sessions.values() {
+        for (tenant, inner) in sessions.iter() {
             for (client_id, session) in inner.iter() {
                 for (filter, options) in session.subscriptions.read().iter() {
                     if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
                         break;
                     }
                     rows.push(GlobalSubscription {
+                        tenant: tenant.clone(),
+                        client_id: client_id.clone(),
+                        filter: filter.clone(),
+                        options: *options,
+                    });
+                }
+                if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
+                    break;
+                }
+            }
+        }
+        drop(sessions);
+        rows.sort_by(|a, b| {
+            (a.tenant.as_str(), a.client_id.as_str(), a.filter.as_str()).cmp(&(
+                b.tenant.as_str(),
+                b.client_id.as_str(),
+                b.filter.as_str(),
+            ))
+        });
+        if rows.len() > MAX_GLOBAL_SUBSCRIPTIONS {
+            rows.truncate(MAX_GLOBAL_SUBSCRIPTIONS);
+        }
+        rows
+    }
+
+    /// Snapshot every subscription owned by `tenant` (MT-07 readiness
+    /// for the later management API): only the owning tenant's rows, so
+    /// one tenant's listing never observes another tenant's mirror.
+    /// Same bounded snapshot discipline as
+    /// [`SessionManager::global_subscriptions`] (at most
+    /// [`MAX_GLOBAL_SUBSCRIPTIONS`] rows, sorted by `(client_id,
+    /// filter)`); management-plane only, never on the publish or
+    /// deliver path.
+    pub fn global_subscriptions_in_tenant(&self, tenant: &str) -> Vec<GlobalSubscription> {
+        let sessions = self.sessions.read();
+        let mut rows: Vec<GlobalSubscription> = Vec::new();
+        if let Some(inner) = sessions.get(tenant) {
+            for (client_id, session) in inner.iter() {
+                for (filter, options) in session.subscriptions.read().iter() {
+                    if rows.len() >= MAX_GLOBAL_SUBSCRIPTIONS {
+                        break;
+                    }
+                    rows.push(GlobalSubscription {
+                        tenant: tenant.to_string(),
                         client_id: client_id.clone(),
                         filter: filter.clone(),
                         options: *options,
@@ -2225,18 +2304,22 @@ impl SessionManager {
     }
 
     /// Full detail row for one client, if known (for the management API).
-    /// Default-tenant row; tenant callers use
-    /// [`SessionManager::client_info_in_tenant`].
-    /// TODO(parity): row selection across tenants is MT-07's call.
+    /// Default-tenant row (today's shape, unchanged in this wave);
+    /// tenant callers use [`SessionManager::client_info_in_tenant`].
     pub fn client_info(&self, client_id: &str) -> Option<ClientInfo> {
         self.client_info_in_tenant(tenant::DEFAULT_TENANT_ID, client_id)
     }
 
     /// Full detail row for one `(tenant, client id)` pair, if known.
+    /// The row carries its owning tenant (MT-07 readiness; the
+    /// management output omits it, keeping today's shape). The same
+    /// client id in two tenants yields two distinct tenant-tagged rows,
+    /// never the other tenant's session.
     pub fn client_info_in_tenant(&self, tenant: &str, client_id: &str) -> Option<ClientInfo> {
         self.get_in_tenant(tenant, client_id)
             .map(|session| ClientInfo {
                 client_id: session.client_id.clone(),
+                tenant_id: session.tenant_id.read().clone(),
                 session_id: session.id.0,
                 conn_id: *session.conn_id.read(),
                 keepalive_secs: *session.keepalive_secs.read(),
@@ -4432,5 +4515,86 @@ mod tests {
             manager.unbind_connection_in_tenant(&tenant, "c", 200_000 + i as u64);
         }
         assert!(manager.sessions.read().len() <= MAX_TENANTS);
+    }
+
+    #[test]
+    fn test_mt07_same_client_id_reports_distinct_tenant_tagged_records() {
+        // MT-07: the same client id in two tenants reports two distinct
+        // tenant-tagged records, and tenant-filtered internal queries
+        // return only the owning tenant's entries. Management output
+        // keeps today's shapes: the tenant tag rides the record, never
+        // the serialized row.
+        let manager = SessionManager::new();
+        let (a, _) = manager.get_or_create_in_tenant("tenant-a", "dup", true);
+        manager.bind_session(&a, 701);
+        let (b, _) = manager.get_or_create_in_tenant("tenant-b", "dup", true);
+        manager.bind_session(&b, 702);
+
+        // Distinct tenant-tagged records, never the other tenant's.
+        let info_a = manager
+            .client_info_in_tenant("tenant-a", "dup")
+            .expect("a record");
+        let info_b = manager
+            .client_info_in_tenant("tenant-b", "dup")
+            .expect("b record");
+        assert_eq!(info_a.tenant_id, "tenant-a");
+        assert_eq!(info_b.tenant_id, "tenant-b");
+        assert_ne!(info_a.session_id, info_b.session_id);
+        assert_eq!(info_a.conn_id, Some(701));
+        assert_eq!(info_b.conn_id, Some(702));
+        assert!(manager
+            .client_info_in_tenant("tenant-a", "missing")
+            .is_none());
+
+        // Tenant-filtered client listings return only the owning
+        // tenant's entries; the global list keeps today's shape.
+        assert_eq!(manager.active_client_ids_in_tenant("tenant-a"), vec!["dup"]);
+        assert_eq!(manager.active_client_ids_in_tenant("tenant-b"), vec!["dup"]);
+        assert!(manager.active_client_ids_in_tenant("tenant-zz").is_empty());
+        let mut global = manager.active_client_ids();
+        global.sort();
+        assert_eq!(global, vec!["dup", "dup"]);
+
+        // Mirrored subscription index carries the owning tenant per row.
+        let filter_a = TopicFilter::new("t/a").unwrap();
+        let filter_b = TopicFilter::new("t/b").unwrap();
+        manager.add_subscription_with_options_in_tenant(
+            "tenant-a",
+            "dup",
+            filter_a.clone(),
+            QoS::AtMostOnce,
+            0,
+            0,
+            0,
+        );
+        manager.add_subscription_with_options_in_tenant(
+            "tenant-b",
+            "dup",
+            filter_b.clone(),
+            QoS::AtMostOnce,
+            0,
+            0,
+            0,
+        );
+        let rows_a = manager.global_subscriptions_in_tenant("tenant-a");
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(rows_a[0].tenant, "tenant-a");
+        assert_eq!(rows_a[0].filter, filter_a);
+        let rows_b = manager.global_subscriptions_in_tenant("tenant-b");
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].tenant, "tenant-b");
+        assert_eq!(rows_b[0].filter, filter_b);
+        assert!(manager
+            .global_subscriptions_in_tenant("tenant-zz")
+            .is_empty());
+        let all = manager.global_subscriptions();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|r| r.tenant == "tenant-a"));
+        assert!(all.iter().any(|r| r.tenant == "tenant-b"));
+
+        // Detaching A's connection removes only A's listing entry.
+        manager.unbind_connection_in_tenant("tenant-a", "dup", 701);
+        assert!(manager.active_client_ids_in_tenant("tenant-a").is_empty());
+        assert_eq!(manager.active_client_ids_in_tenant("tenant-b"), vec!["dup"]);
     }
 }

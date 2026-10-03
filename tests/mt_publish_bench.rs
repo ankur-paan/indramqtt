@@ -1,7 +1,10 @@
-//! MT-01 single-tenant publish-to-deliver load (BENCH gate).
+//! MT-07 single-tenant publish-to-deliver load (BENCH gate).
 //!
 //! Driven by the pipeline, never by the agent: an `#[ignore]`
-//! integration test using only APIs present on this task's base commit.
+//! integration test using only APIs present on this task's base commit
+//! (d5874f0: `SessionManager::{new,get_or_create,bind_session,get,
+//! add_subscription}`, `Router::{new,subscribe,matches}`,
+//! `Subscription::new`, `Topic::new`, `TopicFilter::new`).
 //! It connects real clients (session records via `get_or_create` plus
 //! `bind_session`, the same session writes the kernel bind hook makes),
 //! subscribes one of them through the router, then drives a
@@ -10,8 +13,8 @@
 //! session, verifies it is connected on the subscribing connection, and
 //! counts the delivery). It prints `BENCH throughput <value>
 //! msg_per_sec` and `BENCH p99 <value> ms`. Accept bar: no regression
-//! beyond run-to-run spread for single-tenant installs (MT-01 ships an
-//! empty default expression, so the publish path is unchanged).
+//! beyond run-to-run spread for single-tenant installs (MT-07 records
+//! the tenant on bind only, so the publish path is unchanged).
 
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};

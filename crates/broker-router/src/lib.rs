@@ -2617,6 +2617,63 @@ mod tests {
     }
 
     #[test]
+    fn conn_table_labels_carry_the_owning_tenant() {
+        // MT-07: connection-table labels carry the owning tenant stamped
+        // at bind; tenant-filtered queries return only the owning
+        // tenant's connections. Unlabelled connections fail closed to
+        // the default tenant, never to another tenant's scope, and
+        // `unregister` sweeps the label with the slot.
+        let table = ConnTable::default();
+        let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_c, _rx_c) = tokio::sync::mpsc::unbounded_channel();
+        table.register(501, tx_a);
+        table.register(502, tx_b);
+        table.register(503, tx_c);
+        table.set_client_label_in_tenant(501, "dup", "tenant-a");
+        table.set_client_label_in_tenant(502, "dup", "tenant-b");
+        table.set_client_label(503, "plain");
+
+        assert_eq!(
+            table.client_label_for(501).as_deref(),
+            Some("dup"),
+            "client label rides alongside the tenant label"
+        );
+        assert_eq!(table.tenant_for(501).as_deref(), Some("tenant-a"));
+        assert_eq!(table.tenant_for(502).as_deref(), Some("tenant-b"));
+        assert_eq!(
+            table.tenant_for(503).as_deref(),
+            Some(DEFAULT_TENANT_ID),
+            "unlabelled connections fail closed to the default tenant"
+        );
+        assert!(
+            table.tenant_for(9999).is_none(),
+            "unknown connections report nothing"
+        );
+        assert_eq!(table.conns_in_tenant("tenant-a"), vec![501]);
+        assert_eq!(table.conns_in_tenant("tenant-b"), vec![502]);
+        assert_eq!(table.conns_in_tenant(DEFAULT_TENANT_ID), vec![503]);
+        assert!(table.conns_in_tenant("tenant-zz").is_empty());
+
+        // Re-binds overwrite both labels together.
+        table.set_client_label_in_tenant(501, "dup", "tenant-b");
+        assert_eq!(table.tenant_for(501).as_deref(), Some("tenant-b"));
+        assert_eq!(table.conns_in_tenant("tenant-a"), Vec::<u64>::new());
+
+        // Empty and overlong tenant ids fall back to the default
+        // tenant, never to another tenant's scope.
+        table.set_tenant_label(502, "");
+        assert_eq!(table.tenant_for(502).as_deref(), Some(DEFAULT_TENANT_ID));
+        table.set_tenant_label(502, &"t".repeat(MAX_TENANT_ID_LEN + 1));
+        assert_eq!(table.tenant_for(502).as_deref(), Some(DEFAULT_TENANT_ID));
+
+        // Disconnect sweeps the label with the slot.
+        table.unregister(501);
+        assert!(table.tenant_for(501).is_none());
+        assert!(table.conns_in_tenant("tenant-b").is_empty());
+    }
+
+    #[test]
     fn route_reports_dead_mailbox_and_prunes_it() {
         let table = ConnTable::default();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3122,6 +3179,19 @@ struct ConnSlot {
     /// back to the global shed counter alone when unset (tests that
     /// never bind still count every drop).
     client: RwLock<Option<Arc<str>>>,
+    /// Tenant owning this connection (MT-07). Set by
+    /// [`ConnTable::set_tenant_label`] on bind alongside the client
+    /// label, from the session record the bind hook just stamped (the
+    /// single source of truth, never re-rendered here); `unregister`
+    /// drops the whole slot so the label is swept with the connection.
+    /// Read only by management-plane tenant-filtered queries
+    /// ([`ConnTable::tenant_for`], [`ConnTable::conns_in_tenant`]); the
+    /// publish and deliver paths never touch it, so fan-out pays no new
+    /// lock and no new allocation. Stored tags are clamped to
+    /// [`MAX_TENANT_ID_LEN`]: empty or overlong ids fall back to the
+    /// default tenant (fail closed, never another tenant's), matching
+    /// [`normalize_tenant`].
+    tenant: RwLock<Option<Arc<str>>>,
     /// Per-transport wakeup for QoS 0 arrivals (D1-02). The owning edge
     /// task sets its own [`Notify`] via [`ConnTable::set_waker`] on
     /// bind; `route`/`route_qos0` signal exactly this task
@@ -3155,6 +3225,7 @@ impl ConnTable {
                 next_seq: AtomicU64::new(1),
                 qos0: Mutex::new(VecDeque::new()),
                 client: RwLock::new(None),
+                tenant: RwLock::new(None),
                 waker: RwLock::new(None),
             },
         );
@@ -3169,6 +3240,85 @@ impl ConnTable {
         if let Some(slot) = shard.get(&conn_id) {
             *slot.client.write() = Some(Arc::<str>::from(client_id));
         }
+    }
+
+    /// Remember which tenant owns `conn_id` (MT-07). Called on
+    /// bind/connect after [`ConnTable::register`] with the tenant the
+    /// kernel bind hook just stamped on the session record; re-binds
+    /// overwrite. Unknown connections are ignored. Empty or overlong
+    /// ids fall back to the default tenant (fail closed, never another
+    /// tenant's). Bind/disconnect paths only: one short shard read plus
+    /// one short slot write, and the entry dies with the slot in
+    /// `unregister`, so no sweep beyond the existing removal is needed.
+    pub fn set_tenant_label(&self, conn_id: u64, tenant: &str) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.tenant.write() = Some(normalize_tenant(tenant));
+        }
+    }
+
+    /// Remember which client in which tenant owns `conn_id` (MT-07):
+    /// exactly [`ConnTable::set_client_label`] plus
+    /// [`ConnTable::set_tenant_label`] in one shard visit. Called on
+    /// bind/connect after [`ConnTable::register`]; re-binds overwrite.
+    /// Unknown connections are ignored.
+    pub fn set_client_label_in_tenant(&self, conn_id: u64, client_id: &str, tenant: &str) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.client.write() = Some(Arc::<str>::from(client_id));
+            *slot.tenant.write() = Some(normalize_tenant(tenant));
+        }
+    }
+
+    /// Client id owning `conn_id`, if labelled. Management-plane hook
+    /// for tests and operators; the deliver path never calls it.
+    pub fn client_label_for(&self, conn_id: u64) -> Option<Arc<str>> {
+        let shard = self.shard(conn_id).lock();
+        shard
+            .get(&conn_id)
+            .and_then(|slot| slot.client.read().clone())
+    }
+
+    /// Tenant owning `conn_id` (MT-07): the label stamped at bind, or
+    /// the default tenant when the connection was registered but never
+    /// labelled (fail closed to the pre-tenancy scope, never another
+    /// tenant's). `None` only for unknown connections. Management-plane
+    /// hook for tests and operators; the publish and deliver paths never
+    /// call it.
+    pub fn tenant_for(&self, conn_id: u64) -> Option<Arc<str>> {
+        let shard = self.shard(conn_id).lock();
+        shard.get(&conn_id).map(|slot| {
+            slot.tenant
+                .read()
+                .clone()
+                .unwrap_or_else(|| Arc::from(DEFAULT_TENANT_ID))
+        })
+    }
+
+    /// Every live connection id labelled with `tenant` (MT-07).
+    /// Management-plane read only (tenant-filtered client listings for
+    /// the later management API): visits each bucket once and clones at
+    /// most one small integer per matching connection, so the snapshot
+    /// is bounded by the live connection count; never called on the
+    /// publish or deliver path, so fan-out pays no full scan.
+    pub fn conns_in_tenant(&self, tenant: &str) -> Vec<u64> {
+        let want = normalize_tenant(tenant);
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.lock();
+            for (conn_id, slot) in guard.iter() {
+                let held = slot
+                    .tenant
+                    .read()
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(DEFAULT_TENANT_ID));
+                if held.as_ref() == want.as_ref() {
+                    out.push(*conn_id);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Remember which edge task owns `conn_id` for directed QoS 0

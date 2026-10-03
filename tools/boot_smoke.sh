@@ -249,6 +249,25 @@ report("a subscriber gets the publish of a client in the same tenant",
 report("a subscriber does not get the publish of a client in a different tenant",
        ready and secret not in other_tenant)
 
+# Same client id in two tenants. Both connects succeed.
+# Both sockets stay open. A takeover between tenants fails.
+a_dup, a_dup_ok = tenant_client(b"smoke-dup", b"alpha")
+b_dup, b_dup_ok = tenant_client(b"smoke-dup", b"beta")
+b_pub, _ = tenant_client(b"smoke-b-pub", b"beta")
+dup_topic = b"smoke/dup"
+dup_ready = (a_dup_ok and b_dup_ok
+             and subscribe(a_dup, dup_topic) and subscribe(b_dup, dup_topic))
+a_pub.sendall(packet(0x30, field(dup_topic) + secret))
+a_dup_got = receive(a_dup, 5)
+b_dup_got = receive(b_dup, 2)
+report("two clients with the same client id stay connected in two tenants",
+       dup_ready and a_dup_got.endswith(secret) and secret not in b_dup_got)
+b_pub.sendall(packet(0x30, field(dup_topic) + secret))
+b_dup_got2 = receive(b_dup, 5)
+a_dup_got2 = receive(a_dup, 2)
+report("a takeover between tenants does not happen",
+       dup_ready and b_dup_got2.endswith(secret) and secret not in a_dup_got2)
+
 def upgrade(path):
     sock = wait_port(ws_port)
     key = base64.b64encode(os.urandom(16)).decode()
