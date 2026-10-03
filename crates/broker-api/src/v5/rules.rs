@@ -1748,11 +1748,31 @@ pub(crate) async fn register_live_sink(
                 batch_size: Some(1),
                 batch_bytes: Some(1_048_576),
                 linger_ms: Some(10),
+                buffer_capacity: None,
                 max_retries: Some(3),
                 initial_backoff_ms: Some(100),
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
+            // Same production split as the v1 wiring: Basic + plaintext
+            // rides the maintained driver, anything else stays on REST.
+            if config.use_driver() {
+                if let Ok(transport) =
+                    broker_connectors_enterprise::tdengine::DriverTdengineTransport::new(&config)
+                {
+                    let transport = Arc::new(transport);
+                    if let Ok(sink) =
+                        broker_connectors_enterprise::tdengine::TdengineSink::new(config, transport)
+                    {
+                        let sink = Arc::new(sink);
+                        engine.connectors().register(name, sink.clone());
+                        engine
+                            .connectors()
+                            .register(format!("tdengine:{}", name), sink);
+                    }
+                }
+                return;
+            }
             let client = reqwest::Client::builder()
                 .timeout(config.timeout())
                 .build()

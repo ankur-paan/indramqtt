@@ -4425,6 +4425,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     batch_size: Some(1),
                     batch_bytes: None,
                     linger_ms: Some(20),
+                    buffer_capacity: None,
                     max_retries: Some(4),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),

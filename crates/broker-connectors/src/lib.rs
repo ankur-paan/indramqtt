@@ -31,6 +31,7 @@ pub mod redis;
 pub mod redshift;
 pub mod s3;
 pub mod sparkplug_b;
+pub mod tdengine;
 pub mod timescaledb;
 
 pub use clickhouse::{

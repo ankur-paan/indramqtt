@@ -133,6 +133,15 @@ redis = { version = "0.25", default-features = false, features = ["tokio-comp"] 
 # wiring uses `DriverMssqlTransport` below.
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+# TDengine sink on the maintained `reqwest` REST SQL driver
+# (MIT/Apache-2.0): `POST {base}/rest/sql/{database}` carrying the
+# same `INSERT INTO ... USING ... TAGS ...` text, with Basic auth and
+# driver-owned connection setup. The spec named the official `taos`
+# client, but every `taos` 0.12 line pulls denied `ring` 0.16.20 and
+# `parse_duration` 2.1.1, so the spec cannot pass the licence gate.
+# The hand-written `HttpTdengineTransport` stays for token/TLS configs
+# and offline unit tests; production wiring uses
+# `DriverTdengineTransport` below (`reqwest` REST, Basic + plaintext).
 
 [dev-dependencies]
 axum = { workspace = true }

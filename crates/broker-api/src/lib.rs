@@ -1557,14 +1557,32 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid tdengine config: {e}"))?;
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpTdengineTransport::new(&config, reqwest::Client::new())
+                // Production split: Basic + plaintext rides the maintained
+                // driver; token auth and TLS endpoints stay on REST so
+                // stored configuration keeps working. Either way the kind
+                // stays `tdengine`.
+                if config.use_driver() {
+                    let transport = std::sync::Arc::new(
+                        broker_connectors_enterprise::DriverTdengineTransport::new(&config)
+                            .map_err(|e| format!("invalid tdengine transport: {e}"))?,
+                    );
+                    let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
+                        .map_err(|e| format!("invalid tdengine sink: {e}"))?;
+                    Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
+                        as std::sync::Arc<dyn broker_connectors::Sink>))
+                } else {
+                    let transport = std::sync::Arc::new(
+                        broker_connectors_enterprise::HttpTdengineTransport::new(
+                            &config,
+                            reqwest::Client::new(),
+                        )
                         .map_err(|e| format!("invalid tdengine transport: {e}"))?,
-                );
-                let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
-                    .map_err(|e| format!("invalid tdengine sink: {e}"))?;
-                Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
-                    as std::sync::Arc<dyn broker_connectors::Sink>))
+                    );
+                    let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
+                        .map_err(|e| format!("invalid tdengine sink: {e}"))?;
+                    Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
+                        as std::sync::Arc<dyn broker_connectors::Sink>))
+                }
             }
             "iotdb" | "iot_db" => {
                 let config: broker_connectors_enterprise::IotDbSinkConfig =

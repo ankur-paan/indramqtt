@@ -253,9 +253,10 @@ pub use tablestore::{
     TablestoreTransport, BATCH_WRITE_ROW_PATH, OTS_API_VERSION,
 };
 pub use tdengine::{
-    parse_rest_response, render_insert, CapturedTdengineSql, HttpTdengineTransport,
-    MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse,
-    TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport,
+    parse_rest_response, render_insert, CapturedTdengineSql, DriverTdengineTransport,
+    HttpTdengineTransport, MockTdengineOutcome, MockTdengineTransport, TdengineAuth,
+    TdengineConnector, TdengineResponse, TdengineRow, TdengineSink, TdengineSinkConfig,
+    TdengineTransport,
 };
 pub use timestream::{
     render_write_records_body, HttpTimestreamTransport, MockTimestreamOutcome,
