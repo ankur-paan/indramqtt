@@ -3675,19 +3675,16 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     put("kernel_host", quoted(&kernel_host));
     put("kernel_port", port.to_string());
 
-    let mut listener = |prefix: &str,
-                        setting: &str,
-                        enabled: bool,
-                        bind: &str|
-     -> Result<(), ConfigError> {
-        put(&format!("{prefix}_enabled"), enabled.to_string());
-        let (ip, port) = edge_bind(setting, bind)?;
-        put(&format!("{prefix}_port"), port.to_string());
-        if !ip.is_unspecified() {
-            put(&format!("{prefix}_ip"), quoted(&ip.to_string()));
-        }
-        Ok(())
-    };
+    let mut listener =
+        |prefix: &str, setting: &str, enabled: bool, bind: &str| -> Result<(), ConfigError> {
+            put(&format!("{prefix}_enabled"), enabled.to_string());
+            let (ip, port) = edge_bind(setting, bind)?;
+            put(&format!("{prefix}_port"), port.to_string());
+            if !ip.is_unspecified() {
+                put(&format!("{prefix}_ip"), quoted(&ip.to_string()));
+            }
+            Ok(())
+        };
     listener(
         "mqtt",
         "listeners.tcp.bind",
@@ -3735,9 +3732,7 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
 /// the command line becomes an override. If a flag is absent, the file,
 /// the fragments and the environment set the value.
 fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
-    let typed = |id: &str| {
-        matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
-    };
+    let typed = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
     let text = |id: &str, value: &str| typed(id).then(|| value.to_string());
     CliOverrides {
         node_id: text("node_id", &args.node_id),
@@ -7737,8 +7732,8 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = <Args as clap::CommandFactory>::command().get_matches();
-    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
-        .unwrap_or_else(|err| err.exit());
+    let mut args =
+        <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
 
     // Resolve the startup configuration from the layers: the defaults,
     // `indra.toml`, `conf.d`, the `INDRA_` variables and the typed flags.

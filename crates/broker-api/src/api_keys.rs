@@ -225,7 +225,9 @@ mod tests {
     fn store_is_bounded_and_rejects_past_the_cap() {
         let store = ApiKeyStore::new();
         for i in 0..MAX_API_KEYS {
-            store.insert(&format!("operator-key-{i:06}")).expect("insert under cap");
+            store
+                .insert(&format!("operator-key-{i:06}"))
+                .expect("insert under cap");
         }
         assert_eq!(store.len(), MAX_API_KEYS);
         assert!(store.insert("operator-key-one-too-many").is_err());
