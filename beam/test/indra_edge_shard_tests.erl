@@ -498,11 +498,12 @@ sup_init_starts_k_shards_test() ->
     try
         ok = application:set_env(indra_edge, brokerlink_shards, 1),
         {ok, {_, Kids1}} = indra_edge_sup:init([]),
-        ?assertEqual(3, length(Kids1)),
+        %% Registry + brokerlink + TCP listener + WS listener (M1-01).
+        ?assertEqual(4, length(Kids1)),
         ok = application:set_env(indra_edge, brokerlink_shards, 4),
         {ok, {_, Kids4}} = indra_edge_sup:init([]),
-        %% registry + 4 brokerlinks + listener.
-        ?assertEqual(6, length(Kids4))
+        %% registry + 4 brokerlinks + TCP listener + WS listener.
+        ?assertEqual(7, length(Kids4))
     after
         restore_env(Old)
     end.

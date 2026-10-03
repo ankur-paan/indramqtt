@@ -1,0 +1,59 @@
+# IndraMQTT single-node config for the compose example (M1-09).
+#
+# Copy this file and adjust the named values only; every key below has
+# exactly one typed home in the configuration schema
+# (`crates/broker-config/src/schema.rs`), and the full reference with all
+# settings is `indramqtt.example.toml` at the repository root. A wrong type
+# or an out-of-range value refuses startup with an error naming the
+# setting; an unknown `INDRA_*` variable does the same (fail closed).
+#
+# Layering (M1-04): this file wins over schema defaults, and `INDRA_*`
+# environment variables win over this file. The compose stack sets
+# `INDRA_LOGGING__LEVEL=debug`, which wins over `[logging] level` below;
+# prove it with `GET /api/v1/config/explain?key=logging.level` (see
+# deploy/compose/README.md).
+
+[node]
+# Unique identifier for this broker node.
+id = "indra-node-1"
+
+# Data directory. Must stay under /var/lib/indramqtt: that is the
+# compose data volume, so state survives container restarts.
+data_dir = "/var/lib/indramqtt/data"
+
+# BrokerLink IPC listen address for the edge (container loopback).
+brokerlink_bind = "127.0.0.1:18883"
+
+[listeners.tcp]
+# Standard plaintext MQTT listener (mapped to host port 1883).
+enabled = true
+bind = "0.0.0.0:1883"
+
+[listeners.ws]
+# MQTT-over-WebSocket listener (mapped to host port 8083).
+enabled = true
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+
+[listeners.api]
+# Management API and `/healthz` readiness probe (mapped to host 18083).
+enabled = true
+bind = "0.0.0.0:18083"
+
+[logging]
+# The compose stack overrides this to `debug` via INDRA_LOGGING__LEVEL.
+level = "info"
+
+[session]
+# Per-subscriber QoS 0 egress backlog bound: past it the oldest queued
+# QoS 0 frame drops so a slow consumer costs bounded memory and never
+# slows publishers. QoS 1/2 never shed.
+max_qos0_backlog = 1000
+
+[auth]
+# Evaluation default: accept anonymous clients so the round trip in
+# deploy/compose/README.md works with no users configured. Production
+# sets this to `false` and creates users first; a non-empty user store
+# always rejects unauthenticated clients regardless of this flag.
+enabled = true
+allow_anonymous = true

@@ -87,7 +87,7 @@ impl PostgreSqlSinkConfig {
 /// reach the server.
 /// All `$n` markers referenced outside strings/comments, in order.
 /// Shared with the TimescaleDB sink (same wire protocol, wider shape).
-pub(crate) fn referenced_params(template: &str) -> Result<Vec<u32>> {
+pub fn referenced_params(template: &str) -> Result<Vec<u32>> {
     let chars: Vec<char> = template.chars().collect();
     let n = chars.len();
     let mut found = Vec::new();

@@ -505,6 +505,40 @@ impl Authenticator for LdapAuthenticator {
     }
 }
 
+impl LdapAuthenticator {
+    /// Tenant-aware authentication (MT-06): the lookup signature carries
+    /// the connection's tenant. Only the built-in table executes
+    /// per-tenant state in this wave (deferred-backend rule): the
+    /// directory is global, so the default tenant delegates to the live
+    /// directory (an unreachable directory denies, never grants) while a
+    /// non-default tenant fails closed (deny + log) until per-tenant
+    /// directory partitioning is specified.
+    // TODO(parity): how are directory entries partitioned per tenant
+    // (per-tenant base DN, search scope or group)? The rulebook does not
+    // decide the mapping; current choice fails closed for non-default
+    // tenants until the checker pins it.
+    pub async fn authenticate_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        username: Option<&str>,
+        password: Option<&[u8]>,
+    ) -> Result<()> {
+        if !tenant.is_empty() && tenant != crate::DEFAULT_TENANT_ID {
+            tracing::warn!(
+                client_id,
+                tenant,
+                "LDAP authentication refused: non-default tenant directory is deferred, failing closed"
+            );
+            return Err(Self::fail(
+                client_id,
+                "presented LDAP credentials that cannot be verified in this tenant",
+            ));
+        }
+        <Self as Authenticator>::authenticate(self, client_id, username, password).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

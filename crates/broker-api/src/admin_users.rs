@@ -191,6 +191,22 @@ impl AdminUsers {
         store
     }
 
+    /// Replace users with one validated snapshot root in place (M1-05
+    /// runtime apply path for the `admin_users` root).
+    ///
+    /// Driven afterwards by management login (each login consults this
+    /// store). An empty snapshot restores the default admin, matching boot.
+    /// Undecodable verifiers lock their accounts instead of dropping them,
+    /// matching [`AdminUsers::from_snapshot`].
+    pub fn apply_snapshot_conf(&self, conf: &AdminUsersConf) -> Result<(), AdminUserError> {
+        conf.validate()
+            .map_err(|err| AdminUserError::Persist(err.to_string()))?;
+        let fresh = Self::from_snapshot(conf);
+        let mut users = self.users.write().unwrap();
+        *users = fresh.users.into_inner().unwrap();
+        Ok(())
+    }
+
     /// Export the current contents as a validated config root, sorted by
     /// username so the persisted file is deterministic.
     fn export_conf(&self) -> AdminUsersConf {

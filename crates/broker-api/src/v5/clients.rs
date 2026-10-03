@@ -187,18 +187,22 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
 /// tearing down kernel state: the synchronous route hands the frame to
 /// the still-registered connection mailbox, so delivery cannot lose a
 /// race with the `unregister` below. Both sends are non-blocking and
-/// never fail the kick; a dead edge only warns. Returns true when a live
-/// connection was closed, false for unknown ids or sessions with nothing
-/// live to disconnect.
-fn kick_one(state: &ApiState, client_id: &str) -> bool {
+/// never fail the kick; a dead edge only warns. Returns whether a live
+/// connection was closed (false for unknown ids or sessions with nothing
+/// live to disconnect) plus the kicked session's taken will, if any: a
+/// kick counts as unexpected (MT-05), so the caller fires the taken will
+/// into its registration tenant. The detach itself never fires, so the
+/// edge's later death notice finds an empty slot and cannot double-fire.
+fn kick_one(state: &ApiState, client_id: &str) -> (bool, Option<broker_session::StoredWill>) {
     let session = match state.sessions.get(client_id) {
         Some(session) => session,
-        None => return false,
+        None => return (false, None),
     };
     let conn_id = *session.conn_id.read();
     let Some(conn_id) = conn_id else {
-        return false;
+        return (false, None);
     };
+    let will = session.take_will();
     match brokerlink::BrokerFrame::new(
         brokerlink::OpCode::ConnClose,
         conn_id,
@@ -228,14 +232,18 @@ fn kick_one(state: &ApiState, client_id: &str) -> bool {
     }
     state.conns.unregister(conn_id);
     state.sessions.unbind_connection(client_id, conn_id);
-    true
+    (true, will)
 }
 
 pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
-    if !kick_one(&state, &client_id) {
+    let (closed, will) = kick_one(&state, &client_id);
+    if !closed {
         // Unknown id or known session with nothing live to disconnect:
         // report not-found with the documented error shape.
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+    }
+    if let Some(will) = will {
+        fire_kicked_will(&state, will).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -252,11 +260,17 @@ pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> R
     // frame per id through the shared single-kick routine, no extra
     // buffering beyond the result list and no spawned tasks. The result
     // list is management-plane only; the per-message path stays free of
-    // new allocation (empty metadata and payload frames).
+    // new allocation (empty metadata and payload frames). Taken wills
+    // fire after their kick (a kick is an unexpected disconnect, MT-05).
     let mut results = Vec::with_capacity(client_ids.len());
+    let mut fired_wills = Vec::new();
     for client_id in &client_ids {
-        if kick_one(&state, client_id) {
+        let (closed, will) = kick_one(&state, client_id);
+        if closed {
             results.push(serde_json::json!({"clientid": client_id, "result": "ok"}));
+            if let Some(will) = will {
+                fired_wills.push(will);
+            }
         } else {
             results.push(serde_json::json!({
                 "clientid": client_id,
@@ -266,7 +280,42 @@ pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> R
             }));
         }
     }
+    for will in fired_wills {
+        fire_kicked_will(&state, will).await;
+    }
     (StatusCode::OK, Json(results)).into_response()
+}
+
+/// Deliver a kicked client's taken will into its registration tenant
+/// (MT-05: a kick counts as unexpected).
+///
+/// Retained write when will-retain is set (same caps as the management
+/// publish mirror, scoped to the will's tenant instead of the default),
+/// then per-tenant fan-out through the router into live mailboxes.
+/// At-least-once like the kernel fire path: duplicates permitted, loss
+/// is a defect. Management-plane only (kicks are rare); the per-message
+/// path takes no new lock.
+async fn fire_kicked_will(state: &ApiState, will: broker_session::StoredWill) {
+    if will.retain {
+        handle_mgmt_retained_in_tenant(
+            state,
+            &will.topic,
+            will.qos,
+            true,
+            &will.payload,
+            &will.tenant,
+        )
+        .await;
+    }
+    let (frames, _offline, _matched) = build_publish_deliveries_in_tenant(
+        state,
+        &will.topic,
+        will.qos,
+        will.retain,
+        &will.payload,
+        &will.tenant,
+    );
+    route_publish_frames(state, frames);
 }
 
 /// Maximum subscriptions returned by one per-client listing. The read
@@ -944,15 +993,44 @@ fn build_publish_deliveries(
     retain: bool,
     payload: &Bytes,
 ) -> (Vec<(u64, brokerlink::BrokerFrame)>, usize, usize) {
+    build_publish_deliveries_in_tenant(
+        state,
+        topic,
+        qos,
+        retain,
+        payload,
+        broker_storage::DEFAULT_TENANT_ID,
+    )
+}
+
+/// Tenant-scoped fan-out for one publish (MT-02 kernel parity, MT-05
+/// will fire): only subscriptions carrying `tenant` are eligible, so a
+/// message in one tenant never reaches another tenant's subscribers. The
+/// default tenant follows the same walk as the unscoped path.
+fn build_publish_deliveries_in_tenant(
+    state: &ApiState,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    tenant: &str,
+) -> (Vec<(u64, brokerlink::BrokerFrame)>, usize, usize) {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
-    let matched = state.router.matches(topic);
+    // Tenant scope (MT-02, MT-03): fan-out stays inside the caller's
+    // tenant, so one tenant's subscriptions never observe another
+    // tenant's topic space. Mismatches deliver nothing and are counted
+    // here, never an error to the publisher.
+    let (matched, tenant_skipped) = state.router.matches_in_tenant_counted(topic, None, tenant);
+    if tenant_skipped > 0 {
+        state.metrics.inc_tenant_mismatch_dropped_by(tenant_skipped);
+    }
     let matched_count = matched.len();
     let mut deliveries = Vec::new();
     let mut offline_queued = 0usize;
     for sub in matched {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-        match state.sessions.get(sub.client_id.as_ref()) {
+        match state.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
             Some(session) => {
                 let connected = *session.connected.read();
                 let live = *session.conn_id.read();
@@ -1184,9 +1262,21 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
         let mut offline_failed = false;
-        for sub in self.router.matches(&topic) {
+        // Tenant scope (MT-02, MT-03): rule republishes fan out in the
+        // default tenant only (fail closed, single-tenant behaviour
+        // unchanged); the tenant attribution for derived messages is open
+        // until the rule engine dispatches per tenant.
+        let (matched, _tenant_skipped) = self.router.matches_in_tenant_counted(
+            &topic,
+            None,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+        );
+        for sub in matched {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-            match self.sessions.get(sub.client_id.as_ref()) {
+            match self.sessions.get_in_tenant(
+                broker_session::tenant::DEFAULT_TENANT_ID,
+                sub.client_id.as_ref(),
+            ) {
                 Some(session) => {
                     let connected = *session.connected.read();
                     let live = *session.conn_id.read();
@@ -1338,11 +1428,46 @@ async fn handle_mgmt_retained(
     retain: bool,
     payload: &Bytes,
 ) {
+    // TODO(parity): management publishes carry no client tenant yet, so the
+    // mirror stores in the default tenant only (fail closed: never another
+    // tenant's; single-tenant behaviour unchanged). The open question is the
+    // tenant attribution for management publishes once authenticated callers
+    // carry a tenant.
+    handle_mgmt_retained_in_tenant(
+        state,
+        topic,
+        qos,
+        retain,
+        payload,
+        broker_storage::DEFAULT_TENANT_ID,
+    )
+    .await;
+}
+
+async fn handle_mgmt_retained_in_tenant(
+    state: &ApiState,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    tenant: &str,
+) {
     if !retain {
         return;
     }
+    // Per-tenant accounting: the global `backend.max_retained_messages` cap
+    // (and the hard `broker_storage::MAX_RETAINED_MESSAGES` cap inside the
+    // store) counts `(tenant, topic)` pairs across all tenants, so every
+    // tenant's retained usage counts toward the same finite bound with no
+    // second unlimited default. Consults state the store already holds with
+    // one short-lock lookup, never a scan, so the per-lookup cost stays flat.
     if payload.is_empty() {
-        if state.retained.clear_retained(topic).await.is_ok() {
+        if state
+            .retained
+            .clear_retained_in_tenant(topic, tenant)
+            .await
+            .is_ok()
+        {
             sync_retained_count(state).await;
         }
         return;
@@ -1357,7 +1482,7 @@ async fn handle_mgmt_retained(
     if cap > 0 {
         let already = state
             .retained
-            .get_retained(topic)
+            .get_retained_in_tenant(topic, tenant)
             .await
             .ok()
             .flatten()
@@ -1368,7 +1493,7 @@ async fn handle_mgmt_retained(
     }
     if state
         .retained
-        .set_retained(topic.clone(), qos, payload.clone())
+        .set_retained_in_tenant(topic.clone(), qos, payload.clone(), tenant)
         .await
         .is_ok()
     {
@@ -1377,15 +1502,12 @@ async fn handle_mgmt_retained(
 }
 
 /// Recount retained topics into the stats gauge after a management retained
-/// write, mirroring the kernel lifecycle helper. One bounded scan per
-/// retained management publish (rare path); delivery never waits on it.
+/// write, mirroring the kernel lifecycle helper. O(1) total length across
+/// all tenants (no scan, no allocation), so the gauge stays exact once
+/// tenants share the store; delivery never waits on it.
 async fn sync_retained_count(state: &ApiState) {
-    let filter = match TopicFilter::new("#") {
-        Ok(valid) => valid,
-        Err(_) => return,
-    };
-    if let Ok(matched) = state.retained.find_matching(&filter).await {
-        state.stats.set_retained(matched.len() as u64);
+    if let Ok(count) = state.retained.count_retained().await {
+        state.stats.set_retained(count as u64);
     }
 }
 
@@ -1678,5 +1800,215 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(rendered["code"], serde_json::json!("TOO_MANY_REQUESTS"));
+    }
+    #[tokio::test]
+    async fn mgmt_retained_publish_stays_in_default_tenant() {
+        use broker_protocol::{QoS, Topic, TopicFilter};
+
+        let state = standalone_state();
+        let topic = Topic::new("mt4/retained").expect("valid topic");
+        // Same topic retained in another tenant behind the broker path's
+        // store; the management mirror must never observe or disturb it.
+        state
+            .retained
+            .set_retained_in_tenant(
+                topic.clone(),
+                QoS::AtMostOnce,
+                Bytes::from_static(b"from-b"),
+                "tenant-b",
+            )
+            .await
+            .expect("seed other tenant");
+        // Management publish goes through the broker mirror (metrics, rule
+        // dispatch, retained store, fan-out), never store-only.
+        do_mgmt_publish(
+            &state,
+            &topic,
+            &Bytes::from_static(b"from-default"),
+            QoS::AtMostOnce,
+            true,
+        )
+        .await;
+        let own = state
+            .retained
+            .get_retained_in_tenant(&topic, broker_storage::DEFAULT_TENANT_ID)
+            .await
+            .expect("read default")
+            .expect("management publish stored");
+        assert_eq!(own.payload, Bytes::from_static(b"from-default"));
+        let other = state
+            .retained
+            .get_retained_in_tenant(&topic, "tenant-b")
+            .await
+            .expect("read other")
+            .expect("other tenant intact");
+        assert_eq!(other.payload, Bytes::from_static(b"from-b"));
+        // `#` in each tenant excludes the other's message.
+        let filter = TopicFilter::new("#").expect("valid filter");
+        let own_all = state
+            .retained
+            .find_matching_in_tenant(&filter, broker_storage::DEFAULT_TENANT_ID)
+            .await
+            .expect("match default");
+        assert_eq!(own_all.len(), 1);
+        assert_eq!(own_all[0].payload, Bytes::from_static(b"from-default"));
+        let other_all = state
+            .retained
+            .find_matching_in_tenant(&filter, "tenant-b")
+            .await
+            .expect("match other");
+        assert_eq!(other_all.len(), 1);
+        assert_eq!(other_all[0].payload, Bytes::from_static(b"from-b"));
+        // Gauge counts both tenants toward the same global cap.
+        assert_eq!(state.stats.retained(), 2);
+        // Clearing via the management mirror (empty retained publish)
+        // clears only the default tenant.
+        do_mgmt_publish(&state, &topic, &Bytes::new(), QoS::AtMostOnce, true).await;
+        assert!(
+            state
+                .retained
+                .get_retained_in_tenant(&topic, broker_storage::DEFAULT_TENANT_ID)
+                .await
+                .expect("read cleared")
+                .is_none(),
+            "default tenant cleared"
+        );
+        let other = state
+            .retained
+            .get_retained_in_tenant(&topic, "tenant-b")
+            .await
+            .expect("read other after clear")
+            .expect("clear stays in its tenant");
+        assert_eq!(other.payload, Bytes::from_static(b"from-b"));
+        assert_eq!(state.stats.retained(), 1);
+    }
+
+    #[tokio::test]
+    async fn mgmt_retained_default_round_trip_unchanged() {
+        use broker_protocol::{QoS, Topic};
+
+        let state = standalone_state();
+        let topic = Topic::new("mt4/plain").expect("valid topic");
+        // Default-tenant retained publish, subscribe-time read and clear
+        // behave exactly as before the tenant change.
+        do_mgmt_publish(
+            &state,
+            &topic,
+            &Bytes::from_static(b"hello"),
+            QoS::AtMostOnce,
+            true,
+        )
+        .await;
+        let stored = state
+            .retained
+            .get_retained(&topic)
+            .await
+            .expect("read stored")
+            .expect("default publish stored");
+        assert_eq!(stored.payload, Bytes::from_static(b"hello"));
+        assert!(stored.retain);
+        assert_eq!(state.stats.retained(), 1);
+        do_mgmt_publish(&state, &topic, &Bytes::new(), QoS::AtMostOnce, true).await;
+        assert!(
+            state
+                .retained
+                .get_retained(&topic)
+                .await
+                .expect("read after clear")
+                .is_none(),
+            "cleared retained state must not be delivered"
+        );
+        assert_eq!(state.stats.retained(), 0);
+    }
+
+    #[tokio::test]
+    async fn kick_fires_will_into_owning_tenant_only() {
+        use broker_protocol::{QoS, Topic, TopicFilter};
+
+        // A kick counts as unexpected (MT-05) through the management
+        // path: kicking a client with a stored will delivers it to live
+        // subscribers in the will's own tenant only (through the router,
+        // never store-only), stores it retained when will-retain is set,
+        // and fires at most once.
+        let state = standalone_state();
+        let (pub_session, _) = state.sessions.get_or_create("kick-will-pub", true);
+        state.sessions.bind_session(&pub_session, 5001);
+        pub_session.set_tenant_id("tenant-a".to_string());
+        assert!(pub_session.register_will(broker_session::StoredWill {
+            tenant: "tenant-a".to_string(),
+            topic: Topic::new("kick/will").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            payload: Bytes::from_static(b"bye-kick"),
+        }));
+
+        // Live subscribers in tenant-a and tenant-b on the same topic.
+        for (conn, client, tenant) in [
+            (5002u64, "kick-sub-a", "tenant-a"),
+            (5003u64, "kick-sub-b", "tenant-b"),
+        ] {
+            let (session, _) = state.sessions.get_or_create(client, true);
+            state.sessions.bind_session(&session, conn);
+            session.set_tenant_id(tenant.to_string());
+            state.router.subscribe(
+                &TopicFilter::new("kick/will").unwrap(),
+                Subscription {
+                    client_id: client.into(),
+                    conn_id: conn,
+                    qos: QoS::AtMostOnce,
+                    group: None,
+                    tenant: tenant.into(),
+                },
+            );
+        }
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        state.conns.register(5002, tx_a);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        state.conns.register(5003, tx_b);
+
+        // Kick through the real handler: the session detaches and the
+        // will fires into its registration tenant. QoS 0 rides the
+        // bounded backlog (D1-02), never the guaranteed mailbox.
+        let response = kick_client(State(state.clone()), Path("kick-will-pub".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!*pub_session.connected.read());
+        assert_eq!(*pub_session.conn_id.read(), None);
+        assert!(!pub_session.has_will(), "kick consumes the will");
+
+        assert!(rx_a.try_recv().is_err(), "QoS 0 never rides the mailbox");
+        let queued_a = state.conns.drain_qos0(5002, 8);
+        assert_eq!(queued_a.len(), 1, "A's subscriber gets the will");
+        assert_eq!(queued_a[0].header.opcode, brokerlink::OpCode::PublishOut);
+        assert_eq!(queued_a[0].payload, Bytes::from_static(b"bye-kick"));
+        assert!(
+            rx_b.try_recv().is_err(),
+            "B's subscriber never sees A's will"
+        );
+        assert_eq!(state.conns.qos0_len(5003), 0, "B's backlog untouched");
+
+        // Will-retain landed only in the owning tenant's retained store.
+        let topic = Topic::new("kick/will").unwrap();
+        let stored = state
+            .retained
+            .get_retained_in_tenant(&topic, "tenant-a")
+            .await
+            .expect("read A")
+            .expect("A's retained will stored");
+        assert_eq!(stored.payload, Bytes::from_static(b"bye-kick"));
+        assert!(
+            state
+                .retained
+                .get_retained_in_tenant(&topic, "tenant-b")
+                .await
+                .expect("read B")
+                .is_none(),
+            "B's retained store untouched"
+        );
+
+        // A second kick finds nothing live: not-found, no second fire.
+        let response = kick_client(State(state.clone()), Path("kick-will-pub".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(rx_a.try_recv().is_err(), "will fires at most once");
+        assert_eq!(state.conns.qos0_len(5002), 0, "no second fire queued");
     }
 }

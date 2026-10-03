@@ -3,8 +3,17 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn init_tracing() {
+    init_tracing_with_level("info");
+}
+
+/// Starts the log output at the level in `logging.level`.
+///
+/// If `RUST_LOG` is set, it overrides the level. `RUST_LOG` is a
+/// developer filter (`RUST_LOG=broker_router=trace`). It has no schema
+/// home.
+pub fn init_tracing_with_level(level: &str) {
     let _ = tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)))
         .with(tracing_subscriber::fmt::layer())
         .try_init();
 }
@@ -49,6 +58,12 @@ pub struct Metrics {
     // QoS 1 downlinks delivered live once but not tracked for redelivery
     // because the per-session inflight window (T-31) was full.
     inflight_dropped: AtomicU64,
+    // Fan-out matches excluded by tenant scope (MT-02). Bumped exactly
+    // where the mismatch is already being skipped: a tenant mismatch
+    // delivers nothing, counted, never an error to the publisher.
+    // Reads via `tenant_mismatch_dropped`; management snapshots stay
+    // unchanged (management output belongs to MT-07).
+    tenant_mismatch_dropped: AtomicU64,
     // QoS 1 downlinks spilled past the in-memory window into the bounded
     // per-session overflow buffer (B4-01). Each bump means one live
     // delivery that IS still tracked for DUP redelivery, unlike
@@ -140,6 +155,7 @@ pub struct MetricsSnapshot {
     pub rule_spill_dropped: u64,
     pub rule_spill_torn: u64,
     pub rule_spill_recovered: u64,
+    pub tenant_mismatch_dropped: u64,
     pub transport_sent: u64,
     pub transport_send_failed: u64,
     pub egress_qos0_shed: u64,
@@ -418,6 +434,12 @@ impl Metrics {
         self.inflight_dropped.fetch_add(n, Ordering::Relaxed) + n
     }
 
+    /// Count tenant-scoped fan-out exclusions (MT-02): one per
+    /// subscription skipped for tenant mismatch. Returns the new total.
+    pub fn inc_tenant_mismatch_dropped_by(&self, n: u64) -> u64 {
+        self.tenant_mismatch_dropped.fetch_add(n, Ordering::Relaxed) + n
+    }
+
     /// One QoS 1 downlink spilled past the window into the bounded
     /// overflow buffer (B4-01). The live delivery still goes out once and
     /// stays tracked for DUP redelivery.
@@ -659,6 +681,10 @@ impl Metrics {
         self.inflight_dropped.load(Ordering::Relaxed)
     }
 
+    pub fn tenant_mismatch_dropped(&self) -> u64 {
+        self.tenant_mismatch_dropped.load(Ordering::Relaxed)
+    }
+
     pub fn inflight_spilled(&self) -> u64 {
         self.inflight_spilled.load(Ordering::Relaxed)
     }
@@ -760,6 +786,7 @@ impl Metrics {
             rule_spill_dropped: self.rule_spill_dropped(),
             rule_spill_torn: self.rule_spill_torn(),
             rule_spill_recovered: self.rule_spill_recovered(),
+            tenant_mismatch_dropped: self.tenant_mismatch_dropped(),
             transport_sent: self.transport_sent(),
             transport_send_failed: self.transport_send_failed(),
             egress_qos0_shed: self.egress_qos0_shed(),
@@ -828,6 +855,9 @@ impl Metrics {
               # HELP indramqtt_rule_spill_recovered_total Rule-ingress events found on disk when a spill directory opened.\n\
               # TYPE indramqtt_rule_spill_recovered_total counter\n\
               indramqtt_rule_spill_recovered_total {}\n\
+              # HELP indramqtt_tenant_mismatch_dropped_total Fan-out matches excluded by tenant scope.\n\
+              # TYPE indramqtt_tenant_mismatch_dropped_total counter\n\
+              indramqtt_tenant_mismatch_dropped_total {}\n\
               # HELP indramqtt_transport_sent_total Frames actually written toward the edge by successful transport batch writes.\n\
               # TYPE indramqtt_transport_sent_total counter\n\
               indramqtt_transport_sent_total {}\n\
@@ -870,6 +900,7 @@ impl Metrics {
             self.rule_spill_dropped(),
             self.rule_spill_torn(),
             self.rule_spill_recovered(),
+            self.tenant_mismatch_dropped(),
             self.transport_sent(),
             self.transport_send_failed(),
             self.egress_qos0_shed(),

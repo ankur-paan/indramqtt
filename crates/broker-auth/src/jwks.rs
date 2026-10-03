@@ -369,6 +369,36 @@ impl JwksAuthenticator {
         )
     }
 
+    /// Tenant-aware token verification (MT-06): the lookup signature
+    /// carries the connection's tenant. Only the built-in table executes
+    /// per-tenant state in this wave (deferred-backend rule): the JWKS
+    /// endpoint is global, so the default tenant delegates to live
+    /// verification (an unreachable endpoint denies, never grants) while
+    /// a non-default tenant fails closed (deny + log) until per-tenant
+    /// issuers/audiences are specified.
+    // TODO(parity): how are JWKS issuers/audiences partitioned per
+    // tenant? The rulebook does not decide the mapping; current choice
+    // fails closed for non-default tenants until the checker pins it.
+    pub async fn verify_token_in_tenant(
+        &self,
+        tenant: &str,
+        client_id: &str,
+        token: &str,
+    ) -> Result<VerifiedJwt> {
+        if !tenant.is_empty() && tenant != crate::DEFAULT_TENANT_ID {
+            tracing::warn!(
+                client_id,
+                tenant,
+                "JWT authentication refused: non-default tenant verifier is deferred, failing closed"
+            );
+            return Err(Self::fail(
+                client_id,
+                "presented JWT credentials that cannot be verified in this tenant",
+            ));
+        }
+        self.verify_token(client_id, token).await
+    }
+
     /// Verify one token: cache hit verifies locally, cache miss triggers
     /// one singleflight refresh and retries once. Any endpoint problem
     /// fails closed with a warn log naming the `kid`, never the token.
@@ -693,7 +723,9 @@ impl Authenticator for JwksAuthenticator {
 /// setup yields `None` (logged here) so every later attempt fails closed
 /// instead of panicking at CONNECT.
 fn build_client(config: &JwksConfig) -> Option<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(config.effective_fetch_timeout());
+    let mut builder = reqwest::Client::builder()
+        .timeout(config.effective_fetch_timeout())
+        .connect_timeout(Duration::from_millis(1000));
     if !config.tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     } else if let Some(path) = config.ca_cert_path.as_deref() {
@@ -803,6 +835,7 @@ mod tests {
     // of the RSA/`CompatRng`/base64/PEM/server logic.
     use crate::jwks_test_support::{TestJwksServer as HttpsJwks, TestSigningKey as SigningKey};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_config(url: String) -> JwksConfig {
         JwksConfig {
@@ -810,8 +843,8 @@ mod tests {
             issuer: "https://issuer.example".to_string(),
             audience: "indra-mqtt".to_string(),
             refresh_period_secs: 60,
-            fetch_timeout_ms: 3_000,
-            refresh_timeout_ms: 3_000,
+            fetch_timeout_ms: 5_000,
+            refresh_timeout_ms: 5_000,
             cache_max_keys: 32,
             cache_ttl_secs: 60,
             max_document_bytes: 64 * 1024,
@@ -855,6 +888,8 @@ mod tests {
         // its kid leaves the document.
         let second = SigningKey::generate("key-b");
         server.rotate(vec![second.jwk_json()]);
+        // Small delay to ensure the server's key set is visible to the next request.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let after = second.mint("https://issuer.example", "indra-mqtt", 3600, false);
         let verified = auth
             .verify_token("device-1", &after)

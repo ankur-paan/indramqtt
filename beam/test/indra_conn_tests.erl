@@ -105,6 +105,106 @@ connect_fragmented_tcp_reassembly_test() ->
     end.
 
 %%====================================================================
+%% Last will (MT-05)
+%%====================================================================
+
+connect_forwards_will_in_bind_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5011}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-will">>, <<"w/bye">>, <<"goodbye">>)),
+        [Sent] = wait_frames(Mock, 1),
+        ?assertEqual(16#0010, maps:get(opcode, Sent)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-will">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"w/bye">>, maps:get(will_topic, Bind)),
+        ?assertEqual(<<"goodbye">>, maps:get(will_payload, Bind)),
+        ?assertEqual(0, maps:get(will_qos, Bind)),
+        ?assertEqual(false, maps:get(will_retain, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(4242, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_without_will_binds_without_will_section_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5012}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet(<<"dev-nowill">>, true, 60)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-nowill">>, maps:get(client_id, Bind)),
+        ?assertEqual(undefined, maps:get(will_topic, Bind)),
+        ?assertEqual(undefined, maps:get(will_payload, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(4243, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+unexpected_close_reports_disconnect_in_test() ->
+    %% A peer that vanishes without DISCONNECT is an unexpected death:
+    %% the edge reports it so a stored will fires once. A clean
+    %% DISCONNECT instead unbinds (suppress) and reports nothing more.
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5013}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-gone">>, <<"w/bye">>, <<"bye">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(4244, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        %% Vanish without DISCONNECT: the socket close kills the edge.
+        ok = gen_tcp:close(Client),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        [_BindAgain, Death] = wait_frames(Mock, 2),
+        ?assertEqual(16#0040, maps:get(opcode, Death)),
+        ?assertEqual(5013, maps:get(conn_id, Death)),
+        {ok, Unbind} = indra_brokerlink:decode_unbind_meta(maps:get(meta, Death)),
+        ?assertEqual(<<"dev-gone">>, maps:get(client_id, Unbind))
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+clean_disconnect_unbinds_without_disconnect_in_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5014}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-clean">>, <<"w/bye">>, <<"bye">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(4245, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        %% Clean DISCONNECT: unbind (suppress) and exactly nothing more.
+        ok = gen_tcp:send(Client, <<16#E0, 16#00>>),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        timer:sleep(200),
+        Frames = mock_broker:sent(Mock),
+        ?assertEqual(2, length(Frames)),
+        ?assertEqual(16#0010, maps:get(opcode, lists:nth(1, Frames))),
+        ?assertEqual(16#0012, maps:get(opcode, lists:nth(2, Frames)))
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%%====================================================================
 %% Rejection paths
 %%====================================================================
 
@@ -617,6 +717,16 @@ connect_packet_raw(ClientId, Flags, Keepalive) ->
     Body = <<Var/binary, Payload/binary>>,
     <<16#10, (byte_size(Body)), Body/binary>>.
 
+%% @private CONNECT with a QoS 0 non-retained last will
+%% (remaining length < 128 bytes).
+connect_packet_will(ClientId, WillTopic, WillPayload) ->
+    Var = <<0, 4, "MQTT", 4, 16#06, 0, 60>>,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary,
+                (byte_size(WillTopic)):16/big, WillTopic/binary,
+                (byte_size(WillPayload)):16/big, WillPayload/binary>>,
+    Body = <<Var/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
 %% @private CONNECT with username + password credentials.
 connect_packet_creds(ClientId, User, Pass) ->
     Var = <<0, 4, "MQTT", 4, 16#C2, 0, 60>>,
@@ -658,18 +768,10 @@ recv_all(Sock) ->
     {ok, Bin} = gen_tcp:recv(Sock, 0, ?RECV_TIMEOUT),
     Bin.
 
-%% @private CONNECT with a last will (QoS 0, no retain).
-connect_packet_will(ClientId, WillTopic, WillPayload) ->
-    Flags = 16#02 bor 16#04,  %% clean + will
-    Var = <<0, 4, "MQTT", 4, Flags:8, 60:16/big>>,
-    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary,
-                (byte_size(WillTopic)):16/big, WillTopic/binary,
-                (byte_size(WillPayload)):16/big, WillPayload/binary>>,
-    Body = <<Var/binary, Payload/binary>>,
-    <<16#10, (byte_size(Body)), Body/binary>>.
-
 %% @doc CONNECT carrying a will forwards it in the bind (F1-01).
-connect_forwards_will_in_bind_test() ->
+%% (Helper `connect_packet_will/3' is defined once above; the merge
+%% duplicate was byte-identical and is removed.)
+connect_forwards_f1_will_in_bind_test() ->
     {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5010}]),
     _ = Port,
     try
@@ -866,6 +968,91 @@ connack_v5_socket_carries_binding_maximum_test() ->
         ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
         ?assertEqual(<<16#20, 16#06, 16#00, 16#00, 16#03, 34, 16#00, 16#0A>>,
                      recv_exact(Client, 8)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @private Minimal MQTT 5 CONNECT carrying an arbitrary properties
+%% block (X1-01): session expiry, receive maximum, user properties and
+%% the alias maximum ride together here.
+connect_packet_v5_props(ClientId, Props) ->
+    Var = <<0, 4, "MQTT", 5, 16#02:8, 60:16/big>>,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary>>,
+    Body = <<Var/binary, (byte_size(Props)):8, Props/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+%% @doc A version-5 handshake reaches the kernel bind with the
+%% negotiated version plus the decoded properties, and the client gets
+%% a version-5 CONNACK (X1-01 framing + transport).
+v5_connect_properties_reach_kernel_bind_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5023}]),
+    _ = Port,
+    try
+        %% Props: session expiry 3600 (17), receive max 100 (33),
+        %% alias max 10 (34), user "k"->"v" (38).
+        Props = <<17, 0, 0, 14, 16, 33, 0, 100, 34, 0, 10,
+                  38, 0, 1, "k", 0, 1, "v">>,
+        ok = gen_tcp:send(Client, connect_packet_v5_props(<<"dev-v5p">>, Props)),
+        [Sent] = wait_frames(Mock, 1),
+        ?assertEqual(16#0010, maps:get(opcode, Sent)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-v5p">>, maps:get(client_id, Bind)),
+        ?assertEqual(5, maps:get(protocol_version, Bind)),
+        ?assertEqual(3600, maps:get(session_expiry, Bind)),
+        ?assertEqual(100, maps:get(receive_maximum, Bind)),
+        ?assertEqual(10, maps:get(client_alias_max, Bind)),
+        ?assertEqual([{<<"k">>, <<"v">>}], maps:get(user_properties, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(11, false, 0, 10),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        Connack = recv_exact(Client, 8),
+        {ok, Dec} = indra_mqtt_codec:decode_connack_v5(binary:part(Connack, 2, 6)),
+        ?assertEqual(false, maps:get(session_present, Dec)),
+        ?assertEqual(0, maps:get(reason_code, Dec)),
+        ?assertEqual(10, maps:get(alias_max, Dec)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc A version-5 refusal carries the raw v5 reason code: the kernel
+%% RC 16#86 (bad user name or password) is not folded to the 3.1.1
+%% code 4 on v5 sockets.
+v5_refusal_carries_raw_reason_code_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5024}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_v5(<<"dev-v5r">>, 0)),
+        [_Sent] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(0, false, 16#86, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        %% V5 CONNACK with empty properties: 0x20 Len(3) SP RC PropLen(0).
+        ?assertEqual(<<16#20, 16#03, 16#00, 16#86, 16#00>>,
+                      recv_exact(Client, 5)),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%% @doc A version-4 handshake on the same build still succeeds with the
+%% fixed 4-byte CONNACK (no behaviour change for 3.1.1 peers).
+v4_handshake_unchanged_alongside_v5_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5025}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet(<<"dev-v4b">>, true, 60)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(4, maps:get(protocol_version, Bind)),
+        ?assertEqual([], maps:get(user_properties, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(12, false, 0, 10),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
         ?assertMatch({connected, _}, sys:get_state(Conn))
     after
         teardown(LSock, Mock, Client, Conn)

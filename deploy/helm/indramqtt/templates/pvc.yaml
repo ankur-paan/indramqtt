@@ -1,0 +1,24 @@
+# The broker's one persistent volume claim (M1-09).
+#
+# Backs /var/lib/indramqtt: `node.data_dir`, `state.toml` beside it and
+# the stream journal when configured. Config stays on the ConfigMap,
+# never on this claim. Size and class are values; the 10 Gi default is
+# reasoned in values.yaml.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-indramqtt-data
+  labels:
+    app.kubernetes.io/name: indramqtt
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  accessModes:
+    # Single-node broker: one writer only. Shared access would need a
+    # clustered broker, which this chart is not (see README.md).
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.storage.size | quote }}
+{{- if .Values.storage.storageClassName }}
+  storageClassName: {{ .Values.storage.storageClassName | quote }}
+{{- end }}

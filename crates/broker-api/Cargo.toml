@@ -17,6 +17,7 @@ broker-auth = { workspace = true }
 broker-config = { workspace = true }
 brokerlink = { workspace = true }
 broker-connectors = { workspace = true }
+broker-connectors-enterprise = { workspace = true }
 broker-storage = { workspace = true }
 broker-cluster = { workspace = true }
 broker-gateway = { workspace = true }

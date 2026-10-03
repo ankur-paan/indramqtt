@@ -1,0 +1,46 @@
+# ConfigMap holding the operator's main config file (M1-09).
+#
+# Same mechanism as the compose example: this renders `indra.toml`, the
+# only file name the M1-04 loader reads under the config dir, and
+# `extraEnv` (INDRA_* variables from values.yaml) wins over it at
+# startup. Binds are composed from the same service port values the
+# Service and container ports use, so one value cannot ask for MQTT on
+# one port while the broker serves another.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-indramqtt-config
+  labels:
+    app.kubernetes.io/name: indramqtt
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  indra.toml: |
+    [node]
+    id = {{ .Values.config.nodeId | quote }}
+    # Data directory. Must stay under /var/lib/indramqtt: that is the
+    # persistent volume claim, so state survives pod restarts.
+    data_dir = "/var/lib/indramqtt/data"
+    brokerlink_bind = "127.0.0.1:18883"
+
+    [listeners.tcp]
+    enabled = true
+    bind = "0.0.0.0:{{ .Values.service.mqttPort }}"
+
+    [listeners.ws]
+    enabled = true
+    bind = "0.0.0.0:{{ .Values.service.wsPort }}"
+    path = "/mqtt"
+
+    [listeners.api]
+    enabled = true
+    bind = "0.0.0.0:{{ .Values.service.apiPort }}"
+
+    [logging]
+    level = {{ .Values.config.logLevel | quote }}
+
+    [session]
+    max_qos0_backlog = 1000
+
+    [auth]
+    enabled = true
+    allow_anonymous = {{ .Values.config.allowAnonymous }}

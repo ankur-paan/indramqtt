@@ -1,0 +1,727 @@
+{
+  "$id": "https://indramqtt.com/schemas/config-schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Typed schema for the IndraMQTT broker file configuration. Generated from the single source of truth in broker-config; do not edit by hand.",
+  "properties": {
+    "auth": {
+      "properties": {
+        "allow_anonymous": {
+          "default": false,
+          "description": "Whether anonymous connections are accepted while no users are configured.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether authentication checks apply to client connects.",
+          "type": "boolean"
+        },
+        "password_hash": {
+          "default": "sha256",
+          "description": "Password hashing algorithm for stored credentials.",
+          "enum": [
+            "sha256",
+            "bcrypt"
+          ],
+          "type": "string"
+        },
+        "superusers": {
+          "default": [
+            "admin",
+            "root"
+          ],
+          "description": "Superuser usernames bypassing ACL rules.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "cluster": {
+      "properties": {
+        "bind": {
+          "default": "127.0.0.1:19883",
+          "description": "Cluster SWIM UDP bind address for peer discovery and membership.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether multi-node distributed clustering is enabled.",
+          "type": "boolean"
+        },
+        "gossip_bind": {
+          "default": "0.0.0.0:7946",
+          "description": "Gossip membership bind address for peer discovery.",
+          "type": "string"
+        },
+        "quic_bind": {
+          "default": "0.0.0.0:9092",
+          "description": "Multiplexed data plane bind address for inter-broker message routing.",
+          "type": "string"
+        },
+        "seed_nodes": {
+          "default": [],
+          "description": "Seed node addresses to join an existing cluster.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "dbauth": {
+      "properties": {
+        "cache_size": {
+          "default": 1024,
+          "description": "Cached database verdicts per source; 0 disables the cache.",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 60,
+          "description": "Seconds a cached database verdict stays valid.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "connect_timeout_ms": {
+          "default": 3000,
+          "description": "Timeout for connecting to an authentication database in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "mongodb_url": {
+          "default": "",
+          "description": "MongoDB URL for database authentication.",
+          "type": "string"
+        },
+        "mysql_url": {
+          "default": "",
+          "description": "MySQL URL for database authentication.",
+          "type": "string"
+        },
+        "pool_size": {
+          "default": 8,
+          "description": "Connections kept per authentication database.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "postgres_url": {
+          "default": "",
+          "description": "PostgreSQL URL for database authentication.",
+          "type": "string"
+        },
+        "read_timeout_ms": {
+          "default": 3000,
+          "description": "Timeout for one authentication lookup in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "redis_url": {
+          "default": "",
+          "description": "Redis URL for database authentication.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "delayed": {
+      "properties": {
+        "max_secs": {
+          "default": 86400,
+          "description": "Upper bound for delayed deferrals in seconds.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "gateway": {
+      "properties": {
+        "coap_bind": {
+          "default": "",
+          "description": "CoAP gateway UDP listen address. Empty disables the gateway.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "jwks": {
+      "properties": {
+        "audience": {
+          "default": "",
+          "description": "Expected JWT audience.",
+          "type": "string"
+        },
+        "ca_cert": {
+          "default": "",
+          "description": "Extra CA certificate trusted for the JWKS endpoint.",
+          "type": "string"
+        },
+        "cache_max_keys": {
+          "default": 32,
+          "description": "Most JWKS keys held in the cache.",
+          "maximum": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 300,
+          "description": "Seconds a cached JWKS key stays valid.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "clock_skew_secs": {
+          "default": 60,
+          "description": "Clock skew tolerated when checking token times, in seconds.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fetch_timeout_ms": {
+          "default": 5000,
+          "description": "Timeout for one JWKS fetch in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "issuer": {
+          "default": "",
+          "description": "Expected JWT issuer.",
+          "type": "string"
+        },
+        "refresh_period_secs": {
+          "default": 300,
+          "description": "Seconds between background JWKS refreshes.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "refresh_timeout_ms": {
+          "default": 5000,
+          "description": "Longest a CONNECT waits for a JWKS refresh in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "url": {
+          "default": "",
+          "description": "JWKS endpoint URL for JWT authentication.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "kerberos": {
+      "properties": {
+        "allowed_realms": {
+          "default": [],
+          "description": "Trusted client realms. Empty allows any realm that verifies.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "clock_skew_secs": {
+          "default": 300,
+          "description": "Clock-skew allowance in seconds for ticket validity and authenticator timestamps.",
+          "maximum": 3600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "keytab_path": {
+          "default": "",
+          "description": "Keytab file for Kerberos authentication. Empty disables Kerberos.",
+          "type": "string"
+        },
+        "realm": {
+          "default": "",
+          "description": "Expected service realm. Empty disables the realm check on the service name.",
+          "type": "string"
+        },
+        "replay_max_entries": {
+          "default": 1024,
+          "description": "Replay-cache bound for Kerberos authenticators.",
+          "maximum": 8192,
+          "minimum": 16,
+          "type": "integer"
+        },
+        "role_map": {
+          "default": "",
+          "description": "Comma-separated principal=role mappings for verified client principals.",
+          "type": "string"
+        },
+        "service_principal": {
+          "default": "",
+          "description": "Service principal name held in the keytab.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ldap": {
+      "properties": {
+        "base_dn": {
+          "default": "",
+          "description": "Base DN under which directory users are searched.",
+          "type": "string"
+        },
+        "bind_dn": {
+          "default": "",
+          "description": "Service account DN used for the initial bind plus search.",
+          "type": "string"
+        },
+        "bind_password": {
+          "default": "",
+          "description": "Service account password for the initial bind.",
+          "type": "string"
+        },
+        "ca_cert_path": {
+          "default": "",
+          "description": "Path to a PEM CA certificate for private directories.",
+          "type": "string"
+        },
+        "connect_timeout_ms": {
+          "default": 5000,
+          "description": "Timeout covering TCP connect plus TLS handshake.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "group_attribute": {
+          "default": "memberOf",
+          "description": "User-entry attribute listing directory groups.",
+          "type": "string"
+        },
+        "pool_size": {
+          "default": 8,
+          "description": "Bound on concurrent directory authentications.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "read_timeout_ms": {
+          "default": 5000,
+          "description": "Timeout covering each directory bind/search round-trip.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "required_group": {
+          "default": "",
+          "description": "Required group DN: the entry must list this DN to connect.",
+          "type": "string"
+        },
+        "server_url": {
+          "default": "",
+          "description": "Directory server URL for LDAP authentication. Empty disables LDAP.",
+          "type": "string"
+        },
+        "user_filter": {
+          "default": "(uid={username})",
+          "description": "User search filter with a {username} placeholder, escaped per RFC 4515.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "licence": {
+      "properties": {
+        "expiry_warn_days": {
+          "default": 30,
+          "description": "Days before expiry that the approaching-expiry alarm and log warning start.",
+          "maximum": 365,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "install_file": {
+          "default": "",
+          "description": "Install the licence token read from this path and exit.",
+          "type": "string"
+        },
+        "license_file": {
+          "default": "/etc/indramqtt/license.key",
+          "description": "Path to the enterprise cryptographic license key file.",
+          "type": "string"
+        },
+        "license_key": {
+          "default": "",
+          "description": "Enterprise commercial license key for multi-node clustering.",
+          "type": "string"
+        },
+        "request_out": {
+          "default": "",
+          "description": "Write the installation licence request to this path and exit.",
+          "type": "string"
+        },
+        "trusted_keys_path": {
+          "default": "",
+          "description": "Trusted licence-signing keys: a JSON file or directory of JSON files.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "listeners": {
+      "properties": {
+        "api": {
+          "properties": {
+            "bind": {
+              "default": "0.0.0.0:18083",
+              "description": "Bind address for the management REST API. Empty disables the API.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": true,
+              "description": "Whether the management REST API and dashboard serve requests.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "tcp": {
+          "properties": {
+            "backlog": {
+              "default": 1024,
+              "description": "Listener accept backlog for the plaintext MQTT listener.",
+              "maximum": 65536,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "bind": {
+              "default": "0.0.0.0:1883",
+              "description": "Bind address for the plaintext MQTT listener.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": true,
+              "description": "Whether the plaintext MQTT listener accepts connections.",
+              "type": "boolean"
+            },
+            "max_connections": {
+              "default": 1000000,
+              "description": "Maximum concurrent connections on the plaintext MQTT listener.",
+              "maximum": 10000000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "tls": {
+          "properties": {
+            "bind": {
+              "default": "0.0.0.0:8883",
+              "description": "Bind address for the secure TLS MQTT listener.",
+              "type": "string"
+            },
+            "cert_file": {
+              "default": "",
+              "description": "Path to the PEM server certificate for the TLS listener.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": false,
+              "description": "Whether the secure TLS MQTT listener accepts connections.",
+              "type": "boolean"
+            },
+            "key_file": {
+              "default": "",
+              "description": "Path to the PEM private key for the TLS listener.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "ws": {
+          "properties": {
+            "bind": {
+              "default": "0.0.0.0:8083",
+              "description": "Bind address for the MQTT-over-WebSocket listener.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": true,
+              "description": "Whether the MQTT-over-WebSocket listener accepts connections.",
+              "type": "boolean"
+            },
+            "path": {
+              "default": "/mqtt",
+              "description": "HTTP path serving MQTT-over-WebSocket traffic.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "wss": {
+          "properties": {
+            "bind": {
+              "default": "0.0.0.0:8084",
+              "description": "Bind address for the secure WebSocket listener.",
+              "type": "string"
+            },
+            "cert_file": {
+              "default": "",
+              "description": "Path to the PEM server certificate for the secure WebSocket listener.",
+              "type": "string"
+            },
+            "enabled": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener accepts connections.",
+              "type": "boolean"
+            },
+            "key_file": {
+              "default": "",
+              "description": "Path to the PEM private key for the secure WebSocket listener.",
+              "type": "string"
+            },
+            "path": {
+              "default": "/mqtt",
+              "description": "HTTP path serving secure WebSocket traffic.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "logging": {
+      "properties": {
+        "level": {
+          "default": "info",
+          "description": "Logging verbosity for the kernel (trace, debug, info, warn, error).",
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "node": {
+      "properties": {
+        "brokerlink_bind": {
+          "default": "127.0.0.1:18883",
+          "description": "BrokerLink IPC listen address for edge clients (TCP loopback).",
+          "type": "string"
+        },
+        "data_dir": {
+          "default": "./data",
+          "description": "Directory holding kernel persistent state (state.toml). Created on boot when missing.",
+          "type": "string"
+        },
+        "id": {
+          "default": "indra-node-1",
+          "description": "Unique identifier for this broker node within the cluster.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "observability": {
+      "properties": {
+        "monitor_sample_secs": {
+          "default": 10,
+          "description": "Monitor sampling interval in seconds.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "persistence": {
+      "properties": {
+        "stream_dir": {
+          "default": "",
+          "description": "Durable stream journal directory. Empty disables journaling.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "quotas": {
+      "properties": {
+        "burst_multiplier": {
+          "default": 2.0,
+          "description": "Token bucket burst multiplier (allows bursts up to burst times rate).",
+          "maximum": 10.0,
+          "minimum": 1.0,
+          "type": "number"
+        },
+        "default_max_connections": {
+          "default": 10000,
+          "description": "Default max connections per authenticated username (0 = unlimited).",
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "default_max_publish_rate": {
+          "default": 50000,
+          "description": "Default token-bucket publish rate limit in messages per second (0 = unlimited).",
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "rules_engine": {
+      "properties": {
+        "backpressure_policy": {
+          "default": "DropOldest",
+          "description": "Default memory backpressure policy when the rule buffer is full.",
+          "enum": [
+            "Block",
+            "DropNewest",
+            "DropOldest",
+            "SpillToDisk",
+            "RejectPublisher"
+          ],
+          "type": "string"
+        },
+        "spill_dir": {
+          "default": "",
+          "description": "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+          "type": "string"
+        },
+        "window_channel_depth": {
+          "default": 65536,
+          "description": "Ingress ring buffer channel depth for stateful window worker tasks.",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "session": {
+      "properties": {
+        "keep_alive_grace": {
+          "default": 1.5,
+          "description": "Keep-alive grace multiplier before disconnect.",
+          "maximum": 5.0,
+          "minimum": 1.0,
+          "type": "number"
+        },
+        "max_inflight_messages": {
+          "default": 65535,
+          "description": "Maximum inflight unacknowledged QoS 1 and QoS 2 messages.",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_offline_queue": {
+          "default": 50000,
+          "description": "Maximum queued offline messages per session.",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_qos0_backlog": {
+          "default": 1000,
+          "description": "Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_qos1_inflight": {
+          "default": 100,
+          "description": "Per-session QoS 1 inflight window bound.",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_qos1_spill": {
+          "default": 1000,
+          "description": "Per-session QoS 1 spill bound past the window.",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_session_expiry_secs": {
+          "default": 86400,
+          "description": "Max session expiry interval in seconds.",
+          "maximum": 2592000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic_alias_maximum": {
+          "default": 10,
+          "description": "Inbound topic-alias maximum advertised in CONNACK.",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "webhook": {
+      "properties": {
+        "breaker_reset_ms": {
+          "default": 30000,
+          "description": "Milliseconds an open circuit breaker waits before retrying the webhook.",
+          "maximum": 600000,
+          "minimum": 1000,
+          "type": "integer"
+        },
+        "breaker_threshold": {
+          "default": 5,
+          "description": "Consecutive webhook failures that open the circuit breaker.",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cache_size": {
+          "default": 1024,
+          "description": "Cached webhook verdicts; 0 disables the cache.",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 60,
+          "description": "Seconds a cached webhook verdict stays valid.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pool_size": {
+          "default": 8,
+          "description": "Concurrent requests allowed to the webhook endpoint.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 2000,
+          "description": "Timeout for one webhook request in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "url": {
+          "default": "",
+          "description": "HTTP webhook verdict endpoint.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "IndraMQTT broker configuration",
+  "type": "object"
+}

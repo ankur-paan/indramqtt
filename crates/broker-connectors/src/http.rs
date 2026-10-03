@@ -9,22 +9,26 @@
 //!
 //! Retryable statuses are 429 and 500..=504; 400/401/403/404 fail
 //! immediately without retry. Every other non-2xx status is a terminal
-//! dispatch failure. All limits are `Option`-typed: `None` means
-//! unbounded, with zero clamped ceilings.
+//! dispatch failure. Batch/retry limits are `Option`-typed with finite
+//! defaults (`None` there is an explicit operator opt-in to unbounded,
+//! the code never chooses it, with zero clamped ceilings); the outer
+//! backlog (`buffer_capacity`) is always bounded with a finite default
+//! and fails closed when full.
 
 use async_trait::async_trait;
 use base64::Engine;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
+use super::{
+    hmac_sha1 as maintained_hmac_sha1, hmac_sha256 as maintained_hmac_sha256, now_millis,
+    render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
+};
 
 /// HTTP method for webhook delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -170,91 +174,73 @@ impl HttpHmacSignature {
     }
 }
 
-/// HMAC-SHA256 via the sha2 crate (shared shape with the S3 signer).
+/// HMAC-SHA256 via the maintained `hmac` + `sha2` crates (shared with
+/// the S3/Kinesis signers in [`super`]); no hand-rolled cryptography.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = Sha256::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
+    maintained_hmac_sha256(key, message)
 }
 
-/// HMAC-SHA1 via the sha1 crate (GitHub-style `X-Hub-Signature-256`
-/// uses SHA-256; SHA-1 covers legacy receivers).
+/// HMAC-SHA1 via the maintained `hmac` + `sha1` crates (GitHub-style
+/// `X-Hub-Signature-256` uses SHA-256; SHA-1 covers legacy receivers).
 fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let mut digest = Sha1::new();
-        digest.update(key);
-        let sum = digest.finalize();
-        key_block[..sum.len()].copy_from_slice(&sum);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = Sha1::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-    let mut outer = Sha1::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
+    maintained_hmac_sha1(key, message)
 }
 
 fn default_batch_size() -> Option<usize> {
+    // Reason: bounds one flush to 100 requests so a slow receiver cannot
+    // wedge the rule worker behind an arbitrarily large batch.
     Some(100)
 }
 
 fn default_batch_bytes() -> Option<usize> {
+    // Reason: 1 MiB keeps one flush under common receiver body limits.
     Some(1_048_576)
 }
 
 fn default_linger_ms() -> Option<u64> {
+    // Reason: 50 ms flush latency for interactive webhooks without
+    // busy-looping the rule worker.
     Some(50)
 }
 
 fn default_timeout_ms() -> Option<u64> {
+    // Reason: 5 s per-request ceiling so an unreachable receiver fails
+    // closed instead of stalling the rule worker.
     Some(5_000)
 }
 
 fn default_max_retries() -> Option<usize> {
+    // Reason: 3 retries ride out transient 429/5xx without retrying
+    // forever against a dead receiver.
     Some(3)
 }
 
 fn default_initial_backoff_ms() -> Option<u64> {
+    // Reason: 100 ms first retry delay, the floor for the exponential
+    // backoff below.
     Some(100)
 }
 
 fn default_max_backoff_ms() -> Option<u64> {
+    // Reason: 2 s retry ceiling so backoff stays interactive while the
+    // fail-fast breaker (2 s, 4 s, ... capped at 30 s) covers outages.
     Some(2_000)
 }
 
-/// Webhook sink configuration. All limits are optional (`None` =
-/// unbounded) with zero clamped ceilings.
+/// Default outer backlog ceiling: 10_000 rows (about one hundred
+/// 100-row flushes) so a burst or a stalled receiver cannot grow the
+/// queue without bound while the fail-fast breaker is engaged, while
+/// steady throughput still fits in memory (10_000 small JSON records
+/// stay well under tens of MiB).
+fn default_buffer_capacity_10k() -> Option<usize> {
+    Some(10_000)
+}
+
+/// Webhook sink configuration. All limits are optional with finite
+/// defaults; `None` on the batch/retry knobs below is an explicit
+/// operator opt-in to unbounded (the code never chooses it) with zero
+/// clamped ceilings. The outer backlog (`buffer_capacity`) is always
+/// bounded: `None` there means the finite default, never unlimited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpSinkConfig {
     /// Target URL with `${topic}`, `${client_id}`, `${qos}` and
@@ -296,6 +282,15 @@ pub struct HttpSinkConfig {
     /// Retry delay ceiling in ms (default 2000).
     #[serde(default = "default_max_backoff_ms")]
     pub max_backoff_ms: Option<u64>,
+    /// In-memory queue backlog ceiling (`None` = default 10_000 rows:
+    /// about one hundred 100-row flushes, bounding worst-case backlog
+    /// memory while absorbing bursts; an old stored configuration
+    /// without this field parses to the same default, so stored
+    /// configuration keeps working. When full the sink fails closed
+    /// with a connection error instead of growing without bound or
+    /// shedding rows silently).
+    #[serde(default = "default_buffer_capacity_10k")]
+    pub buffer_capacity: Option<usize>,
 }
 
 impl HttpSinkConfig {
@@ -330,6 +325,11 @@ impl HttpSinkConfig {
                 "webhook batch_bytes must be >= 1".to_string(),
             ));
         }
+        if self.buffer_capacity == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "webhook buffer_capacity must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -339,6 +339,14 @@ impl HttpSinkConfig {
 
     pub fn effective_batch_bytes(&self) -> usize {
         self.batch_bytes.unwrap_or(usize::MAX).max(1)
+    }
+
+    /// Outer backlog ceiling (default 10_000 rows: about one hundred
+    /// 100-row flushes, bounding worst-case backlog memory while the
+    /// fail-fast breaker is engaged and absorbing bursts; `None`
+    /// means this finite default, never unlimited).
+    pub fn effective_buffer_capacity(&self) -> usize {
+        self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
     pub fn effective_linger(&self) -> Duration {
@@ -849,6 +857,11 @@ impl HttpSink {
         Ok(())
     }
 
+    /// Restore a failed batch at the front, preserving order. The rows
+    /// were already admitted against `effective_buffer_capacity` by
+    /// `buffer_row`, so restore cannot grow the queue beyond what send
+    /// admitted; the bound stays enforced at admission while the
+    /// fail-fast breaker is engaged.
     fn restore(&self, rows: Vec<HttpRow>, oldest: Option<std::time::Instant>, bytes: usize) {
         let mut buffer = self.buffer.lock();
         buffer.queue.restore(rows, oldest);
@@ -856,7 +869,12 @@ impl HttpSink {
     }
 
     /// Validate + buffer one event. Returns true when the batch is
-    /// full, stale, or over the byte limit (caller flushes).
+    /// full, stale, or over the byte limit (caller flushes). The outer
+    /// backlog is bounded: when the queue already holds
+    /// `effective_buffer_capacity` rows (e.g. while the fail-fast
+    /// breaker is engaged) the row is refused with a connection error
+    /// instead of growing memory without bound. Bound check and push
+    /// share one queue lock.
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<bool> {
         if topic.as_str().is_empty() {
             return Err(ConnectorError::Dispatch(
@@ -873,6 +891,11 @@ impl HttpSink {
         };
         let added = row.payload.len() + row.topic.len() + 16;
         let mut buffer = self.buffer.lock();
+        if buffer.queue.len() >= self.config.effective_buffer_capacity() {
+            return Err(ConnectorError::Connection(
+                "webhook buffer limit reached".to_string(),
+            ));
+        }
         let full = buffer.queue.push(row);
         buffer.bytes = buffer.bytes.saturating_add(added);
         Ok(full || buffer.bytes >= self.config.effective_batch_bytes())
@@ -949,6 +972,7 @@ mod tests {
             max_retries: Some(3),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(2_000),
+            buffer_capacity: Some(10_000),
         }
     }
 
@@ -989,6 +1013,9 @@ mod tests {
         config.batch_size = None;
         config.batch_bytes = Some(0);
         assert!(config.validate().is_err());
+        config.buffer_capacity = Some(0);
+        assert!(config.validate().is_err());
+        config.buffer_capacity = Some(10_000);
         // Unbounded + huge limits accepted: zero clamped ceilings.
         config.batch_bytes = None;
         config.max_retries = None;
@@ -1298,5 +1325,321 @@ mod tests {
         let calls = transport.calls();
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), calls);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_bound_fails_closed() {
+        let mut config = test_config("http://127.0.0.1:1/hook");
+        config.batch_size = Some(10);
+        config.buffer_capacity = Some(1);
+        let (sink, _) = test_sink(config);
+        let topic = Topic::new("t").unwrap();
+        sink.send(&topic, &Bytes::from_static(br#"{"n":1}"#), QoS::AtMostOnce)
+            .await
+            .expect("first row fits");
+        let err = sink
+            .send(&topic, &Bytes::from_static(br#"{"n":2}"#), QoS::AtMostOnce)
+            .await
+            .expect_err("full buffer must fail closed");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "a full backlog is backpressure, got {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_buffer_capacity_default_is_finite_and_back_compatible() {
+        // The bound's default is finite (RULEBOOK §2): omitted means
+        // 10_000 rows, never unlimited.
+        let config = test_config("http://127.0.0.1:1/hook");
+        assert_eq!(config.effective_buffer_capacity(), 10_000);
+        // Stored configuration written before this field existed keeps
+        // working: the field defaults instead of failing to parse.
+        let legacy = serde_json::json!({
+            "url": "https://hooks.example.com/ingest",
+        });
+        let parsed: HttpSinkConfig = serde_json::from_value(legacy).expect("legacy config parses");
+        assert_eq!(parsed.effective_buffer_capacity(), 10_000);
+        assert!(parsed.validate().is_ok());
+    }
+
+    /// Loopback exercise (QUAL-NONE: a generic webhook is a test-owned
+    /// endpoint, not a server product, so no container is needed) for
+    /// the enterprise [`HttpSink`] on the maintained `reqwest` driver
+    /// ([`ReqwestHttpTransport`]).
+    ///
+    /// Serves its own loopback receiver (ephemeral `axum` server with
+    /// HMAC verification plus scripted `429`-then-`200` and `500`
+    /// faults), streams 500 events through the broker's connector
+    /// manager (`ConnectorManager` -> `HttpSink`), asserts
+    /// byte-identical bodies with valid HMAC headers and exact counts,
+    /// proves `429`-then-`200` retries to success, and proves a
+    /// persistent `500` aborts with the buffer retained. Runs offline:
+    /// needs only loopback, never skips.
+    ///
+    /// This is the manager-level exercise only. The rule-path exercise
+    /// (rule registered with the connector manager, message published
+    /// through `RuleEngine::dispatch_ingress` with a `ForwardConnector`
+    /// action, never `sink.send` directly) lives in `broker-rules`
+    /// (`tests::test_qualify_webhook_write_path_through_rule_engine`).
+    /// QUAL-NONE: a generic webhook is a test-owned endpoint served as
+    /// real HTTP in-process (ephemeral `axum` receiver), so there is no
+    /// `QUAL_RESULT` to produce; together the two tests prove 500
+    /// byte-identical bodies with valid HMAC headers and exact counts,
+    /// `429`-then-`200` retry to success, and persistent-`500` abort
+    /// with the buffer retained.
+    #[tokio::test]
+    async fn test_webhook_loopback_write_path_through_manager() {
+        use crate::ConnectorManager;
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Mutex as StdMutex,
+        };
+
+        const SECRET: &str = "qual-hmac-secret";
+        const EVENTS: usize = 500;
+
+        #[derive(Debug, Default)]
+        struct QualState {
+            bodies: StdMutex<Vec<Vec<u8>>>,
+            signatures: StdMutex<Vec<String>>,
+            bad_hmac: AtomicU64,
+            flaky_calls: AtomicU64,
+            dead_calls: AtomicU64,
+        }
+
+        fn expected_signature(body: &[u8]) -> String {
+            HttpHmacSignature {
+                header_name: "X-Signature-SHA256".to_string(),
+                algorithm: HmacAlgorithm::Sha256,
+                secret: SECRET.to_string(),
+                encoding: HmacEncoding::Hex,
+            }
+            .sign(body)
+        }
+
+        async fn hook_handler(
+            State(state): State<Arc<QualState>>,
+            headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let signature = headers
+                .get("X-Signature-SHA256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if signature != expected_signature(&body) {
+                state.bad_hmac.fetch_add(1, AtomicOrdering::SeqCst);
+                return (StatusCode::BAD_REQUEST, "bad hmac".to_string());
+            }
+            state.signatures.lock().unwrap().push(signature);
+            state.bodies.lock().unwrap().push(body.to_vec());
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        async fn flaky_handler(
+            State(state): State<Arc<QualState>>,
+            headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let call = state.flaky_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                return (StatusCode::TOO_MANY_REQUESTS, "slow down".to_string());
+            }
+            hook_handler(State(state), headers, body).await
+        }
+
+        async fn dead_handler(
+            State(state): State<Arc<QualState>>,
+            _headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            state.dead_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            state.bodies.lock().unwrap().push(body.to_vec());
+            (StatusCode::INTERNAL_SERVER_ERROR, "nope".to_string())
+        }
+
+        let state = Arc::new(QualState::default());
+        let app = Router::new()
+            .route("/hook", post(hook_handler))
+            .route("/flaky", post(flaky_handler))
+            .route("/dead", post(dead_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("qual bind loopback");
+        let port = listener.local_addr().expect("qual addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("qual serve");
+        });
+
+        fn qual_config(url: &str) -> HttpSinkConfig {
+            HttpSinkConfig {
+                url: url.to_string(),
+                method: HttpMethod::Post,
+                headers: HashMap::new(),
+                auth: HttpAuth::None,
+                body_format: HttpBodyFormat::RawJson,
+                signature: Some(HttpHmacSignature {
+                    header_name: "X-Signature-SHA256".to_string(),
+                    algorithm: HmacAlgorithm::Sha256,
+                    secret: SECRET.to_string(),
+                    encoding: HmacEncoding::Hex,
+                }),
+                batch_size: Some(EVENTS),
+                batch_bytes: Some(1_048_576),
+                linger_ms: Some(50),
+                timeout_ms: Some(5_000),
+                max_retries: Some(3),
+                initial_backoff_ms: Some(100),
+                max_backoff_ms: Some(2_000),
+                buffer_capacity: Some(10_000),
+            }
+        }
+
+        // 500 events end to end over the real `reqwest` driver, through
+        // the broker's connector manager (never `sink.send` directly).
+        let config = qual_config(&format!("http://127.0.0.1:{port}/hook"));
+        let transport = Arc::new(
+            ReqwestHttpTransport::new(&config, reqwest::Client::new()).expect("qual transport"),
+        );
+        let sink = Arc::new(HttpSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "webhook");
+        let manager = ConnectorManager::new();
+        manager.register("qual-http", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        let mut expected_bodies = Vec::with_capacity(EVENTS);
+        for seq in 0..EVENTS {
+            let payload = format!(r#"{{"seq":{seq},"device":"dev-{:02}"}}"#, seq % 16);
+            // The sink forwards the projected JSON verbatim, so the wire
+            // body is the canonical re-serialization of the payload.
+            let document: serde_json::Value =
+                serde_json::from_str(&payload).expect("qual payload parses");
+            expected_bodies.push(serde_json::to_vec(&document).expect("qual body encodes"));
+            manager
+                .send("qual-http", &topic, &Bytes::from(payload), QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), EVENTS as u64, "qual row count");
+        assert_eq!(sink.sent_requests(), EVENTS as u64, "qual request count");
+        assert_eq!(sink.buffered_rows(), 0);
+        eprintln!("qual rows sent: records={EVENTS}");
+
+        // Byte-identical bodies with valid HMAC headers, exact counts, no
+        // tolerance: every key present, none extra, none mutated.
+        let captured = state.bodies.lock().unwrap().clone();
+        assert_eq!(captured.len(), EVENTS, "qual captured count");
+        for (index, (got, want)) in captured.iter().zip(expected_bodies.iter()).enumerate() {
+            assert_eq!(got, want, "qual body byte mismatch at {index}");
+        }
+        assert_eq!(
+            state.bad_hmac.load(AtomicOrdering::SeqCst),
+            0,
+            "every request must carry a valid HMAC header"
+        );
+        assert_eq!(
+            state.signatures.lock().unwrap().len(),
+            EVENTS,
+            "every request must carry the signature header"
+        );
+        eprintln!("qual rows asserted: count={EVENTS} byte-identical with valid HMAC");
+
+        // 429-then-200 retries to success on the same body.
+        let flaky_config = HttpSinkConfig {
+            url: format!("http://127.0.0.1:{port}/flaky"),
+            batch_size: Some(10),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            ..qual_config(&format!("http://127.0.0.1:{port}/flaky"))
+        };
+        let flaky_transport = Arc::new(
+            ReqwestHttpTransport::new(&flaky_config, reqwest::Client::new())
+                .expect("qual flaky transport"),
+        );
+        let flaky_sink =
+            Arc::new(HttpSink::new(flaky_config, flaky_transport).expect("qual flaky sink"));
+        manager.register("qual-flaky", flaky_sink.clone());
+        let bodies_before = state.bodies.lock().unwrap().len();
+        manager
+            .send(
+                "qual-flaky",
+                &topic,
+                &Bytes::from_static(br#"{"seq":"retry-probe"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual flaky buffer");
+        flaky_sink.flush().await.expect("429-then-200 must succeed");
+        assert_eq!(
+            state.flaky_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "one 429 plus one 200"
+        );
+        assert_eq!(flaky_sink.sent_requests(), 1);
+        assert_eq!(flaky_sink.sent_records(), 1);
+        assert_eq!(flaky_sink.buffered_rows(), 0);
+        // The retried body arrived intact with a valid HMAC.
+        let after_retry = state.bodies.lock().unwrap().clone();
+        assert_eq!(after_retry.len(), bodies_before + 1);
+        let probe: serde_json::Value =
+            serde_json::from_slice(&after_retry[bodies_before]).expect("retry body parses");
+        assert_eq!(probe, serde_json::json!({"seq": "retry-probe"}));
+        eprintln!("qual retry asserted: 429-then-200 delivered once with valid HMAC");
+
+        // Persistent 500 aborts: retries exhausted, buffer retained for
+        // inspection, fail-fast breaker engaged.
+        let dead_config = HttpSinkConfig {
+            url: format!("http://127.0.0.1:{port}/dead"),
+            batch_size: Some(10),
+            max_retries: Some(1),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            ..qual_config(&format!("http://127.0.0.1:{port}/dead"))
+        };
+        let dead_transport = Arc::new(
+            ReqwestHttpTransport::new(&dead_config, reqwest::Client::new())
+                .expect("qual dead transport"),
+        );
+        let dead_sink =
+            Arc::new(HttpSink::new(dead_config, dead_transport).expect("qual dead sink"));
+        manager.register("qual-dead", dead_sink.clone());
+        manager
+            .send(
+                "qual-dead",
+                &topic,
+                &Bytes::from_static(br#"{"seq":"abort-probe"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual dead buffer");
+        let err = dead_sink.flush().await.expect_err("500 must abort");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "exhausted 500s are backpressure, got {err:?}"
+        );
+        assert_eq!(
+            state.dead_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "initial attempt plus one retry"
+        );
+        assert_eq!(dead_sink.buffered_rows(), 1);
+        let calls = state.dead_calls.load(AtomicOrdering::SeqCst);
+        assert!(dead_sink.flush().await.is_err());
+        assert_eq!(
+            state.dead_calls.load(AtomicOrdering::SeqCst),
+            calls,
+            "breaker must fail fast without touching the transport"
+        );
+        eprintln!("qual abort asserted: persistent 500 aborts with buffer retained");
+
+        // Cleanup: stop the loopback receiver (nothing else to remove;
+        // no table, bucket, or container was created).
+        server.abort();
+        eprintln!("qual done: rows={EVENTS} cleaned loopback receiver");
     }
 }

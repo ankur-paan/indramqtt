@@ -3,10 +3,11 @@
   {vsn, "0.1.0"},
   {registered, []},
   {mod, {indra_edge_app, []}},
-  {applications,
-   [kernel,
-    stdlib
-   ]},
+   {applications,
+    [kernel,
+     stdlib,
+     crypto
+    ]},
   {env,[]},
   {modules, []},
   {licenses, ["MIT", "Apache-2.0"]},

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+broker-config = { workspace = true }
 broker-protocol = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -68,6 +69,15 @@ couchbase = { version = "1" }
 # pooling. The hand-written `TcpMySqlTransport` stays for offline unit
 # tests only; production wiring uses `DriverMySqlTransport`.
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+# MongoDB sink on the maintained official driver (Apache-2.0 + MIT).
+# The hand-written `NativeMongoDbTransport` (OP_MSG + SCRAM-SHA-256)
+# stays for offline unit tests only; production wiring uses
+# `DriverMongoDbTransport` below (bulk insert, collection routing).
+# Uses `rustls-tls-aws-lc` (not default `rustls-tls`/ring): the workspace
+# enables exactly one rustls provider (`aws-lc-rs`), and enabling both
+# `ring` and `aws_lc_rs` makes `CryptoProvider::from_crate_features`
+# ambiguous so `get_default_or_install_from_crate_features` panics.
+mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "dns-resolver", "rustls-tls-aws-lc"] }
 # Google Cloud Pub/Sub sink on the maintained official driver
 # (Apache-2.0). The sink publishes through `google-cloud-pubsub` gRPC
 # `Publisher` (base64 data, ordering keys, attributes); the hand-written

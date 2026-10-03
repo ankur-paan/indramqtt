@@ -5,13 +5,13 @@
 [![Enterprise Edition](https://img.shields.io/badge/Enterprise-Commercial%20%2F%20Eval-gold.svg)](LICENSE-ENTERPRISE)
 [![Rust Version](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![OTP Version](https://img.shields.io/badge/Erlang%2FOTP-26%2B-red.svg)](https://www.erlang.org)
-[![Automated Tests](https://img.shields.io/badge/Tests-388%20Passing%20(100%25)-brightgreen.svg)](https://indramqtt.com)
+[![Automated Tests](https://img.shields.io/badge/Tests-automated-brightgreen.svg)](https://indramqtt.com/docs)
 
 **Official Website**: [indramqtt.com](https://indramqtt.com) | **Documentation**: upcoming
 
 [Architecture](ARCHITECTURE.md) • [Benchmarks](BENCHMARKS.md) • [Roadmap](ROADMAP.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md) • [Docker](#one-click-evaluation-with-docker)
 
-**IndraMQTT** is an ultra-fast, lightweight, and highly concurrent dual-licensed distributed MQTT messaging and streaming platform designed from first principles for mission-critical IoT, industrial edge, and hyper-scale cloud deployments.
+**IndraMQTT** is a dual-licensed distributed MQTT messaging and streaming platform for IoT, industrial edge, and cloud deployments.
 
 ---
 
@@ -23,12 +23,12 @@ All figures below are grounded in reproducible, multi-sample automated benchmark
 
 | Subsystem / Benchmark | Measured Throughput (Release) | What Is Measured | Profile & Methodology |
 | :--- | :--- | :--- | :--- |
-| **Radix Trie Router (Hit-Path)** | **~3.05M ± 0.10M msg/sec** | In-process microbenchmark `bench_router_match_throughput`: lookup matching 3 subscriber targets across 1,000 installed topic filters | Single-threaded in-memory function call, `ahash` + zero-allocation `Arc<str>` tokens; not end-to-end network throughput |
-| **Radix Trie Router (Fast-Miss)** | **~7.80M ± 0.20M msg/sec** | In-process microbenchmark `bench_router_match_throughput`: walk-only trie branch evaluation on non-matching topic prefix | Single-threaded in-memory branch walk; not end-to-end network throughput |
-| **Streaming SQL Ingress Engine** | **~4.77M ± 0.10M events/sec** | In-process microbenchmark `bench_sql_ingress_throughput`: JSON parsing + SQL `WHERE` filter + `SELECT` field projection | Single-threaded, **100% verified delivered to sink** (0 drops), `Block` backpressure; not end-to-end network throughput |
+| **Radix Trie Router (Hit-Path)** | **~3.05M ± 0.10M msg/sec** | In-process microbenchmark `bench_router_match_throughput`: lookup matching 3 subscriber targets across 1,000 installed topic filters | Single-threaded in-memory function call, `ahash` + zero-allocation `Arc<str>` tokens; hardware-dependent (re-run locally with `cargo test --release --bench broker_throughput -- --nocapture`); not end-to-end network throughput |
+| **Radix Trie Router (Fast-Miss)** | **~7.80M ± 0.20M msg/sec** | In-process microbenchmark `bench_router_match_throughput`: walk-only trie branch evaluation on non-matching topic prefix | Single-threaded in-memory branch walk; hardware-dependent (re-run locally with `cargo test --release --bench broker_throughput -- --nocapture`); not end-to-end network throughput |
+| **Streaming SQL Ingress Engine** | **~4.77M ± 0.10M events/sec** | In-process microbenchmark `bench_sql_ingress_throughput`: JSON parsing + SQL `WHERE` filter + `SELECT` field projection | Single-threaded, **100% verified delivered to sink** (0 drops), `Block` backpressure; hardware-dependent (re-run locally with `cargo test --release --bench broker_throughput -- --nocapture`); not end-to-end network throughput |
 
 > [!IMPORTANT]
-> **Scope Note**: The table above measures purely in-process, function-level microbenchmarks (radix trie matching and streaming SQL expression evaluation). It does **not** represent end-to-end network throughput over TCP/TLS sockets. End-to-end loopback measurements (with delivery percentages and RSS under load) live in `benchmark_suite/benchmark_results_v5.json`. No idle-RSS benchmark is committed in-tree, so no idle footprint figure is claimed here. For architectural comparison targets, competitor network baselines (HiveMQ, VerneMQ, Mosquitto), and literature citations, see [BENCHMARKS.md](BENCHMARKS.md).
+> **Scope Note**: The table above measures purely in-process, function-level microbenchmarks (radix trie matching and streaming SQL expression evaluation). It does **not** represent end-to-end network throughput over TCP/TLS sockets. The figures are hardware-dependent: no machine is cited because the rate varies by CPU and build flags, so re-run `cargo test --release --bench broker_throughput -- --nocapture` on your own hardware instead of comparing across machines. End-to-end loopback measurements (with delivery percentages and RSS under load, plus the CPU, memory, OS and network in the `environment` block) live in `benchmark_suite/benchmark_results_v5.json`. No idle-RSS benchmark is committed in-tree, so no idle footprint figure is claimed here. For architectural comparison targets, externally published network baselines, and literature citations, see [BENCHMARKS.md](BENCHMARKS.md) (none of those are IndraMQTT measurements).
 
 ---
 
@@ -120,11 +120,11 @@ IndraMQTT is engineered with a transparent **Open-Core** architecture designed t
 | :--- | :--- | :--- |
 | **Licensing** | **Permissive MIT OR Apache-2.0** ([`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE)) | **Commercial Subscription** ([`LICENSE-ENTERPRISE`](LICENSE-ENTERPRISE)) |
 | **License Enforcement** | **Zero license key required**. Free forever for production. | Hardware-rooted ECDSA P-256 licence verification against a configured key set. Free Community Evaluation mode for local dev/testing. |
-| **Broker Kernel** | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec; no idle-RSS figure claimed) | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec; no idle-RSS figure claimed) |
+| **Broker Kernel** | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec single-threaded, hardware-dependent, 1,000 filters with 3 targets; not network throughput; no idle-RSS figure claimed) | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec single-threaded, hardware-dependent, 1,000 filters with 3 targets; not network throughput; no idle-RSS figure claimed) |
 | **Network Edge** | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity |
-| **Protocols Supported** | MQTT v3.1.1 only (v5 CONNECT rejected as `unsupported_protocol` in `beam/src/indra_mqtt_codec.erl:decode_connect`; v5 not supported yet), TLS via edge `ssl` transport (`beam/test/indra_listener_tests.erl:tls_connect_connack_test`), MQTT-over-WebSocket test console on the API port (`/ws/mqtt` in `crates/broker-api/src/ws.rs`) | MQTT v3.1.1 only (v5 CONNECT rejected as `unsupported_protocol`; v5 not supported yet), TLS via edge `ssl` transport, MQTT-over-WebSocket test console on the API port (`/ws/mqtt`), Sparkplug B, OPC-UA |
+| **Protocols Supported** | MQTT v3.1.1 only on every edge listener (TCP, TLS, `ws`, `wss`): v5 CONNECT rejected as `unsupported_protocol` in `beam/src/indra_mqtt_codec.erl:decode_connect`; v5 not supported yet. Plaintext `ws` edge listener enabled by default (`0.0.0.0:8083`, configurable path; `beam/src/indra_ws_listener.erl`, proven by `beam/test/indra_ws_tests.erl`). Opt-in `wss` edge listener disabled by default (needs cert/key or it fails closed at startup; `beam/test/indra_wss_tests.erl`). TLS via edge `ssl` transport (`beam/test/indra_listener_tests.erl:tls_connect_connack_test`). MQTT-over-WebSocket test console on the API port (`/ws/mqtt` in `crates/broker-api/src/ws.rs`) is a test console only | MQTT v3.1.1 only on every edge listener (v5 not supported yet), `ws` edge listener, opt-in `wss` edge listener, TLS via edge `ssl` transport, MQTT-over-WebSocket test console on the API port (`/ws/mqtt`), Sparkplug B, OPC-UA |
 | **Routing & Sessions** | Zero-allocation Radix Trie, QoS 0/1/2, Shared Subscriptions (`$share`), Delayed Messages (`$delayed`), Retained Store | Radix Trie, QoS 0/1/2, Shared Subscriptions, Delayed Messages, Retained Store |
-| **Scale Limits** | **Zero artificial limits**. Unbounded channels, queues, and connection limits. | **Zero artificial limits**. Unbounded channels, queues, and connection limits. |
+| **Scale Limits** | **Configurable bounds with finite defaults**. Queue and pool capacities are bounded by default (for example `session.max_qos0_backlog` 1000, `session.max_offline_queue` 50000, `rules_engine.window_channel_depth` 65536 in `indramqtt.example.toml` and `crates/broker-config/src/schema.rs`); unbounded is only an explicit operator opt-in, never the default. | **Configurable bounds with finite defaults** (same defaults as Community); unbounded only as an explicit operator opt-in. |
 | **Clustering** | Single-Node Standalone / Edge Appliance | **Distributed QUIC Data Plane**, SWIM Gossip Membership, Distributed Raft Consensus |
 | **Stream Processing** | Embedded `rekuiper` Stateless SQL (all 185 scalar functions, `WHERE`, `SELECT`, `CASE`, math, trig, bitwise, string, date/time) | Embedded `rekuiper` Stateful Windowing (`TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW`, `COUNTWINDOW`), multi-event aggregations (`avg`, `sum`, `count`, `min`, `max`, `stddev`, `percentile`) |
 | **Data Sinks & Bridges** | PostgreSQL, MySQL, Redis, ClickHouse, InfluxDB, TimescaleDB, Amazon S3 / MinIO, Elasticsearch / OpenSearch, RabbitMQ, HTTP Webhook, Remote MQTT Bridge, Rotating Local Disk Log | Apache Kafka, Sparkplug B, Amazon Kinesis, Google Cloud Pub/Sub, Azure Event Hubs, Apache Pulsar, Snowflake, BigQuery, AI/LLM Bridges (OpenAI, Claude, Gemini, MCP) |
@@ -137,18 +137,18 @@ For enterprise licensing, multi-node clustering subscriptions, or commercial sup
 
 ## Core Capabilities & Features
 
-### 1. Ultra-Low-Latency Message Router
+### 1. Message Router
 - **Radix Trie Architecture**: Evaluates exact and wildcard topic filters (`+`, `#`, `$SYS/`, `$share/<group>/<topic>`, `$delayed/<sec>/<topic>`) in a single lock-free pass using `ahash` and zero-allocation `Arc<str>` segments.
-- **In-process routing throughput (microbenchmark)**: `bench_router_match_throughput` in `crates/broker-node/benches/broker_throughput.rs` sustains **~3.05M ± 0.10M lookups/sec** on hit-path evaluation (1,000 filters, 3 targets) and **~7.80M ± 0.20M lookups/sec** fast-miss traversal, single-threaded; not end-to-end network throughput.
+- **In-process routing throughput (microbenchmark, hardware-dependent)**: `bench_router_match_throughput` in `crates/broker-node/benches/broker_throughput.rs` sustains **~3.05M ± 0.10M lookups/sec** on hit-path evaluation (1,000 filters, 3 targets) and **~7.80M ± 0.20M lookups/sec** fast-miss traversal, single-threaded; re-run locally with `cargo test --release --bench broker_throughput -- --nocapture`; not end-to-end network throughput.
 
 ### 2. Embedded Streaming SQL Engine (`rekuiper`)
 - **185-Function Scalar Catalog** (count asserted by `test_function_catalog_has_185_entries` in `crates/broker-rules/src/lib.rs`): Full trigonometry (`sin`, `cos`, `atan2`), arithmetic, bitwise operators, string manipulation, datetime transformations (`now()`, `format_date()`), conditionals (`CASE WHEN ... THEN ... ELSE ... END`), and null coalescing.
-- **Stateless Ingress Hot-Path (microbenchmark)**: `bench_sql_ingress_throughput` in `crates/broker-node/benches/broker_throughput.rs` evaluates SQL filters in-memory at **~4.77M ± 0.10M events/sec** with zero network loopback (`Block` backpressure, 100 percent sink delivery); not end-to-end network throughput.
+- **Stateless Ingress Hot-Path (microbenchmark, hardware-dependent)**: `bench_sql_ingress_throughput` in `crates/broker-node/benches/broker_throughput.rs` evaluates SQL filters in-memory at **~4.77M ± 0.10M events/sec** with zero network loopback (`Block` backpressure, 100 percent sink delivery); re-run locally with `cargo test --release --bench broker_throughput -- --nocapture`; not end-to-end network throughput.
 - **Stateful Window Operators**: Enterprise tumbling, hopping, sliding, and count windows executing on dedicated background Tokio workers with interval timestamp injection (`window_start()`, `window_end()`).
 - **SQL `INTO connector("id")`**: Native SQL syntax for declarative routing directly into downstream streaming bridges and databases.
 
 ### 3. Comprehensive Data Sinks & Bridges Suite
-- **Message Streaming**: Apache Kafka (RecordBatch v2, murmur2 hashing), RabbitMQ (AMQP 0-9-1), Remote MQTT Outbound Bridge (clean-room 3.1.1/5.0 wire encoder).
+- **Message Streaming**: Apache Kafka (RecordBatch v2, murmur2 hashing), RabbitMQ (AMQP 0-9-1), Remote MQTT Outbound Bridge (clean-room 3.1.1/5.0 PUBLISH wire encoder for outbound bridging only; edge ingress remains MQTT 3.1.1).
 - **Relational & KV Databases**: PostgreSQL (connection-pooled JSONB batching, SCRAM/MD5), MySQL / MariaDB (native handshake & authentication, prepared batching), Redis (RESP pipeline, Streams `XADD`, `LPUSH`, `PUBLISH`).
 - **Analytics & Time-Series**: ClickHouse (vectorized `JSONEachRow` HTTP POST, SQL injection whitelisting), InfluxDB (Line Protocol v2 with Token auth), TimescaleDB (hypertable chunking and parametrized `$1..$4` upsert).
 - **Object Storage & Search**: Amazon S3 / MinIO (buffer-and-flush micro-batching, partitioned key templates, ndjson/gzip, full AWS SigV4 signing), Elasticsearch / OpenSearch (`_bulk` newline JSON with dynamic date-indices and 429/503 retry).
@@ -160,12 +160,12 @@ For enterprise licensing, multi-node clustering subscriptions, or commercial sup
 - **Live SVG Metrics**: Real-time cluster connection counters, ingress/egress message rates, and throughput delta sparklines.
 - **SQL Studio & Rule Tester**: Interactive query editor with batch evaluation (`POST /api/v1/rules/test`), function catalog browser (`GET /api/v1/rules/functions`), and Community/Enterprise tier badges.
 - **Connectors Studio**: Visual registration forms for streaming, relational, analytical, object storage, and industrial sinks.
-- **MQTT-over-WebSocket Test Console**: Integrated binary MQTT 3.1.1 test client connecting over `ws://localhost:18083/ws/mqtt` on the API port (test console only: no retained fetch/store, no rule execution, no offline queue, per `crates/broker-api/src/ws.rs`); not an edge listener on `:8083`.
+- **MQTT-over-WebSocket Test Console**: Integrated binary MQTT 3.1.1 test client connecting over `ws://localhost:18083/ws/mqtt` on the API port (test console only: no retained fetch/store, no rule execution, no offline queue, per `crates/broker-api/src/ws.rs`); production `ws`/`wss` clients use the edge listeners (`beam/src/indra_ws_listener.erl`, proven by `beam/test/indra_ws_tests.erl` and `beam/test/indra_wss_tests.erl`).
 - **Auth & ACL Manager**: Runtime credential and topic access policy configuration.
 
-### 5. Resilience & Zero-Limit Scale Architecture
-- **Core Restart Immunity (single-connection test)**: Decoupled BEAM edge holds the client socket in `await_core` and rebinds after a core restart without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget); not a multi-client production restart measurement.
-- **Zero Hardcoded Limits**: Buffer depths (`window_channel_depth`), offline session queues (`max_offline_queue`), batch sizes, and pool capacities are unconstrained and fully configurable.
+### 5. Resilience & Bounded Scale Architecture
+- **Core Restart Immunity (single-connection test)**: Decoupled BEAM edge holds the client socket in `await_core` and rebinds after a core restart without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget); not a multi-client production restart measurement. No end-to-end restart throughput or multi-client recovery rate is claimed.
+- **Zero Hardcoded Limits, Finite Defaults**: Buffer depths (`window_channel_depth`, default 65536), offline session queues (`max_offline_queue`, default 50000), per-subscriber QoS 0 backlog (`max_qos0_backlog`, default 1000), batch sizes, and pool capacities are configurable with finite defaults (see `indramqtt.example.toml` and `crates/broker-config/src/schema.rs`); unbounded is only an explicit operator opt-in, never the default.
 - **Multi-Tenant Protection**: Per-client and per-user connection quotas (`max_connections` -> RC `0x8B`) and token-bucket publish rate limiters (`max_publish_rate` -> RC `0x97`).
 
 ---
@@ -189,7 +189,7 @@ indramqtt/
 │
 ├── crates/
 │   ├── brokerlink/               # Shared IPC framing, codec, and transport abstractions
-│   ├── broker-protocol/          # MQTT 3.1.1 & 5.0 protocol primitives
+│   ├── broker-protocol/          # MQTT 3.1.1 protocol primitives
 │   ├── broker-router/            # Radix trie subscription router
 │   ├── broker-session/           # Canonical session engine & QoS tracking
 │   ├── broker-storage/           # Segmented log and cursor persistence
@@ -234,7 +234,7 @@ docker compose up -d
 # 1. Build the Rust broker kernel
 cargo build --workspace --release
 
-# 2. Run the complete automated test suite (388 tests, 100% green)
+# 2. Run the complete automated test suite (no hardcoded count: the suite changes, so no total is claimed here)
 cargo test --workspace
 
 # 3. Build the BEAM network edge

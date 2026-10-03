@@ -80,6 +80,7 @@
 -define(MAX_PSK_IDENTITY_BYTES, 128).
 
 -type listen_opt() :: {port, inet:port_number()}
+                    | {ip, inet:ip_address()}
                     | {transport, tcp | ssl}
                     | {certfile, file:filename()}
                     | {keyfile, file:filename()}
@@ -149,7 +150,9 @@ init(Opts) ->
     DefaultPort = case Transport of ssl -> ?DEFAULT_TLS_PORT; _ -> ?DEFAULT_PORT end,
     Port = proplists:get_value(port, Opts, DefaultPort),
     ConnOpts = proplists:get_value(conn, Opts, []),
-    SockOpts = listen_sock_opts(),
+    %% `{ip, Addr}' binds one interface. If it is absent, the listener
+    %% binds all the interfaces.
+    SockOpts = listen_sock_opts() ++ [{ip, Ip} || {ip, Ip} <- Opts],
     ListenResult = case Transport of
         ssl ->
             %% TLS needs the ssl application (and its tracker sup) even

@@ -12,174 +12,36 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-pub mod alloydb;
-pub mod aws_iot;
-pub mod azure_blob;
-pub mod azure_eventhubs;
-pub mod azure_iot;
-pub mod bigquery;
-pub mod cassandra;
 pub mod clickhouse;
 pub mod cloud_tls;
-pub mod cockroachdb;
-pub mod confluent;
-pub mod couchbase;
-pub mod databricks;
-pub mod datalayers;
 pub mod disk_log;
-pub mod doris;
-pub mod dynamodb;
 pub mod elasticsearch;
-pub mod gcp_iot;
-pub mod gcp_pubsub;
 pub mod greptimedb;
 pub mod http;
 pub mod influxdb;
-pub mod iotdb;
 pub mod kafka;
-pub mod kinesis;
-pub mod mongodb;
 pub mod mqtt_bridge;
-pub mod mssql;
 pub mod mysql;
-pub mod oci_streaming;
-pub mod opc_ua;
 pub mod opentsdb;
-pub mod oracle;
 pub mod postgres;
-pub mod pulsar;
 pub mod rabbitmq;
 pub mod redis;
-pub mod redshift;
-pub mod rocketmq;
 pub mod s3;
-pub mod s3_tables;
-pub mod snowflake;
-pub mod sparkplug_b;
-pub mod tablestore;
-pub mod tdengine;
 pub mod timescaledb;
-pub mod timestream;
 
-pub use alloydb::{
-    alloydb_connect_config, alloydb_value_to_boxed, build_alloydb_insert_query,
-    classify_alloydb_error, extract_alloydb_row, map_driver_error, resolve_alloydb_password,
-    AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
-    AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
-    CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport, TcpAlloydbTransport,
-};
-pub use aws_iot::{
-    shadow_update_document, sign_websocket_url, sigv4_signature_via_sdk, sigv4_signing_key_manual,
-    sigv4_signing_key_via_sdk, AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIotSink,
-    AwsIotTransport, BridgeDirection, BridgeTopicMapping, MockAwsIotOutcome, MockAwsIotTransport,
-    ShadowSyncConfig, ShadowTopics, TlsAwsIotTransport,
-};
-pub use azure_blob::{
-    azure_error_code, canonicalized_resource, classify_blob_status, container_string_to_sign,
-    shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AzureBlobAuth,
-    AzureBlobCompression, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
-    AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
-};
-pub use azure_eventhubs::{
-    render_batch_body as render_azure_batch_body, sas_token, AzureEventHubsConnector,
-    AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem,
-    CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome,
-};
-pub use azure_iot::{
-    d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token, AzureIotAuth,
-    AzureIotConfig, AzureIotConnectTransport, AzureIotPublish, AzureIotSink, AzureIotTransport,
-    CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TlsAzureIotTransport,
-    TwinTopics,
-};
-pub use bigquery::{
-    classify_driver_response, classify_insert_errors, driver_insert_request,
-    render_insert_body as render_bigquery_body, BigQueryConnector, BigQueryInsertResponse,
-    BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert,
-    HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
-};
-pub use cassandra::{
-    decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token,
-    parse_contact_point, CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink,
-    CassandraSinkConfig, CassandraTransport, CqlBoundStatement, CqlConsistency, CqlError,
-    CqlResultKind, MockCassandraOutcome, MockCassandraTransport, NativeCassandraTransport,
-    ScyllaCassandraTransport,
-};
 pub use clickhouse::{
     CapturedClickHouseBatch, ClickHouseConnector, ClickHouseRow, ClickHouseSink,
     ClickHouseSinkConfig, ClickHouseTransport, DriverClickHouseTransport, HttpClickHouseTransport,
     MockClickHouseOutcome, MockClickHouseTransport,
 };
-pub use cockroachdb::{
-    build_native_upsert_query, build_on_conflict_upsert_query, classify_cockroach_sqlstate,
-    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed, extract_cockroach_row,
-    map_cockroach_driver_error, CapturedCockroachExecution, CockroachDbConfig,
-    CockroachDbConnector, CockroachDbSink, CockroachDbTransport, CockroachErrorClassification,
-    CockroachQueryResult, CockroachRow, CockroachValue, MockCockroachDbTransport,
-    PgDriverCockroachDbTransport, TcpCockroachDbTransport,
-};
-pub use confluent::{
-    classify_driver_error, classify_kafka_error, frame_schema_registry, is_terminal_driver_message,
-    parse_scram_server_first, rdkafka_client_config, registry_subject_for_topic,
-    resolve_key as resolve_confluent_key, resolve_template as resolve_confluent_template,
-    resolve_topic as resolve_confluent_topic, sasl_plain_payload, schema_registry_basic_auth,
-    scram_client_first_message, scram_client_proof as scram_confluent_client_proof, scram_hi,
-    scram_nonce, scram_server_signature, split_schema_registry, ConfluentKafkaConfig,
-    ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord,
-    ConfluentSchemaRegistryConfig, ConfluentTransport, MemoryConfluentTransport,
-    RdkafkaConfluentTransport, RegistrySchemaClient, SaslMechanism, ScramHash, ScramServerFirst,
-    TcpConfluentTransport,
-};
-pub use couchbase::{
-    decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,
-    parse_connection_string as parse_couchbase_connection_string, CapturedCouchbaseBatch,
-    CouchbaseAuth, CouchbaseConnector, CouchbaseDocItem, CouchbaseEndpoint, CouchbaseOperation,
-    CouchbaseSink, CouchbaseSinkConfig, CouchbaseTransport, DriverCouchbaseTransport, KvResponse,
-    MockCouchbaseOutcome, MockCouchbaseTransport, NativeCouchbaseTransport,
-};
-pub use databricks::{
-    parse_result_rows, parse_statement_id, parse_statement_response, parse_statement_state,
-    render_statement_body, statement_status_url, CapturedDatabricksStatement, DatabricksConnector,
-    DatabricksParam, DatabricksSink, DatabricksSinkConfig, DatabricksTransport,
-    HttpDatabricksTransport, MockDatabricksOutcome, MockDatabricksTransport, StatementState,
-};
-pub use datalayers::{
-    extract_datalayers_record, extract_microsecond_timestamp, parse_count_result, DatalayersConfig,
-    DatalayersConnector, DatalayersRecord, DatalayersSink, DatalayersTransport,
-    DatalayersWriteRequest, HttpDatalayersTransport, MockDatalayersTransport,
-};
 pub use disk_log::{
     BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink,
     DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter,
-};
-pub use doris::{
-    classify_status as classify_doris_status, doris_http_client, parse_load_result,
-    render_body as render_doris_body, CapturedDorisLoad, DorisAuth, DorisConnector, DorisFormat,
-    DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport,
-    MockDorisOutcome, MockDorisTransport,
-};
-pub use dynamodb::{
-    attribute_value_from_dynamodb_json, build_item_body, dynamodb_attribute,
-    item_body_to_attribute_map, parse_unprocessed, render_batch_body as render_dynamodb_batch_body,
-    DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig,
-    DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome,
-    MockDynamoDbTransport, SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
 };
 pub use elasticsearch::{
     BulkOutcome, CapturedBulk, DriverElasticsearchTransport, ElasticsearchAuth,
     ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport,
     HttpElasticsearchTransport, MockElasticsearchTransport,
-};
-pub use gcp_iot::{
-    build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
-    state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
-    GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
-    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, TlsGcpIotTransport,
-};
-pub use gcp_pubsub::{
-    build_jwt_assertion, driver_message_for, parse_publish_response, render_publish_body,
-    CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink,
-    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome,
-    MockGcpPubSubTransport, SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
 };
 pub use greptimedb::{
     build_greptime_sql_insert, build_influx_line_protocol, extract_greptime_record,
@@ -193,27 +55,11 @@ pub use http::{
     HttpTransport, MockHttpOutcome, MockHttpTransport, ReqwestHttpTransport,
 };
 pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
-pub use iotdb::{
-    render_tablet_body, CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector,
-    IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport,
-    MockIotDbOutcome, MockIotDbTransport,
-};
 pub use kafka::{
     classify_driver_error as classify_kafka_driver_error,
     is_terminal_driver_message as is_kafka_terminal_driver_message,
     rdkafka_client_config as rdkafka_kafka_client_config, KafkaRecord, KafkaSink, KafkaSinkConfig,
     KafkaTransport, MemoryKafkaTransport, RdkafkaKafkaTransport, TcpKafkaTransport,
-};
-pub use kinesis::{
-    HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
-    KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
-    MockKinesisOutcome, MockKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
-};
-pub use mongodb::{
-    decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
-    scram_client_proof, BsonDocument, BsonValue, CapturedMongoBulk, MockMongoDbTransport,
-    MockMongoOutcome, MongoDbConnector, MongoDbDocumentItem, MongoDbSink, MongoDbSinkConfig,
-    MongoDbTransport, MongoEndpoint, MongoOperation, NativeMongoDbTransport,
 };
 pub use mqtt_bridge::{
     decode_publish, decode_remaining_length, encode_publish, encode_remaining_length,
@@ -221,29 +67,9 @@ pub use mqtt_bridge::{
     MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig,
     MqttBridgeTransport, RumqttcMqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport,
 };
-pub use mssql::{
-    days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password,
-    parse_reply_tokens, CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth,
-    MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport,
-    NativeMssqlTransport, TdsReply,
-};
 pub use mysql::{
     DriverMySqlTransport, MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig,
     MySqlTransport, TcpMySqlTransport,
-};
-pub use oci_streaming::{
-    authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages,
-    rfc1123_date, rsa_sign, signing_string, HttpOciStreamingTransport, MockOciOutcome,
-    MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage,
-    OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport,
-};
-pub use opc_ua::{
-    datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant,
-    encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json,
-    MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector,
-    OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode,
-    OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport,
-    OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
 };
 pub use opentsdb::{
     extract_opentsdb_point, sanitize_opentsdb_string, serialize_telnet_lines,
@@ -251,21 +77,9 @@ pub use opentsdb::{
     OpenTsdbConnector, OpenTsdbDataPoint, OpenTsdbProtocol, OpenTsdbSink, OpenTsdbSummaryResponse,
     OpenTsdbTransport,
 };
-pub use oracle::{
-    build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
-    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OracleBindParam,
-    OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig, OracleTransport,
-    OracleValue,
-};
 pub use postgres::{
     DriverPgTransport, MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink,
     PostgreSqlSinkConfig, TcpPgTransport,
-};
-pub use pulsar::{
-    crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
-    CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector,
-    PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
-    TcpPulsarTransport,
 };
 pub use rabbitmq::{
     AmqpFrame, LapinRabbitTransport, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig,
@@ -275,70 +89,13 @@ pub use redis::{
     DriverRedisTransport, MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply,
     RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport,
 };
-pub use redshift::{
-    default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
-    render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
-    MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
-    RedshiftSink, RedshiftSinkConfig, RedshiftTransport,
-};
-pub use rocketmq::{
-    authorization_header as rocketmq_authorization,
-    build_system_properties as build_rocketmq_properties,
-    classify_status as classify_rocketmq_status, decode_envelope as decode_rocketmq_envelope,
-    encode_envelope as encode_rocketmq_envelope, fifo_partition, fnv1a_32,
-    md5_hex as rocketmq_md5_hex, resolve_system_field as resolve_rocketmq_field,
-    signing_string as rocketmq_signing_string, MockRocketMqTransport, RocketMqConnector,
-    RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink,
-    RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
-    TcpRocketMqTransport, ENVELOPE_VERSION,
-};
 pub use s3::{
     HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
     S3Transport, SdkS3Transport, SigV4Request,
 };
-pub use s3_tables::{
-    apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path,
-    parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization,
-    HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport,
-    S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSigning, S3TablesSink,
-    S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
-};
-pub use snowflake::{
-    build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows,
-    CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport,
-    SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport,
-};
-pub use sparkplug_b::{
-    decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint,
-    payload_from_json, payload_to_json, tier, MemorySparkplugTransport, SparkplugBConnector,
-    SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
-    SparkplugStateMachine, SparkplugTopic, SparkplugTransport, SpbAnomaly, SpbDataType,
-    SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SPARKPLUG_TIER,
-};
-pub use tablestore::{
-    classify_error_code as classify_ots_error_code,
-    classify_http_status as classify_ots_http_status, content_md5_b64,
-    failed_positions as tablestore_failed_positions, ots_authorization,
-    render_batch_body as render_ots_batch_body, string_to_sign as ots_string_to_sign,
-    AttributeColumnMapping, AttributeColumnType, HttpTablestoreTransport, MockTablestoreOutcome,
-    MockTablestoreTransport, OtsOutcome, OtsRow, OtsRowFailure, OtsValue, PrimaryKeyMapping,
-    PrimaryKeyType, TablestoreAuth, TablestoreConnector, TablestoreSink, TablestoreSinkConfig,
-    TablestoreTransport, BATCH_WRITE_ROW_PATH, OTS_API_VERSION,
-};
-pub use tdengine::{
-    parse_rest_response, render_insert, CapturedTdengineSql, HttpTdengineTransport,
-    MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse,
-    TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport,
-};
 pub use timescaledb::{
     DriverTimescaleDbTransport, MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch,
     TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
-};
-pub use timestream::{
-    render_write_records_body, HttpTimestreamTransport, MockTimestreamOutcome,
-    MockTimestreamTransport, TimestreamConnector, TimestreamRecord, TimestreamSink,
-    TimestreamSinkConfig, TimestreamTimeUnit, TimestreamTransport, TimestreamWriteRequest,
-    TimestreamWriteResponse, TIMESTREAM_CONTENT_TYPE, TIMESTREAM_TARGET,
 };
 
 #[derive(Error, Debug)]
@@ -434,8 +191,33 @@ pub struct HttpWebhookSink {
     sent: AtomicU64,
 }
 
+/// Resolve a connector config field that may hold a secret reference.
+///
+/// `file:`/`env:` references resolve to UTF-8 at use time through the
+/// secret store; anything else passes through verbatim. Unresolvable or
+/// non-UTF-8 secrets fail closed to an empty string (the caller then fails
+/// its construction instead of sending with a wrong credential).
+/// Reason: connector URLs, tokens and passwords must never travel as
+/// plaintext in the snapshot while still connecting with the real value.
+#[must_use]
+pub fn resolve_field_secret(value: &str) -> String {
+    let trimmed = value.trim();
+    if broker_config::secrets::is_secret_ref(trimmed) {
+        match broker_config::secrets::resolve_maybe_secret(trimmed) {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    } else {
+        value.to_string()
+    }
+}
+
 impl HttpWebhookSink {
     pub fn new(url: String, headers: HeaderMap, client: reqwest::Client) -> Self {
+        // Connector URLs may be secret references; resolve at construction
+        // (use time) so the snapshot keeps the reference while the live
+        // sink dials the real target.
+        let url = resolve_field_secret(&url);
         Self {
             url,
             headers,
@@ -605,7 +387,7 @@ impl ConnectorManager {
 /// (Postgres, MySQL, ClickHouse, InfluxDB). Rows accumulate until the
 /// batch is full or the oldest row outlives the linger window; failures
 /// restore rows in order instead of dropping them.
-pub(crate) struct BatchQueue<T> {
+pub struct BatchQueue<T> {
     rows: Vec<T>,
     oldest: Option<Instant>,
     max_rows: usize,
@@ -613,7 +395,7 @@ pub(crate) struct BatchQueue<T> {
 }
 
 impl<T> BatchQueue<T> {
-    pub(crate) fn new(max_rows: usize, linger: Duration) -> Self {
+    pub fn new(max_rows: usize, linger: Duration) -> Self {
         Self {
             rows: Vec::new(),
             oldest: None,
@@ -623,7 +405,7 @@ impl<T> BatchQueue<T> {
     }
 
     /// Push one row; true means flush now (full or stale).
-    pub(crate) fn push(&mut self, row: T) -> bool {
+    pub fn push(&mut self, row: T) -> bool {
         if self.is_empty() {
             self.oldest = Some(Instant::now());
         }
@@ -631,23 +413,23 @@ impl<T> BatchQueue<T> {
         self.rows.len() >= self.max_rows || self.is_stale()
     }
 
-    pub(crate) fn is_stale(&self) -> bool {
+    pub fn is_stale(&self) -> bool {
         self.oldest
             .map(|oldest| oldest.elapsed() >= self.linger)
             .unwrap_or(false)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.rows.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Take all rows, resetting the linger clock. Callers restore via
     /// [`BatchQueue::restore`] when the transport fails.
-    pub(crate) fn take_batch(&mut self) -> (Vec<T>, Option<Instant>) {
+    pub fn take_batch(&mut self) -> (Vec<T>, Option<Instant>) {
         let rows = std::mem::take(&mut self.rows);
         let oldest = self.oldest.take();
         (rows, oldest)
@@ -655,7 +437,7 @@ impl<T> BatchQueue<T> {
 
     /// Restore a failed batch at the front, preserving order and the
     /// original linger clock.
-    pub(crate) fn restore(&mut self, mut rows: Vec<T>, oldest: Option<Instant>) {
+    pub fn restore(&mut self, mut rows: Vec<T>, oldest: Option<Instant>) {
         rows.append(&mut self.rows);
         self.rows = rows;
         if self.oldest.is_none() {
@@ -668,13 +450,13 @@ impl<T> BatchQueue<T> {
 /// transports. While backing off, flushes fail fast without touching
 /// the transport.
 #[derive(Default)]
-pub(crate) struct BackoffState {
+pub struct BackoffState {
     consecutive_errors: u32,
     retry_after: Option<Instant>,
 }
 
 impl BackoffState {
-    pub(crate) fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
         if let Some(retry_after) = self.retry_after {
             if Instant::now() < retry_after {
                 return Err(ConnectorError::Connection(
@@ -685,12 +467,12 @@ impl BackoffState {
         Ok(())
     }
 
-    pub(crate) fn success(&mut self) {
+    pub fn success(&mut self) {
         self.consecutive_errors = 0;
         self.retry_after = None;
     }
 
-    pub(crate) fn failure(&mut self) {
+    pub fn failure(&mut self) {
         self.consecutive_errors += 1;
         let secs = 2u64.saturating_pow(self.consecutive_errors.min(5)).min(30);
         self.retry_after = Some(Instant::now() + Duration::from_secs(secs));
@@ -702,7 +484,7 @@ impl BackoffState {
 /// `${...}` must close and must name a key present in `vars`; anything
 /// else is a dispatch error, so typos fail loudly at buffer time
 /// instead of silently producing wrong object names.
-pub(crate) fn render_template(template: &str, vars: &[(&str, String)]) -> Result<String> {
+pub fn render_template(template: &str, vars: &[(&str, String)]) -> Result<String> {
     let mut out = String::with_capacity(template.len() + 32);
     let bytes = template.as_bytes();
     let mut i = 0;
@@ -746,7 +528,7 @@ pub(crate) fn render_template(template: &str, vars: &[(&str, String)]) -> Result
 }
 
 /// Wall-clock milliseconds since the Unix epoch (saturating at zero).
-pub(crate) fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -756,7 +538,7 @@ pub(crate) fn now_millis() -> i64 {
 /// Split Unix millis into civil (year, month, day) via Howard Hinnant's
 /// days-from-civil inverse (proleptic Gregorian, UTC). Negative inputs
 /// clamp to the epoch so templates never render year 1969 surprises.
-pub(crate) fn ymd_from_millis(millis: i64) -> (i32, u32, u32) {
+pub fn ymd_from_millis(millis: i64) -> (i32, u32, u32) {
     let days = millis.max(0).div_euclid(86_400_000);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -774,7 +556,7 @@ pub(crate) fn ymd_from_millis(millis: i64) -> (i32, u32, u32) {
 }
 
 /// Split Unix millis into (hour, minute, second, milli) UTC time of day.
-pub(crate) fn hms_milli_from_millis(millis: i64) -> (u32, u32, u32, u32) {
+pub fn hms_milli_from_millis(millis: i64) -> (u32, u32, u32, u32) {
     let day_millis = millis.max(0).rem_euclid(86_400_000) as u64;
     let secs = day_millis / 1_000;
     (
@@ -786,7 +568,7 @@ pub(crate) fn hms_milli_from_millis(millis: i64) -> (u32, u32, u32, u32) {
 }
 
 /// RFC 3339 UTC timestamp with millis (`2026-09-12T11:18:09.123Z`).
-pub(crate) fn rfc3339_millis(millis: i64) -> String {
+pub fn rfc3339_millis(millis: i64) -> String {
     let (y, mo, d) = ymd_from_millis(millis);
     let (h, mi, s, ms) = hms_milli_from_millis(millis);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
@@ -798,7 +580,7 @@ pub(crate) fn rfc3339_millis(millis: i64) -> String {
 
 /// HMAC-SHA256 on the maintained `hmac` + `sha2` crates (shared by
 /// the S3 and Kinesis signers and the Azure SharedKey/SAS signers).
-pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
     use hmac::Mac;
     let mut mac =
         hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("hmac accepts any key length");
@@ -807,7 +589,7 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 /// Lowercase hex SHA-256 of `data`.
-pub(crate) fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(data)
         .iter()
@@ -817,7 +599,7 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 
 /// HMAC-SHA1 on the maintained `hmac` + `sha1` crates. Shared by
 /// the Alibaba Tablestore and RocketMQ signers.
-pub(crate) fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
+pub fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
     use hmac::Mac;
     let mut mac =
         hmac::Hmac::<sha1::Sha1>::new_from_slice(key).expect("hmac accepts any key length");
@@ -826,7 +608,7 @@ pub(crate) fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 /// SigV4 `x-amz-date` timestamp (`YYYYMMDDTHHMMSSZ`, UTC).
-pub(crate) fn amz_date(millis: i64) -> String {
+pub fn amz_date(millis: i64) -> String {
     let (year, month, day) = ymd_from_millis(millis);
     let (hour, minute, second, _) = hms_milli_from_millis(millis);
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
@@ -834,7 +616,7 @@ pub(crate) fn amz_date(millis: i64) -> String {
 
 /// SigV4 percent-encoding for canonical URIs: every byte except
 /// unreserved marks and the `/` path separator becomes `%XX`.
-pub(crate) fn aws_encode_path(path: &str) -> String {
+pub fn aws_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
@@ -848,7 +630,7 @@ pub(crate) fn aws_encode_path(path: &str) -> String {
 
 /// Inputs to [`sigv4_authorization`]. Header names must already be
 /// lowercase; values trimmed. The signer sorts headers by name.
-pub(crate) struct SigV4Signing<'a> {
+pub struct SigV4Signing<'a> {
     pub method: &'a str,
     pub canonical_uri: String,
     pub canonical_query: String,
@@ -862,7 +644,7 @@ pub(crate) struct SigV4Signing<'a> {
 }
 
 /// Build an AWS Signature Version 4 `Authorization` header value.
-pub(crate) fn sigv4_authorization(signing: &SigV4Signing<'_>) -> String {
+pub fn sigv4_authorization(signing: &SigV4Signing<'_>) -> String {
     let date = amz_date(signing.millis);
     let short_date = &date[..8];
     let mut headers = signing.headers.clone();
@@ -914,15 +696,6 @@ fn signing_hex(key: &[u8], string_to_sign: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// Test-only RSA keypair (generated with openssl, never deployed).
-/// Shared by the GCP/Snowflake/BigQuery JWT tests so the PEMs live in
-/// exactly one place.
-#[cfg(test)]
-pub(crate) mod test_rsa_keys {
-    pub const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwQ2w63oB3FtHg\n7xysQK8MuX9S0WkbAVlxWpLHDNIdRVxA9Ra2gFFpKy8jX45UMSow6Yny7IvYWFzZ\nL4y9yoFiqu+LxhlJHIO6JO8+ZmeBoNwuDiIzgesbZwjyQiQ2M7p/4c18a2ffGPWF\nBETT7uVwVKJ3hTp97RN7Mc1/eFMimuT/TC11I+sFCZUHgrbhEG3L5Gg3RJ2MKbcX\nGEIxjFDJdLJ9RK0BopD6lxR1a4zeYr+iF/m3+JeJPAaS15yMD+sB1g5C7XZ1OIsB\nNBBnHWHpNhYO2IrCc9lZeSSzSkbRC6k1oqvTurFRzHWZqBKQGYnH8BftubIPSTBg\nU/BM4rR3AgMBAAECggEAHSRwmwUZoVb1CWcPSw2Aw65RtkwoQA5Hjv3GIcHlZXCH\n0beT80Wg8C3zI7qTSik8zAx4weDJOFJXu5LohqKaJMmVRHtSx+s+fkLICX2d5GlH\nrhepIPH8gLHW4VL9MLb5wVYAhu8tI845Ha54gL/RUHK1z+QHqTVO0MIJs2cd+6zx\nKsAtnqEQJMFpl1D0y0uutuboK4soHJMyRyrHBNWdgfzmTrCsngzu2zVM4aZh/gQY\nHcQgJ1rK6Wnen/GGPrNluwWU+bfLdlWO2qiXXwGLfhyx2H6cuROGdoU607BFJNpM\nkAudvEuLa0fOi1ym6lJ5pcJ6pSLkbeveW6+thkO2fQKBgQDXc2GiKx15vQHmdDmZ\nUJEiPJ+hSry5fjaowzrfgqJHyeNfUjnM/E9WlNn2AuxKDWGc3UNEr6jB9V7leKev\nQaPB2LAgXt0YVHmyim51/gTDguE9TOTGWqL4npZG9Nqh8xMxWt08ULvknkOQQOso\nzCoZQYlG4BHegAG7n0/5IN7HdQKBgQDRb/VbJ9iE0wtY/A3e3eWPbGfTF7AZREUu\n/mt94tFEWDDvedX1EPi4DJgPMqQ4eHnBZb3+G7jPcRdm6/KQzR5QiRMHSylfIQRH\nLqqfHBzZDDSZINLW1FMReC9xGfkRoG0Tlt2iQzXOy90+uE/9k5BGSbQNakfVDXJs\n3JAHDMy6uwKBgQCaazxC+xv5MRq3jf3qgPBE1aaj9+kkGe4bLzJ3GC4vveeVXl3H\nKd/DcpR12sp4mPapc3zPMgeGXNNTLRMiba1tNl2mFdfppEJFUSqyrwnDB39gbEhc\nUoIUJ7YVzVEWWh4bdcCzhjnlNfm+3oitiQdzaqF1hwvHqX+Udi7fpEuIMQKBgQC5\nu0bkQu7Rw/MRQ93tIe19ho6AdkZV8eREq52Z8vbQXEFxbiOfBCD93zVObQOTjMu1\nBcw6uEzpsgol3OKtJSpYE2eLlU0oLriDg9AN8DlpBljy31f66iqMmH/CFl16E0II\nGEeOqXnjXYlkIMHXR/CvVJdXOkRfnWA3SFZ12hUJFwKBgD8JlGTyrVfNsNMOaTDV\nNopoYnUQ6ljFmJi6TGmnkliCRXPuqBl+2hVxiKeWI2MprJ5Ya8qLbL6M56uCwAD2\nqEhvjEuatma5rJyE5NULOjAXA5tLw9qM1M9j1FNOaXnFC9/Yii2a49R8zu05wRB2\nH+dMMSDXQ4EHHYcKIFJjDbxn\n-----END PRIVATE KEY-----\n";
-    pub const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsENsOt6AdxbR4O8crECv\nDLl/UtFpGwFZcVqSxwzSHUVcQPUWtoBRaSsvI1+OVDEqMOmJ8uyL2Fhc2S+MvcqB\nYqrvi8YZSRyDuiTvPmZngaDcLg4iM4HrG2cI8kIkNjO6f+HNfGtn3xj1hQRE0+7l\ncFSid4U6fe0TezHNf3hTIprk/0wtdSPrBQmVB4K24RBty+RoN0SdjCm3FxhCMYxQ\nyXSyfUStAaKQ+pcUdWuM3mK/ohf5t/iXiTwGktecjA/rAdYOQu12dTiLATQQZx1h\n6TYWDtiKwnPZWXkks0pG0QupNaKr07qxUcx1magSkBmJx/AX7bmyD0kwYFPwTOK0\ndwIDAQAB\n-----END PUBLIC KEY-----\n";
 }
 
 #[cfg(test)]

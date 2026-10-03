@@ -334,7 +334,7 @@ impl KafkaTransport for MemoryKafkaTransport {
     }
 }
 
-pub(crate) fn encode_request_header(
+pub fn encode_request_header(
     api_key: i16,
     api_version: i16,
     correlation: i32,
@@ -354,7 +354,7 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(s.as_bytes());
 }
 
-pub(crate) async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf))
         .await
@@ -374,7 +374,7 @@ pub(crate) async fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-pub(crate) async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
+pub async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Result<()> {
     let mut prefixed = (frame.len() as i32).to_be_bytes().to_vec();
     prefixed.append(&mut frame);
     stream
@@ -390,11 +390,11 @@ pub(crate) async fn send_frame(stream: &mut TcpStream, mut frame: Vec<u8>) -> Re
 
 /// Minimal ApiVersions v0 exchange: proves the peer speaks Kafka and
 /// surfaces broker-side errors early.
-pub(crate) fn encode_api_versions_request(correlation: i32, client_id: &str) -> Vec<u8> {
+pub fn encode_api_versions_request(correlation: i32, client_id: &str) -> Vec<u8> {
     encode_request_header(18, 0, correlation, client_id)
 }
 
-pub(crate) fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
+pub fn decode_api_versions_response(body: &[u8], correlation: i32) -> Result<()> {
     if body.len() < 6 {
         return Err(ConnectorError::Connection(
             "truncated ApiVersions response".to_string(),
@@ -436,7 +436,7 @@ pub(crate) fn encode_produce_body(
 }
 
 /// Produce v3 request for pre-grouped `(topic, partition) -> records`.
-pub(crate) fn encode_produce_request(
+pub fn encode_produce_request(
     correlation: i32,
     client_id: &str,
     acks: i16,
@@ -447,7 +447,7 @@ pub(crate) fn encode_produce_request(
     frame
 }
 
-pub(crate) fn parse_acks(acks: &str) -> Result<i16> {
+pub fn parse_acks(acks: &str) -> Result<i16> {
     match acks {
         "all" | "-1" => Ok(-1),
         "1" => Ok(1),

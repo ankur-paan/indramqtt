@@ -12,13 +12,13 @@ This document provides the full empirical methodology, test harness specificatio
 > 1. Radix Trie topic filter matching in memory (`Router::matches`).
 > 2. Streaming SQL expression evaluation and projection in memory (`RuleEngine::dispatch_ingress`).
 >
-> They do **not** measure full network stack delivery (TCP/TLS socket I/O, packet serialization, kernel syscalls, or client fan-out). The competitor figures cited in Section 3 are end-to-end network service measurements. They are provided as reference baselines and architectural targets for the upcoming end-to-end test harness (Section 4).
+> They do **not** measure full network stack delivery (TCP/TLS socket I/O, packet serialization, kernel syscalls, or client fan-out). The figures below are hardware-dependent: no machine is cited because the rate varies by CPU and build flags, so re-run `cargo test --release --bench broker_throughput -- --nocapture` on your own hardware instead of comparing across machines. The externally published figures cited in Section 3 are end-to-end network service measurements from other projects. They are provided as cited reference baselines and architectural targets for the upcoming end-to-end test harness (Section 4). None of them were measured locally and none of them are IndraMQTT results: do not compare them directly with the §2 microbenchmarks.
 
 ---
 
 ## 2. Internal Microbenchmark Methodology & Results
 
-All microbenchmarks run via `cargo test --release --bench broker_throughput -- --nocapture` using compiler dead-code elimination guards (`std::hint::black_box`) and multi-sample variance reporting:
+All microbenchmarks run via `cargo test --release --bench broker_throughput -- --nocapture` using compiler dead-code elimination guards (`std::hint::black_box`) and multi-sample variance reporting. Figures are hardware-dependent and carry no machine citation for that reason; the reproducible claim is the methodology and the end-to-end suite in `benchmark_suite/benchmark_results_v5.json` (whose `environment` block states the CPU, memory, OS and network for those runs).
 
 ### 1. Router Matching (`bench_router_match_throughput`)
 - **What It Measures**: Single-threaded in-process Radix Trie lookup (`router.matches(topic)`).
@@ -47,9 +47,9 @@ All microbenchmarks run via `cargo test --release --bench broker_throughput -- -
 
 ---
 
-## 3. Competitor Reference Baselines & Literature Citations
+## 3. Externally Published Reference Baselines & Literature Citations
 
-The following baselines represent published end-to-end network performance figures for existing enterprise MQTT brokers, provided as context and architectural targets:
+The following baselines are externally published end-to-end network performance figures for other projects, provided as cited context and architectural targets. None were measured in this tree; they are not IndraMQTT results.
 
 - <a id="ref-abb"></a>**[1] ABB Corporate Research / ECSA 2020 Comparative Study**: Heiko Koziolek, Sten Grüner, Julius Rückert. *"A Comparison of MQTT Brokers for Distributed IoT Edge Computing"*, European Conference on Software Architecture ([Preprint PDF](http://www.koziolek.de/docs/Koziolek2020-ECSA-preprint.pdf), [DOI: 10.1007/978-3-030-58923-3_25](https://doi.org/10.1007/978-3-030-58923-3_25)). Experiment data, Kubernetes manifests, and MZBench BDL scripts are published at [hkoziolek/ECSA2020-experiment-data](https://github.com/hkoziolek/ECSA2020-experiment-data). The study benchmarks distributed MQTT brokers (including VerneMQ and HiveMQ) on identical bare-metal edge cluster hardware, measuring multi-core saturation plateaus (500k–800k msg/sec on 16-thread hardware under subscriber fanout) and memory growth.
 - <a id="ref-arxiv"></a>**[2] Academic Multi-Broker Benchmark / arXiv**: Jasenka Dizdarevic, Marc Michalke, Admela Jukan. *"Engineering and Experimentally Benchmarking Open Source MQTT Broker Implementations"* ([arXiv:2305.13893](https://arxiv.org/abs/2305.13893), [DOI: 10.48550/arXiv.2305.13893](https://doi.org/10.48550/arXiv.2305.13893)). Evaluates Mosquitto, RabbitMQ, VerneMQ, and HiveMQ on AMD64 and ARM64 platforms under varying payload sizes and network conditions.
@@ -66,9 +66,8 @@ To complement our function-level microbenchmarks with rigorous, defensible end-t
 * **Target Workload**:
   - Full TCP socket listener (`:1883`) backed by BEAM network edge.
   - Multi-lane BrokerLink binary IPC transport to Rust core.
-  - Real MQTT v3.1.1 and v5.0 packet parsing, QoS 0 and QoS 1 framing, and network socket fan-out.
-* **Realistic Target Baseline**: **~80k – 150k msg/sec** on single-core network loopback.
-* **Hardware Standardization**: Benchmarks will report exact CPU model, core/thread count, memory, OS kernel version, and network configuration.
+  - Real MQTT v3.1.1 packet parsing (v5 is not supported yet), QoS 0 and QoS 1 framing, and network socket fan-out.
+* **No throughput target is claimed**: the suite reports what it measures. Measured end-to-end rates, with delivery percentages, latencies, hardware class (`environment` block: CPU model, core count, memory, OS) and load shapes, live in `benchmark_suite/benchmark_results_v5.json`. No single-core loopback target is stated because no such local measurement is committed in-tree.
 
 ---
 

@@ -14,6 +14,8 @@
          decode_connect/1,
          encode_connack/2,
          encode_connack/3,
+         encode_connack_v5/3,
+         decode_connack_v5/1,
          connack_return_code/1,
           decode_subscribe/1,
           encode_suback/2,
@@ -54,6 +56,34 @@
 -define(REASON_TOPIC_ALIAS_INVALID, 16#94).
 %% Largest alias value the wire format carries (u16, minus 0).
 -define(MAX_TOPIC_ALIAS, 65535).
+%% MQTT 5 CONNECT/CONNACK property identifiers carried on this path.
+-define(PROP_SESSION_EXPIRY, 17).
+-define(PROP_AUTH_METHOD, 21).
+-define(PROP_AUTH_DATA, 22).
+-define(PROP_REQ_PROBLEM_INFO, 23).
+-define(PROP_REQ_RESP_INFO, 25).
+-define(PROP_REASON_STRING, 28).
+-define(PROP_RECV_MAXIMUM, 33).
+-define(PROP_USER_PROPERTY, 38).
+-define(PROP_MAX_PACKET_SIZE, 39).
+-define(PROP_ASSIGNED_CLIENT_ID, 18).
+%% Largest CONNECT properties block the edge accepts (bytes). Reason: one
+%% CONNECT properties block must fit the 65535-byte BrokerLink meta cap
+%% downstream once framed into a bind; a larger block fails closed instead
+%% of registering half a connection.
+-define(MAX_CONNECT_PROPS_LEN, 65535).
+%% Largest CONNACK properties block the edge emits (bytes). Reason: a
+%% CONNACK is a single small control packet; a larger block means a caller
+%% bug (runaway user properties), so encode refuses instead of shedding.
+-define(MAX_CONNACK_PROPS_LEN, 65535).
+%% Most user properties carried per CONNECT/CONNACK (count). Reason: bounds
+%% per-connection memory on the handshake path; mirrors the 16-SAN bound on
+%% the bind certificate section.
+-define(MAX_V5_USER_PROPS, 16).
+%% Largest single user-property key, value, authentication-method or reason
+%% string (bytes). Reason: bounds per-connection memory on the handshake
+%% path; mirrors the 1024-byte bound on bind certificate fields.
+-define(MAX_V5_PROP_STRING_LEN, 1024).
 
 -type packet_map() :: #{type := 1..14,
                         type_atom := atom(),
@@ -74,7 +104,32 @@
                          will_retain := boolean(),
                          will_topic := binary() | undefined,
                          will_payload := binary() | undefined,
-                         alias_max := 0..65535}.
+                         alias_max := 0..65535,
+                         session_expiry := 0..4294967295,
+                         receive_max := 0..65535,
+                         max_packet_size := 0..4294967295,
+                         req_resp_info := boolean(),
+                         req_problem_info := boolean(),
+                         auth_method := binary() | undefined,
+                         auth_data := binary() | undefined,
+                         user_properties := [{binary(), binary()}]}.
+-type connack_v5_opts() :: #{assigned_client_id => binary(),
+                             session_expiry => 0..4294967295,
+                             receive_max => 0..65535,
+                             max_packet_size => 0..4294967295,
+                             reason_string => binary(),
+                             user_properties => [{binary(), binary()}],
+                             alias_max => 0..65535}.
+-type connack_v5_map() :: #{session_present := boolean(),
+                            reason_code := 0..255,
+                            assigned_client_id := binary() | undefined,
+                            session_expiry := 0..4294967295 | undefined,
+                            receive_max := 0..65535 | undefined,
+                            max_packet_size := 0..4294967295 | undefined,
+                            reason_string := binary() | undefined,
+                            user_properties := [{binary(), binary()}]}.
+%% Note: when the kernel inbound alias maximum (property 34) rides the
+%% CONNACK, `decode_connack_v5/1' additionally returns `alias_max'.
 -type subscribe_map() :: #{packet_id := 1..65535,
                            subscriptions := [{binary(), 0..2}]}.
 -type publish_map() :: #{topic := binary(),
@@ -86,10 +141,8 @@
                          alias_present := boolean(),
                          payload := binary()}.
 
-%%====================================================================
-%% Public API
-%%====================================================================
-
+%%=============================================================%% Public API
+%%=============================================================
 %% @doc Decode one MQTT packet from the front of Binary.
 %%
 %% Returns {@code {ok, Packet, Rest}} where Packet is a map with
@@ -214,6 +267,251 @@ encode_connack(SessionPresent, ReturnCode, AliasMax)
     Body = <<SP:8, ReturnCode:8, (byte_size(Props)):8, Props/binary>>,
     RL = encode_remaining_length(byte_size(Body)),
     <<16#20, RL/binary, Body/binary>>.
+
+%% @doc Encode an MQTT 5 CONNACK packet (X1-01, v5 connections only).
+%%
+%% Wire form: `CONNACK | Remaining | AckFlags:8 | ReasonCode:8 |
+%% PropertyLength:varint | Properties'. The caller must gate on the
+%% negotiated protocol level and use {@link encode_connack/2} (or /3 for
+%% the alias-only shape) for 3.1.1 peers. Reason codes ride unmapped:
+%% the kernel answers with v5 reason codes (0 success, 16#86 bad user
+%% name or password, 16#87 not authorized, ...) and a v5 client reads
+%% them directly, unlike the 3.1.1 fold in {@link connack_return_code/1}.
+%% Opts carries the properties to advertise; every key is optional:
+%% <ul>
+%% <li>`session_expiry' (u32, property 17) — omitted when absent.</li>
+%% <li>`assigned_client_id' (UTF-8, property 18) — omitted when absent.</li>
+%% <li>`receive_max' (u16, property 33) — omitted when 0 or absent.</li>
+%% <li>`max_packet_size' (u32, property 39) — omitted when 0 or absent.</li>
+%% <li>`reason_string' (UTF-8, property 28) — omitted when absent/empty.</li>
+%% <li>`user_properties' ([{Key, Value}]) — one property 38 per pair.</li>
+%% <li>`alias_max' (u16, property 34, the CONNACK Topic Alias Maximum)
+%% — omitted when 0 or absent.</li>
+%% </ul>
+%% Each string is bounded by `MAX_V5_PROP_STRING_LEN' and the list by
+%% `MAX_V5_USER_PROPS'; the whole block by `MAX_CONNACK_PROPS_LEN'.
+%% Violations raise `error(badarg)' (caller bug, never a half packet).
+-spec encode_connack_v5(boolean(), 0..255, connack_v5_opts()) -> binary().
+encode_connack_v5(SessionPresent, ReasonCode, Opts)
+  when is_boolean(SessionPresent),
+       is_integer(ReasonCode), ReasonCode >= 0, ReasonCode =< 255,
+       is_map(Opts) ->
+    SP = case SessionPresent of true -> 1; false -> 0 end,
+    Props = encode_connack_v5_props(Opts),
+    true = (byte_size(Props) =< ?MAX_CONNACK_PROPS_LEN) orelse erlang:error(badarg),
+    PropLen = encode_varint(byte_size(Props)),
+    Body = <<SP:8, ReasonCode:8, PropLen/binary, Props/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#20, RL/binary, Body/binary>>.
+
+%% @doc Decode an MQTT 5 CONNACK body (the variable header after the
+%% fixed header) back into its fields. Used by EUnit vectors and any
+%% future v5 client path; the edge accept path only encodes.
+-spec decode_connack_v5(binary()) -> {ok, connack_v5_map()} | {error, term()}.
+decode_connack_v5(<<SP:8, RC:8, Rest/binary>>) when SP =:= 0; SP =:= 1 ->
+    case decode_varint(Rest) of
+        {ok, PropLen, Rest1} ->
+            case byte_size(Rest1) < PropLen of
+                true ->
+                    {error, truncated_connack};
+                false ->
+                    <<Props:PropLen/binary, Tail/binary>> = Rest1,
+                    case Tail of
+                        <<>> ->
+                            case parse_connack_props(Props) of
+                                {ok, Parsed} ->
+                                    {ok, Parsed#{session_present => SP =:= 1,
+                                                 reason_code => RC}};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        _ ->
+                            {error, trailing_connack_bytes}
+                    end
+            end;
+        {error, _} = Err ->
+            Err
+    end;
+decode_connack_v5(_) ->
+    {error, malformed_connack}.
+
+%% @private Encode the CONNACK v5 property block from Opts.
+encode_connack_v5_props(Opts) ->
+    Parts = [encode_connack_prop_session_expiry(maps:get(session_expiry, Opts, undefined)),
+             encode_connack_prop_assigned_id(maps:get(assigned_client_id, Opts, undefined)),
+             encode_connack_prop_recv_max(maps:get(receive_max, Opts, undefined)),
+             encode_connack_prop_max_pkt(maps:get(max_packet_size, Opts, undefined)),
+             encode_connack_prop_reason(maps:get(reason_string, Opts, undefined)),
+             encode_connack_prop_users(maps:get(user_properties, Opts, [])),
+             encode_connack_prop_alias_max(maps:get(alias_max, Opts, undefined))],
+    iolist_to_binary(Parts).
+
+encode_connack_prop_alias_max(undefined) -> <<>>;
+encode_connack_prop_alias_max(0) -> <<>>;
+encode_connack_prop_alias_max(V) when is_integer(V), V >= 1, V =< ?MAX_TOPIC_ALIAS ->
+    <<?ALIAS_MAXIMUM_PROPERTY_ID:8, V:16/big>>;
+encode_connack_prop_alias_max(_) -> erlang:error(badarg).
+
+encode_connack_prop_session_expiry(undefined) -> <<>>;
+encode_connack_prop_session_expiry(V)
+  when is_integer(V), V >= 0, V =< 16#FFFFFFFF ->
+    <<?PROP_SESSION_EXPIRY:8, V:32/big>>;
+encode_connack_prop_session_expiry(_) -> erlang:error(badarg).
+
+encode_connack_prop_assigned_id(undefined) -> <<>>;
+encode_connack_prop_assigned_id(Id) when is_binary(Id), byte_size(Id) > 0,
+                                         byte_size(Id) =< ?MAX_V5_PROP_STRING_LEN ->
+    <<?PROP_ASSIGNED_CLIENT_ID:8, (byte_size(Id)):16/big, Id/binary>>;
+encode_connack_prop_assigned_id(_) -> erlang:error(badarg).
+
+encode_connack_prop_recv_max(undefined) -> <<>>;
+encode_connack_prop_recv_max(0) -> <<>>;
+encode_connack_prop_recv_max(V) when is_integer(V), V >= 1, V =< 65535 ->
+    <<?PROP_RECV_MAXIMUM:8, V:16/big>>;
+encode_connack_prop_recv_max(_) -> erlang:error(badarg).
+
+encode_connack_prop_max_pkt(undefined) -> <<>>;
+encode_connack_prop_max_pkt(0) -> <<>>;
+encode_connack_prop_max_pkt(V) when is_integer(V), V >= 1, V =< 16#FFFFFFFF ->
+    <<?PROP_MAX_PACKET_SIZE:8, V:32/big>>;
+encode_connack_prop_max_pkt(_) -> erlang:error(badarg).
+
+encode_connack_prop_reason(undefined) -> <<>>;
+encode_connack_prop_reason(<<>>) -> <<>>;
+encode_connack_prop_reason(S) when is_binary(S), byte_size(S) >= 1,
+                                   byte_size(S) =< ?MAX_V5_PROP_STRING_LEN ->
+    <<?PROP_REASON_STRING:8, (byte_size(S)):16/big, S/binary>>;
+encode_connack_prop_reason(_) -> erlang:error(badarg).
+
+encode_connack_prop_users([]) -> <<>>;
+encode_connack_prop_users(Pairs) when is_list(Pairs) ->
+    true = (length(Pairs) =< ?MAX_V5_USER_PROPS) orelse erlang:error(badarg),
+    lists:foldl(
+      fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                             byte_size(K) >= 1, byte_size(K) =< ?MAX_V5_PROP_STRING_LEN,
+                             byte_size(V) =< ?MAX_V5_PROP_STRING_LEN ->
+              <<Acc/binary, ?PROP_USER_PROPERTY:8,
+                (byte_size(K)):16/big, K/binary,
+                (byte_size(V)):16/big, V/binary>>;
+         (_, _) ->
+              erlang:error(badarg)
+      end, <<>>, Pairs);
+encode_connack_prop_users(_) -> erlang:error(badarg).
+
+%% @private Parse a CONNACK v5 property block. Duplicates of
+%% single-occurrence properties fail closed; user properties accumulate.
+parse_connack_props(Props) ->
+    parse_connack_props(Props,
+                        #{assigned_client_id => undefined,
+                          session_expiry => undefined,
+                          receive_max => undefined,
+                          max_packet_size => undefined,
+                          reason_string => undefined,
+                          user_properties => []}, #{}).
+
+parse_connack_props(<<>>, Acc, _Seen) ->
+    {ok, Acc};
+parse_connack_props(Bin, Acc, Seen) ->
+    case decode_varint(Bin) of
+        {ok, ?PROP_SESSION_EXPIRY, Rest} ->
+            case take_seen(?PROP_SESSION_EXPIRY, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<V:32/big, Tail/binary>> ->
+                            parse_connack_props(Tail, Acc#{session_expiry => V}, Seen1);
+                        _ -> {error, truncated_connack}
+                    end
+            end;
+        {ok, ?PROP_ASSIGNED_CLIENT_ID, Rest} ->
+            case take_seen(?PROP_ASSIGNED_CLIENT_ID, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case take_prop_utf8(Rest) of
+                        {ok, Id, Tail} ->
+                            parse_connack_props(Tail, Acc#{assigned_client_id => Id}, Seen1);
+                        {error, _} -> {error, truncated_connack}
+                    end
+            end;
+        {ok, ?PROP_RECV_MAXIMUM, Rest} ->
+            case take_seen(?PROP_RECV_MAXIMUM, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<V:16/big, Tail/binary>> ->
+                            parse_connack_props(Tail, Acc#{receive_max => V}, Seen1);
+                        _ -> {error, truncated_connack}
+                    end
+            end;
+        {ok, ?PROP_MAX_PACKET_SIZE, Rest} ->
+            case take_seen(?PROP_MAX_PACKET_SIZE, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<V:32/big, Tail/binary>> ->
+                            parse_connack_props(Tail, Acc#{max_packet_size => V}, Seen1);
+                        _ -> {error, truncated_connack}
+                    end
+            end;
+        {ok, ?PROP_REASON_STRING, Rest} ->
+            case take_seen(?PROP_REASON_STRING, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case take_prop_utf8(Rest) of
+                        {ok, S, Tail} ->
+                            parse_connack_props(Tail, Acc#{reason_string => S}, Seen1);
+                        {error, _} -> {error, truncated_connack}
+                    end
+            end;
+        {ok, ?PROP_USER_PROPERTY, Rest} ->
+            case take_prop_utf8(Rest) of
+                {ok, K, Rest1} ->
+                    case take_prop_utf8(Rest1) of
+                        {ok, V, Tail} ->
+                            Got = maps:get(user_properties, Acc),
+                            case length(Got) >= ?MAX_V5_USER_PROPS of
+                                true -> {error, malformed_connack_properties};
+                                false ->
+                                    parse_connack_props(
+                                      Tail, Acc#{user_properties => Got ++ [{K, V}]}, Seen)
+                            end;
+                        {error, _} -> {error, truncated_connack}
+                    end;
+                {error, _} -> {error, truncated_connack}
+            end;
+        {ok, ?ALIAS_MAXIMUM_PROPERTY_ID, Rest} ->
+            case take_seen(?ALIAS_MAXIMUM_PROPERTY_ID, Seen) of
+                error -> {error, malformed_connack_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<V:16/big, Tail/binary>> ->
+                            parse_connack_props(Tail, Acc#{alias_max => V}, Seen1);
+                        _ -> {error, truncated_connack}
+                    end
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} -> parse_connack_props(Tail, Acc, Seen);
+                {error, _} = Err -> Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private Encode a variable-byte integer (property and CONNACK
+%% property lengths). Mirrors `encode_remaining_length/1' but accepts
+%% the full 32-bit range the varint form carries.
+encode_varint(N) when is_integer(N), N >= 0, N =< 16#0FFFFFFF ->
+    encode_varint_out(N, <<>>).
+
+encode_varint_out(0, <<>>) -> <<0>>;
+encode_varint_out(0, Acc) -> Acc;
+encode_varint_out(N, Acc) ->
+    Digit = N rem 128,
+    Rest = N div 128,
+    if Rest > 0 -> encode_varint_out(Rest, <<Acc/binary, (Digit bor 16#80)>>);
+       true -> <<Acc/binary, Digit>>
+    end.
 
 %% @doc Map a kernel bind return code to an MQTT 3.1.1 CONNACK return
 %% code. The kernel answers with MQTT 5 reason codes (e.g. 16#86 bad
@@ -481,10 +779,8 @@ packet_type_code(pingresp) -> 13;
 packet_type_code(disconnect) -> 14;
 packet_type_code(N) when is_integer(N), N >= 0, N =< 15 -> N.
 
-%%====================================================================
-%% Internal helpers
-%%====================================================================
-
+%%=============================================================%% Internal helpers
+%%=============================================================
 is_valid_type(Type) when Type >= 1, Type =< 14 -> true;
 is_valid_type(_) -> false.
 
@@ -627,11 +923,26 @@ validate_publish_id(0, _) -> ok;
 validate_publish_id(_, PacketId) when PacketId >= 1 -> ok;
 validate_publish_id(_, _) -> erlang:error(badarg).
 
+%% @private Defaults for the v5 CONNECT property fields. Level 4 has
+%% no properties section so it always reports these (plus alias_max 0);
+%% level 5 starts here and overrides each present property. Receive
+%% Maximum defaults to 65535 (no flow-control limit announced), Maximum
+%% Packet Size 0 means no limit announced, Session Expiry 0 means the
+%% session ends at disconnect, Request Response Information defaults off
+%% and Request Problem Information defaults on.
+v5_connect_defaults(AliasMax) ->
+    #{alias_max => AliasMax,
+      session_expiry => 0,
+      receive_max => 65535,
+      max_packet_size => 0,
+      req_resp_info => false,
+      req_problem_info => true,
+      auth_method => undefined,
+      auth_data => undefined,
+      user_properties => []}.
+
 %% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3 (shared by v5: the
 %% flag byte is unchanged, only the properties section is new).
-decode_connect_flags(Flags, Keepalive, Payload) ->
-    decode_connect_flags(Flags, Keepalive, Payload, 4, 0).
-
 decode_connect_flags(Flags, Keepalive, Payload, Level, AliasMax) ->
     Username = (Flags band 16#80) =/= 0,
     Password = (Flags band 16#40) =/= 0,
@@ -651,21 +962,21 @@ decode_connect_flags(Flags, Keepalive, Payload, Level, AliasMax) ->
                 {ok, ClientId, Rest} ->
                     case take_connect_options(Rest, WillFlag, Username, Password) of
                         {ok, User, Pass, WillTopic, WillPayload} ->
-                            {ok, #{protocol_name => <<"MQTT">>,
-                                   protocol_level => Level,
-                                   clean_start => CleanStart,
-                                   keepalive => Keepalive,
-                                   client_id => ClientId,
-                                   username_flag => Username,
-                                   password_flag => Password,
-                                   username => User,
-                                   password => Pass,
-                                   will_flag => WillFlag,
-                                   will_qos => WillQos,
-                                   will_retain => WillRetain,
-                                   will_topic => WillTopic,
-                                   will_payload => WillPayload,
-                                   alias_max => AliasMax}};
+                            {ok, maps:merge(v5_connect_defaults(AliasMax),
+                                            #{protocol_name => <<"MQTT">>,
+                                              protocol_level => Level,
+                                              clean_start => CleanStart,
+                                              keepalive => Keepalive,
+                                              client_id => ClientId,
+                                              username_flag => Username,
+                                              password_flag => Password,
+                                              username => User,
+                                              password => Pass,
+                                              will_flag => WillFlag,
+                                              will_qos => WillQos,
+                                              will_retain => WillRetain,
+                                              will_topic => WillTopic,
+                                              will_payload => WillPayload})};
                         {error, _} = Err ->
                             Err
                     end;
@@ -674,21 +985,32 @@ decode_connect_flags(Flags, Keepalive, Payload, Level, AliasMax) ->
             end
     end.
 
-%% @private Decode a level-5 CONNECT: properties (Topic Alias Maximum
-%% extracted) then the payload with its will-properties section.
+%% @private Decode a level-5 CONNECT: properties (X1-01: session
+%% expiry, receive maximum, maximum packet size, topic-alias maximum,
+%% request-response/problem information, authentication method/data and
+%% user properties) then the payload with its will-properties section.
+%% A truncated property length, an overlong properties block (beyond
+%% `MAX_CONNECT_PROPS_LEN') or a duplicate/malformed mandatory property
+%% fails the CONNECT closed; trailing garbage after the payload fails it
+%% the same way the 3.1.1 path does.
 decode_connect_v5(Flags, Keepalive, Payload) ->
     case decode_varint(Payload) of
         {ok, PropLen, Rest} ->
-            case byte_size(Rest) < PropLen of
+            case PropLen > ?MAX_CONNECT_PROPS_LEN of
                 true ->
-                    {error, truncated_connect};
+                    {error, malformed_connect_properties};
                 false ->
-                    <<Props:PropLen/binary, Tail/binary>> = Rest,
-                    case parse_connect_alias_max(Props) of
-                        {ok, AliasMax} ->
-                            decode_connect_v5_tail(Flags, Keepalive, AliasMax, Tail);
-                        {error, _} = Err ->
-                            Err
+                    case byte_size(Rest) < PropLen of
+                        true ->
+                            {error, truncated_connect};
+                        false ->
+                            <<Props:PropLen/binary, Tail/binary>> = Rest,
+                            case parse_connect_props(Props) of
+                                {ok, Parsed} ->
+                                    decode_connect_v5_tail(Flags, Keepalive, Parsed, Tail);
+                                {error, _} = Err ->
+                                    Err
+                            end
                     end
             end;
         {error, _} = Err ->
@@ -697,7 +1019,10 @@ decode_connect_v5(Flags, Keepalive, Payload) ->
 
 %% @private After the v5 CONNECT properties: client id, will properties
 %% plus will topic/payload when the will flag is set, then credentials.
-decode_connect_v5_tail(Flags, Keepalive, AliasMax, Tail) ->
+%% The parsed v5 properties ride into the connect map for the bind; the
+%% kernel owns their session semantics (X1-02), the edge only frames and
+%% transports them.
+decode_connect_v5_tail(Flags, Keepalive, Parsed, Tail) ->
     Username = (Flags band 16#80) =/= 0,
     Password = (Flags band 16#40) =/= 0,
     WillRetain = (Flags band 16#20) =/= 0,
@@ -718,21 +1043,20 @@ decode_connect_v5_tail(Flags, Keepalive, AliasMax, Tail) ->
                         {ok, Rest1} ->
                             case take_connect_options(Rest1, WillFlag, Username, Password) of
                                 {ok, User, Pass, WillTopic, WillPayload} ->
-                                    {ok, #{protocol_name => <<"MQTT">>,
-                                           protocol_level => 5,
-                                           clean_start => CleanStart,
-                                           keepalive => Keepalive,
-                                           client_id => ClientId,
-                                           username_flag => Username,
-                                           password_flag => Password,
-                                           username => User,
-                                           password => Pass,
-                                           will_flag => WillFlag,
-                                           will_qos => WillQos,
-                                           will_retain => WillRetain,
-                                           will_topic => WillTopic,
-                                           will_payload => WillPayload,
-                                           alias_max => AliasMax}};
+                                    {ok, (Parsed#{protocol_name => <<"MQTT">>,
+                                                  protocol_level => 5,
+                                                  clean_start => CleanStart,
+                                                  keepalive => Keepalive,
+                                                  client_id => ClientId,
+                                                  username_flag => Username,
+                                                  password_flag => Password,
+                                                  username => User,
+                                                  password => Pass,
+                                                  will_flag => WillFlag,
+                                                  will_qos => WillQos,
+                                                  will_retain => WillRetain,
+                                                  will_topic => WillTopic,
+                                                  will_payload => WillPayload})};
                                 {error, _} = Err ->
                                     Err
                             end;
@@ -781,38 +1105,178 @@ decode_varint(<<Byte:8, Rest/binary>>, Value, Shift) when Shift < 28 ->
 decode_varint(_, _, _) ->
     {error, malformed_varint}.
 
-%% @private Extract the Topic Alias Maximum (property 34, u16) from a
-%% CONNECT properties block. Absent means 0 (client accepts no
-%% aliases). A duplicate or out-of-range value fails closed.
-parse_connect_alias_max(Props) ->
-    parse_connect_alias_max(Props, undefined).
+%% @private Extract the v5 CONNECT properties (X1-01) from a
+%% properties block. Returns the full property map merged over
+%% {@link v5_connect_defaults/1}: absent means the default documented
+%% there. A duplicate single-occurrence property, an out-of-range value
+%% or a truncated value fails closed. Known-but-inapplicable properties
+%% (valid identifiers the CONNECT path does not use) are length-checked
+%% and skipped, never fatal; a totally unknown identifier fails closed
+%% (its length is unknowable, so skipping would desynchronise the
+%% packet).
+%% TODO(parity): the specification's "ignore unknown properties" rule
+%% for future property identifiers is open: without a length table the
+%% edge cannot skip them, so it currently fails closed. Confirm whether
+%% a future identifier registry or a kernel consult should decide.
+parse_connect_props(Props) ->
+    parse_connect_props(Props, v5_connect_defaults(0), #{}).
 
-parse_connect_alias_max(<<>>, undefined) ->
-    {ok, 0};
-parse_connect_alias_max(<<>>, {ok, Max}) ->
-    {ok, Max};
-parse_connect_alias_max(Bin, Seen) ->
+parse_connect_props(<<>>, Acc, _Seen) ->
+    {ok, Acc};
+parse_connect_props(Bin, Acc, Seen) ->
     case decode_varint(Bin) of
-        {ok, 34, Rest} ->
-            case Rest of
-                <<Max:16/big, Tail/binary>> ->
-                    case Seen of
-                        undefined -> parse_connect_alias_max(Tail, {ok, Max});
-                        _ -> {error, malformed_connect_properties}
+        {ok, ?PROP_SESSION_EXPIRY, Rest} ->
+            case take_seen(?PROP_SESSION_EXPIRY, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<Expiry:32/big, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{session_expiry => Expiry}, Seen1);
+                        _ ->
+                            {error, truncated_connect}
+                    end
+            end;
+        {ok, ?PROP_RECV_MAXIMUM, Rest} ->
+            case take_seen(?PROP_RECV_MAXIMUM, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<RecvMax:16/big, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{receive_max => RecvMax}, Seen1);
+                        _ ->
+                            {error, truncated_connect}
+                    end
+            end;
+        {ok, ?PROP_MAX_PACKET_SIZE, Rest} ->
+            case take_seen(?PROP_MAX_PACKET_SIZE, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<MaxPkt:32/big, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{max_packet_size => MaxPkt}, Seen1);
+                        _ ->
+                            {error, truncated_connect}
+                    end
+            end;
+        {ok, ?ALIAS_MAXIMUM_PROPERTY_ID, Rest} ->
+            case take_seen(?ALIAS_MAXIMUM_PROPERTY_ID, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<Max:16/big, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{alias_max => Max}, Seen1);
+                        _ ->
+                            {error, truncated_connect}
+                    end
+            end;
+        {ok, ?PROP_REQ_RESP_INFO, Rest} ->
+            case take_seen(?PROP_REQ_RESP_INFO, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<1:8, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{req_resp_info => true}, Seen1);
+                        <<0:8, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{req_resp_info => false}, Seen1);
+                        _ ->
+                            {error, malformed_connect_properties}
+                    end
+            end;
+        {ok, ?PROP_REQ_PROBLEM_INFO, Rest} ->
+            case take_seen(?PROP_REQ_PROBLEM_INFO, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case Rest of
+                        <<1:8, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{req_problem_info => true}, Seen1);
+                        <<0:8, Tail/binary>> ->
+                            parse_connect_props(Tail, Acc#{req_problem_info => false}, Seen1);
+                        _ ->
+                            {error, malformed_connect_properties}
+                    end
+            end;
+        {ok, ?PROP_AUTH_METHOD, Rest} ->
+            case take_seen(?PROP_AUTH_METHOD, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case take_prop_utf8(Rest) of
+                        {ok, Method, Tail} ->
+                            parse_connect_props(Tail, Acc#{auth_method => Method}, Seen1);
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        {ok, ?PROP_AUTH_DATA, Rest} ->
+            case take_seen(?PROP_AUTH_DATA, Seen) of
+                error -> {error, malformed_connect_properties};
+                {ok, Seen1} ->
+                    case take_prop_binary(Rest) of
+                        {ok, Data, Tail} ->
+                            parse_connect_props(Tail, Acc#{auth_data => Data}, Seen1);
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        {ok, ?PROP_USER_PROPERTY, Rest} ->
+            case take_prop_utf8(Rest) of
+                {ok, Key, Rest1} ->
+                    case take_prop_utf8(Rest1) of
+                        {ok, Value, Tail} ->
+                            Got = maps:get(user_properties, Acc),
+                            case length(Got) >= ?MAX_V5_USER_PROPS of
+                                true ->
+                                    {error, malformed_connect_properties};
+                                false ->
+                                    parse_connect_props(
+                                      Tail, Acc#{user_properties => Got ++ [{Key, Value}]}, Seen)
+                            end;
+                        {error, _} = Err ->
+                            Err
                     end;
-                _ ->
-                    {error, truncated_connect}
+                {error, _} = Err ->
+                    Err
             end;
         {ok, Id, Rest} ->
             case skip_property(Id, Rest) of
                 {ok, Tail} ->
-                    parse_connect_alias_max(Tail, Seen);
+                    parse_connect_props(Tail, Acc, Seen);
                 {error, _} = Err ->
                     Err
             end;
         {error, _} = Err ->
             Err
     end.
+
+%% @private Mark a single-occurrence property seen; a second occurrence
+%% is a protocol error (fail closed).
+take_seen(Id, Seen) ->
+    case maps:is_key(Id, Seen) of
+        true -> error;
+        false -> {ok, Seen#{Id => true}}
+    end.
+
+%% @private Take one length-prefixed UTF-8 string inside CONNECT
+%% properties, enforcing the per-string bound. Returns the value plus
+%% the tail; overlong or truncated fails the CONNECT closed.
+take_prop_utf8(<<Len:16/big, Rest/binary>>) when Len =< ?MAX_V5_PROP_STRING_LEN ->
+    case Rest of
+        <<Str:Len/binary, Tail/binary>> -> {ok, Str, Tail};
+        _ -> {error, truncated_connect}
+    end;
+take_prop_utf8(<<Len:16/big, _/binary>>) when Len > ?MAX_V5_PROP_STRING_LEN ->
+    {error, malformed_connect_properties};
+take_prop_utf8(_) ->
+    {error, truncated_connect}.
+
+%% @private Take one length-prefixed binary data value inside CONNECT
+%% properties. The u16 length is the wire bound; truncation fails closed.
+take_prop_binary(<<Len:16/big, Rest/binary>>) ->
+    case Rest of
+        <<Data:Len/binary, Tail/binary>> -> {ok, Data, Tail};
+        _ -> {error, truncated_connect}
+    end;
+take_prop_binary(_) ->
+    {error, truncated_connect}.
 
 %% @private Extract the Topic Alias (property 35, u16) from a PUBLISH
 %% properties block. Returns `{ok, Alias, Present}': absent means
@@ -888,6 +1352,11 @@ skip_property(38, Bin) ->
         {ok, Tail} -> skip_utf8(Tail);
         {error, _} = Err -> Err
     end;
+%% TODO(parity): a totally unknown property identifier fails closed
+%% here because its value length is unknowable: skipping would
+%% desynchronise the properties block. The open question is whether the
+%% specification's "ignore unknown properties" rule wants a future
+%% identifier registry (or a kernel consult) instead of failing.
 skip_property(Id, _) -> {error, {unknown_property, Id}}.
 
 %% @private Skip one length-prefixed UTF-8 string inside properties.
@@ -927,6 +1396,11 @@ skip_connect_string(_) ->
 %% username/password values. Username and password come back as
 %% `undefined' when their flags are clear; will topic and payload come
 %% back as `undefined' when the will flag is clear.
+%% @private Take optional CONNECT fields, capturing username/password
+%% plus the last-will topic/message for the kernel bind (MT-05). The
+%% edge never validates the will topic itself; the kernel fails a bad
+%% will closed at registration. Username, password, will topic and will
+%% payload come back as `undefined` when their flags are clear.
 take_connect_options(Rest, false, false, false) ->
     case Rest of
         <<>> -> {ok, undefined, undefined, undefined, undefined};

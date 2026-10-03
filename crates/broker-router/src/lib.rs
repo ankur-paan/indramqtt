@@ -5,38 +5,58 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use brokerlink::{BrokerFrame, OpCode};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
+
+/// Tenant id used when no tenant was assigned (MT-01 default registry).
+/// Single-tenant installs only ever carry this value, so their match path
+/// behaves as before with no prefix a client can observe.
+pub const DEFAULT_TENANT_ID: &str = "default";
+
+/// Longest tenant id stored on a subscription. Mirrors the MT-01 render
+/// bound so a subscription's tenant tag can never outgrow the assignment
+/// it came from: at most ~128 bytes of shared string per subscription,
+/// replaced (never duplicated) on re-subscribe.
+pub const MAX_TENANT_ID_LEN: usize = 128;
 
 /// One client's subscription. `client_id` is reference-counted so fan-out
 /// matching clones pointers instead of heap strings. `group` carries a
 /// shared-subscription group (`$share/<group>/...`): members of one group
 /// split matching messages round-robin instead of each receiving a copy.
+/// `tenant` scopes the entry to one tenant's topic space (MT-02): the same
+/// topic string in two tenants is two independent spaces, and the same
+/// group name in two tenants balances independently.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub client_id: Arc<str>,
     /// Ephemeral edge connection owning this subscription copy. A
     /// re-subscribe from a new connection replaces the entry, so at most
-    /// one `conn_id` per `(filter node, client_id)` exists.
+    /// one `conn_id` per `(filter node, client_id, tenant)` exists.
     pub conn_id: u64,
     pub qos: QoS,
     pub group: Option<Arc<str>>,
+    /// Tenant owning this subscription copy, assigned at connect (MT-01)
+    /// and stamped at subscribe time. Consulted on the match path with no
+    /// new lock and no per-message allocation beyond the result set the
+    /// path already builds.
+    pub tenant: Arc<str>,
 }
 
 impl Subscription {
-    /// Plain (non-shared) subscription.
+    /// Plain (non-shared) subscription in the default tenant.
     pub fn new(client_id: impl Into<Arc<str>>, conn_id: u64, qos: QoS) -> Self {
         Self {
             client_id: client_id.into(),
             conn_id,
             qos,
             group: None,
+            tenant: Arc::from(DEFAULT_TENANT_ID),
         }
     }
 
-    /// Shared-subscription member of `group`.
+    /// Shared-subscription member of `group` in the default tenant.
     pub fn shared(
         client_id: impl Into<Arc<str>>,
         conn_id: u64,
@@ -48,7 +68,50 @@ impl Subscription {
             conn_id,
             qos,
             group: Some(group.into()),
+            tenant: Arc::from(DEFAULT_TENANT_ID),
         }
+    }
+
+    /// Plain (non-shared) subscription scoped to `tenant`. Overlong ids
+    /// fall back to the default tenant (fail closed, never another
+    /// tenant's): the assignment registry already rejects them the same
+    /// way, so this only guards direct construction.
+    pub fn new_in_tenant(
+        client_id: impl Into<Arc<str>>,
+        conn_id: u64,
+        qos: QoS,
+        tenant: &str,
+    ) -> Self {
+        let mut sub = Self::new(client_id, conn_id, qos);
+        sub.tenant = normalize_tenant(tenant);
+        sub
+    }
+
+    /// Shared-subscription member of `group` scoped to `tenant` (same
+    /// fallback as [`Subscription::new_in_tenant`]).
+    pub fn shared_in_tenant(
+        client_id: impl Into<Arc<str>>,
+        conn_id: u64,
+        qos: QoS,
+        group: impl Into<Arc<str>>,
+        tenant: &str,
+    ) -> Self {
+        let mut sub = Self::shared(client_id, conn_id, qos, group);
+        sub.tenant = normalize_tenant(tenant);
+        sub
+    }
+}
+
+/// Clamp a tenant id to what a subscription may store: empty or overlong
+/// ids become the default tenant (fail closed, never another tenant's).
+/// The connect path already validates, so this only guards direct
+/// construction and keeps the stored tag bounded per
+/// [`MAX_TENANT_ID_LEN`].
+fn normalize_tenant(tenant: &str) -> Arc<str> {
+    if tenant.is_empty() || tenant.len() > MAX_TENANT_ID_LEN {
+        Arc::from(DEFAULT_TENANT_ID)
+    } else {
+        Arc::from(tenant)
     }
 }
 
@@ -482,12 +545,21 @@ const NUM_GROUP_SHARDS: usize = 32;
 /// eviction costs at most one rotation step, never a drop.
 const MAX_SHARED_GROUPS_PER_SHARD: usize = MAX_SHARED_GROUPS / NUM_GROUP_SHARDS;
 
-/// Sharded round-robin cursors: one atomic counter per group, striped so
-/// the match path never takes a global lock. Reads hit one shard's read
-/// lock to fetch the counter; only a missing group takes that shard's
-/// write lock. Increments are lock-free relaxed `fetch_add`s.
+/// Key scoping a shared-subscription group to one tenant (MT-02):
+/// `(tenant, group)`. The same group name in two tenants balances
+/// independently.
+type TenantGroupKey = (Arc<str>, Arc<str>);
+/// One sharded cursor map: one shard of the cursor array.
+type CursorShard = RwLock<AHashMap<TenantGroupKey, AtomicUsize>>;
+/// One sharded sticky-affinity map: one shard of the sticky array.
+type StickyShard = RwLock<AHashMap<TenantGroupKey, StickyEntry>>;
+
+/// Sharded round-robin cursors: one atomic counter per `(tenant, group)`,
+/// striped so the match path never takes a global lock. Reads hit one
+/// shard's read lock to fetch the counter; only a missing group takes
+/// that shard's write lock. Increments are lock-free relaxed `fetch_add`s.
 struct ShardedCursors {
-    shards: [RwLock<AHashMap<Arc<str>, AtomicUsize>>; NUM_GROUP_SHARDS],
+    shards: [CursorShard; NUM_GROUP_SHARDS],
 }
 
 impl Default for ShardedCursors {
@@ -498,11 +570,11 @@ impl Default for ShardedCursors {
     }
 }
 
-/// Sharded sticky affinity: one [`StickyEntry`] per group, striped the
-/// same way as the cursors. A delivery locks only its own group's shard
-/// (read first, write only on a miss or membership change).
+/// Sharded sticky affinity: one [`StickyEntry`] per `(tenant, group)`,
+/// striped the same way as the cursors. A delivery locks only its own
+/// group's shard (read first, write only on a miss or membership change).
 struct ShardedSticky {
-    shards: [RwLock<AHashMap<Arc<str>, StickyEntry>>; NUM_GROUP_SHARDS],
+    shards: [StickyShard; NUM_GROUP_SHARDS],
 }
 
 impl Default for ShardedSticky {
@@ -540,9 +612,10 @@ pub struct Router {
     /// does not change the count.
     subscription_count: AtomicUsize,
     /// Round-robin cursors per shared-subscription group, sharded (B4-08).
-    /// Keyed by group name alone so one group balances across all its
-    /// filters. No global lock on the match path: each delivery touches
-    /// only its group's shard.
+    /// Keyed by `(tenant, group)` (MT-02) so one group balances across
+    /// all its filters within one tenant's topic space, independently of
+    /// the same group name in another tenant. No global lock on the match
+    /// path: each delivery touches only its group's shard.
     rr_cursors: ShardedCursors,
     /// Per-group dispatch strategy (B4-02), copy-on-write (B4-08).
     /// Written by [`Router::set_shared_strategy`] under `strategy_write`
@@ -557,7 +630,7 @@ pub struct Router {
     /// Serializes strategy-table writers. Readers never take it.
     strategy_write: Mutex<()>,
     /// Sticky affinity per shared-subscription group (B4-02), sharded
-    /// (B4-08). Keyed by group name alone. See [`StickyEntry`] for the
+    /// (B4-08). Keyed by `(tenant, group)` (MT-02). See [`StickyEntry`] for the
     /// pin/re-pick rule.
     sticky: ShardedSticky,
     /// Xorshift random seed for the `random` strategy. One relaxed atomic
@@ -568,6 +641,8 @@ pub struct Router {
     /// Known concrete topics seen on publishes (W1-15). Separate lock
     /// from the subscription trie so management list reads never block
     /// the routing path and publishes only take a short write.
+    /// Lock-free single-tenant fast path (MT-02). Set on subscribe when tenant != default.
+    has_non_default: AtomicBool,
     known_topics: RwLock<AHashSet<Arc<str>>>,
     /// Ordered compiled rewrite rules (B4-04). Written once per
     /// configuration change under a write lock; the publish and
@@ -612,6 +687,7 @@ impl Router {
             strategy_write: Mutex::new(()),
             sticky: ShardedSticky::default(),
             random_seed: std::sync::atomic::AtomicU64::new(seed),
+            has_non_default: AtomicBool::new(false),
             known_topics: RwLock::new(AHashSet::new()),
             rewrite_rules: RwLock::new(Vec::new()),
             rewrite_rewritten: AtomicU64::new(0),
@@ -681,13 +757,19 @@ impl Router {
     }
 
     /// Number of live round-robin cursor entries across all shards
-    /// (operator/test hook for the B4-08 bound check).
+    /// (operator/test hook for the B4-08 bound check). Never exceeds
+    /// `MAX_SHARED_GROUPS`: cursors are keyed per `(tenant, group)` and
+    /// each shard holds at most its per-shard share of entries,
+    /// so the shards sum to at most one cursor per live shared group.
     pub fn rr_cursor_count(&self) -> usize {
-        self.rr_cursors
+        let count: usize = self
+            .rr_cursors
             .shards
             .iter()
             .map(|shard| shard.read().len())
-            .sum()
+            .sum();
+        debug_assert!(count <= MAX_SHARED_GROUPS, "cursor table past its bound");
+        count
     }
 
     /// Number of live sticky affinity entries across all shards
@@ -908,10 +990,17 @@ impl Router {
     /// success); replacing the same client's entry always succeeds and
     /// returns `true`.
     pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) -> bool {
+        if sub.tenant.as_ref() != DEFAULT_TENANT_ID {
+            self.has_non_default.store(true, Ordering::Relaxed);
+        }
         let _guard = self.trie_write.lock();
         let current = self.root.load_full();
-        if !Self::terminal_contains(&current, filter, sub.client_id.as_ref())
-            && self.subscription_count.load(Ordering::Relaxed) >= MAX_SUBSCRIPTIONS
+        if !Self::terminal_contains(
+            &current,
+            filter,
+            sub.client_id.as_ref(),
+            sub.tenant.as_ref(),
+        ) && self.subscription_count.load(Ordering::Relaxed) >= MAX_SUBSCRIPTIONS
         {
             return false;
         }
@@ -945,9 +1034,9 @@ impl Router {
             let existed = node
                 .multi_wildcard_subs
                 .iter()
-                .any(|s| s.client_id == sub.client_id);
+                .any(|s| s.client_id == sub.client_id && s.tenant == sub.tenant);
             node.multi_wildcard_subs
-                .retain(|s| s.client_id != sub.client_id);
+                .retain(|s| s.client_id != sub.client_id || s.tenant != sub.tenant);
             node.multi_wildcard_subs.insert(sub);
             return (node, !existed);
         }
@@ -960,8 +1049,10 @@ impl Router {
                 let existed = child
                     .exact_subs
                     .iter()
-                    .any(|s| s.client_id == sub.client_id);
-                child.exact_subs.retain(|s| s.client_id != sub.client_id);
+                    .any(|s| s.client_id == sub.client_id && s.tenant == sub.tenant);
+                child
+                    .exact_subs
+                    .retain(|s| s.client_id != sub.client_id || s.tenant != sub.tenant);
                 child.exact_subs.insert(sub);
                 node.single_wildcard = Some(Arc::new(child));
                 return (node, !existed);
@@ -983,8 +1074,10 @@ impl Router {
             let existed = child
                 .exact_subs
                 .iter()
-                .any(|s| s.client_id == sub.client_id);
-            child.exact_subs.retain(|s| s.client_id != sub.client_id);
+                .any(|s| s.client_id == sub.client_id && s.tenant == sub.tenant);
+            child
+                .exact_subs
+                .retain(|s| s.client_id != sub.client_id || s.tenant != sub.tenant);
             child.exact_subs.insert(sub);
             node.children.insert(level.into(), Arc::new(child));
             return (node, !existed);
@@ -998,12 +1091,17 @@ impl Router {
         (node, added)
     }
 
-    /// Probe the snapshot for a live `(filter, client)` entry: true when
-    /// the filter path exists and its terminal set already holds
-    /// `client_id`. Used to tell a same-client replacement (always
-    /// allowed) from a new entry (counted against [`MAX_SUBSCRIPTIONS`]),
-    /// and to skip no-op unsubscribes without copying.
-    fn terminal_contains(node: &TrieNode, filter: &TopicFilter, client_id: &str) -> bool {
+    /// Probe the snapshot for a live `(filter, client, tenant)` entry:
+    /// true when the filter path exists and its terminal set already holds
+    /// it. Used to tell a same-client replacement (always allowed) from a
+    /// new entry (counted against [`MAX_SUBSCRIPTIONS`]), and to skip
+    /// no-op unsubscribes without copying.
+    fn terminal_contains(
+        node: &TrieNode,
+        filter: &TopicFilter,
+        client_id: &str,
+        tenant: &str,
+    ) -> bool {
         let mut curr = node;
         let levels: Vec<&str> = filter.as_str().split('/').collect();
         for (pos, level) in levels.iter().enumerate() {
@@ -1011,17 +1109,16 @@ impl Router {
                 return curr
                     .multi_wildcard_subs
                     .iter()
-                    .any(|s| s.client_id.as_ref() == client_id);
+                    .any(|s| s.client_id.as_ref() == client_id && s.tenant.as_ref() == tenant);
             }
             let is_last = pos + 1 == levels.len();
             if *level == "+" {
                 match curr.single_wildcard.as_ref() {
                     Some(child) => {
                         if is_last {
-                            return child
-                                .exact_subs
-                                .iter()
-                                .any(|s| s.client_id.as_ref() == client_id);
+                            return child.exact_subs.iter().any(|s| {
+                                s.client_id.as_ref() == client_id && s.tenant.as_ref() == tenant
+                            });
                         }
                         curr = &**child;
                     }
@@ -1031,10 +1128,9 @@ impl Router {
                 match curr.children.get(*level) {
                     Some(child) => {
                         if is_last {
-                            return child
-                                .exact_subs
-                                .iter()
-                                .any(|s| s.client_id.as_ref() == client_id);
+                            return child.exact_subs.iter().any(|s| {
+                                s.client_id.as_ref() == client_id && s.tenant.as_ref() == tenant
+                            });
                         }
                         curr = &**child;
                     }
@@ -1046,24 +1142,34 @@ impl Router {
     }
 
     /// Unsubscribe event: remove `client_id` at `filter` with the same
-    /// path-copying discipline as [`Router::subscribe`]. A filter path
-    /// without a live entry for `client_id` returns after one lock-free
+    /// path-copying discipline as [`Router::subscribe`]. Default-tenant
+    /// entry; tenant callers use [`Router::unsubscribe_in_tenant`]. A
+    /// filter path without a live entry returns after one lock-free
     /// snapshot load and one probe, with no copy and no store, so no-op
     /// unsubscribes pay no allocation. A real removal copies only the
     /// filter path, prunes nodes left empty, and decrements the
     /// [`MAX_SUBSCRIPTIONS`] count.
     pub fn unsubscribe(&self, filter: &TopicFilter, client_id: &str) {
+        self.unsubscribe_in_tenant(filter, client_id, DEFAULT_TENANT_ID);
+    }
+
+    /// Unsubscribe one `(tenant, client id)` entry at `filter` (MT-02):
+    /// only the owning tenant's copy is removed, so one tenant's teardown
+    /// never removes another tenant's subscription for the same client id.
+    /// Same path-copying discipline and count handling as
+    /// [`Router::unsubscribe`].
+    pub fn unsubscribe_in_tenant(&self, filter: &TopicFilter, client_id: &str, tenant: &str) {
         let _guard = self.trie_write.lock();
         let current = self.root.load_full();
         if !Self::path_exists(&current, filter) {
             return;
         }
-        if !Self::terminal_contains(&current, filter, client_id) {
+        if !Self::terminal_contains(&current, filter, client_id, tenant) {
             return;
         }
         let levels: Vec<&str> = filter.as_str().split('/').collect();
         let root_owned = (*current).clone();
-        let (next, changed) = Self::remove_owned(root_owned, &levels, 0, client_id);
+        let (next, changed) = Self::remove_owned(root_owned, &levels, 0, client_id, tenant);
         if changed {
             self.subscription_count.fetch_sub(1, Ordering::Relaxed);
             self.root.store(Arc::new(next));
@@ -1115,13 +1221,14 @@ impl Router {
         levels: &[&str],
         pos: usize,
         client_id: &str,
+        tenant: &str,
     ) -> (TrieNode, bool) {
         let level = levels[pos];
         let is_last = pos + 1 == levels.len();
         if level == "#" {
             let before = node.multi_wildcard_subs.len();
             node.multi_wildcard_subs
-                .retain(|s| s.client_id.as_ref() != client_id);
+                .retain(|s| s.client_id.as_ref() != client_id || s.tenant.as_ref() != tenant);
             let changed = node.multi_wildcard_subs.len() != before;
             return (node, changed);
         }
@@ -1135,7 +1242,7 @@ impl Router {
                 let mut child = child;
                 child
                     .exact_subs
-                    .retain(|s| s.client_id.as_ref() != client_id);
+                    .retain(|s| s.client_id.as_ref() != client_id || s.tenant.as_ref() != tenant);
                 if child.exact_subs.len() == before {
                     node.single_wildcard = Some(Arc::new(child));
                     return (node, false);
@@ -1145,7 +1252,8 @@ impl Router {
                 }
                 return (node, true);
             }
-            let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+            let (next_child, changed) =
+                Self::remove_owned(child, levels, pos + 1, client_id, tenant);
             if !changed {
                 node.single_wildcard = Some(Arc::new(next_child));
                 return (node, false);
@@ -1164,7 +1272,7 @@ impl Router {
             let mut child = child;
             child
                 .exact_subs
-                .retain(|s| s.client_id.as_ref() != client_id);
+                .retain(|s| s.client_id.as_ref() != client_id || s.tenant.as_ref() != tenant);
             if child.exact_subs.len() == before {
                 node.children.insert(level.into(), Arc::new(child));
                 return (node, false);
@@ -1174,7 +1282,7 @@ impl Router {
             }
             return (node, true);
         }
-        let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+        let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id, tenant);
         if !changed {
             node.children.insert(level.into(), Arc::new(next_child));
             return (node, false);
@@ -1183,6 +1291,61 @@ impl Router {
             node.children.insert(level.into(), Arc::new(next_child));
         }
         (node, true)
+    }
+
+    /// Collect one node subscriptions carrying tenant, counting skipped.
+    fn collect_tenant(
+        subs: &SubscriptionSet,
+        tenant: &str,
+        matched: &mut SubscriptionSet,
+        skipped: &mut u64,
+    ) {
+        for sub in subs {
+            if sub.tenant.as_ref() == tenant {
+                matched.insert(sub.clone());
+            } else {
+                *skipped += 1;
+            }
+        }
+    }
+
+    /// Match one topic within tenant only, preserving publisher context
+    /// for shared-group balancing (MT-02).  Returns the reduced, tenant-filtered
+    /// subscription set; when everything is in the default tenant the
+    /// tenant filter is a no-op (fast path).
+    pub fn matches_in_tenant_with_publisher(
+        &self,
+        topic: &Topic,
+        publisher: Option<&str>,
+        tenant: &str,
+    ) -> SubscriptionSet {
+        self.matches_in_tenant_with_publisher_counted(topic, publisher, tenant)
+            .0
+    }
+
+    /// Match one topic within tenant only, preserving publisher context,
+    /// plus the count excluded by tenant scope. The match runs once; the
+    /// count lets the delivery path observe tenant exclusions without a
+    /// second walk. Driven by the publish delivery event.
+    pub fn matches_in_tenant_with_publisher_counted(
+        &self,
+        topic: &Topic,
+        publisher: Option<&str>,
+        tenant: &str,
+    ) -> (SubscriptionSet, u64) {
+        let all = self.matches_with_publisher(topic, publisher);
+        if tenant == DEFAULT_TENANT_ID && !self.has_non_default.load(Ordering::Relaxed) {
+            return (all, 0);
+        }
+        let mut matched = SubscriptionSet::default();
+        let mut skipped = 0u64;
+        Self::collect_tenant(&all, tenant, &mut matched, &mut skipped);
+        (matched, skipped)
+    }
+
+    /// Match one topic within tenant only.
+    pub fn matches_in_tenant(&self, topic: &Topic, tenant: &str) -> SubscriptionSet {
+        self.matches_in_tenant_counted(topic, None, tenant).0
     }
 
     pub fn matches(&self, topic: &Topic) -> SubscriptionSet {
@@ -1236,6 +1399,36 @@ impl Router {
         matched
     }
 
+    /// Tenant-scoped match plus shared-group reduction (MT-02): only
+    /// subscriptions carrying `tenant` match, and the same group name in
+    /// two tenants balances on independent cursors. Returns the reduced
+    /// set plus the number of subscriptions skipped for tenant mismatch
+    /// (the caller counts them: a mismatch delivers nothing, never an
+    /// error to the publisher). Filtering happens before group reduction,
+    /// so a foreign tenant's member can never win a group pick.
+    /// Same locking and per-match cost as [`Router::matches_with_publisher`]
+    /// plus one tenant compare per candidate subscription.
+    pub fn matches_in_tenant_counted(
+        &self,
+        topic: &Topic,
+        publisher: Option<&str>,
+        tenant: &str,
+    ) -> (SubscriptionSet, u64) {
+        let snapshot = self.root.load_full();
+        let mut matched = SubscriptionSet::default();
+        let mut skipped = 0u64;
+        Self::match_recursive_in_tenant(
+            &snapshot,
+            topic.as_str(),
+            tenant,
+            &mut matched,
+            &mut skipped,
+        );
+        drop(snapshot);
+        self.balance_shared_groups(&mut matched, topic, publisher);
+        (matched, skipped)
+    }
+
     /// Reduce each shared group in `matched` to exactly one member using
     /// that group's configured [`SharedStrategy`] (B4-02). Members sort
     /// by client id first so every strategy but `random` is
@@ -1270,10 +1463,18 @@ impl Router {
         if !matched.iter().any(|s| s.group.is_some()) {
             return;
         }
-        let mut groups: AHashMap<Arc<str>, Vec<Subscription>> = AHashMap::new();
+        // Keyed by `(tenant, group)` (MT-02): the same group name in two
+        // tenants balances independently, and a tenant-filtered match set
+        // reduces exactly like an unfiltered single-tenant one. Strategies
+        // stay keyed by group name alone (management plane sets them by
+        // name); cursors and sticky affinity are per `(tenant, group)`.
+        let mut groups: AHashMap<(Arc<str>, Arc<str>), Vec<Subscription>> = AHashMap::new();
         matched.retain(|sub| match &sub.group {
             Some(group) => {
-                groups.entry(group.clone()).or_default().push(sub.clone());
+                groups
+                    .entry((sub.tenant.clone(), group.clone()))
+                    .or_default()
+                    .push(sub.clone());
                 false
             }
             None => true,
@@ -1284,11 +1485,11 @@ impl Router {
         // Lock-free strategy snapshot: one `ArcSwap` load for the whole
         // delivery, then no lock per group on the hot path.
         let strategies = self.strategies.load_full();
-        for (group, mut members) in groups {
+        for ((tenant, group), mut members) in groups {
             members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
             let strategy = strategies.get(&group).copied().unwrap_or_default();
             let pick = match strategy {
-                SharedStrategy::RoundRobin => self.pick_round_robin(&group, &members),
+                SharedStrategy::RoundRobin => self.pick_round_robin(&tenant, &group, &members),
                 SharedStrategy::Random => self.pick_random(&members),
                 SharedStrategy::HashClientId => {
                     // TODO(parity): what key should non-MQTT delivery paths
@@ -1301,13 +1502,14 @@ impl Router {
                     Self::pick_hash(&members, key)
                 }
                 SharedStrategy::HashTopic => Self::pick_hash(&members, topic.as_str()),
-                SharedStrategy::Sticky => self.pick_sticky(&group, &members),
+                SharedStrategy::Sticky => self.pick_sticky(&tenant, &group, &members),
             };
             matched.insert(pick);
         }
     }
 
-    /// Round-robin pick: cursor per group, deterministic client-id order.
+    /// Round-robin pick: cursor per `(tenant, group)`, deterministic
+    /// client-id order.
     /// Locking (`crates/broker-router/src/lib.rs`, `ShardedCursors`):
     /// exactly one shard is touched. The fast path takes that shard's
     /// read lock to fetch the atomic counter and bumps it lock-free with
@@ -1315,20 +1517,26 @@ impl Router {
     /// insert. Bounded per shard by [`MAX_SHARED_GROUPS_PER_SHARD`]: a
     /// missing group in a full shard evicts one arbitrary entry of that
     /// same shard first (documented on the constant).
-    fn pick_round_robin(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
+    fn pick_round_robin(
+        &self,
+        tenant: &Arc<str>,
+        group: &Arc<str>,
+        members: &[Subscription],
+    ) -> Subscription {
         debug_assert!(!members.is_empty());
+        let key = (tenant.clone(), group.clone());
         let shard = &self.rr_cursors.shards[group_shard(group)];
         // Fast path: the group already has a cursor.
         {
             let cursors = shard.read();
-            if let Some(cursor) = cursors.get(group) {
+            if let Some(cursor) = cursors.get(&key) {
                 let prev = cursor.fetch_add(1, Ordering::Relaxed);
                 return members[prev % members.len()].clone();
             }
         }
         // Slow path: install the cursor (at most one shard write).
         let mut cursors = shard.write();
-        if let Some(cursor) = cursors.get(group) {
+        if let Some(cursor) = cursors.get(&key) {
             let prev = cursor.fetch_add(1, Ordering::Relaxed);
             return members[prev % members.len()].clone();
         }
@@ -1337,7 +1545,7 @@ impl Router {
                 cursors.remove(&victim);
             }
         }
-        cursors.insert(group.clone(), AtomicUsize::new(1));
+        cursors.insert(key, AtomicUsize::new(1));
         members[0].clone()
     }
 
@@ -1380,13 +1588,19 @@ impl Router {
     /// only on a miss or membership change). Bounded per shard by
     /// [`MAX_SHARED_GROUPS_PER_SHARD`] with the same arbitrary-evict
     /// rule as the cursors.
-    fn pick_sticky(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
+    fn pick_sticky(
+        &self,
+        tenant: &Arc<str>,
+        group: &Arc<str>,
+        members: &[Subscription],
+    ) -> Subscription {
         debug_assert!(!members.is_empty());
         let fingerprint = fingerprint_members(members);
+        let key = (tenant.clone(), group.clone());
         let shard = &self.sticky.shards[group_shard(group)];
         {
             let sticky = shard.read();
-            if let Some(entry) = sticky.get(group) {
+            if let Some(entry) = sticky.get(&key) {
                 if entry.fingerprint == fingerprint {
                     if let Some(pinned) = members.iter().find(|m| m.client_id == entry.pinned) {
                         return pinned.clone();
@@ -1399,20 +1613,20 @@ impl Router {
         let mut sticky = shard.write();
         // Re-check under the write lock: another delivery may have
         // installed the current membership while we were unlocked.
-        if let Some(entry) = sticky.get(group) {
+        if let Some(entry) = sticky.get(&key) {
             if entry.fingerprint == fingerprint {
                 if let Some(pinned) = members.iter().find(|m| m.client_id == entry.pinned) {
                     return pinned.clone();
                 }
             }
         }
-        if !sticky.contains_key(group) && sticky.len() >= MAX_SHARED_GROUPS_PER_SHARD {
+        if !sticky.contains_key(&key) && sticky.len() >= MAX_SHARED_GROUPS_PER_SHARD {
             if let Some(victim) = sticky.keys().next().cloned() {
                 sticky.remove(&victim);
             }
         }
         sticky.insert(
-            group.clone(),
+            key,
             StickyEntry {
                 pinned: pick.client_id.clone(),
                 fingerprint,
@@ -1447,6 +1661,66 @@ impl Router {
                 if let Some(ref child) = node.single_wildcard {
                     matched.extend(child.multi_wildcard_subs.iter().cloned());
                     matched.extend(child.exact_subs.iter().cloned());
+                }
+            }
+        }
+    }
+
+    /// Collect one terminal set's subscriptions that carry `tenant`,
+    /// counting every other tenant's entry in `skipped` (MT-02). Keeps the
+    /// tenant check on the match path to one tag compare per candidate
+    /// with no new lock and no allocation beyond the result set the path
+    /// already builds.
+    fn collect_in_tenant(
+        set: &SubscriptionSet,
+        tenant: &str,
+        matched: &mut SubscriptionSet,
+        skipped: &mut u64,
+    ) {
+        for sub in set.iter() {
+            if sub.tenant.as_ref() == tenant {
+                matched.insert(sub.clone());
+            } else {
+                *skipped += 1;
+            }
+        }
+    }
+
+    /// Tenant-scoped match walk (MT-02): same traversal as
+    /// [`Router::match_recursive`], collecting only `tenant`'s
+    /// subscriptions and counting every other tenant's entry as skipped.
+    /// Runs before group reduction so a foreign member can never win a
+    /// group pick.
+    fn match_recursive_in_tenant(
+        node: &TrieNode,
+        topic: &str,
+        tenant: &str,
+        matched: &mut SubscriptionSet,
+        skipped: &mut u64,
+    ) {
+        // Multi-level '#' matches all subtopics at this level and deeper.
+        Self::collect_in_tenant(&node.multi_wildcard_subs, tenant, matched, skipped);
+
+        match topic.split_once('/') {
+            Some((head, tail)) => {
+                // Match exact segment.
+                if let Some(child) = node.children.get(head) {
+                    Self::match_recursive_in_tenant(child, tail, tenant, matched, skipped);
+                }
+                // Match single wildcard '+'.
+                if let Some(ref child) = node.single_wildcard {
+                    Self::match_recursive_in_tenant(child, tail, tenant, matched, skipped);
+                }
+            }
+            None => {
+                // Final segment: descend once more for terminal sets.
+                if let Some(child) = node.children.get(topic) {
+                    Self::collect_in_tenant(&child.multi_wildcard_subs, tenant, matched, skipped);
+                    Self::collect_in_tenant(&child.exact_subs, tenant, matched, skipped);
+                }
+                if let Some(ref child) = node.single_wildcard {
+                    Self::collect_in_tenant(&child.multi_wildcard_subs, tenant, matched, skipped);
+                    Self::collect_in_tenant(&child.exact_subs, tenant, matched, skipped);
                 }
             }
         }
