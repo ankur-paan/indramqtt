@@ -936,12 +936,15 @@ pub fn load_layered(config_dir: &Path, cli: &CliOverrides) -> Result<LayeredConf
     load_layered_from(config_dir, &env, cli)
 }
 
-/// `INDRA_*` variables that carry credentials rather than settings. They
-/// have no schema home (a key must never show up in `explain` or a config
-/// export), so the settings layer skips them instead of refusing startup
-/// on an unknown setting. `INDRA_API_KEYS` seeds the broker's operator
-/// API keys; `INDRA_API_KEY` is the key `indra ctl` presents, and is
-/// commonly exported in the same shell that starts the broker.
+/// The `INDRA_*` variables that contain credentials.
+///
+/// These variables are not settings and have no schema home. `explain`
+/// and the configuration exports must not show a key. Thus the settings
+/// layer ignores these variables and does not refuse the startup.
+///
+/// - `INDRA_API_KEYS` gives the operator API keys to the broker.
+/// - `INDRA_API_KEY` is the key that `indra ctl` sends. An operator can
+///   export it in the shell that starts the broker.
 pub const CREDENTIAL_ENV_VARS: &[&str] = &["INDRA_API_KEYS", "INDRA_API_KEY"];
 
 fn is_credential_env(name: &str) -> bool {
@@ -1688,7 +1691,7 @@ mod tests {
         ]);
         let layered = load_layered(&dir, &CliOverrides::default())
             .expect("credential variables are not settings");
-        // Keys never become settings: nothing in the provenance names them.
+        // A key is not a setting. No provenance entry refers to a key.
         assert!(layered
             .provenance()
             .values()

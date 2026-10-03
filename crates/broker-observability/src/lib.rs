@@ -6,10 +6,11 @@ pub fn init_tracing() {
     init_tracing_with_level("info");
 }
 
-/// Start logging at the configured level (`logging.level`).
+/// Starts the log output at the level in `logging.level`.
 ///
-/// `RUST_LOG`, when set, still wins: it is the developer's per-module
-/// filter (`RUST_LOG=broker_router=trace`) and has no schema home.
+/// If `RUST_LOG` is set, it overrides the level. `RUST_LOG` is a
+/// developer filter (`RUST_LOG=broker_router=trace`). It has no schema
+/// home.
 pub fn init_tracing_with_level(level: &str) {
     let _ = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)))

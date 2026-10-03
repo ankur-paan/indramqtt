@@ -127,7 +127,8 @@ init(Opts) ->
     MaxConns = proplists:get_value(max_connections, Opts,
                                    indra_ws:default_max_connections()),
     ConnOpts = proplists:get_value(conn, Opts, []),
-    %% `{ip, Addr}' binds one interface; absent binds every interface.
+    %% `{ip, Addr}' binds one interface. If it is absent, the listener
+    %% binds all the interfaces.
     SockOpts = indra_listener:listen_sock_opts() ++ [{ip, Ip} || {ip, Ip} <- Opts],
     ListenResult = case Transport of
         ssl ->
@@ -278,16 +279,17 @@ accept_loop(Server, Transport, LSock) ->
 accept_one(tcp, LSock) ->
     gen_tcp:accept(LSock);
 accept_one(ssl, LSock) ->
-    %% Only the transport accept runs here. The TLS handshake runs in the
-    %% per-connection handler (see `tls_upgrade/2'), so a client that
-    %% opens a socket and sends nothing holds one handler for the
-    %% handshake timeout and never stalls the accept loop.
+    %% Only the transport accept runs here. The handler of the
+    %% connection does the TLS handshake (see `tls_upgrade/2'). A client
+    %% that opens a socket and sends no data holds one handler until the
+    %% handshake timeout. It does not stop the accept loop.
     ssl:transport_accept(LSock).
 
-%% @private Complete the TLS handshake on a `wss' socket inside its own
-%% handler process, bounded by the same 5 s as the TCP/TLS listener. A
-%% plaintext socket passes through. Any failure (including plaintext
-%% bytes on the `wss' port) logs its reason and fails the socket closed.
+%% @private Does the TLS handshake of a `wss' socket in the handler
+%% process of the connection. The limit is 5 s, as for the TCP/TLS
+%% listener. A plaintext socket needs no handshake. If the handshake
+%% fails, the function writes the reason to the log and closes the
+%% socket. Plaintext bytes on the `wss' port are such a failure.
 tls_upgrade(tcp, Sock) ->
     {ok, Sock};
 tls_upgrade(ssl, Sock) ->

@@ -1,15 +1,15 @@
-# Configuration baked into the IndraMQTT image.
+# The configuration file of the IndraMQTT image.
 #
-# Mount your own file at /etc/indramqtt/indra.toml to replace this one
-# whole; keep these two settings in it. Every other setting has a schema
-# default (docs/settings-reference.md).
+# To use your own file, mount it at /etc/indramqtt/indra.toml. Your file
+# replaces this file. Keep these two settings in your file.
+# For all other settings, refer to docs/settings-reference.md.
 
 [node]
-# All mutable state lives on the image's one volume.
+# The broker writes all of its state on the volume of the image.
 data_dir = "/var/lib/indramqtt/data"
 
 [listeners.api]
-# Reachable through a published port. Put it behind your own network
-# controls: the first-boot administrator has a default password that
-# must be changed at first login.
+# This bind makes the API available through a published port.
+# Protect the port with your network controls. The first administrator
+# has a default password. Change the password at the first login.
 bind = "0.0.0.0:18083"

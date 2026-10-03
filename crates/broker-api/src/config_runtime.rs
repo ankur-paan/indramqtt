@@ -181,10 +181,10 @@ async fn apply_candidate(
         return Err(Box::new(bad_request(err.to_string())));
     }
     let previous = state.config.snapshot();
-    // An empty administrator list restores the built-in default account
-    // with its default password. A candidate that drops every
-    // administrator from an installation that has some is refused, so a
-    // reload or restore can never reopen the default login by omission.
+    // An empty administrator list restores the default account and its
+    // default password. Refuse a candidate that removes all the
+    // administrators of an installation. Thus a reload or a restore
+    // cannot open the default login again.
     if candidate.admin_users.users.is_empty() && !previous.admin_users.users.is_empty() {
         return Err(Box::new(bad_request(
             "admin_users.users must keep at least one administrator: an empty list would restore the default account (field `admin_users.users`)",

@@ -608,13 +608,13 @@ fn clamp_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_LIMIT)
 }
 
-/// True when the endpoint host is this machine (`localhost` or a
-/// loopback address).
+/// Returns true if the endpoint host is the local machine. The host is
+/// local if it is `localhost` or a loopback address.
 fn is_loopback_host(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    // IPv6 hosts come back bracketed (`[::1]`).
+    // An IPv6 host has brackets (`[::1]`). Remove them.
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -648,8 +648,8 @@ async fn request(
     let url = format!("{base}{path}");
     let parsed = reqwest::Url::parse(&url)
         .map_err(|e| CtlError::validation(format!("malformed endpoint URL: {e}")))?;
-    // The key is an administrator credential. Over plain http it is only
-    // safe on the machine itself, so any other host needs https.
+    // The key is an administrator credential. Plain http is safe only
+    // on the local machine. All other hosts must use https.
     if parsed.scheme() != "https" && !is_loopback_host(&parsed) {
         return Err(CtlError::validation(
             "refusing to send the API key over plain http to a remote host: use an https endpoint",

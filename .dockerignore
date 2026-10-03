@@ -30,7 +30,7 @@ erl_crash.dump
 scratch/
 benchmark_suite/benchmark_results_*.json
 
-# Deployment examples ship config text, not build inputs. The image's
-# start script under deploy/docker is a build input and stays.
+# The deployment examples are not build inputs. The files in
+# deploy/docker are build inputs, thus the build keeps them.
 deploy/compose/
 deploy/helm/

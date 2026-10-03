@@ -481,10 +481,11 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MONITOR_SAMPLE_SECS)]
     monitor_sample_secs: u64,
 
-    /// Print the edge's `erl` arguments for the resolved listener
-    /// settings, one argument per line, and exit. The edge holds the MQTT,
-    /// TLS and WebSocket sockets; starting it with these arguments makes
-    /// `indra.toml` the one place a listener is configured.
+    /// Print the `erl` arguments of the edge and exit. The output has
+    /// one argument on each line. The arguments contain the resolved
+    /// listener settings. The edge holds the MQTT, TLS and WebSocket
+    /// sockets. Start the edge with these arguments. Then you set a
+    /// listener in `indra.toml` only.
     #[arg(long)]
     print_edge_args: bool,
 }
@@ -3630,9 +3631,10 @@ fn load_startup_config(
     )
 }
 
-/// Split one listener bind (`ip:port`) for the edge. The edge binds
-/// sockets by IP address, so a host name is refused here by name instead
-/// of failing later inside the edge.
+/// Splits one listener bind (`ip:port`) for the edge.
+///
+/// The edge binds a socket to an IP address. This function refuses a
+/// host name and gives the name of the setting in the error.
 fn edge_bind(setting: &str, bind: &str) -> Result<(std::net::IpAddr, u16), ConfigError> {
     bind.parse::<std::net::SocketAddr>()
         .map(|addr| (addr.ip(), addr.port()))
@@ -3643,12 +3645,13 @@ fn edge_bind(setting: &str, bind: &str) -> Result<(std::net::IpAddr, u16), Confi
         })
 }
 
-/// The edge's application environment for the resolved configuration, as
-/// `erl` arguments (`-indra_edge <key> <Erlang term>` triples).
+/// Returns the `erl` arguments that give the resolved configuration to
+/// the edge. Each setting is three arguments:
+/// `-indra_edge <key> <Erlang term>`.
 ///
-/// The edge reads these keys in `indra_edge_sup`. Strings are printed as
-/// quoted Erlang strings. A listener bound to every interface passes no
-/// address, which is the edge's own default.
+/// `indra_edge_sup` reads these keys. A string value is an Erlang string
+/// in quotation marks. If a listener binds all the interfaces, the
+/// function gives no address. That is the default of the edge.
 fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, ConfigError> {
     fn quoted(text: &str) -> String {
         format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
@@ -3662,8 +3665,8 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     let listeners = &cfg.listeners;
 
     let (ip, port) = edge_bind("node.brokerlink_bind", &cfg.node.brokerlink_bind)?;
-    // The edge dials the kernel; a kernel listening on every interface is
-    // reached over loopback.
+    // The edge connects to the kernel. If the kernel listens on all the
+    // interfaces, the edge uses the loopback address.
     let kernel_host = if ip.is_unspecified() {
         "127.0.0.1".to_string()
     } else {
@@ -3724,12 +3727,13 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     Ok(out)
 }
 
-/// The flags the operator actually typed, as the flag layer.
+/// Returns the flags that the operator typed. These flags are the flag
+/// layer.
 ///
-/// Most flags carry a clap default, so the parsed value alone cannot tell
-/// a typed flag from an absent one. `matches` can: only a value that came
-/// from the command line becomes an override, so an absent flag leaves its
-/// setting to the file, fragment and environment layers.
+/// Most flags have a clap default. Thus the parsed value does not show
+/// if the operator typed the flag. `matches` shows it. Only a value from
+/// the command line becomes an override. If a flag is absent, the file,
+/// the fragments and the environment set the value.
 fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
     let typed = |id: &str| {
         matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
@@ -3814,13 +3818,14 @@ fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
     }
 }
 
-/// Make the resolved configuration the one the kernel boots from.
+/// Copies the resolved configuration to the fields that the startup
+/// reads.
 ///
-/// Every setting that a startup layer set (`indra.toml`, a `conf.d`
-/// fragment, an `INDRA_*` variable or a typed flag) is copied onto the
-/// field the boot path reads, so the value `explain` reports is the value
-/// in effect. A setting no layer touched keeps the flag's built-in
-/// default, which is what the kernel ran on before layered configuration.
+/// A startup layer is `indra.toml`, a `conf.d` fragment, an `INDRA_*`
+/// variable or a typed flag. If a layer set a setting, this function
+/// copies the value to its field. Thus the value that `explain` shows is
+/// the value in operation. If no layer set a setting, the field keeps
+/// the default of the flag.
 fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(), ConfigError> {
     let root = toml::Value::try_from(layered.config()).map_err(|err| {
         ConfigError::Invalid(format!("resolved configuration cannot be read back: {err}"))
@@ -3841,7 +3846,7 @@ fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(),
         }
         match lookup(path) {
             Some(toml::Value::String(value)) => *slot = value.clone(),
-            // Lists resolve to the comma-separated form the flag takes.
+            // The flag uses a list with commas. Convert the list to that form.
             Some(toml::Value::Array(entries)) => {
                 *slot = entries
                     .iter()
@@ -6136,12 +6141,11 @@ async fn ingress_pipeline_with_publisher(
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
     //
-    // Rules, the CoAP observers below and cluster forwarding carry no
-    // tenant yet: rule output republishes into the default tenant and
-    // observers are default-tenant readers. Feeding them another tenant's
-    // publish would move its payload across the tenant boundary, so they
-    // see default-tenant traffic only until each of them carries a
-    // tenant. A default-only install takes the same path as before.
+    // The rules and the CoAP observers do not contain a tenant. A rule
+    // publishes its output in the default tenant. An observer reads the
+    // default tenant. Thus they get only the messages of the default
+    // tenant. A message of a different tenant does not go to them. An
+    // installation with the default tenant only operates as before.
     let default_tenant = is_default_tenant(publisher_tenant);
     if default_tenant {
         let rules_fired = shared
@@ -6191,7 +6195,8 @@ async fn ingress_pipeline_with_publisher(
     deliveries
 }
 
-/// True for the default tenant (the empty id is the default too).
+/// Returns true for the default tenant. An empty id is also the default
+/// tenant.
 fn is_default_tenant(tenant: &str) -> bool {
     tenant.is_empty() || tenant == broker_session::tenant::DEFAULT_TENANT_ID
 }
@@ -6205,11 +6210,10 @@ async fn forward_cluster(
     payload: &Bytes,
     publisher_tenant: &str,
 ) {
-    // The cluster protocol carries no tenant, and a peer fans a forwarded
-    // message out in the default tenant. Forwarding another tenant's
-    // publish would hand it to default-tenant subscribers on the peer, so
-    // only default-tenant publishes leave this node until the protocol
-    // carries the tenant.
+    // The cluster protocol does not contain the tenant. A peer delivers
+    // a forwarded message in the default tenant. Thus this node forwards
+    // only the messages of the default tenant. A message of a different
+    // tenant stays on this node.
     if !is_default_tenant(publisher_tenant) {
         return;
     }
@@ -7736,11 +7740,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
         .unwrap_or_else(|err| err.exit());
 
-    // Resolve the startup configuration through the typed-schema layers
-    // (defaults, `indra.toml`, `conf.d`, `INDRA_` env, typed flags), then
-    // copy the result onto the fields the boot path reads, so every
-    // reader below runs on the resolved value. A typed flag wins; a
-    // setting no layer touched keeps the flag's built-in default.
+    // Resolve the startup configuration from the layers: the defaults,
+    // `indra.toml`, `conf.d`, the `INDRA_` variables and the typed flags.
+    // Then copy the result to the fields that the startup reads. A typed
+    // flag overrides the other layers. If no layer set a setting, the
+    // field keeps the default of the flag.
     let layered = load_startup_config(&args, &matches)?;
     apply_resolved_config(&mut args, &layered)?;
     let cfg = layered.config().clone();
@@ -7750,9 +7754,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    // Logging starts after the configuration resolves so `logging.level`
-    // takes effect. A configuration error before this point is returned
-    // from `main` and printed on stderr.
+    // Start the log output after the configuration is resolved. Thus
+    // `logging.level` applies. If the configuration has an error, `main`
+    // returns the error and the runtime prints it on stderr.
     broker_observability::init_tracing_with_level(&cfg.logging.level);
 
     info!(
@@ -8366,8 +8370,8 @@ mod tests {
         ))
     }
 
-    /// Parse a command line the way `main` does and resolve it against
-    /// the files in `config_dir`.
+    /// Parses a command line as `main` does. Resolves it with the files
+    /// in `config_dir`.
     fn resolve_boot(config_dir: &std::path::Path, flags: &[&str]) -> Args {
         let mut argv = vec![
             "indramqtt".to_string(),
@@ -8398,7 +8402,7 @@ mod tests {
         )
         .expect("write indra.toml");
 
-        // No flags: every file setting reaches the field the boot reads.
+        // No flags. Each file setting goes to the field that the startup reads.
         let args = resolve_boot(&dir, &[]);
         assert_eq!(args.node_id, "from-file");
         assert_eq!(args.api_bind, "127.0.0.1:28099");
@@ -8406,16 +8410,16 @@ mod tests {
         assert!(args.allow_anonymous);
         assert_eq!(args.cluster_seeds.as_deref(), Some("a:1,b:2"));
         assert_eq!(args.webhook_breaker_threshold, 9);
-        // A setting no layer touched keeps the flag's built-in default.
+        // No layer set this setting. The field keeps the default of the flag.
         assert_eq!(args.brokerlink_bind, "127.0.0.1:18883");
 
-        // A typed flag wins over the file; the rest still comes from it.
+        // A typed flag overrides the file. The file sets the other values.
         let args = resolve_boot(&dir, &["--node-id", "from-flag", "--qos0-backlog", "3"]);
         assert_eq!(args.node_id, "from-flag");
         assert_eq!(args.qos0_backlog, 3);
         assert_eq!(args.api_bind, "127.0.0.1:28099");
 
-        // A flag typed with its own default value still wins over the file.
+        // The operator typed the default value. The flag overrides the file.
         let args = resolve_boot(&dir, &["--node-id", "indra-node-1"]);
         assert_eq!(args.node_id, "indra-node-1");
         let _ = std::fs::remove_dir_all(&dir);
@@ -8432,7 +8436,7 @@ mod tests {
         };
         assert_eq!(triple(&defaults, "mqtt_enabled").as_deref(), Some("true"));
         assert_eq!(triple(&defaults, "mqtt_port").as_deref(), Some("1883"));
-        // Every interface is the edge's own default: no address is passed.
+        // All the interfaces is the default of the edge. No address is given.
         assert_eq!(triple(&defaults, "mqtt_ip"), None);
         assert_eq!(triple(&defaults, "tls_enabled").as_deref(), Some("false"));
         assert_eq!(triple(&defaults, "ws_path").as_deref(), Some("\"/mqtt\""));
@@ -8458,7 +8462,7 @@ mod tests {
             Some("\"/etc/indramqtt/tls/cert.pem\"")
         );
 
-        // The edge binds by address: a host name is refused by setting name.
+        // The edge binds to an address. The error for a host name gives the setting.
         cfg.listeners.ws.bind = "localhost:8083".to_string();
         let err = edge_args(&cfg).expect_err("host names are refused");
         assert!(err.to_string().contains("listeners.ws.bind"), "got: {err}");

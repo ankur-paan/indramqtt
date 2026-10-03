@@ -40,16 +40,16 @@ init([]) ->
     SupFlags = #{strategy => one_for_all,
                  intensity => 10,
                  period => 5},
-    %% Listener settings arrive as application environment. The kernel
-    %% prints them from the resolved configuration (`indramqtt
-    %% --print-edge-args'), so `indra.toml' is the one place an operator
-    %% sets a listener. `*_ip' is the bind address as a string; absent
-    %% binds every interface.
+    %% The listener settings are application environment values. The
+    %% kernel prints them from the resolved configuration with
+    %% `indramqtt --print-edge-args'. Thus the operator sets a listener in
+    %% `indra.toml' only. `*_ip' is the bind address as a string. If it is
+    %% absent, the listener binds all the interfaces.
     MqttEnabled = application:get_env(indra_edge, mqtt_enabled, true),
     MqttPort = application:get_env(indra_edge, mqtt_port, 1883),
     MqttIp = application:get_env(indra_edge, mqtt_ip, undefined),
-    %% The TLS MQTT listener is opt-in like `wss': it cannot start
-    %% without certificate material.
+    %% The TLS MQTT listener is off by default, as `wss' is. It cannot
+    %% start without a certificate and a key.
     TlsEnabled = application:get_env(indra_edge, tls_enabled, false),
     TlsPort = application:get_env(indra_edge, tls_port, 8883),
     TlsIp = application:get_env(indra_edge, tls_ip, undefined),
@@ -90,9 +90,9 @@ init([]) ->
                  wss_child_spec(WssEnabled, WssPort, WssPath, WssCert, WssKey, WssIp),
     {ok, {SupFlags, ChildSpecs}}.
 
-%% @private Bind-address option for a listener. Absent binds every
-%% interface (the historic behaviour); an address that does not parse
-%% fails the boot naming it, never a silent bind on every interface.
+%% @private The bind address option of a listener. If the address is
+%% absent, the listener binds all the interfaces. If the address is not
+%% valid, the start fails and the error shows the address.
 ip_opt(undefined) ->
     [];
 ip_opt(Ip) when is_tuple(Ip) ->
@@ -105,8 +105,8 @@ ip_opt(Ip) when is_list(Ip) ->
         {error, _} -> erlang:error({bad_listener_ip, Ip})
     end.
 
-%% @private Plaintext MQTT listener child. Disabled only when the
-%% operator sets `mqtt_enabled' to false.
+%% @private The child of the plaintext MQTT listener. It is off only if
+%% the operator sets `mqtt_enabled' to false.
 mqtt_child_spec(false, _Port, _Ip) ->
     [];
 mqtt_child_spec(_, Port, Ip) ->
@@ -117,9 +117,9 @@ mqtt_child_spec(_, Port, Ip) ->
        type => worker,
        modules => [indra_listener]}].
 
-%% @private TLS MQTT listener child. Runs only when `tls_enabled' is
-%% set; missing certificate material fails the child (and the boot)
-%% closed, never as plaintext.
+%% @private The child of the TLS MQTT listener. It runs only if
+%% `tls_enabled' is true. If the certificate or the key is absent, the
+%% child and the start fail. The listener does not use plaintext.
 tls_child_spec(false, _Port, _Ip, _Cert, _Key) ->
     [];
 tls_child_spec(_, Port, Ip, Cert, Key) ->
@@ -133,8 +133,9 @@ tls_child_spec(_, Port, Ip, Cert, Key) ->
        type => worker,
        modules => [indra_listener]}].
 
-%% @private WS listener child: runs beside TCP/TLS, never instead of
-%% them. Disabled only when the operator sets `ws_enabled' to false.
+%% @private The child of the WS listener. It runs together with the
+%% TCP and TLS listeners. It is off only if the operator sets
+%% `ws_enabled' to false.
 ws_child_spec(false, _Port, _Path, _Ip) ->
     [];
 ws_child_spec(_, Port, Path, Ip) ->
@@ -221,8 +222,8 @@ announce_shard(Pid) ->
 %% K > 1 hands `{broker, [Pid1, ..., PidK]}' so each connection can pin
 %% to one shard by `conn_id rem K'.
 start_listener(Opts) ->
-    %% A TLS listener hands TLS sockets to its connections, which must
-    %% be told so they read and write through `ssl'.
+    %% A TLS listener gives TLS sockets to its connections. Tell each
+    %% connection, because it must read and write through `ssl'.
     ConnExtra = case proplists:get_value(transport, Opts, tcp) of
         ssl -> [{transport, ssl}];
         _ -> []

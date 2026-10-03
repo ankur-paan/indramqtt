@@ -155,8 +155,9 @@ handshake(Sock, Transport, Path, TimeoutMs) when is_list(Path) ->
     handshake(Sock, Transport, list_to_binary(Path), TimeoutMs);
 handshake(Sock, Transport, Path, TimeoutMs)
   when is_binary(Path), (Transport =:= tcp orelse Transport =:= ssl) ->
-    %% One deadline covers the whole upgrade request, so a client that
-    %% trickles bytes cannot hold a connection slot past `TimeoutMs'.
+    %% One deadline applies to the full upgrade request. A client that
+    %% sends the bytes slowly cannot hold a connection slot for longer
+    %% than `TimeoutMs'.
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
     case recv_head(Sock, Transport, <<>>, Deadline) of
         {ok, Head} ->

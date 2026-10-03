@@ -150,7 +150,8 @@ init(Opts) ->
     DefaultPort = case Transport of ssl -> ?DEFAULT_TLS_PORT; _ -> ?DEFAULT_PORT end,
     Port = proplists:get_value(port, Opts, DefaultPort),
     ConnOpts = proplists:get_value(conn, Opts, []),
-    %% `{ip, Addr}' binds one interface; absent binds every interface.
+    %% `{ip, Addr}' binds one interface. If it is absent, the listener
+    %% binds all the interfaces.
     SockOpts = listen_sock_opts() ++ [{ip, Ip} || {ip, Ip} <- Opts],
     ListenResult = case Transport of
         ssl ->

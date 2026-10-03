@@ -39,10 +39,12 @@ use crate::v5::auth::TokenInfo;
 /// nothing is evicted to make room.
 pub const MAX_API_KEYS: usize = 1024;
 
-/// Shortest accepted operator API key. Every key resolves as an
-/// administrator, so a guessable key is a full compromise; 16 characters
-/// keeps a random key out of reach of online guessing while staying easy
-/// to paste. Shorter keys are refused, never truncated or padded.
+/// The minimum length of an operator API key.
+///
+/// Each key gives administrator access. A key that an attacker can
+/// guess gives full control of the broker. A random key of 16
+/// characters is too long to guess through the network. The store
+/// refuses a shorter key. It does not change the key.
 pub const MIN_API_KEY_LEN: usize = 16;
 
 /// Environment variable seeding the store at boot. Comma-separated opaque
@@ -98,7 +100,7 @@ impl ApiKeyStore {
             store.keys.lock().unwrap().insert(key.to_string(), ());
         }
         if too_short > 0 {
-            // Counted, never echoed: the value is a credential.
+            // The log shows the count only. A key is a credential.
             tracing::warn!(
                 ignored = too_short,
                 minimum_length = MIN_API_KEY_LEN,
@@ -109,8 +111,8 @@ impl ApiKeyStore {
     }
 
     /// Insert one key. Fails when the store already holds
-    /// [`MAX_API_KEYS`] keys; empty keys and keys shorter than
-    /// [`MIN_API_KEY_LEN`] are rejected as invalid.
+    /// [`MAX_API_KEYS`] keys. The store also refuses an empty key and a
+    /// key that is shorter than [`MIN_API_KEY_LEN`].
     pub fn insert(&self, key: &str) -> Result<(), String> {
         if key.is_empty() {
             return Err("api key must not be empty".to_string());
@@ -211,7 +213,7 @@ mod tests {
     fn empty_key_is_rejected() {
         let store = ApiKeyStore::new();
         assert!(store.insert("").is_err());
-        // One character under the minimum is refused, never stored.
+        // The store refuses a key that is one character too short.
         assert!(store.insert(&"k".repeat(MIN_API_KEY_LEN - 1)).is_err());
         assert!(store.insert(&"k".repeat(MIN_API_KEY_LEN)).is_ok());
         assert_eq!(store.len(), 1);

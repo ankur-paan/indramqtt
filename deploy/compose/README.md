@@ -10,7 +10,7 @@ internals: adjust the named values below, then start and connect.
 | `[node] id` | `deploy/compose/indra.toml` | `"indra-node-1"` | Give each node a unique id (matters once clustering is used). |
 | `[auth] allow_anonymous` | `deploy/compose/indra.toml` | `true` | Set `false` for anything beyond evaluation, and create users first. |
 | `[logging] level` | `deploy/compose/indra.toml`, but `INDRA_LOGGING__LEVEL` in `docker-compose.yml` wins | file `info`, running `debug` | Change the environment entry to set the running level without editing the file. |
-| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change together with the matching `ports:` entry in `docker-compose.yml`. The kernel passes the MQTT and WebSocket binds to the edge at start, so this file is the one place a listener is set. |
+| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change the bind and the related `ports:` entry in `docker-compose.yml` together. Set a listener in this file only. The kernel gives the MQTT and WebSocket binds to the edge at start. |
 | Image tag | `docker-compose.yml` (`image:`) | `indramqtt/indramqtt:0.1.0` (workspace version) | Track releases; never use `:latest` for a running deployment. |
 
 Every other setting keeps its schema default (see
@@ -51,18 +51,18 @@ no credentials are needed for evaluation.
 
 The mounted file sets `[logging] level = "info"`, while
 `docker-compose.yml` sets `INDRA_LOGGING__LEVEL=debug`. The environment
-wins, so the broker logs at `debug`:
+wins. The broker writes `debug` log lines:
 
 ```bash
 docker compose logs indramqtt | grep -c DEBUG   # more than 0
 ```
 
-`RUST_LOG`, when set, overrides `logging.level`; it is a developer
-filter (`RUST_LOG=broker_router=trace`) and the compose file leaves it
-unset.
+If you set `RUST_LOG`, it overrides `logging.level`. `RUST_LOG` is a
+developer filter (`RUST_LOG=broker_router=trace`). The compose file
+does not set it.
 
-The authenticated `GET /api/v1/config/explain` endpoint names the layer
-that set a value (an unauthenticated request gets 401):
+The `GET /api/v1/config/explain` endpoint shows the layer that set a
+value. The endpoint needs a token. A request without a token gets 401.
 
 ```bash
 # Log in as the first-boot default admin, rotate the password (a

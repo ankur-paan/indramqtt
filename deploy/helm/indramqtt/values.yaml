@@ -20,10 +20,10 @@ service:
   # Service type for the broker ports. ClusterIP keeps the broker inside
   # the cluster; set NodePort or LoadBalancer to reach it from outside.
   type: ClusterIP
-  # Broker ports. Each one is rendered into indra.toml as the listener's
-  # bind (see templates/configmap.yaml), and the broker starts its
-  # listeners from that file. Change a port in one place only: the
-  # Service, the container ports, the probes and the file all follow it.
+  # Broker ports. The chart writes each port into indra.toml as the bind
+  # of the listener (see templates/configmap.yaml). The broker starts its
+  # listeners from that file. Change a port here only. The Service, the
+  # container ports, the probes and the file use the same value.
   mqttPort: 1883
   wsPort: 8083
   apiPort: 18083

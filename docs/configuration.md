@@ -74,30 +74,34 @@ Two names from the shipped container files keep working as aliases:
 sets `listeners.api.bind`. The canonical `INDRA_LICENCE__LICENSE_KEY`
 and `INDRA_LISTENERS__API__BIND` forms win when both are set.
 
-Two `INDRA_` variables carry credentials and are not settings, so they
-have no schema home and never appear in `explain` or an export:
-`INDRA_API_KEYS` (comma-separated operator API keys the broker accepts,
-each at least 16 characters) and `INDRA_API_KEY` (the key `indra ctl`
-presents).
+Two `INDRA_` variables contain credentials. They are not settings. They
+have no schema home, and `explain` and the exports do not show them.
 
-## What the broker does with the result
+- `INDRA_API_KEYS`: the operator API keys that the broker accepts. Use
+  a comma between keys. Each key must have 16 characters or more.
+- `INDRA_API_KEY`: the key that `indra ctl` sends.
 
-The kernel boots from the resolved values: the value `explain` reports
-for a setting is the value in effect. A setting that no file, variable
-or flag set runs on the flag's built-in default.
+## How the broker uses the result
 
-`logging.level` sets the log level. `RUST_LOG`, when set, overrides it;
-it is a developer filter (`RUST_LOG=broker_router=trace`) with no schema
-home.
+The kernel starts with the resolved values. The value that `explain`
+shows for a setting is the value in operation. If no file, variable or
+flag sets a setting, the kernel uses the default of the flag.
 
-The MQTT, TLS and WebSocket sockets are held by the edge, a separate
-process. `indramqtt --print-edge-args` prints the edge's start
-arguments for the resolved `listeners.*` and `node.brokerlink_bind`
-settings, one per line, and the container image starts the edge with
-them, so a listener is configured in `indra.toml` only. A listener bind
-must be an IP address and port. `listeners.tcp.max_connections` and
-`listeners.tcp.backlog` are accepted and reported but not yet enforced
-by the edge.
+`logging.level` sets the log level. If you set `RUST_LOG`, it overrides
+`logging.level`. `RUST_LOG` is a developer filter
+(`RUST_LOG=broker_router=trace`) and has no schema home.
+
+The edge is a separate process. It holds the MQTT, TLS and WebSocket
+sockets. Set a listener in `indra.toml` only:
+
+1. `indramqtt --print-edge-args` prints the start arguments of the edge,
+   one argument on each line. It reads the resolved `listeners.*` and
+   `node.brokerlink_bind` settings.
+2. The container image starts the edge with these arguments.
+
+A listener bind must be an IP address and a port. The broker accepts
+and reports `listeners.tcp.max_connections` and `listeners.tcp.backlog`,
+but the edge does not apply them at this time.
 
 ## Flags: one more layer, then the schema
 
