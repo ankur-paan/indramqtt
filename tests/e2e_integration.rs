@@ -14,6 +14,21 @@ use broker_session::{QueuedMessage, SessionManager};
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
+/// Reports a test that cannot run because the edge or `erl` is absent.
+///
+/// On a developer machine the test prints the reason and stops. If
+/// `E2E_REQUIRE_EDGE` is set, the test fails. CI and the build lanes set
+/// it, because a test that does not run must not count as a pass.
+macro_rules! e2e_skip {
+    ($($arg:tt)*) => {{
+        let reason = format!($($arg)*);
+        if std::env::var_os("E2E_REQUIRE_EDGE").is_some() {
+            panic!("{reason}. E2E_REQUIRE_EDGE is set, thus this test must run.");
+        }
+        eprintln!("{reason}");
+    }};
+}
+
 #[derive(Debug, Default)]
 struct TestBrokerSink {
     published: Mutex<Vec<(Topic, Bytes, QoS, bool)>>,
@@ -546,7 +561,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
     let ebin = manifest.join("../../beam/ebin");
     let ebin = ebin.canonicalize().unwrap_or(ebin);
     if !ebin.join("indra_edge.app").is_file() {
-        eprintln!(
+        e2e_skip!(
             "SKIP kicked_mqtt_client_sees_disconnect: no compiled edge at {} (build beam/ first)",
             ebin.display()
         );
@@ -610,7 +625,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
         )
         .await;
         if !has_erl.as_ref().is_some_and(|out| out.status.success()) {
-            eprintln!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH and none in WSL");
+            e2e_skip!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH and none in WSL");
             return None;
         }
         let route = e2e_command_output(
@@ -680,7 +695,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
             .as_ref()
             .is_some_and(|out| out.status.success())
         {
-            eprintln!(
+            e2e_skip!(
                 "SKIP kicked_mqtt_client_sees_disconnect: no `python` for the WSL firewall proxy"
             );
             return None;
@@ -749,7 +764,7 @@ async fn e2e_edge_target(bl_port: u16) -> Option<(EdgeTarget, u16, u16)> {
             ws_port,
         ));
     }
-    eprintln!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH");
+    e2e_skip!("SKIP kicked_mqtt_client_sees_disconnect: no `erl` on PATH");
     None
 }
 
@@ -1794,7 +1809,7 @@ async fn sy02_spawn_edge(bl_port: u16) -> Option<Sy02Edge> {
     // The WebSocket listener beams must exist; without them the edge
     // supervisor cannot start and no port ever opens.
     if !ebin.join("indra_ws_listener.beam").is_file() {
-        eprintln!(
+        e2e_skip!(
             "SKIP sy02 edge test: no WS edge beams at {} (build beam/ first)",
             ebin.display()
         );
@@ -1948,13 +1963,20 @@ fn sy02_connect5(
     }
     rest.push(flags);
     rest.extend_from_slice(&keepalive.to_be_bytes());
-    if alias_max == 0 {
-        rest.push(0x00);
-    } else {
-        rest.push(0x03);
-        rest.push(34);
-        rest.extend_from_slice(&alias_max.to_be_bytes());
+    let mut props: Vec<u8> = Vec::new();
+    if !clean_start {
+        // MQTT 5: a session stays after the disconnect only if the client
+        // sends a Session Expiry Interval (property 17). A client that
+        // resumes its session asks for one hour.
+        props.push(17);
+        props.extend_from_slice(&3600u32.to_be_bytes());
     }
+    if alias_max != 0 {
+        props.push(34);
+        props.extend_from_slice(&alias_max.to_be_bytes());
+    }
+    rest.push(props.len() as u8);
+    rest.extend_from_slice(&props);
     rest.extend_from_slice(&sy02_mqtt_str(client_id));
     if will.is_some() {
         // Empty will-property section, then topic and payload.
@@ -2095,10 +2117,49 @@ fn sy02_parse_connack5(body: &[u8]) -> (bool, u8, u16) {
                 alias_max = u16::from_be_bytes([props[0], props[1]]);
                 props = &props[2..];
             }
+            // The other CONNACK properties of MQTT 5. This parser skips
+            // each one by its wire size.
+            // One byte: maximum QoS, retain available, wildcard
+            // subscription available, subscription identifier
+            // available, shared subscription available.
+            36 | 37 | 40 | 41 | 42 => {
+                assert!(!props.is_empty(), "property {id} carries one byte");
+                props = &props[1..];
+            }
+            // Two bytes: receive maximum, server keep alive.
+            33 | 19 => {
+                assert!(props.len() >= 2, "property {id} carries a u16");
+                props = &props[2..];
+            }
+            // Four bytes: session expiry interval, maximum packet size.
+            17 | 39 => {
+                assert!(props.len() >= 4, "property {id} carries a u32");
+                props = &props[4..];
+            }
+            // One string or one binary value with a u16 length:
+            // assigned client identifier, reason string, response
+            // information, server reference, authentication method,
+            // authentication data.
+            18 | 31 | 26 | 28 | 21 | 22 => {
+                props = sy02_skip_prefixed(props, id);
+            }
+            // User property: two strings.
+            38 => {
+                props = sy02_skip_prefixed(props, id);
+                props = sy02_skip_prefixed(props, id);
+            }
             _ => panic!("unexpected CONNACK property {id}"),
         }
     }
     (present, reason, alias_max)
+}
+
+/// Skips one value that has a u16 length before it.
+fn sy02_skip_prefixed(props: &[u8], id: usize) -> &[u8] {
+    assert!(props.len() >= 2, "property {id} carries a length");
+    let len = u16::from_be_bytes([props[0], props[1]]) as usize;
+    assert!(props.len() >= 2 + len, "property {id} fits the section");
+    &props[2 + len..]
 }
 
 /// Parse a classic SUBACK body into `(packet_id, granted codes)`.

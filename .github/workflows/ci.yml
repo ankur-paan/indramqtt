@@ -54,7 +54,23 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '26.2'
+
+      # The end-to-end tests start the edge from beam/ebin.
+      - name: Compile the edge
+        working-directory: beam
+        run: |
+          mkdir -p ebin
+          erlc -o ebin src/*.erl
+          cp src/indra_edge.app.src ebin/indra_edge.app
+
+      # E2E_REQUIRE_EDGE makes a test fail if it cannot start the edge.
       - name: Run E2E Integration Suite
+        env:
+          E2E_REQUIRE_EDGE: "1"
         run: cargo test -p broker-node --test e2e_integration -- --nocapture
 
       - name: Run Deep Soak & Chaos Test Suite

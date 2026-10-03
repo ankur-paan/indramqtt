@@ -81,6 +81,10 @@ bind = "127.0.0.1:$API_PORT"
 
 [logging]
 level = "warn"
+
+# A client with a username goes into the tenant of that username.
+[[tenants.rules]]
+expression = "t-\${username}"
 EOF
 
 # --- 1. The kernel starts from the file and the credential variables ---
@@ -177,10 +181,24 @@ def wait_port(port):
 def packet(kind, body):
     return bytes([kind, len(body)]) + body
 
-def mqtt_connect(sock, client_id):
-    header = b"\x00\x04MQTT\x04\x02\x00\x3c"
-    sock.sendall(packet(0x10, header + struct.pack(">H", len(client_id)) + client_id))
+def field(data):
+    return struct.pack(">H", len(data)) + data
+
+def mqtt_connect(sock, client_id, username=None):
+    if username is None:
+        body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
+    else:
+        # Connect flags: username, password and clean session.
+        body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
+    sock.sendall(packet(0x10, body))
     return sock.recv(4) == b"\x20\x02\x00\x00"
+
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
 
 failures = 0
 def report(name, good):
@@ -203,6 +221,29 @@ except OSError:
     delivered = b""
 report("a publish goes to a subscriber through the edge and the kernel",
        suback[:1] == b"\x90" and delivered.endswith(b"smoke-ok"))
+
+# Tenants. The payload is random, thus the broker cannot know it.
+def tenant_client(client_id, username):
+    sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    return sock, mqtt_connect(sock, client_id, username)
+
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+
+secret = base64.b16encode(os.urandom(8))
+a_sub, a_ok = tenant_client(b"smoke-a-sub", b"alpha")
+b_sub, b_ok = tenant_client(b"smoke-b-sub", b"beta")
+a_pub, _ = tenant_client(b"smoke-a-pub", b"alpha")
+topic = b"smoke/tenant"
+ready = a_ok and b_ok and subscribe(a_sub, topic) and subscribe(b_sub, topic)
+a_pub.sendall(packet(0x30, field(topic) + secret))
+in_tenant = receive(a_sub, 5)
+other_tenant = receive(b_sub, 2)
+report("a subscriber gets the publish of a client in the same tenant",
+       ready and in_tenant.endswith(secret))
+report("a subscriber does not get the publish of a client in a different tenant",
+       ready and secret not in other_tenant)
 
 def upgrade(path):
     sock = wait_port(ws_port)

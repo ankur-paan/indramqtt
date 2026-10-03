@@ -1114,17 +1114,21 @@ fn merge_table(
         let mut full = prefix.clone();
         full.push(key.clone());
         let full = canonical_segments(&full);
+        // Use the canonical name of this key at this position. An alias
+        // applies at its own level only: `rules` is an alias at the top
+        // level, but `tenants.rules` is a setting and must keep its name.
+        let canonical = full.last().cloned().unwrap_or_else(|| key.clone());
         match value {
             toml::Value::Table(nested) => {
                 let entry = base
-                    .entry(canonical_key(key))
+                    .entry(canonical)
                     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
                 if let toml::Value::Table(base_nested) = entry {
                     merge_table(base_nested, nested, layer, provenance, full);
                 }
             }
             leaf => {
-                base.insert(canonical_key(key), leaf.clone());
+                base.insert(canonical, leaf.clone());
                 provenance.insert(full.join("."), layer.clone());
             }
         }
@@ -1143,14 +1147,6 @@ fn merge_layer(
             set_path(base, path, value.clone());
             provenance.insert(path.clone(), layer.clone());
         }
-    }
-}
-
-fn canonical_key(key: &str) -> String {
-    match key {
-        "rules" => "rules_engine".to_string(),
-        "websocket" => "ws".to_string(),
-        other => other.to_string(),
     }
 }
 
@@ -1766,6 +1762,31 @@ mod tests {
         // The struct literal above has no `..Default::default()`. A new
         // flag field does not compile until this test contains it.
         assert!(provenance.len() >= 60, "got {} homes", provenance.len());
+    }
+
+    /// `rules` is an alias for `rules_engine` at the top level only. The
+    /// loader must keep the name of `tenants.rules`. If the loader
+    /// changes it, the tenant rules of the file do not load.
+    #[test]
+    fn tenant_rules_in_the_file_reach_the_resolved_config() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let dir = unique_dir("tenantrules");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "[[tenants.rules]]\nexpression = \"t-${username}\"\n\n\
+             [[tenants.rules]]\nlistener = \"*\"\nexpression = \"${cert_cn}\"\n\n\
+             [rules]\nspill_dir = \"/tmp/spill\"\n",
+        )
+        .expect("write config");
+        let layered = load_layered(&dir, &CliOverrides::default()).expect("file loads");
+        let rules = &layered.config().tenants.rules;
+        assert_eq!(rules.len(), 2, "both tenant rules load");
+        assert_eq!(rules[0].expression, "t-${username}");
+        assert_eq!(rules[1].expression, "${cert_cn}");
+        // The top-level alias continues to operate.
+        assert_eq!(layered.config().rules_engine.spill_dir, "/tmp/spill");
+        scrub(&dir);
     }
 
     #[test]
