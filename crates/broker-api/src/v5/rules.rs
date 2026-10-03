@@ -1625,7 +1625,7 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors_enterprise::NativeMssqlTransport::new(&config)
+            if let Ok(transport) = broker_connectors_enterprise::DriverMssqlTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors_enterprise::MssqlSink::new(config, transport) {
@@ -2518,6 +2518,16 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+            let mqtt_url = body
+                .get("mqtt_url")
+                .or_else(|| body.get("broker_address"))
+                .or_else(|| body.get("server"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let client_id = body
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let config = broker_connectors_enterprise::sparkplug_b::SparkplugSinkConfig {
                 topic_prefix,
@@ -2525,10 +2535,28 @@ pub(crate) async fn register_live_sink(
                 batch_size: Some(1),
                 linger_ms: Some(10),
                 timeout_ms,
+                mqtt_url: mqtt_url.clone(),
+                client_id: client_id.clone(),
+                max_aliases: Some(10_000),
             };
-            let transport = Arc::new(
-                broker_connectors_enterprise::sparkplug_b::MemorySparkplugTransport::new(),
-            );
+            // Production MQTT delivery rides the maintained `rumqttc`
+            // driver transport exactly when the rule names a server;
+            // otherwise frames stay in-process.
+            let transport: Arc<dyn broker_connectors_enterprise::sparkplug_b::SparkplugTransport> =
+                match mqtt_url.filter(|url| !url.trim().is_empty()) {
+                    Some(url) => {
+                        match broker_connectors_enterprise::sparkplug_b::RumqttcSparkplugTransport::new(
+                            &url,
+                            client_id.as_deref(),
+                        ) {
+                            Ok(driver) => Arc::new(driver),
+                            Err(_) => return,
+                        }
+                    }
+                    None => Arc::new(
+                        broker_connectors_enterprise::sparkplug_b::MemorySparkplugTransport::new(),
+                    ),
+                };
             if let Ok(sink) =
                 broker_connectors_enterprise::sparkplug_b::SparkplugBSink::new(config, transport)
             {
@@ -2725,10 +2753,9 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors_enterprise::kinesis::HttpKinesisTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::kinesis::SdkKinesisTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
                     broker_connectors_enterprise::kinesis::KinesisSink::new(config, transport)
@@ -2950,10 +2977,7 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
             };
             if let Ok(transport) =
-                broker_connectors_enterprise::redshift::HttpRedshiftTransport::new(
-                    &config,
-                    reqwest::Client::new(),
-                )
+                broker_connectors_enterprise::redshift::SdkRedshiftTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =

@@ -1228,11 +1228,23 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
-                // Frames are captured in-process; production MQTT
-                // delivery rides the mqtt_bridge connector.
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::MemorySparkplugTransport::new(),
-                );
+                // Production MQTT delivery rides the maintained
+                // `rumqttc` driver transport exactly when the config
+                // names a server; without `mqtt_url` frames stay
+                // in-process (stored configurations keep working).
+                let transport: std::sync::Arc<dyn broker_connectors_enterprise::SparkplugTransport> =
+                    match config.mqtt_url.clone().filter(|url| !url.trim().is_empty()) {
+                        Some(url) => std::sync::Arc::new(
+                            broker_connectors_enterprise::RumqttcSparkplugTransport::new(
+                                &url,
+                                config.client_id.as_deref(),
+                            )
+                            .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?,
+                        ),
+                        None => std::sync::Arc::new(
+                            broker_connectors_enterprise::MemorySparkplugTransport::new(),
+                        ),
+                    };
                 let sink = broker_connectors_enterprise::SparkplugBSink::new(config, transport)
                     .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?;
                 Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
@@ -1246,7 +1258,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid kinesis config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpKinesisTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::SdkKinesisTransport::new(&config)
                         .map_err(|e| format!("invalid kinesis transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::KinesisSink::new(config, transport)
@@ -1498,7 +1510,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid mssql config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::NativeMssqlTransport::new(&config)
+                    broker_connectors_enterprise::DriverMssqlTransport::new(&config)
                         .map_err(|e| format!("invalid mssql transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::MssqlSink::new(config, transport)
@@ -1680,7 +1692,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid redshift config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpRedshiftTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::SdkRedshiftTransport::new(&config)
                         .map_err(|e| format!("invalid redshift transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::RedshiftSink::new(config, transport)

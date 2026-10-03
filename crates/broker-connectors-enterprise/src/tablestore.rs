@@ -78,8 +78,19 @@ fn default_batch_size() -> Option<usize> {
     Some(200)
 }
 
-/// Tablestore sink configuration. Every depth is user-configurable
-/// with no clamped ceiling (`None` = unbounded).
+/// Default outer backlog ceiling: 10_000 rows (fifty 200-row
+/// BatchWriteRow flushes) so a burst or a stalled endpoint cannot grow
+/// the queue without bound, while steady throughput still fits in
+/// memory (10_000 small JSON records stay well under tens of MiB).
+fn default_buffer_capacity_10k() -> Option<usize> {
+    Some(10_000)
+}
+
+/// Tablestore sink configuration. Every limit is optional with a
+/// finite default; `None` on the batch knob below is an explicit
+/// operator opt-in to unbounded (the code never chooses it), with zero
+/// clamped ceilings. The outer backlog (`buffer_capacity`) is always
+/// bounded: `None` means the finite default below, never unlimited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TablestoreSinkConfig {
     /// OTS instance endpoint, e.g.
@@ -98,26 +109,69 @@ pub struct TablestoreSinkConfig {
     /// Attribute column mappings.
     #[serde(default)]
     pub attribute_columns: Vec<AttributeColumnMapping>,
-    /// Flush trigger row count (default 200 = OTS BatchWriteRow limit).
+    /// Flush trigger row count (default 200: the BatchWriteRow
+    /// per-call ceiling; `None` is an explicit operator opt-in to
+    /// unbounded, never the code's choice).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Buffer capacity (`None` = unbounded).
-    #[serde(default)]
+    /// In-memory row backlog ceiling (`None` = default 10_000 rows:
+    /// fifty 200-row flushes, bounding worst-case backlog memory while
+    /// absorbing bursts; an old stored configuration without this field
+    /// parses to the same default, so stored configuration keeps
+    /// working. When full the sink fails closed with a connection error
+    /// instead of growing without bound or shedding rows silently).
+    #[serde(default = "default_buffer_capacity_10k")]
     pub buffer_capacity: Option<usize>,
-    /// Linger flush window in ms (default 100).
+    /// Linger flush window in ms (default 100: enough for a 200-row
+    /// BatchWriteRow batch to fill under burst while keeping
+    /// interactive flush latency far below one MQTT keep-alive tick
+    /// without busy-looping the rule worker).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
-    /// Request timeout in ms (default 5000).
+    /// Request timeout in ms (default 5000: per-request ceiling so an
+    /// unreachable endpoint fails closed instead of stalling the rule
+    /// worker).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
 
 fn default_linger_ms() -> Option<u64> {
+    // Reason: 100 ms lets a 200-row BatchWriteRow batch fill under
+    // burst while keeping interactive flush latency far below one
+    // MQTT keep-alive tick without busy-looping the rule worker.
     Some(100)
+}
+
+/// Selective-retry bound: at most 4 re-attempts of failed rows per
+/// flush. Reason: 4 retries ride out transient OTSTimeout /
+/// OTSRowOperationFailed / throttle bursts without retrying forever
+/// against a persistently failing row set.
+const MAX_SELECTIVE_RETRIES: usize = 4;
+
+/// First selective-retry delay in ms. Reason: 100 ms floor keeps a
+/// hot row-set retry interactive while giving the service a chance
+/// to shed the throttle.
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// Selective-retry delay ceiling in ms. Reason: 2 s ceiling keeps
+/// the retry loop interactive while the fail-fast breaker covers
+/// longer outages.
+const RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+/// Exponential backoff for selective-row retries: 100 ms doubling
+/// per attempt capped at 2 s (see `RETRY_BASE_DELAY_MS` /
+/// `RETRY_MAX_DELAY_MS` for reasons).
+fn selective_retry_delay(attempt: usize) -> Duration {
+    let grown = RETRY_BASE_DELAY_MS
+        .saturating_mul(2u64.saturating_pow(attempt.min(10) as u32))
+        .min(RETRY_MAX_DELAY_MS);
+    Duration::from_millis(grown.max(1))
 }
 
 impl TablestoreSinkConfig {
     pub fn timeout(&self) -> Duration {
+        // Reason: 5 s per-request ceiling so an unreachable endpoint
+        // fails closed instead of stalling the rule worker.
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
     }
 
@@ -164,18 +218,29 @@ impl TablestoreSinkConfig {
                 "tablestore batch_size must be >= 1".to_string(),
             ));
         }
+        if self.buffer_capacity == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "tablestore buffer_capacity must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 
     pub(crate) fn effective_batch_size(&self) -> usize {
-        self.batch_size.unwrap_or(usize::MAX)
+        self.batch_size.unwrap_or(usize::MAX).max(1)
     }
 
+    /// Outer backlog ceiling (default 10_000 rows: fifty 200-row
+    /// flushes, bounding worst-case backlog memory while absorbing
+    /// bursts; `None` means this finite default, never unlimited).
     pub(crate) fn effective_buffer(&self) -> usize {
-        self.buffer_capacity.unwrap_or(usize::MAX)
+        self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
     pub(crate) fn linger(&self) -> Duration {
+        // Reason: same 100 ms batching window as `default_linger_ms`
+        // above — fills a 200-row BatchWriteRow under burst without
+        // busy-looping the rule worker.
         Duration::from_millis(self.linger_ms.unwrap_or(100).max(1))
     }
 }
@@ -650,15 +715,23 @@ impl TablestoreTransport for MockTablestoreTransport {
 pub struct HttpTablestoreTransport {
     config: TablestoreSinkConfig,
     client: reqwest::Client,
+    timeout: Duration,
 }
 
 impl HttpTablestoreTransport {
     pub fn new(config: &TablestoreSinkConfig, client: reqwest::Client) -> Result<Self> {
         config.validate()?;
+        let timeout = config.timeout();
         Ok(Self {
             config: config.clone(),
             client,
+            timeout,
         })
+    }
+
+    /// Per-request timeout wired from `TablestoreSinkConfig::timeout`.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -687,6 +760,7 @@ impl TablestoreTransport for HttpTablestoreTransport {
         let response = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .header("x-ots-date", &date)
             .header("x-ots-apiversion", OTS_API_VERSION)
             .header("x-ots-instancename", &self.config.instance_name)
@@ -844,6 +918,7 @@ impl TablestoreSink {
             content_md5: String::new(),
             authorization: String::new(),
         };
+        let mut attempt = 0usize;
         loop {
             let rows: Vec<OtsRow> = pending.iter().map(|(_, row)| row.clone()).collect();
             match self
@@ -858,6 +933,22 @@ impl TablestoreSink {
                     return Ok(());
                 }
                 Ok(failed) => {
+                    if attempt >= MAX_SELECTIVE_RETRIES {
+                        let mut buffer = self.buffer.lock();
+                        buffer.restore(
+                            pending.into_iter().map(|(event, _)| event).collect(),
+                            oldest,
+                        );
+                        self.backoff.lock().failure();
+                        return Err(ConnectorError::Connection(format!(
+                            "tablestore {} rows still failing after {attempt} selective retries",
+                            failed.len()
+                        )));
+                    }
+                    attempt += 1;
+                    // Exponential backoff per selective retry (see
+                    // `selective_retry_delay` for reasons).
+                    tokio::time::sleep(selective_retry_delay(attempt)).await;
                     // Selective requeue: keep only failed positions.
                     let mut next = Vec::with_capacity(failed.len());
                     for index in failed {
@@ -866,7 +957,6 @@ impl TablestoreSink {
                         }
                     }
                     pending = next;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(ConnectorError::Connection(message)) => {
                     let mut buffer = self.buffer.lock();
@@ -1023,10 +1113,17 @@ mod tests {
 
         config.batch_size = Some(0);
         assert!(config.validate().is_err());
-        config.batch_size = Some(10_000_000);
-
-        // Zero clamped ceilings: huge depths are accepted.
+        // Explicit unbounded opt-in on the batch knob stays accepted
+        // (the code never chooses it); the outer backlog stays
+        // always-bounded with its finite default.
+        config.batch_size = None;
         assert!(config.validate().is_ok());
+        config.batch_size = Some(10_000_000);
+        assert!(config.validate().is_ok());
+        config.buffer_capacity = Some(0);
+        assert!(config.validate().is_err());
+        config.buffer_capacity = None;
+        assert_eq!(config.effective_buffer(), 10_000);
     }
 
     #[test]
@@ -1219,6 +1316,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_thousand_rows_batched_at_vendor_limit() {
+        let transport = Arc::new(MockTablestoreTransport::new());
+        let mut config = test_config();
+        // Default batch depth (200 = BatchWriteRow per-call ceiling)
+        // with a linger window far above the loop below so batches
+        // split on fullness only, never on timing.
+        config.batch_size = Some(200);
+        config.linger_ms = Some(3_600_000);
+        let sink = TablestoreSink::new(config, transport.clone()).unwrap();
+
+        let topic = Topic::new("sensors/fleet").unwrap();
+        for i in 0..1000 {
+            let payload = Bytes::from(format!(
+                r#"{{"client_id":"d{i:04}","temperature":20.5,"online":true}}"#
+            ));
+            sink.send(&topic, &payload, QoS::AtMostOnce).await.unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 0);
+        // 1000 rows at 200 per call: exactly five vendor-sized
+        // batches, nothing lost, nothing split short.
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 5);
+        for batch in &captured {
+            assert_eq!(batch.len(), 200);
+        }
+        assert_eq!(
+            captured[0][0].primary_keys[0].1,
+            OtsValue::String("d0000".to_string())
+        );
+        assert_eq!(
+            captured[4][199].primary_keys[0].1,
+            OtsValue::String("d0999".to_string())
+        );
+        assert_eq!(sink.sent_batches(), 5);
+        assert_eq!(sink.sent_records(), 1000);
+        assert_eq!(transport.calls(), 5);
+    }
+
+    /// Broker-path proof: the sink delivers through the rule engine
+    /// (publish ingress, rule projection, connector forward), never
+    /// through a direct store call.
+    #[tokio::test]
+    async fn test_tablestore_through_rule_engine() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+
+        struct NullBrokerSink;
+
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NullBrokerSink {
+            async fn publish(
+                &self,
+                _topic: Topic,
+                _payload: Bytes,
+                _qos: QoS,
+                _retain: bool,
+            ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let mut config = test_config();
+        config.batch_size = Some(1);
+        let transport = Arc::new(MockTablestoreTransport::new());
+        let sink = Arc::new(TablestoreSink::new(config, transport.clone()).expect("sink"));
+        assert_eq!(sink.kind(), "tablestore");
+        engine.connectors().register("ts-rule", sink.clone());
+        engine
+            .create_rule(
+                "ts-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, temperature, online FROM "sensors/+" WHERE temperature > 20.0 INTO connector("ts-rule")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "device-42", "temperature": 22.5, "online": true }"#,
+                ),
+                QoS::AtMostOnce,
+                &egress,
+            )
+            .await;
+
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 1);
+        assert_eq!(
+            captured[0][0].primary_keys[0].1,
+            OtsValue::String("device-42".to_string())
+        );
+        assert_eq!(captured[0][0].attributes[0].1, OtsValue::Double(22.5));
+        assert_eq!(sink.sent_records(), 1);
+
+        // WHERE-false payloads never reach the connector.
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(
+                    br#"{ "client_id": "device-42", "temperature": 18.0, "online": true }"#,
+                ),
+                QoS::AtMostOnce,
+                &egress,
+            )
+            .await;
+        assert_eq!(transport.captured().len(), 1);
+        assert_eq!(sink.sent_records(), 1);
+    }
+
+    #[tokio::test]
     async fn test_loopback_headers_and_body() {
         use axum::{extract::State, http::StatusCode, routing::post, Router};
 
@@ -1287,7 +1501,8 @@ mod tests {
         config.batch_size = Some(1);
         let transport =
             Arc::new(HttpTablestoreTransport::new(&config, reqwest::Client::new()).unwrap());
-        let sink = TablestoreSink::new(config, transport).unwrap();
+        let sink = TablestoreSink::new(config.clone(), transport).unwrap();
+        let before_ms = now_millis();
         sink.send(
             &Topic::new("sensors/t1").unwrap(),
             &Bytes::from(r#"{"client_id":"sensor-42","temperature":22.5,"online":false}"#),
@@ -1295,6 +1510,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let after_ms = now_millis();
         assert_eq!(sink.sent_batches(), 1);
 
         let calls = captured.inner.lock();
@@ -1318,6 +1534,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["primary_keys"][0]["value"], "sensor-42");
         assert_eq!(rows[0]["attributes"][0]["value"], 22.5);
+        // The receiver verifies the credential it was given: the
+        // authorization header must equal a fresh HMAC-SHA1 signature
+        // recomputed here from the received date/md5/instance and the
+        // configured secret (a receiver that accepts any signature
+        // would prove nothing about authentication).
+        let date = calls[0].date.clone().expect("x-ots-date");
+        let md5 = calls[0].md5.clone().expect("x-ots-contentmd5");
+        let expected = ots_authorization(
+            &config.access_key_id,
+            &config.access_key_secret,
+            &string_to_sign(&md5, &date, &config.instance_name),
+        );
+        assert_eq!(calls[0].auth.as_deref(), Some(expected.as_str()));
+        // Signature-clock handling: the signer runs per attempt with a
+        // fresh timestamp, so the received date must fall inside the
+        // test's own send window (one-second guard each side for
+        // truncation skew), never a stale reuse.
+        let mut fresh = false;
+        let lo = before_ms.div_euclid(1_000) - 1;
+        let hi = after_ms.div_euclid(1_000) + 1;
+        for sec in lo..=hi {
+            if crate::oci_streaming::rfc1123_date(sec * 1_000) == date {
+                fresh = true;
+                break;
+            }
+        }
+        assert!(fresh, "x-ots-date {date:?} is not fresh");
         server.abort();
     }
 }

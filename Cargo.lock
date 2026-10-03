@@ -432,6 +432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "asynchronous-codec"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4057f2c32adbb2fc158e22fb38433c8e9bbf76b75a4732c7c0cbaf695fb65568"
+dependencies = [
+ "bytes",
+ "futures-sink",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -538,6 +551,57 @@ dependencies = [
  "regex-lite",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-kinesis"
+version = "1.123.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eebf8e3c0989ed9fe6bf28ea0fbe6807c0a9891593594b67e8575506d6790ec"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-redshiftdata"
+version = "1.119.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f19552ab43176e4cb9e79541eefbf4581e3e7b3e1c9839237bdb94ffbe3fb24a"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -679,10 +743,10 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rustls 0.23.45",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tower",
  "tracing",
 ]
@@ -1189,7 +1253,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tracing",
  "yamldap",
 ]
@@ -1231,68 +1295,14 @@ dependencies = [
  "apache-avro 0.15.0",
  "async-trait",
  "aws-sdk-dynamodb",
+ "aws-sdk-kinesis",
+ "aws-sdk-redshiftdata",
  "aws-sdk-s3",
  "aws-sigv4",
  "axum",
  "base64 0.22.1",
  "broker-config",
- "broker-protocol",
- "bytes",
- "clickhouse",
- "couchbase",
- "elasticsearch",
- "flate2",
- "futures",
- "gcp-bigquery-client",
- "google-cloud-auth",
- "google-cloud-gax",
- "google-cloud-pubsub",
- "hmac 0.12.1",
- "http",
- "jsonwebtoken",
- "lapin",
- "md-5 0.10.6",
- "mongodb",
- "mysql_async 0.36.2",
- "parking_lot",
- "rand 0.10.2",
- "rdkafka",
- "redis 0.25.5",
- "reqwest 0.12.28",
- "rsa",
- "rumqttc",
- "rustls 0.23.45",
- "rustls-native-certs",
- "rustls-pemfile",
- "rustls-pki-types",
- "schema-registry-client",
- "scylla",
- "serde",
- "serde_json",
- "sha1 0.10.7",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-rustls",
- "tracing",
- "uuid",
- "webpki-roots 0.25.4",
-]
-
-[[package]]
-name = "broker-connectors-enterprise"
-version = "0.1.0"
-dependencies = [
- "apache-avro 0.15.0",
- "async-trait",
- "aws-sdk-dynamodb",
- "aws-sdk-s3",
- "aws-sigv4",
- "axum",
- "base64 0.22.1",
- "broker-connectors",
+ "broker-connectors-enterprise",
  "broker-protocol",
  "broker-rules",
  "bytes",
@@ -1320,7 +1330,7 @@ dependencies = [
  "rsa",
  "rumqttc",
  "rustls 0.23.45",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "rustls-pemfile",
  "rustls-pki-types",
  "schema-registry-client",
@@ -1330,10 +1340,75 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+ "tiberius",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "webpki-roots 0.25.4",
+]
+
+[[package]]
+name = "broker-connectors-enterprise"
+version = "0.1.0"
+dependencies = [
+ "apache-avro 0.15.0",
+ "async-trait",
+ "aws-sdk-dynamodb",
+ "aws-sdk-kinesis",
+ "aws-sdk-redshiftdata",
+ "aws-sdk-s3",
+ "aws-sigv4",
+ "axum",
+ "base64 0.22.1",
+ "broker-connectors",
+ "broker-protocol",
+ "broker-rules",
+ "bytes",
+ "clickhouse",
+ "couchbase",
+ "elasticsearch",
+ "flate2",
+ "futures",
+ "gcp-bigquery-client",
+ "google-cloud-auth",
+ "google-cloud-gax",
+ "google-cloud-pubsub",
+ "hmac 0.12.1",
+ "http",
+ "jsonwebtoken",
+ "lapin",
+ "md-5 0.10.6",
+ "mongodb",
+ "mysql_async 0.36.2",
+ "parking_lot",
+ "prost 0.13.5",
+ "rand 0.10.2",
+ "rdkafka",
+ "redis 0.25.5",
+ "reqwest 0.12.28",
+ "rsa",
+ "rumqttc",
+ "rustls 0.23.45",
+ "rustls-native-certs 0.8.4",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schema-registry-client",
+ "scylla",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tiberius",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls 0.26.5",
+ "tokio-util",
  "tracing",
  "uuid",
  "webpki-roots 0.25.4",
@@ -1396,7 +1471,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "toml",
  "tracing",
  "yamldap",
@@ -1912,6 +1987,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "connection-string"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2008,7 +2089,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2057,7 +2138,7 @@ dependencies = [
  "snap",
  "socket2 0.6.5",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tokio-stream",
  "tokio-util",
  "tracing",
@@ -2697,6 +2778,26 @@ dependencies = [
  "rustversion",
  "scopeguard",
  "simdutf8",
+]
+
+[[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3667,9 +3768,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls 0.23.45",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tower-service",
 ]
 
@@ -4681,7 +4782,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-openssl",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tokio-util",
  "typed-builder 0.22.0",
  "uuid",
@@ -4878,7 +4979,7 @@ dependencies = [
  "openssl-probe 0.2.1",
  "openssl-sys",
  "schannel",
- "security-framework",
+ "security-framework 3.7.0",
  "security-framework-sys",
  "tempfile",
 ]
@@ -5659,6 +5760,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pretty-hex"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fa0831dd7cc608c38a5e323422a0077678fa5744aa2be4ad91c4ece8eec8d5"
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6367,7 +6474,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tokio-util",
  "tower",
  "tower-http",
@@ -6506,6 +6613,7 @@ version = "0.21.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
+ "log",
  "ring",
  "rustls-webpki 0.101.7",
  "sct",
@@ -6543,6 +6651,18 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9aace74cb666635c918e9c12bc0d348266037aa8eb599b5cba565709a8dff00"
+dependencies = [
+ "openssl-probe 0.1.6",
+ "rustls-pemfile",
+ "schannel",
+ "security-framework 2.11.1",
+]
+
+[[package]]
+name = "rustls-native-certs"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
@@ -6550,7 +6670,7 @@ dependencies = [
  "openssl-probe 0.2.1",
  "rustls-pki-types",
  "schannel",
- "security-framework",
+ "security-framework 3.7.0",
 ]
 
 [[package]]
@@ -6584,10 +6704,10 @@ dependencies = [
  "log",
  "once_cell",
  "rustls 0.23.45",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.15",
- "security-framework",
+ "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
  "windows-sys 0.61.2",
@@ -6848,6 +6968,19 @@ dependencies = [
  "pkcs8",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
 ]
 
 [[package]]
@@ -7689,6 +7822,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiberius"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1446cb4198848d1562301a3340424b4f425ef79f35ef9ee034769a9dd92c10d"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "byteorder",
+ "bytes",
+ "connection-string",
+ "encoding_rs",
+ "enumflags2",
+ "futures-util",
+ "num-traits",
+ "once_cell",
+ "pin-project-lite",
+ "pretty-hex",
+ "rustls-native-certs 0.6.3",
+ "rustls-pemfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls 0.24.1",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7883,12 +8044,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
 dependencies = [
  "rustls 0.23.45",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "sha2 0.11.0",
  "tokio",
  "tokio-postgres",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "x509-cert",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
+dependencies = [
+ "rustls 0.21.12",
+ "tokio",
 ]
 
 [[package]]
@@ -8011,10 +8182,10 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.4",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.5",
  "tokio-stream",
  "tower",
  "tower-layer",

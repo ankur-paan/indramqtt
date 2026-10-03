@@ -3,15 +3,37 @@
 //! Buffers MQTT events as base64 key/value messages and publishes
 //! them with `POST
 //! {endpoint}/20180418/streams/{stream_id}/messages` (PutMessages),
-//! authenticated with a clean-room OCI Cavage HTTP signature
-//! (RSA-SHA256 over the `(request-target)` + header signing string).
+//! authenticated with an OCI Cavage HTTP signature (RSA-SHA256 over
+//! the `(request-target)` + header signing string).
 //! Private keys parse from PKCS#1 or PKCS#8 PEM; fingerprints,
 //! OCIDs and the exact header list validate at config time.
+//!
+//! Production transport runs on the maintained `reqwest` driver
+//! ([`HttpOciStreamingTransport`] below): signed `POST
+//! {messages-url}` with driver-owned connection pooling, and the
+//! signature itself built only on maintained crates (`rsa` for
+//! PKCS#1v15 RSA-SHA256, `sha2` for the `x-content-sha256` hash,
+//! `base64` for framing) — no hand-rolled cryptography. The spec's
+//! `oci-rust-sdk` alternative is an unofficial crate under AGPL-3.0,
+//! which the licence gate rejects (`deny.toml` cannot be edited by a
+//! task, so per the rulebook the spec is wrong on that half and the
+//! maintained-`reqwest` option is taken instead).
 //!
 //! Partial failures requeue positionally: entries carrying `error`
 //! retry alone, clean entries stay written. `TooManyRequests`/429
 //! and `InternalError`/500 retry the whole batch; `InvalidParameter`
 //! and `NotAuthorizedOrNotFound` are terminal.
+//!
+//! QUAL-NONE: tenancy-scoped cloud service (streams, API keys) with
+//! no runnable server or official emulator, so the proving tests run
+//! in the ordinary gates against an in-process loopback receiver
+//! that cryptographically verifies the RSA signature it receives;
+//! offset commit and key rotation against the real service are
+//! deferred to a credentialed run outside the lane.
+//! TODO(parity): credentialed offset-commit assertion (which PutMessages
+//! result fields count as committed when the service returns entries
+//! without offsets?) and key-rotation-without-loss proof against the
+//! real tenancy.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -34,27 +56,49 @@ const SIGNED_HEADERS: &str =
     "(request-target) host date x-content-sha256 content-type content-length";
 
 fn default_batch_size() -> Option<usize> {
+    // Reason: one PutMessages call carries at most 500 entries, so a
+    // single flush cannot grow without bound while amortising one
+    // signed POST over hundreds of rows.
     Some(500)
 }
 
 fn default_batch_bytes() -> Option<usize> {
+    // Reason: 4 MiB keeps one flush under the service's per-request
+    // body ceiling while still batching hundreds of small telemetry
+    // records per POST.
     Some(4_194_304)
 }
 
 fn default_linger_ms() -> Option<u64> {
+    // Reason: 20 ms flush latency for interactive telemetry without
+    // busy-looping the rule worker.
     Some(20)
 }
 
 fn default_max_retries() -> Option<usize> {
+    // Reason: 4 retries ride out transient 429/500s without retrying
+    // forever against a dead endpoint.
     Some(4)
 }
 
 fn default_initial_backoff_ms() -> Option<u64> {
+    // Reason: 100 ms first retry delay, the floor for the exponential
+    // backoff below.
     Some(100)
 }
 
 fn default_max_backoff_ms() -> Option<u64> {
+    // Reason: 2.5 s retry ceiling so backoff stays interactive while
+    // the fail-fast breaker covers longer outages.
     Some(2_500)
+}
+
+/// Default outer backlog ceiling: 10_000 rows (about twenty 500-row
+/// flushes) so a burst or a stalled endpoint cannot grow the queue
+/// without bound, while steady throughput still fits in memory
+/// (10_000 small JSON records stay well under tens of MiB).
+fn default_buffer_capacity_10k() -> Option<usize> {
+    Some(10_000)
 }
 
 fn is_ocid(value: &str, resource: &str) -> bool {
@@ -71,8 +115,12 @@ fn is_fingerprint(value: &str) -> bool {
             .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// OCI Streaming sink configuration. All depths are optional (`None`
-/// = unbounded) with zero clamped ceilings.
+/// OCI Streaming sink configuration. Every limit is optional with a
+/// finite default; `None` on the batch/retry knobs below is an
+/// explicit operator opt-in to unbounded (the code never chooses
+/// it), with zero clamped ceilings. The outer backlog
+/// (`buffer_capacity`) is always bounded: `None` means the finite
+/// default below, never unlimited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OciStreamingSinkConfig {
     /// Streaming endpoint, e.g.
@@ -95,8 +143,14 @@ pub struct OciStreamingSinkConfig {
     /// Records per PutMessages call (default 500).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Buffer capacity (`None` unbounded).
-    #[serde(default)]
+    /// In-memory queue backlog ceiling (`None` = default 10_000 rows:
+    /// about twenty 500-row flushes, bounding worst-case backlog
+    /// memory while absorbing bursts; an old stored configuration
+    /// without this field parses to the same default, so stored
+    /// configuration keeps working. When full the sink fails closed
+    /// with a connection error instead of growing without bound or
+    /// shedding rows silently).
+    #[serde(default = "default_buffer_capacity_10k")]
     pub buffer_capacity: Option<usize>,
     /// Batch byte limit (default 4 MiB).
     #[serde(default = "default_batch_bytes")]
@@ -120,6 +174,8 @@ pub struct OciStreamingSinkConfig {
 
 impl OciStreamingSinkConfig {
     pub fn timeout(&self) -> Duration {
+        // Reason: 5 s per-request ceiling so an unreachable endpoint
+        // fails closed instead of stalling the rule worker.
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
     }
 
@@ -195,6 +251,11 @@ impl OciStreamingSinkConfig {
                 "oci batch_bytes must be >= 1".to_string(),
             ));
         }
+        if self.buffer_capacity == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "oci buffer_capacity must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -231,10 +292,15 @@ impl OciStreamingSinkConfig {
         )
     }
 
+    /// Records per flush (default 500: the PutMessages per-call
+    /// ceiling; `None` is an explicit operator opt-in to unbounded,
+    /// never the code's choice).
     pub fn effective_batch_size(&self) -> usize {
         self.batch_size.unwrap_or(usize::MAX).max(1)
     }
 
+    /// Batch byte ceiling (default 4 MiB; `None` is an explicit
+    /// operator opt-in to unbounded, never the code's choice).
     pub fn effective_batch_bytes(&self) -> usize {
         self.batch_bytes.unwrap_or(usize::MAX).max(1)
     }
@@ -245,8 +311,12 @@ impl OciStreamingSinkConfig {
             .unwrap_or(Duration::MAX)
     }
 
+    /// Outer backlog ceiling (default 10_000 rows: about twenty
+    /// 500-row flushes, bounding worst-case backlog memory while
+    /// absorbing bursts; `None` means this finite default, never
+    /// unlimited).
     pub fn effective_buffer(&self) -> usize {
-        self.buffer_capacity.unwrap_or(usize::MAX).max(1)
+        self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
     /// Template variables for one event.
@@ -319,7 +389,8 @@ impl OciStreamingSinkConfig {
 // Cavage HTTP signing (RSA-SHA256).
 // ---------------------------------------------------------------------------
 
-/// Parse a PKCS#1 or PKCS#8 RSA private key PEM.
+/// Parse a PKCS#1 or PKCS#8 RSA private key PEM via the maintained
+/// `rsa` crate (never hand-rolled ASN.1/DER).
 pub fn parse_rsa_key(pem: &str) -> Result<rsa::RsaPrivateKey> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
@@ -371,7 +442,8 @@ pub fn signing_string(
     .join("\n")
 }
 
-/// RSA-SHA256 sign the signing string (deterministic PKCS#1v15).
+/// RSA-SHA256 sign the signing string (deterministic PKCS#1v15 via
+/// the maintained `rsa` + `sha2` crates; never hand-rolled crypto).
 pub fn rsa_sign(private_key_pem: &str, signing_string: &str) -> Result<String> {
     let key = parse_rsa_key(private_key_pem)?;
     let signing_key = SigningKey::<Sha256>::new(key);
@@ -566,8 +638,19 @@ impl OciStreamingTransport for MockOciStreamingTransport {
     }
 }
 
-/// Production transport: signed `POST {messages-url}` with the JSON
-/// body, Cavage headers attached verbatim.
+/// Production transport on the maintained `reqwest` driver: signed
+/// `POST {messages-url}` with the JSON body, Cavage headers attached
+/// verbatim. Fresly signed per attempt (never replays a stale `date`
+/// header).
+///
+/// Bound: `reqwest`'s driver-owned connection pool plus the sink
+/// buffer in front of it (batch rows default 500, batch bytes
+/// default 4 MiB, backlog default 10_000 rows); no extra pool, no
+/// background queue. The defaults are finite because an unbounded
+/// backlog under fan-in would repeat the multi-GB RSS collapse the
+/// v4 benchmark measured on message paths. The sink's send path runs
+/// behind the rule engine's bounded queue, so no benchmark numbers
+/// are needed.
 pub struct HttpOciStreamingTransport {
     url: String,
     path: String,
@@ -575,6 +658,7 @@ pub struct HttpOciStreamingTransport {
     key_id: String,
     private_key_pem: String,
     client: reqwest::Client,
+    timeout: Duration,
 }
 
 impl HttpOciStreamingTransport {
@@ -588,6 +672,7 @@ impl HttpOciStreamingTransport {
             key_id: config.key_id(),
             private_key_pem: config.private_key_pem.clone(),
             client,
+            timeout: config.timeout(),
         })
     }
 }
@@ -611,6 +696,7 @@ impl OciStreamingTransport for HttpOciStreamingTransport {
         let response = self
             .client
             .post(&self.url)
+            .timeout(self.timeout)
             .header("date", date)
             .header("x-content-sha256", content_hash)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1022,11 +1108,17 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
 
         config.batch_size = Some(0);
         assert!(config.validate().is_err());
-        // Unbounded + huge depths accepted: zero clamped ceilings.
+        // Explicit unbounded opt-ins on the batch/retry knobs stay
+        // accepted (the code never chooses them); the outer backlog
+        // stays always-bounded with its finite default.
         config.batch_size = None;
         config.batch_bytes = Some(10_000_000);
         config.max_retries = None;
         assert!(config.validate().is_ok());
+        config.buffer_capacity = Some(0);
+        assert!(config.validate().is_err());
+        config.buffer_capacity = None;
+        assert_eq!(config.effective_buffer(), 10_000);
     }
 
     #[test]
@@ -1185,40 +1277,95 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         assert_eq!(sink.buffered_rows(), 0);
     }
 
+    /// Cryptographically verify one loopback PUT the way the real
+    /// service does: the `keyId` names the test identity, the
+    /// `x-content-sha256` header is the exact hash of the body, and
+    /// the RSA-SHA256 signature verifies against the public half of
+    /// the test key over the reconstructed signing string. A fake
+    /// that accepted any signature would prove nothing about
+    /// authentication.
+    fn verify_loopback_auth(
+        path: &str,
+        headers: &axum::http::HeaderMap,
+        body: &[u8],
+        expected_key_id: &str,
+    ) -> std::result::Result<(), String> {
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::signature::Verifier;
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let auth = header("authorization");
+        let key_id = auth
+            .split("keyId=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        if key_id != expected_key_id {
+            return Err(format!("keyId mismatch: {key_id:?}"));
+        }
+        if !auth.contains("algorithm=\"rsa-sha256\"") {
+            return Err("signature algorithm is not rsa-sha256".to_string());
+        }
+        let signature_b64 = auth
+            .split("signature=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        if header("x-content-sha256") != content_sha256_b64(body) {
+            return Err("x-content-sha256 is not the body hash".to_string());
+        }
+        if header("content-type") != "application/json" {
+            return Err("content-type is not application/json".to_string());
+        }
+        if header("content-length") != body.len().to_string() {
+            return Err("content-length does not match the body".to_string());
+        }
+        let signing = signing_string(
+            path,
+            &header("host"),
+            &header("date"),
+            &content_sha256_b64(body),
+            body.len(),
+        );
+        let private = parse_rsa_key(OCI_TEST_KEY).map_err(|e| e.to_string())?;
+        let verifying = VerifyingKey::<Sha256>::new(rsa::RsaPublicKey::from(&private));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(signature_b64)
+            .map_err(|e| format!("signature is not base64: {e}"))?;
+        let signature =
+            Signature::try_from(bytes.as_slice()).map_err(|e| format!("bad signature: {e}"))?;
+        verifying
+            .verify(signing.as_bytes(), &signature)
+            .map_err(|e| format!("RSA-SHA256 verification failed: {e}"))
+    }
+
     #[tokio::test]
     async fn test_loopback_signed_put() {
         use axum::{http::StatusCode, routing::post, Router};
         use std::sync::Arc as StdArc;
 
-        // The handler asserts the exact content hash of the body the
-        // test sends (computed up front with the same helper).
-        let message = OciMessage {
-            key_b64: base64_encode(b"k"),
-            value_b64: base64_encode(b"loopback-body"),
-        };
-        let expected_hash =
-            content_sha256_b64(&render_put_messages(std::slice::from_ref(&message)));
-        let expected_state = StdArc::new(expected_hash);
+        struct Loopback {
+            key_id: String,
+            path: String,
+        }
+        let state = StdArc::new(Loopback {
+            key_id: test_config().key_id(),
+            path: test_config().messages_path(),
+        });
 
         async fn handler(
             headers: axum::http::HeaderMap,
-            body: String,
-            state: axum::extract::State<StdArc<String>>,
+            body: bytes::Bytes,
+            state: axum::extract::State<StdArc<Loopback>>,
         ) -> (StatusCode, String) {
-            let auth = headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            assert!(auth.starts_with("Signature version=\"1\",headers=\"(request-target) host date x-content-sha256 content-type content-length\",keyId=\"ocid1.tenancy.oc1..test/"));
-            assert!(auth.contains(",algorithm=\"rsa-sha256\",signature=\""));
-            assert_eq!(
-                headers
-                    .get("x-content-sha256")
-                    .and_then(|v| v.to_str().ok()),
-                Some(state.as_str())
-            );
-            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            verify_loopback_auth(&state.path, &headers, &body, &state.key_id)
+                .expect("loopback must verify the RSA signature");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(parsed["messages"].as_array().expect("array").len(), 1);
             (
                 StatusCode::OK,
@@ -1228,10 +1375,10 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         let app = Router::new().route(
             "/20180418/streams/ocid1.stream.oc1.test.stream/messages",
             post({
-                let expected_state = expected_state.clone();
-                move |headers: axum::http::HeaderMap, body: String| {
-                    let expected_state = expected_state.clone();
-                    async move { handler(headers, body, axum::extract::State(expected_state)).await }
+                let state = state.clone();
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                    let state = state.clone();
+                    async move { handler(headers, body, axum::extract::State(state)).await }
                 }
             }),
         );
@@ -1239,7 +1386,7 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             .await
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
 
@@ -1247,6 +1394,10 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
         config.endpoint = format!("http://127.0.0.1:{port}");
         let transport =
             Arc::new(HttpOciStreamingTransport::new(&config, reqwest::Client::new()).unwrap());
+        let message = OciMessage {
+            key_b64: base64_encode(b"k"),
+            value_b64: base64_encode(b"loopback-body"),
+        };
         let result = transport
             .put_messages(
                 vec![message],
@@ -1259,5 +1410,200 @@ XmNha02ZacRF3gOO4hef4n9VR5XZkWOy8ySeiwo31BcvHTCDWQuz
             .await
             .expect("loopback put succeeds");
         assert!(result.is_empty());
+        server.abort();
+    }
+
+    /// Manager-level write path over the real `reqwest` driver
+    /// ([`HttpOciStreamingTransport`]).
+    ///
+    /// Serves its own loopback receiver (ephemeral `axum` server that
+    /// cryptographically verifies the RSA signature on every PUT),
+    /// streams 500 events with rotating partition keys through the
+    /// broker's connector manager (`ConnectorManager` ->
+    /// `OciStreamingSink`, never `sink.send` directly), asserts exact
+    /// per-key counts with no loss, then proves a scripted 429
+    /// retries to success. Runs offline: needs only loopback, never
+    /// skips.
+    ///
+    /// QUAL-NONE: tenancy-scoped cloud service with no runnable
+    /// server, so there is no `QUAL_RESULT` to produce; offset commit
+    /// and key rotation against the real service stay deferred to a
+    /// credentialed run (see the module docs).
+    #[tokio::test]
+    async fn test_oci_loopback_write_path_through_manager() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use broker_connectors::ConnectorManager;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+            Mutex as StdMutex,
+        };
+
+        const EVENTS: usize = 500;
+        const KEYS: usize = 16;
+
+        #[derive(Debug, Default)]
+        struct QualState {
+            key_id: String,
+            path: String,
+            calls: AtomicU64,
+            verified: AtomicU64,
+            entries: StdMutex<Vec<(String, Vec<u8>)>>,
+            fail_first: AtomicBool,
+        }
+
+        async fn qual_handler(
+            state: axum::extract::State<Arc<QualState>>,
+            headers: axum::http::HeaderMap,
+            body: bytes::Bytes,
+        ) -> (StatusCode, String) {
+            state.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            verify_loopback_auth(&state.path, &headers, &body, &state.key_id)
+                .expect("qual must verify the RSA signature");
+            state.verified.fetch_add(1, AtomicOrdering::SeqCst);
+            if state.fail_first.swap(false, AtomicOrdering::SeqCst) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{\"code\":\"TooManyRequests\"}".to_string(),
+                );
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).expect("qual body parses");
+            let messages = parsed["messages"].as_array().expect("qual array");
+            {
+                let mut entries = state.entries.lock().unwrap();
+                for message in messages {
+                    let key = message["key"].as_str().unwrap_or_default().to_string();
+                    let value_b64 = message["value"].as_str().unwrap_or_default().to_string();
+                    let value = base64::engine::general_purpose::STANDARD
+                        .decode(&value_b64)
+                        .expect("qual value decodes");
+                    entries.push((key, value));
+                }
+            }
+            let entries_json: String = (0..messages.len())
+                .map(|index| format!("{{\"offset\":{index},\"partition\":\"0\"}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                StatusCode::OK,
+                format!("{{\"failures\":0,\"entries\":[{entries_json}]}}"),
+            )
+        }
+
+        let base = test_config();
+        let state = Arc::new(QualState {
+            key_id: base.key_id(),
+            path: base.messages_path(),
+            ..QualState::default()
+        });
+        let app = Router::new().route(
+            "/20180418/streams/ocid1.stream.oc1.test.stream/messages",
+            post({
+                let state = state.clone();
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| async move {
+                    qual_handler(axum::extract::State(state), headers, body).await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("qual bind loopback");
+        let port = listener.local_addr().expect("qual addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("qual serve");
+        });
+
+        let mut config = test_config();
+        config.endpoint = format!("http://127.0.0.1:{port}");
+        config.batch_size = Some(EVENTS);
+        config.buffer_capacity = Some(10_000);
+        config.initial_backoff_ms = Some(1);
+        config.max_backoff_ms = Some(2);
+        let transport = Arc::new(
+            HttpOciStreamingTransport::new(&config, reqwest::Client::new())
+                .expect("qual transport"),
+        );
+        let sink = Arc::new(OciStreamingSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "oci_streaming");
+        let manager = ConnectorManager::new();
+        manager.register("qual-oci", sink.clone());
+
+        // 500 events with rotating partition keys (offline analogue
+        // of key rotation): every key must arrive exactly, none lost.
+        let topic = Topic::new("sensors/qual").unwrap();
+        let mut expected: Vec<(String, Vec<u8>)> = Vec::with_capacity(EVENTS);
+        for seq in 0..EVENTS {
+            let device = format!("dev-{0:02}", seq % KEYS);
+            let payload = format!(r#"{{"client_id":"{device}","seq":{seq}}}"#);
+            let key_b64 = base64::engine::general_purpose::STANDARD.encode(&device);
+            expected.push((key_b64, payload.clone().into_bytes()));
+            manager
+                .send("qual-oci", &topic, &Bytes::from(payload), QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), EVENTS as u64, "qual row count");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(
+            state.verified.load(AtomicOrdering::SeqCst),
+            state.calls.load(AtomicOrdering::SeqCst),
+            "every PUT must carry a verifiable signature"
+        );
+        eprintln!(
+            "qual rows sent: records={EVENTS} puts={}",
+            state.calls.load(AtomicOrdering::SeqCst)
+        );
+
+        // Exact per-key counts, no tolerance: at-least-once permits
+        // duplicates, never loss, and the loopback server dedups
+        // nothing, so every key is present exactly as offered.
+        let captured = state.entries.lock().unwrap().clone();
+        assert_eq!(captured.len(), EVENTS, "qual captured count");
+        let mut per_key = std::collections::HashMap::new();
+        for entry in &captured {
+            *per_key.entry(entry.0.clone()).or_insert(0usize) += 1;
+        }
+        assert_eq!(per_key.len(), KEYS, "all rotating keys present");
+        for seq in 0..KEYS {
+            let key_b64 = base64::engine::general_purpose::STANDARD.encode(format!("dev-{seq:02}"));
+            let want = EVENTS / KEYS + usize::from(seq < EVENTS % KEYS);
+            assert_eq!(per_key.get(&key_b64), Some(&want), "key {seq:02} count");
+        }
+        for (index, ((got_key, got_value), (want_key, want_value))) in
+            captured.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(got_key, want_key, "qual key byte mismatch at {index}");
+            assert_eq!(got_value, want_value, "qual body byte mismatch at {index}");
+        }
+        eprintln!("qual rows asserted: count={EVENTS} byte-identical with verified signatures");
+
+        // Scripted 429 retries the whole batch to success.
+        let calls_before = state.calls.load(AtomicOrdering::SeqCst);
+        let entries_before = state.entries.lock().unwrap().len();
+        state.fail_first.store(true, AtomicOrdering::SeqCst);
+        manager
+            .send(
+                "qual-oci",
+                &topic,
+                &Bytes::from_static(br#"{"client_id":"dev-00","seq":"retry-probe"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual retry buffer");
+        sink.flush().await.expect("429-then-200 must succeed");
+        assert_eq!(
+            state.calls.load(AtomicOrdering::SeqCst),
+            calls_before + 2,
+            "one 429 plus one 200"
+        );
+        assert_eq!(state.entries.lock().unwrap().len(), entries_before + 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        eprintln!("qual retry asserted: 429-then-200 delivered once with verified signature");
+
+        // Cleanup: stop the loopback receiver (nothing else to remove;
+        // no stream, tenancy, or container was created).
+        server.abort();
+        eprintln!("qual done: rows={} cleaned loopback receiver", EVENTS + 1);
     }
 }

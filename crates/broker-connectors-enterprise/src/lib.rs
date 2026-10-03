@@ -162,7 +162,8 @@ pub use iotdb::{
 pub use kinesis::{
     HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
     KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
-    MockKinesisOutcome, MockKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
+    MockKinesisOutcome, MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE,
+    KINESIS_TARGET,
 };
 pub use mongodb::{
     decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
@@ -172,9 +173,9 @@ pub use mongodb::{
 };
 pub use mssql::{
     days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password,
-    parse_reply_tokens, CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth,
-    MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport,
-    NativeMssqlTransport, TdsReply,
+    parse_reply_tokens, CapturedMssqlBatch, DriverMssqlTransport, MockMssqlOutcome,
+    MockMssqlTransport, MssqlAuth, MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink,
+    MssqlSinkConfig, MssqlTransport, NativeMssqlTransport, TdsReply,
 };
 pub use oci_streaming::{
     authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages,
@@ -206,7 +207,7 @@ pub use redshift::{
     default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
     render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
     MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
-    RedshiftSink, RedshiftSinkConfig, RedshiftTransport,
+    RedshiftSink, RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
 };
 pub use rocketmq::{
     authorization_header as rocketmq_authorization,
@@ -227,14 +228,17 @@ pub use s3_tables::{
     S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
 };
 pub use snowflake::{
-    build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows,
+    build_jwt_assertion as build_snowflake_jwt,
+    render_create_table_sql as render_snowflake_create_table,
+    render_insert_sql as render_snowflake_insert, render_rows_body as render_snowflake_rows,
     CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport,
     SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport,
 };
 pub use sparkplug_b::{
-    decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint,
-    payload_from_json, payload_to_json, tier, MemorySparkplugTransport, SparkplugBConnector,
-    SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
+    decode_metric, decode_payload, decode_payload_prost, decode_varint, encode_metric,
+    encode_payload, encode_payload_prost, encode_varint, payload_from_json, payload_to_json, tier,
+    MemorySparkplugTransport, ProtoMetric, ProtoPayload, RumqttcSparkplugTransport,
+    SparkplugBConnector, SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
     SparkplugStateMachine, SparkplugTopic, SparkplugTransport, SpbAnomaly, SpbDataType,
     SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SPARKPLUG_TIER,
 };
@@ -266,6 +270,7 @@ pub use timestream::{
 pub use broker_connectors::connector_tier;
 pub use broker_connectors::ConnectorError;
 pub use broker_connectors::Result;
+pub use broker_connectors::Sink;
 
 /// Test-only RSA keypair (generated with openssl, never deployed).
 /// Shared by the GCP/Snowflake/BigQuery JWT tests so the PEMs live in

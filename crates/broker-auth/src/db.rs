@@ -2087,7 +2087,14 @@ mod tests {
 
     #[test]
     fn cache_expires_and_evicts_oldest() {
-        let mut cache = BoundedTtlCache::new(2, Duration::from_millis(50));
+        // TTL 200 ms with a 300 ms sleep: long enough that the three
+        // immediate put/get operations never expire prematurely even when
+        // parallel gate binaries deschedule this thread (the 50 ms bound
+        // flaked under load with `cache.get("b")` expiring before the
+        // eviction assert), yet short enough to still prove lazy TTL
+        // expiry. Reason: CI timing robustness without changing FIFO
+        // eviction semantics.
+        let mut cache = BoundedTtlCache::new(2, Duration::from_millis(200));
         cache.put("a".to_string(), 1u32);
         cache.put("b".to_string(), 2u32);
         assert_eq!(cache.get("a"), Some(1));
@@ -2096,7 +2103,7 @@ mod tests {
         // FIFO: `a` was inserted first, so it evicts past the bound.
         assert_eq!(cache.get("a"), None);
         assert_eq!(cache.get("b"), Some(2));
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(cache.get("b"), None, "TTL expiry must drop the entry");
         assert!(cache.is_empty() || cache.len() <= 2);
     }

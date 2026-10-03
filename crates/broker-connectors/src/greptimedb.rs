@@ -33,6 +33,17 @@ fn default_batch_size_1000() -> Option<usize> {
     Some(1000)
 }
 
+/// Default outer backlog ceiling: 10_000 rows (about ten 1_000-row
+/// flushes) so a burst or a stalled server cannot grow the queue
+/// without bound while backoff is engaged, while steady throughput
+/// still fits in memory (10_000 small JSON-derived rows stay well
+/// under tens of MiB). Reason: the connector's send path runs behind
+/// the rule engine's bounded queue, so this is a backstop, not new
+/// work on the publish path.
+fn default_buffer_capacity_10k() -> Option<usize> {
+    Some(10_000)
+}
+
 /// Ingestion format for GreptimeDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,13 +116,24 @@ pub struct GreptimeDbConfig {
     /// Timestamp precision specifier (default Millisecond).
     #[serde(default = "default_greptime_precision")]
     pub timestamp_precision: GreptimePrecision,
-    /// Batch flush size (unbounded scale, default 1,000).
+    /// Batch flush size (default 1,000 rows: about one SQL multi-row
+    /// INSERT or line batch per flush, keeping each HTTP request well
+    /// under a MiB while amortising request overhead; `None` maps to
+    /// the same finite default, never unlimited).
     #[serde(default = "default_batch_size_1000")]
     pub batch_size: Option<usize>,
-    /// In-memory queue buffer capacity (`None` = unbounded).
-    #[serde(default)]
+    /// In-memory queue backlog ceiling (`None` = default 10_000 rows:
+    /// about ten 1_000-row flushes, bounding worst-case backlog memory
+    /// while absorbing bursts; an old stored configuration without this
+    /// field parses to the same default, so stored configuration keeps
+    /// working. When full the sink fails closed with a connection error
+    /// instead of growing without bound or shedding rows silently).
+    #[serde(default = "default_buffer_capacity_10k")]
     pub buffer_capacity: Option<usize>,
-    /// Request / network timeout in ms (default 5000).
+    /// Request / network timeout in ms (default 5000: bounds the tail
+    /// of a stalled server so a hung endpoint cannot wedge the flush
+    /// behind backoff; 5 s covers a slow insert while still failing
+    /// fast enough to retry).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -119,6 +141,14 @@ pub struct GreptimeDbConfig {
 impl GreptimeDbConfig {
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// Outer backlog ceiling (default 10_000 rows: about ten 1_000-row
+    /// flushes, bounding worst-case backlog memory while the fail-fast
+    /// breaker is engaged and absorbing bursts; `None` means this
+    /// finite default, never unlimited).
+    pub fn effective_buffer_capacity(&self) -> usize {
+        self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -135,6 +165,16 @@ impl GreptimeDbConfig {
         if self.table_template.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "greptimedb table_template cannot be empty".into(),
+            ));
+        }
+        if self.batch_size == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "greptimedb batch_size must be >= 1".into(),
+            ));
+        }
+        if self.buffer_capacity == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "greptimedb buffer_capacity must be >= 1".into(),
             ));
         }
         Ok(())
@@ -406,8 +446,23 @@ pub struct HttpGreptimeDbTransport {
 }
 
 impl HttpGreptimeDbTransport {
+    /// Base URL always carrying the `/v1` API prefix. Stored endpoint
+    /// values end at the host (`http://host:4000`, as the qualification
+    /// environment provides) or already include `/v1`
+    /// (`http://host:4000/v1`, as operator configs do); both must hit
+    /// the same `/v1/...` routes, so the prefix is added only when
+    /// missing.
+    pub fn api_base(endpoint: &str) -> String {
+        let base = endpoint.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            base.to_string()
+        } else {
+            format!("{base}/v1")
+        }
+    }
+
     pub fn new(config: &GreptimeDbConfig) -> Self {
-        let base = config.endpoint.trim_end_matches('/');
+        let base = Self::api_base(&config.endpoint);
         let sql_url = format!("{base}/sql?db={}", config.database);
         let influx_url_base = format!("{base}/influxdb/api/v2/write?db={}", config.database);
         let auth_header = config.auth.as_ref().map(|a| a.auth_header());
@@ -427,11 +482,10 @@ impl HttpGreptimeDbTransport {
 #[async_trait]
 impl GreptimeDbTransport for HttpGreptimeDbTransport {
     async fn post_sql(&self, sql: &str) -> Result<()> {
-        let mut req = self
-            .client
-            .post(&self.sql_url)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(format!("sql={}", urlencoding_like(sql)));
+        // `form()` percent-encodes the statement (quotes, `&`, `=`,
+        // `+` and non-ASCII bytes included); hand-rolled `sql=...`
+        // bodies mangled every value containing those bytes.
+        let mut req = self.client.post(&self.sql_url).form(&[("sql", sql)]);
 
         if let Some(ref auth) = self.auth_header {
             req = req.header(AUTHORIZATION, auth);
@@ -503,10 +557,6 @@ impl GreptimeDbTransport for HttpGreptimeDbTransport {
             )))
         }
     }
-}
-
-fn urlencoding_like(s: &str) -> String {
-    s.replace(' ', "+")
 }
 
 /// Mock transport for GreptimeDB verification.
@@ -643,6 +693,10 @@ impl GreptimeDbSink {
     pub fn new(config: GreptimeDbConfig, transport: Arc<dyn GreptimeDbTransport>) -> Result<Self> {
         config.validate()?;
         let batch_size = config.batch_size.unwrap_or(1000).max(1);
+        // Linger 50 ms: small batches flush promptly without waiting
+        // for a full batch, while steady streams still batch up; 50 ms
+        // keeps added latency negligible against the 5 s request
+        // timeout.
         Ok(Self {
             config,
             transport,
@@ -752,6 +806,15 @@ impl Sink for GreptimeDbSink {
         let rec = extract_greptime_record(payload, topic.as_str(), &self.config)?;
         let should_flush = {
             let mut q = self.queue.lock();
+            // Bounded backlog: past the effective capacity the sink
+            // fails closed with a connection error instead of growing
+            // without bound; buffered rows are kept, nothing is shed.
+            if q.len() >= self.config.effective_buffer_capacity() {
+                return Err(ConnectorError::Connection(format!(
+                    "greptimedb buffer full ({} rows): failing closed",
+                    self.config.effective_buffer_capacity()
+                )));
+            }
             q.push(rec)
         };
 
@@ -1179,6 +1242,236 @@ mod tests {
         assert!(!lines.contains("nanf"));
     }
 
+    #[test]
+    fn test_api_base_normalization() {
+        // Stored endpoints end at the host; operator configs already
+        // carry `/v1`. Both must hit the same `/v1/...` routes.
+        assert_eq!(
+            HttpGreptimeDbTransport::api_base("http://127.0.0.1:4000"),
+            "http://127.0.0.1:4000/v1"
+        );
+        assert_eq!(
+            HttpGreptimeDbTransport::api_base("http://127.0.0.1:4000/"),
+            "http://127.0.0.1:4000/v1"
+        );
+        assert_eq!(
+            HttpGreptimeDbTransport::api_base("http://127.0.0.1:4000/v1"),
+            "http://127.0.0.1:4000/v1"
+        );
+        assert_eq!(
+            HttpGreptimeDbTransport::api_base("http://127.0.0.1:4000/v1/"),
+            "http://127.0.0.1:4000/v1"
+        );
+        let cfg = GreptimeDbConfig {
+            endpoint: "http://127.0.0.1:4000".to_string(),
+            database: "public".to_string(),
+            auth: None,
+            format: GreptimeFormat::SqlInsert,
+            table_template: "t".to_string(),
+            timestamp_precision: GreptimePrecision::Millisecond,
+            batch_size: Some(1),
+            buffer_capacity: None,
+            timeout_ms: None,
+        };
+        let transport = HttpGreptimeDbTransport::new(&cfg);
+        assert!(
+            transport
+                .sql_url
+                .starts_with("http://127.0.0.1:4000/v1/sql?db="),
+            "sql url must carry /v1: {}",
+            transport.sql_url
+        );
+        assert!(
+            transport
+                .influx_url_base
+                .starts_with("http://127.0.0.1:4000/v1/influxdb/api/v2/write?db="),
+            "influx url must carry /v1: {}",
+            transport.influx_url_base
+        );
+    }
+
+    #[test]
+    fn test_buffer_capacity_default_and_validation() {
+        // A stored configuration without the field parses to the finite
+        // default, so old configuration keeps working and the code never
+        // chooses unbounded.
+        let stored = serde_json::json!({
+            "endpoint": "http://127.0.0.1:4000/v1",
+            "database": "public",
+            "table_template": "t",
+        });
+        let cfg: GreptimeDbConfig = serde_json::from_value(stored).expect("stored config parses");
+        assert_eq!(cfg.buffer_capacity, Some(10_000));
+        assert_eq!(cfg.effective_buffer_capacity(), 10_000);
+        assert!(cfg.validate().is_ok());
+
+        let mut explicit_none = cfg.clone();
+        explicit_none.buffer_capacity = None;
+        assert_eq!(explicit_none.effective_buffer_capacity(), 10_000);
+
+        let mut zeroed = cfg.clone();
+        zeroed.buffer_capacity = Some(0);
+        assert!(zeroed.validate().is_err());
+        zeroed.buffer_capacity = Some(10);
+        zeroed.batch_size = Some(0);
+        assert!(zeroed.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_fails_closed_when_buffer_full() {
+        let mut cfg = sample_sql_config();
+        cfg.batch_size = Some(10);
+        cfg.buffer_capacity = Some(2);
+        let transport = Arc::new(MockGreptimeDbTransport::new());
+        let sink = GreptimeDbSink::new(cfg, transport.clone()).expect("valid sink");
+
+        let topic = Topic::new("sensors/temp").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"val": 1}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("first row fits");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"val": 2}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("second row fits");
+        let err = sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"val": 3}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("full buffer must fail closed");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "buffer-full must be a connection error, got {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), 2);
+
+        sink.flush().await.expect("flush drains");
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.sent_count(), 2);
+    }
+
+    /// Decode one `application/x-www-form-urlencoded` body field value:
+    /// `+` is a space, `%XX` is the byte. Test-only helper so the
+    /// round-trip assertion does not need another dependency.
+    fn form_decode_field(body: &str, field: &str) -> Option<String> {
+        for pair in body.split('&') {
+            let (name, value) = pair.split_once('=')?;
+            if name != field {
+                continue;
+            }
+            let mut out = Vec::with_capacity(value.len());
+            let mut bytes = value.as_bytes().iter();
+            while let Some(&b) = bytes.next() {
+                match b {
+                    b'+' => out.push(b' '),
+                    b'%' => {
+                        let hi = bytes.next().copied().unwrap_or(b'0');
+                        let lo = bytes.next().copied().unwrap_or(b'0');
+                        let hex = |c: u8| match c {
+                            b'0'..=b'9' => Some(c - b'0'),
+                            b'a'..=b'f' => Some(c - b'a' + 10),
+                            b'A'..=b'F' => Some(c - b'A' + 10),
+                            _ => None,
+                        };
+                        out.push((hex(hi)? << 4) | hex(lo)?);
+                    }
+                    _ => out.push(b),
+                }
+            }
+            return String::from_utf8(out).ok();
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn test_sql_posts_form_encoded_body() {
+        use std::sync::Mutex as StdMutex;
+        use tokio::net::TcpListener;
+
+        #[derive(Debug, Default)]
+        struct Captured {
+            path: StdMutex<String>,
+            query: StdMutex<String>,
+            content_type: StdMutex<String>,
+            body: StdMutex<String>,
+        }
+
+        let captured = Arc::new(Captured::default());
+        let app = {
+            let captured = captured.clone();
+            axum::Router::new().route(
+                "/v1/sql",
+                axum::routing::post(
+                    move |uri: axum::http::Uri,
+                          headers: axum::http::HeaderMap,
+                          body: bytes::Bytes| {
+                        let captured = captured.clone();
+                        async move {
+                            *captured.path.lock().unwrap() = uri.path().to_string();
+                            *captured.query.lock().unwrap() =
+                                uri.query().unwrap_or_default().to_string();
+                            *captured.content_type.lock().unwrap() = headers
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            // `Bytes` (not `String`): the form content
+                            // type is not a text extractor input.
+                            *captured.body.lock().unwrap() =
+                                String::from_utf8_lossy(&body).into_owned();
+                            // Minimal GreptimeDB SQL success envelope.
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            )
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        // Host-only endpoint on purpose: the transport must add `/v1`.
+        let mut cfg = sample_sql_config();
+        cfg.endpoint = format!("http://127.0.0.1:{port}");
+        let transport = HttpGreptimeDbTransport::new(&cfg);
+        let sql = "INSERT INTO t (ts, note) VALUES (1700000000, 'O''Brien & \"quoted\" + 100%')";
+        transport.post_sql(sql).await.expect("post succeeds");
+
+        assert_eq!(captured.path.lock().unwrap().as_str(), "/v1/sql");
+        assert!(
+            captured.query.lock().unwrap().contains("db=public"),
+            "query must carry db, got {}",
+            captured.query.lock().unwrap()
+        );
+        assert!(
+            captured
+                .content_type
+                .lock()
+                .unwrap()
+                .contains("application/x-www-form-urlencoded"),
+            "content type must be form, got {}",
+            captured.content_type.lock().unwrap()
+        );
+        let decoded =
+            form_decode_field(&captured.body.lock().unwrap(), "sql").expect("sql field present");
+        assert_eq!(
+            decoded, sql,
+            "form body must round-trip the statement byte-identical"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn test_empty_field_name_rejected_at_send() {
         let mut cfg = sample_sql_config();
@@ -1201,5 +1494,539 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 0);
         assert_eq!(sink.sent_count(), 1);
         assert_eq!(transport.captured_sqls.lock().len(), 1);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_now_millis() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0)
+    }
+
+    /// Table names come from the environment, so they must be plain
+    /// SQL identifiers before interpolation into DDL.
+    fn qual_check_ident(name: &str, value: &str) -> String {
+        let ok = !value.is_empty()
+            && value
+                .bytes()
+                .next()
+                .is_some_and(|b| b == b'_' || b.is_ascii_lowercase() || b.is_ascii_uppercase())
+            && value
+                .bytes()
+                .all(|b| b == b'_' || b.is_ascii_alphanumeric());
+        assert!(ok, "qual {name} must be a plain identifier, got {value:?}");
+        value.to_string()
+    }
+
+    /// POST one SQL statement to `{base}/sql?db={db}` and return the
+    /// raw body. HTTP failures and GreptimeDB `code != 0` envelopes
+    /// both fail the test: qualification must fail closed, never pass
+    /// on an error the parser did not understand.
+    async fn qual_sql(client: &reqwest::Client, sql_url: &str, sql: &str) -> String {
+        let resp = client
+            .post(sql_url)
+            .form(&[("sql", sql)])
+            .send()
+            .await
+            .expect("qual sql send");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "qual sql failed: status={status} sql={sql} body={text}"
+        );
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(code) = val.get("code").and_then(|c| c.as_i64()) {
+                assert_eq!(code, 0, "qual sql code: sql={sql} body={text}");
+            }
+        }
+        text
+    }
+
+    /// Recursively find the first `rows[0][0]` cell and read it as u64
+    /// (GreptimeDB `SELECT COUNT(*)` answers
+    /// `{"output":[{"records":{"rows":[[2000]]}}]}`).
+    fn qual_find_count(value: &serde_json::Value) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(rows)) = map.get("rows") {
+                    if let Some(serde_json::Value::Array(cells)) = rows.first() {
+                        if let Some(cell) = cells.first() {
+                            if let Some(n) = cell.as_u64() {
+                                return Some(n);
+                            }
+                            if let Some(n) = cell.as_i64() {
+                                return u64::try_from(n).ok();
+                            }
+                            if let Some(s) = cell.as_str() {
+                                return s.trim().parse::<u64>().ok();
+                            }
+                        }
+                    }
+                }
+                for v in map.values() {
+                    if let Some(n) = qual_find_count(v) {
+                        return Some(n);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    if let Some(n) = qual_find_count(v) {
+                        return Some(n);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn qual_count(body: &str) -> u64 {
+        let val: serde_json::Value = serde_json::from_str(body).expect("qual count body parses");
+        qual_find_count(&val).expect("qual count has rows[0][0]")
+    }
+
+    /// First result row as i64 cells (for `SELECT MIN(ts), MAX(ts)`).
+    fn qual_first_row_numbers(body: &str) -> Vec<i64> {
+        fn find_rows(value: &serde_json::Value) -> Option<Vec<i64>> {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Array(rows)) = map.get("rows") {
+                        if let Some(serde_json::Value::Array(cells)) = rows.first() {
+                            let mut out = Vec::new();
+                            for cell in cells {
+                                if let Some(n) = cell.as_i64() {
+                                    out.push(n);
+                                } else if let Some(n) = cell.as_u64() {
+                                    out.push(n.min(i64::MAX as u64) as i64);
+                                } else if let Some(s) = cell.as_str() {
+                                    if let Ok(n) = s.trim().parse::<i64>() {
+                                        out.push(n);
+                                    }
+                                }
+                            }
+                            return Some(out);
+                        }
+                    }
+                    for v in map.values() {
+                        if let Some(row) = find_rows(v) {
+                            return Some(row);
+                        }
+                    }
+                    None
+                }
+                serde_json::Value::Array(items) => {
+                    for v in items {
+                        if let Some(row) = find_rows(v) {
+                            return Some(row);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        let val: serde_json::Value = serde_json::from_str(body).expect("qual row body parses");
+        find_rows(&val).expect("qual row has rows[0]")
+    }
+
+    /// Qualification against a real server through the maintained
+    /// `reqwest` HTTP write path (SQL form + InfluxDB line protocol).
+    ///
+    /// Run with e.g.:
+    /// `GREPTIMEDB_ENDPOINT=http://127.0.0.1:4000 GREPTIMEDB_DATABASE=public \
+    ///  GREPTIMEDB_TABLE=qual_b320 \
+    ///  cargo test -p broker-connectors --lib greptimedb::tests::test_qualify_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates one table per path (the SQL path stores millisecond
+    /// `TIMESTAMP`, the line-protocol path stores nanosecond
+    /// `TIMESTAMP(9)`), streams 2000 rows through the broker's rule
+    /// path ([`crate::ConnectorManager`] -> [`GreptimeDbSink`], 1000
+    /// via SQL INSERT at millisecond precision and 1000 via line
+    /// protocol at nanosecond precision), asserts the exact query-back
+    /// counts (total plus per-path, no tolerance: the protocol permits
+    /// duplicates, never loss) and the precision mapping of each path
+    /// from the server timestamps, probes Basic auth, then drops both
+    /// tables.
+    #[tokio::test]
+    #[ignore = "needs a real server (see GREPTIMEDB_* env)"]
+    async fn test_qualify_write_path() {
+        use crate::ConnectorManager;
+        let endpoint = qual_env("GREPTIMEDB_ENDPOINT").unwrap_or_else(|| {
+            panic!(
+                "GREPTIMEDB_ENDPOINT must point at a real server for qualification; failing closed"
+            )
+        });
+        let database = qual_env("GREPTIMEDB_DATABASE").unwrap_or_else(|| {
+            panic!("GREPTIMEDB_DATABASE must be set for qualification; failing closed")
+        });
+        let table = qual_env("GREPTIMEDB_TABLE").unwrap_or_else(|| {
+            panic!("GREPTIMEDB_TABLE must be set for qualification; failing closed")
+        });
+        let table = qual_check_ident("GREPTIMEDB_TABLE", &table);
+        let database_ident = qual_check_ident("GREPTIMEDB_DATABASE", &database);
+        let base = HttpGreptimeDbTransport::api_base(endpoint.trim_end_matches('/'));
+        let sql_url = format!("{base}/sql?db={database}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("qual http client");
+
+        // Server identity for the report (best effort; never a constant
+        // standing in for a measurement: omit when unreachable).
+        match client
+            .get(format!("{base}/influxdb/health"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(response) => eprintln!(
+                "qual server: status={} endpoint={endpoint} database={database} table={table}",
+                response.status()
+            ),
+            Err(e) => eprintln!("qual server: health unreachable (tolerated): {e}"),
+        }
+        // Best effort only: `SELECT version()` may not exist on every
+        // server, so a failure here is logged and tolerated (the CREATE
+        // below is the real connectivity proof).
+        match client
+            .post(&sql_url)
+            .form(&[("sql", "SELECT version()")])
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                eprintln!(
+                    "qual server version probe: status={status} body={}",
+                    text.chars().take(200).collect::<String>()
+                );
+            }
+            Err(e) => eprintln!("qual server version probe unreachable (tolerated): {e}"),
+        }
+
+        // The SQL path stores `TIMESTAMP` (millisecond) while the
+        // InfluxDB line-protocol path always stores `TimestampNanosecond`
+        // (server-side, since v0.7): sharing one pre-created table makes
+        // the second writer fail with `expect Millisecond, given
+        // TIMESTAMP_NANOSECOND`. Each path therefore gets its own table
+        // with its native time-index type.
+        let line_table = qual_check_ident("GREPTIMEDB_TABLE_LINE", &format!("{table}_line"));
+        // Fresh tables for this run (the DROPs are best effort: a missing
+        // table on a fresh server must not fail qualification, but the
+        // CREATEs below must succeed, proving connectivity).
+        for drop_table in [&table, &line_table] {
+            match client
+                .post(&sql_url)
+                .form(&[("sql", format!("DROP TABLE IF EXISTS {drop_table}").as_str())])
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    eprintln!(
+                        "qual drop: table={drop_table} status={status} body={}",
+                        text.chars().take(200).collect::<String>()
+                    );
+                }
+                Err(e) => eprintln!("qual drop unreachable (tolerated): {e}"),
+            }
+        }
+        qual_sql(
+            &client,
+            &sql_url,
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {table} \
+                 (ts TIMESTAMP TIME INDEX, device STRING, val DOUBLE, seq BIGINT, ingest_path STRING)"
+            ),
+        )
+        .await;
+        qual_sql(
+            &client,
+            &sql_url,
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {line_table} \
+                 (ts TIMESTAMP(9) TIME INDEX, device STRING, val DOUBLE, seq BIGINT, ingest_path STRING)"
+            ),
+        )
+        .await;
+        eprintln!(
+            "qual tables ensured: database={database_ident} sql_table={table} line_table={line_table}"
+        );
+
+        let sql_config = GreptimeDbConfig {
+            endpoint: endpoint.clone(),
+            database: database.clone(),
+            auth: None,
+            format: GreptimeFormat::SqlInsert,
+            table_template: table.clone(),
+            timestamp_precision: GreptimePrecision::Millisecond,
+            batch_size: Some(200),
+            buffer_capacity: None,
+            timeout_ms: Some(30_000),
+        };
+        let mut line_config = sql_config.clone();
+        line_config.format = GreptimeFormat::InfluxLineProtocol;
+        line_config.table_template = line_table.clone();
+        line_config.timestamp_precision = GreptimePrecision::Nanosecond;
+        sql_config.validate().expect("qual sql config validates");
+        line_config.validate().expect("qual line config validates");
+        assert_eq!(sql_config.effective_buffer_capacity(), 10_000);
+        let sql_sink = Arc::new(
+            GreptimeDbSink::new(
+                sql_config.clone(),
+                Arc::new(HttpGreptimeDbTransport::new(&sql_config)),
+            )
+            .expect("qual sql sink"),
+        );
+        let line_sink = Arc::new(
+            GreptimeDbSink::new(
+                line_config.clone(),
+                Arc::new(HttpGreptimeDbTransport::new(&line_config)),
+            )
+            .expect("qual line sink"),
+        );
+        assert_eq!(sql_sink.kind(), "greptimedb");
+        assert_eq!(line_sink.kind(), "greptimedb");
+        // Precision parameters each path actually sends.
+        assert_eq!(
+            sql_config.timestamp_precision.as_influx_param(),
+            "ms",
+            "sql path precision param"
+        );
+        assert_eq!(
+            line_config.timestamp_precision.as_influx_param(),
+            "ns",
+            "line path precision param"
+        );
+        // The broker's path: rule actions deliver through the shared
+        // connector manager, so the qualification sends through it.
+        let manager = Arc::new(ConnectorManager::new());
+        manager.register("qual-greptime-sql", sql_sink.clone());
+        manager.register("qual-greptime-line", line_sink.clone());
+
+        // 1000 rows per path (2000 total). One row every ~2 ms so rapid
+        // writes never share a millisecond timestamp on the same series:
+        // the server's default last-row merge would otherwise collapse
+        // same-timestamp rows and the exact count below could not hold.
+        // TODO(parity): whether the sink itself should hand out strictly
+        // increasing timestamps (as the line-protocol sink does) instead
+        // of relying on the wall clock is open.
+        const PER_PATH: usize = 1000;
+        let topic = Topic::new("qual/b320").unwrap();
+        let t0 = qual_now_millis();
+        for seq in 0..PER_PATH {
+            let payload = Bytes::from(format!(
+                r#"{{"device": "dev-sql-{seq:04}", "val": {:.2}, "seq": {seq}, "ingest_path": "sql"}}"#,
+                20.0 + seq as f64 * 0.01
+            ));
+            manager
+                .send("qual-greptime-sql", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual sql send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        for seq in 0..PER_PATH {
+            let payload = Bytes::from(format!(
+                r#"{{"device": "dev-line-{seq:04}", "val": {:.2}, "seq": {seq}, "ingest_path": "line"}}"#,
+                30.0 + seq as f64 * 0.01
+            ));
+            manager
+                .send("qual-greptime-line", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual line send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sql_sink.flush().await.expect("qual sql flush");
+        line_sink.flush().await.expect("qual line flush");
+        let t1 = qual_now_millis();
+        assert_eq!(sql_sink.buffered_rows(), 0);
+        assert_eq!(line_sink.buffered_rows(), 0);
+        assert_eq!(sql_sink.sent_count(), PER_PATH as u64);
+        assert_eq!(line_sink.sent_count(), PER_PATH as u64);
+        eprintln!(
+            "qual rows sent: sql={PER_PATH} table={table} line={PER_PATH} table={line_table}"
+        );
+
+        // Query-back from the server, not the counters: exact counts, no
+        // tolerance (at-least-once permits duplicates, never loss, and
+        // the paced timestamps plus per-row devices admit no merges).
+        // Each path is counted in its own table with its native
+        // timestamp type (SQL: millisecond, line: nanosecond).
+        async fn qual_wait_count(
+            client: &reqwest::Client,
+            sql_url: &str,
+            table: &str,
+            expect: u64,
+        ) -> u64 {
+            let mut seen = 0;
+            for _ in 0..30 {
+                let body = qual_sql(
+                    client,
+                    sql_url,
+                    &format!("SELECT COUNT(*) AS n FROM {table}"),
+                )
+                .await;
+                seen = qual_count(&body);
+                if seen == expect {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            seen
+        }
+        let sql_total = qual_wait_count(&client, &sql_url, &table, PER_PATH as u64).await;
+        assert_eq!(sql_total, PER_PATH as u64, "qual sql-path count");
+        let line_total = qual_wait_count(&client, &sql_url, &line_table, PER_PATH as u64).await;
+        assert_eq!(line_total, PER_PATH as u64, "qual line-path count");
+        let total = sql_total + line_total;
+        assert_eq!(
+            total,
+            2 * PER_PATH as u64,
+            "qual count: expected {} rows across {table} + {line_table}, got {total}",
+            2 * PER_PATH
+        );
+        eprintln!("qual rows asserted: total={total} sql={PER_PATH} line={PER_PATH}");
+
+        // Precision mapping: the SQL table stores milliseconds inside the
+        // write window and the line table stores nanoseconds inside the
+        // same window scaled to ns (2 min skew each side for clock
+        // drift). A wrong precision on either path lands far outside its
+        // window, so the windows prove both mappings end to end; the
+        // unit vectors below prove every variant.
+        let sql_window = qual_sql(
+            &client,
+            &sql_url,
+            &format!("SELECT MIN(ts) AS mn, MAX(ts) AS mx FROM {table}"),
+        )
+        .await;
+        let sql_ends = qual_first_row_numbers(&sql_window);
+        assert_eq!(sql_ends.len(), 2, "qual sql min/max row: {sql_window}");
+        for bound in &sql_ends {
+            assert!(
+                *bound >= t0 - 120_000 && *bound <= t1 + 120_000,
+                "qual sql timestamp {bound} outside write window [{t0}, {t1}]"
+            );
+        }
+        assert!(sql_ends[0] <= sql_ends[1], "qual sql min <= max");
+        let line_window = qual_sql(
+            &client,
+            &sql_url,
+            &format!("SELECT MIN(ts) AS mn, MAX(ts) AS mx FROM {line_table}"),
+        )
+        .await;
+        let line_ends = qual_first_row_numbers(&line_window);
+        assert_eq!(line_ends.len(), 2, "qual line min/max row: {line_window}");
+        // SELECT MIN/MAX on a TimestampNanosecond column returns
+        // nanoseconds; scale the millisecond write window by 1e6.
+        let ns_lo = (t0 - 120_000) * 1_000_000;
+        let ns_hi = (t1 + 120_000) * 1_000_000;
+        for bound in &line_ends {
+            assert!(
+                *bound >= ns_lo && *bound <= ns_hi,
+                "qual line timestamp {bound} outside ns write window [{ns_lo}, {ns_hi}]"
+            );
+        }
+        assert!(line_ends[0] <= line_ends[1], "qual line min <= max");
+        eprintln!(
+            "qual precision asserted: sql_min={} sql_max={} window=[{t0}, {t1}] line_min={} line_max={} ns_window=[{ns_lo}, {ns_hi}]",
+            sql_ends[0], sql_ends[1], line_ends[0], line_ends[1]
+        );
+        let probe_ms = 1_700_000_000_123i64;
+        assert_eq!(
+            GreptimePrecision::Second.scale_timestamp(probe_ms),
+            1_700_000_000
+        );
+        assert_eq!(
+            GreptimePrecision::Millisecond.scale_timestamp(probe_ms),
+            1_700_000_000_123
+        );
+        assert_eq!(
+            GreptimePrecision::Microsecond.scale_timestamp(probe_ms),
+            1_700_000_000_123_000
+        );
+        assert_eq!(
+            GreptimePrecision::Nanosecond.scale_timestamp(probe_ms),
+            1_700_000_000_123_000_000
+        );
+        assert_eq!(GreptimePrecision::Nanosecond.as_influx_param(), "ns");
+        assert_eq!(GreptimePrecision::Microsecond.as_influx_param(), "u");
+        assert_eq!(GreptimePrecision::Millisecond.as_influx_param(), "ms");
+        assert_eq!(GreptimePrecision::Second.as_influx_param(), "s");
+
+        // Basic auth probe after the counts (its row lands in the SQL
+        // table, which the cleanup drops). A standalone server without
+        // auth enabled answers 200 and the probe is logged as tolerated;
+        // a secured server must fail closed as a terminal dispatch error
+        // and keep the row.
+        // TODO(parity): whether a default server requires Basic auth is
+        // open; the fail-closed branch is asserted, the open branch is
+        // logged and still exercises the auth-header path shape.
+        let mut authed_config = sql_config.clone();
+        authed_config.auth = Some(GreptimeDbAuth {
+            username: "qual-user".to_string(),
+            password: "qual-pass".to_string(),
+        });
+        let authed_sink = Arc::new(
+            GreptimeDbSink::new(
+                authed_config.clone(),
+                Arc::new(HttpGreptimeDbTransport::new(&authed_config)),
+            )
+            .expect("qual authed sink"),
+        );
+        authed_sink
+            .send(
+                &topic,
+                &Bytes::from_static(
+                    br#"{"device": "dev-auth-0000", "val": 1.0, "seq": 0, "ingest_path": "authprobe"}"#,
+                ),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual auth buffer");
+        match authed_sink.flush().await {
+            Ok(()) => {
+                eprintln!("qual auth: server answered 200 with Basic credentials (open server, tolerated)")
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e, ConnectorError::Dispatch(_)),
+                    "bad auth must be terminal, got {e:?}"
+                );
+                assert_eq!(authed_sink.buffered_rows(), 1);
+                eprintln!("qual auth failure asserted: bad Basic auth is a dispatch error");
+            }
+        }
+
+        // Cleanup: drop both qualification tables (best effort; a failure
+        // is logged, not hidden).
+        for drop_table in [&table, &line_table] {
+            match client
+                .post(&sql_url)
+                .form(&[("sql", format!("DROP TABLE IF EXISTS {drop_table}").as_str())])
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    eprintln!("qual cleanup: dropped table {drop_table} status={status}");
+                }
+                Err(e) => {
+                    eprintln!("qual cleanup FAILED to drop {drop_table} (tolerated): {e}")
+                }
+            }
+        }
+        eprintln!(
+            "qual done: rows={} tables={table},{line_table} cleaned tables",
+            2 * PER_PATH
+        );
     }
 }

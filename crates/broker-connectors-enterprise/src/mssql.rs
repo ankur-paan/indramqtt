@@ -7,11 +7,13 @@
 //! interpolation. Deadlock error 1205 and transport disconnects retry
 //! with backoff; other server errors are terminal.
 //!
-//! Wire framing is a clean-room TDS subset: packet headers, PRELOGIN
-//! negotiation (aborts loudly when the server *requires* TLS —
-//! terminate TLS in a sidecar or enable it on the edge), LOGIN7 with
-//! obscured SQL password, RPC `sp_executesql` batches, and DONE/ERROR
-//! token parsing.
+//! Production execution runs on the maintained `tiberius` driver
+//! ([`DriverMssqlTransport`] below): it speaks TDS (PRELOGIN, LOGIN7,
+//! `sp_executesql`) with SQL auth and typed params over tokio. The
+//! hand-written framing below (`NativeMssqlTransport`: packet headers,
+//! PRELOGIN negotiation, LOGIN7 with obscured SQL password, RPC
+//! `sp_executesql` batches, DONE/ERROR token parsing) is retained for
+//! offline unit tests only.
 
 #![allow(unknown_lints)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
@@ -850,7 +852,7 @@ impl MssqlTransport for NativeMssqlTransport {
         for row in &rows {
             let statement = match &self.query_mode {
                 MssqlQueryMode::InsertJson => format!(
-                    "INSERT INTO {table} (timestamp, topic, client_id, qos, payload) VALUES ($1, $2, $3, $4, $5)"
+                    "INSERT INTO {table} ([event_time], [topic], [client_id], [qos], [payload]) VALUES ($1, $2, $3, $4, $5)"
                 ),
                 MssqlQueryMode::CustomUpsert { sql_template } => sql_template.clone(),
             };
@@ -880,6 +882,252 @@ impl MssqlTransport for NativeMssqlTransport {
                     return Err(ConnectorError::Dispatch(format!(
                         "mssql error {number}: {message}"
                     )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Maintained-driver transport (tiberius).
+// ---------------------------------------------------------------------------
+
+/// Concrete driver session: a `tiberius` TDS client over a tokio TCP
+/// stream adapted to futures-io via `tokio-util` compat.
+type DriverClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+/// Map a driver error onto the sink's retry contract: deadlocks (1205)
+/// and transport/TLS failures are `Connection` (the sink retries them
+/// in place); every other server refusal is `Dispatch` (terminal, the
+/// buffer is retained and backoff engages). Login refusals carry a
+/// server code (18456), so a wrong password surfaces here as an auth
+/// error instead of a silent retry.
+fn map_driver_error(error: tiberius::error::Error) -> ConnectorError {
+    if error.is_deadlock() {
+        return ConnectorError::Connection(format!("mssql deadlock 1205: {error}"));
+    }
+    if let Some(code) = error.code() {
+        return ConnectorError::Dispatch(format!("mssql error {code}: {error}"));
+    }
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("login failed")
+        || lower.contains("login error")
+        || lower.contains("cannot open database")
+    {
+        return ConnectorError::Dispatch(format!("mssql login refused: {error}"));
+    }
+    ConnectorError::Connection(format!("mssql driver: {error}"))
+}
+
+/// Rewrite `$1..$5` markers to the driver's `@P1..@P5` bind markers
+/// (the same naive substitution the hand-written path applies in
+/// `encode_executesql`, so both paths accept the same templates).
+fn driver_sql(statement: &str) -> String {
+    let mut sql = statement.to_string();
+    for index in 1..=5 {
+        sql = sql.replace(&format!("${index}"), &format!("@P{index}"));
+    }
+    sql
+}
+
+/// Build a typed `DATETIMEOFFSET` bind value from unix millis (UTC,
+/// zero offset). Millis clamp at zero so pre-epoch inputs never render
+/// a surprising year; the civil conversion mirrors
+/// `encode_datetimeoffset` (days since 0001-01-01 plus 100ns day
+/// fractions at scale 7).
+///
+/// The newtype carries the value through `tiberius::Query::bind`:
+/// tiberius 0.12 implements `IntoSql` for borrowed/owned scalars but
+/// not for `ColumnData` itself, so binding the `ColumnData` directly
+/// fails to compile.
+#[derive(Debug, Clone)]
+struct DriverDateTimeOffset(tiberius::time::DateTimeOffset);
+
+impl<'a> tiberius::IntoSql<'a> for DriverDateTimeOffset {
+    fn into_sql(self) -> tiberius::ColumnData<'a> {
+        tiberius::ColumnData::DateTimeOffset(Some(self.0))
+    }
+}
+
+fn driver_datetimeoffset(millis: i64) -> DriverDateTimeOffset {
+    let clamped = millis.max(0);
+    let days = clamped.div_euclid(86_400_000) + 719_162;
+    let day_nanos = clamped.rem_euclid(86_400_000) as u64 * 1_000_000;
+    let date = tiberius::time::Date::new(days as u32);
+    let time = tiberius::time::Time::new(day_nanos / 100, 7);
+    let moment = tiberius::time::DateTime2::new(date, time);
+    DriverDateTimeOffset(tiberius::time::DateTimeOffset::new(moment, 0))
+}
+
+/// Production transport on the maintained `tiberius` driver: real TDS
+/// (PRELOGIN, LOGIN7, `sp_executesql`) with SQL auth and typed params
+/// (`DATETIMEOFFSET`, `NVARCHAR`, `BIGINT`), negotiated by the driver
+/// instead of by hand.
+///
+/// Bound: one cached driver session plus the sink buffer in front of
+/// it (batch rows default 200, batch bytes default 2 MiB); no pool,
+/// no background queue. The default is finite because an unbounded
+/// session pool under fan-in would repeat the multi-GB RSS collapse
+/// the v4 benchmark measured on this path. The sink's send path runs
+/// behind the rule engine's bounded queue, so no benchmark numbers
+/// are needed.
+pub struct DriverMssqlTransport {
+    config: MssqlSinkConfig,
+    client: tokio::sync::Mutex<Option<DriverClient>>,
+    timeout: Duration,
+}
+
+impl DriverMssqlTransport {
+    pub fn new(config: &MssqlSinkConfig) -> Result<Self> {
+        config.validate()?;
+        // Fail closed on integrated auth: without Kerberos/GSSAPI
+        // there is no credential to offer. TODO(parity): support
+        // integrated auth via GSSAPI or a managed-identity sidecar —
+        // which credential flow should the sink use?
+        if matches!(config.auth, MssqlAuth::Integrated) {
+            return Err(ConnectorError::Dispatch(
+                "mssql integrated auth is not supported by the driver transport; use sql_password"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            config: config.clone(),
+            client: tokio::sync::Mutex::new(None),
+            timeout: config.timeout(),
+        })
+    }
+
+    /// Driver login for the sink's stored credentials.
+    /// `ActiveDirectoryPassword` authenticates as SQL password
+    /// credentials (no FEDAUTH token flow), exactly as the
+    /// hand-written path documents; use a sidecar or managed identity
+    /// proxy for true AAD.
+    fn driver_config(&self) -> Result<tiberius::Config> {
+        let mut driver = tiberius::Config::new();
+        driver.host(&self.config.host);
+        driver.port(self.config.port_or_default());
+        driver.database(&self.config.database);
+        driver.application_name("IndraMQTT");
+        match &self.config.auth {
+            MssqlAuth::SqlPassword { username, password }
+            | MssqlAuth::ActiveDirectoryPassword { username, password } => {
+                driver.authentication(tiberius::AuthMethod::sql_server(username, password));
+            }
+            MssqlAuth::Integrated => {
+                return Err(ConnectorError::Dispatch(
+                    "mssql integrated auth is not supported by the driver transport".to_string(),
+                ));
+            }
+        }
+        if self.config.trust_server_certificate {
+            driver.trust_cert();
+        }
+        Ok(driver)
+    }
+
+    /// Dial and log in, following one routing redirect (some firewall
+    /// setups answer the login with an alternate address; a second
+    /// redirect is a misconfiguration, and looping would hang flush).
+    async fn connect_new(&self, driver: tiberius::Config) -> Result<DriverClient> {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let addr = driver.get_addr().to_string();
+        let tcp = tokio::time::timeout(
+            self.timeout,
+            tokio::net::TcpStream::connect(driver.get_addr()),
+        )
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("mssql connect timeout: {addr}")))?
+        .map_err(|e| ConnectorError::Connection(format!("mssql connect failed: {e}")))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| ConnectorError::Connection(format!("mssql tcp setup failed: {e}")))?;
+        match tokio::time::timeout(
+            self.timeout,
+            tiberius::Client::connect(driver, tcp.compat_write()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(tiberius::error::Error::Routing { host, port })) => {
+                let mut follow = self.driver_config()?;
+                follow.host(&host);
+                follow.port(port);
+                let addr = follow.get_addr().to_string();
+                let tcp = tokio::time::timeout(
+                    self.timeout,
+                    tokio::net::TcpStream::connect(follow.get_addr()),
+                )
+                .await
+                .map_err(|_| ConnectorError::Connection(format!("mssql redirect timeout: {addr}")))?
+                .map_err(|e| ConnectorError::Connection(format!("mssql redirect failed: {e}")))?;
+                tcp.set_nodelay(true).map_err(|e| {
+                    ConnectorError::Connection(format!("mssql tcp setup failed: {e}"))
+                })?;
+                tokio::time::timeout(
+                    self.timeout,
+                    tiberius::Client::connect(follow, tcp.compat_write()),
+                )
+                .await
+                .map_err(|_| ConnectorError::Connection("mssql login timeout".to_string()))?
+                .map_err(map_driver_error)
+            }
+            Ok(Err(error)) => Err(map_driver_error(error)),
+            Err(_) => Err(ConnectorError::Connection(
+                "mssql login timeout".to_string(),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl MssqlTransport for DriverMssqlTransport {
+    async fn execute_batch(&self, table: &str, rows: Vec<MssqlRowItem>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            let driver = self.driver_config()?;
+            match self.connect_new(driver).await {
+                Ok(client) => *guard = Some(client),
+                Err(error) => return Err(error),
+            }
+        }
+        let client = guard
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Connection("mssql not connected".to_string()))?;
+        let template = match &self.config.query_mode {
+            MssqlQueryMode::InsertJson => format!(
+                "INSERT INTO {table} ([event_time], [topic], [client_id], [qos], [payload]) VALUES ($1, $2, $3, $4, $5)"
+            ),
+            MssqlQueryMode::CustomUpsert { sql_template } => sql_template.clone(),
+        };
+        let statement = driver_sql(&template);
+        for row in &rows {
+            let mut query = tiberius::Query::new(statement.as_str());
+            query.bind(driver_datetimeoffset(row.time_ms));
+            query.bind(row.topic.as_str());
+            query.bind(row.client_id.as_str());
+            query.bind(i64::from(row.qos));
+            query.bind(row.payload_json.as_str());
+            match tokio::time::timeout(self.timeout, query.execute(&mut *client)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    let mapped = map_driver_error(error);
+                    // Drop a broken session so the next batch (or the
+                    // sink's in-loop retry) dials fresh; a pure server
+                    // refusal leaves the session usable.
+                    if matches!(mapped, ConnectorError::Connection(_)) {
+                        *guard = None;
+                    }
+                    return Err(mapped);
+                }
+                Err(_) => {
+                    *guard = None;
+                    return Err(ConnectorError::Connection(
+                        "mssql execute timeout".to_string(),
+                    ));
                 }
             }
         }
@@ -1454,5 +1702,397 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    #[test]
+    fn test_driver_sql_markers() {
+        let converted = driver_sql(
+            "INSERT INTO t (timestamp, topic, client_id, qos, payload) VALUES ($1, $2, $3, $4, $5)",
+        );
+        assert!(converted.contains("@P1") && converted.contains("@P5"));
+        assert!(!converted.contains('$'));
+        // Custom templates convert the same way; unreferenced text is untouched.
+        assert_eq!(
+            driver_sql("UPDATE t SET payload = $5 WHERE topic = $2"),
+            "UPDATE t SET payload = @P5 WHERE topic = @P2"
+        );
+    }
+
+    #[test]
+    fn test_driver_datetimeoffset_vector() {
+        // Epoch: day 719162 (days since 0001-01-01), midnight, UTC.
+        let moment = driver_datetimeoffset(0).0;
+        assert_eq!(moment.datetime2().date().days(), 719_162);
+        assert_eq!(moment.datetime2().time().increments(), 0);
+        assert_eq!(moment.datetime2().time().scale(), 7);
+        assert_eq!(moment.offset(), 0);
+        // 2026-09-12T11:18:09.123Z: day 739870, 100ns fractions, UTC.
+        let moment = driver_datetimeoffset(1_789_211_889_123).0;
+        assert_eq!(moment.datetime2().date().days(), 739_870);
+        assert_eq!(moment.datetime2().time().increments(), 406_891_230_000);
+        assert_eq!(moment.offset(), 0);
+        // Pre-epoch clamps to the epoch instead of rendering year 1 surprises.
+        let moment = driver_datetimeoffset(-5).0;
+        assert_eq!(moment.datetime2().date().days(), 719_162);
+    }
+
+    #[test]
+    fn test_driver_transport_fails_closed() {
+        // Integrated auth has no credential to offer without Kerberos.
+        let mut integrated = test_config();
+        integrated.auth = MssqlAuth::Integrated;
+        let err = match DriverMssqlTransport::new(&integrated) {
+            Ok(_) => panic!("integrated must fail closed"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConnectorError::Dispatch(_)));
+        // Stored-config validation still applies on the driver path.
+        let mut bad = test_config();
+        bad.host.clear();
+        assert!(DriverMssqlTransport::new(&bad).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must point at a real Microsoft SQL Server server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. MSSQL_HOST=127.0.0.1)"
+            )
+        })
+    }
+
+    fn qual_identifier(name: &str, value: &str) -> String {
+        assert!(
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "qual {name} must match [A-Za-z0-9_]+, got {value:?} (failing closed)"
+        );
+        value.to_string()
+    }
+
+    /// Open a bare driver session for setup and assertions (DDL,
+    /// version, counts). Panics with context when unreachable: a
+    /// qualification against a missing server must fail, never skip.
+    async fn qual_admin_client(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+    ) -> DriverClient {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let mut config = tiberius::Config::new();
+        config.host(host);
+        config.port(port);
+        config.database(database);
+        config.authentication(tiberius::AuthMethod::sql_server(user, password));
+        // Qualification runs against a container with a self-signed
+        // certificate: trust it explicitly (production deployments
+        // with a chained certificate leave this off via config).
+        config.trust_cert();
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::net::TcpStream::connect(config.get_addr()),
+        )
+        .await
+        .expect("qual connect timed out")
+        .unwrap_or_else(|e| panic!("qual connect failed: {e:?}"));
+        tcp.set_nodelay(true).expect("qual nodelay");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            tiberius::Client::connect(config, tcp.compat_write()),
+        )
+        .await
+        .expect("qual login timed out")
+        .unwrap_or_else(|e| panic!("qual login failed: {e:?}"))
+    }
+
+    /// Qualification against a real Microsoft SQL Server server over
+    /// the maintained `tiberius` driver ([`DriverMssqlTransport`]).
+    ///
+    /// Run with e.g.:
+    /// `MSSQL_HOST=127.0.0.1 MSSQL_PORT=1433 MSSQL_DATABASE=qual_b328 \
+    ///  MSSQL_TABLE=qual_rows MSSQL_USER=sa MSSQL_PASSWORD='Qualpass1!' \
+    ///  cargo test -p broker-connectors-enterprise --lib mssql::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates a table with `DATETIMEOFFSET` / `NVARCHAR` / `BIGINT`
+    /// columns, proves a wrong password fails closed with an auth
+    /// error, streams 1000 rows through the broker
+    /// ([`crate::ConnectorManager`] -> [`MssqlSink`] on
+    /// [`DriverMssqlTransport`], never `sink.send` directly), asserts
+    /// `SELECT COUNT(*)` returns 1000 with every key present and the
+    /// column types round-tripping, then drops the table it created.
+    /// Panics when its environment is missing (fail closed, never
+    /// skips).
+    #[tokio::test]
+    #[ignore = "needs a real Microsoft SQL Server server (see MSSQL_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use broker_connectors::ConnectorManager;
+        use std::collections::HashSet;
+
+        const ROWS: usize = 1000;
+
+        let host = qual_require("MSSQL_HOST");
+        let port: u16 = qual_require("MSSQL_PORT")
+            .parse()
+            .expect("qual MSSQL_PORT must be a port number");
+        let database = qual_identifier("database", &qual_require("MSSQL_DATABASE"));
+        let table = qual_identifier("table", &qual_require("MSSQL_TABLE"));
+        let user = qual_require("MSSQL_USER");
+        let password = qual_require("MSSQL_PASSWORD");
+
+        let mut admin = qual_admin_client(&host, port, &user, &password, &database).await;
+
+        // Server version for the report (connectivity is already
+        // proved by the login above; the version string is context).
+        let version_rows = admin
+            .simple_query("SELECT @@VERSION AS version")
+            .await
+            .expect("qual version query")
+            .into_first_result()
+            .await
+            .expect("qual version rows");
+        let version: &str = version_rows
+            .first()
+            .expect("qual version row")
+            .get(0)
+            .expect("qual version value");
+        eprintln!("qual server: version={version} host={host}:{port} database={database}");
+
+        admin
+            .simple_query(format!("DROP TABLE IF EXISTS [{table}]").as_str())
+            .await
+            .expect("qual drop stale table")
+            .into_first_result()
+            .await
+            .expect("qual drop drained");
+        admin
+            .simple_query(
+                format!(
+                    "CREATE TABLE [{table}] (\
+                     event_time DATETIMEOFFSET NOT NULL, \
+                     topic NVARCHAR(256) NOT NULL, \
+                     client_id NVARCHAR(256) NOT NULL, \
+                     qos BIGINT NOT NULL, \
+                     payload NVARCHAR(MAX) NOT NULL)"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("qual create table")
+            .into_first_result()
+            .await
+            .expect("qual create drained");
+        eprintln!("qual table created: {table} (DATETIMEOFFSET/NVARCHAR/BIGINT)");
+
+        // Wrong password fails closed with an auth error through the
+        // same transport mapping production uses (Dispatch, never a
+        // retryable silence, and nothing written).
+        let bad_row = MssqlRowItem {
+            time_ms: broker_connectors::now_millis(),
+            topic: "sensors/qual".to_string(),
+            client_id: "qual-bad".to_string(),
+            qos: 1,
+            payload_json: r#"{"client_id":"qual-bad","seq":-1}"#.to_string(),
+        };
+        let bad_config = MssqlSinkConfig {
+            host: host.clone(),
+            port: Some(port),
+            database: database.clone(),
+            table_template: table.clone(),
+            auth: MssqlAuth::SqlPassword {
+                username: user.clone(),
+                password: "wrongpass".to_string(),
+            },
+            query_mode: MssqlQueryMode::InsertJson,
+            trust_server_certificate: true,
+            batch_size: Some(200),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(60_000),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_500),
+            timeout_ms: Some(15_000),
+        };
+        let bad_transport =
+            Arc::new(DriverMssqlTransport::new(&bad_config).expect("qual bad transport"));
+        let bad_err = bad_transport
+            .execute_batch(&table, vec![bad_row])
+            .await
+            .expect_err("wrong password must fail");
+        assert!(
+            matches!(bad_err, ConnectorError::Dispatch(_)),
+            "qual bad password must surface an auth error, got {bad_err:?}"
+        );
+        eprintln!("qual auth asserted: wrong password fails closed ({bad_err:?})");
+
+        // The broker's path: rule actions deliver through the shared
+        // connector manager (this is what `register_live_sink` fills
+        // and what `ForwardConnector` sends through), so the
+        // qualification sends through it and never `sink.send`.
+        let sink_config = MssqlSinkConfig {
+            host: host.clone(),
+            port: Some(port),
+            database: database.clone(),
+            table_template: table.clone(),
+            auth: MssqlAuth::SqlPassword {
+                username: user.clone(),
+                password: password.clone(),
+            },
+            query_mode: MssqlQueryMode::InsertJson,
+            trust_server_certificate: true,
+            batch_size: Some(200),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(60_000), // explicit flushes only; keeps auto-batches exact
+            max_retries: Some(3),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_500),
+            timeout_ms: Some(30_000), // container cold start + TLS handshake
+        };
+        sink_config.validate().expect("qual config validates");
+        let transport = Arc::new(DriverMssqlTransport::new(&sink_config).expect("qual transport"));
+        let sink = Arc::new(MssqlSink::new(sink_config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "mssql");
+        let manager = ConnectorManager::new();
+        manager.register("qual-mssql", sink.clone());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        let window_start = broker_connectors::now_millis();
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"client_id":"qual-{seq:06}","seq":{seq}}}"#));
+            manager
+                .send("qual-mssql", &topic, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        sink.flush().await.expect("qual flush");
+        let window_end = broker_connectors::now_millis();
+        assert_eq!(sink.sent_records(), ROWS as u64, "qual sent records");
+        assert_eq!(sink.sent_batches(), 5, "qual sent batches");
+        eprintln!("qual rows sent: records={ROWS} batches=5 table={table}");
+
+        // Row count asserted back from the server, not the counters.
+        let count_rows = admin
+            .simple_query(format!("SELECT COUNT(*) AS n FROM [{table}]").as_str())
+            .await
+            .expect("qual count")
+            .into_first_result()
+            .await
+            .expect("qual count rows");
+        let count: i32 = count_rows
+            .first()
+            .expect("qual count row")
+            .get(0)
+            .expect("qual count value");
+        assert_eq!(count, ROWS as i32, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={table}");
+
+        // Column types asserted back from the catalog: the params must
+        // have landed as DATETIMEOFFSET / NVARCHAR / BIGINT.
+        let schema_rows = admin
+            .simple_query(
+                format!(
+                    "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
+                     WHERE TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("qual schema")
+            .into_first_result()
+            .await
+            .expect("qual schema rows");
+        let schema: Vec<(String, String)> = schema_rows
+            .iter()
+            .map(|row| {
+                let name: &str = row.get(0).expect("qual column name");
+                let dtype: &str = row.get(1).expect("qual column type");
+                (name.to_string(), dtype.to_string())
+            })
+            .collect();
+        assert_eq!(
+            schema,
+            vec![
+                ("event_time".to_string(), "datetimeoffset".to_string()),
+                ("topic".to_string(), "nvarchar".to_string()),
+                ("client_id".to_string(), "nvarchar".to_string()),
+                ("qos".to_string(), "bigint".to_string()),
+                ("payload".to_string(), "nvarchar".to_string()),
+            ],
+            "qual column types must round-trip"
+        );
+        eprintln!("qual types asserted: {schema:?}");
+
+        // Every key present with exact values (at-least-once permits
+        // duplicates, never loss; here the count is already exact).
+        // Event times come back as epoch millis via DATEDIFF_BIG so
+        // the assertion needs no client date library.
+        let value_rows = admin
+            .simple_query(
+                format!(
+                    "SELECT DATEDIFF_BIG(MILLISECOND, '1970-01-01T00:00:00+00:00', event_time), \
+                     topic, client_id, qos, payload FROM [{table}]"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("qual values")
+            .into_first_result()
+            .await
+            .expect("qual value rows");
+        assert_eq!(value_rows.len(), ROWS, "qual value row count");
+        let mut seen = HashSet::with_capacity(ROWS);
+        for row in &value_rows {
+            let event_ms: i64 = row.get(0).expect("qual event_time");
+            let row_topic: &str = row.get(1).expect("qual topic");
+            let row_client: &str = row.get(2).expect("qual client_id");
+            let row_qos: i64 = row.get(3).expect("qual qos");
+            let row_payload: &str = row.get(4).expect("qual payload");
+            assert!(
+                (window_start..=window_end).contains(&event_ms),
+                "qual event_time {event_ms} outside send window"
+            );
+            assert_eq!(row_topic, "sensors/qual");
+            assert_eq!(row_qos, 1);
+            let value: serde_json::Value =
+                serde_json::from_str(row_payload).expect("qual payload JSON");
+            assert_eq!(
+                value.get("client_id").and_then(|v| v.as_str()),
+                Some(row_client)
+            );
+            assert!(
+                seen.insert(row_client.to_string()),
+                "qual duplicate {row_client}"
+            );
+        }
+        for seq in 0..ROWS {
+            assert!(
+                seen.contains(&format!("qual-{seq:06}")),
+                "qual missing key qual-{seq:06}"
+            );
+        }
+        eprintln!("qual values asserted: every key present, types exact");
+
+        // Cleanup: drop the table created for this run (best effort;
+        // the next run drops stale tables first).
+        match admin
+            .simple_query(format!("DROP TABLE IF EXISTS [{table}]").as_str())
+            .await
+        {
+            Ok(stream) => match stream.into_first_result().await {
+                Ok(_) => eprintln!("qual cleanup: dropped table {table}"),
+                Err(error) => {
+                    eprintln!("qual cleanup FAILED to drop {table} (tolerated): {error}")
+                }
+            },
+            Err(error) => {
+                eprintln!("qual cleanup FAILED to drop {table} (tolerated): {error}")
+            }
+        }
+        eprintln!("qual done: rows={ROWS} table={table} database={database}");
     }
 }

@@ -20,13 +20,17 @@ pub mod greptimedb;
 pub mod http;
 pub mod influxdb;
 pub mod kafka;
+pub mod kinesis;
 pub mod mqtt_bridge;
+pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;
 pub mod postgres;
 pub mod rabbitmq;
 pub mod redis;
+pub mod redshift;
 pub mod s3;
+pub mod sparkplug_b;
 pub mod timescaledb;
 
 pub use clickhouse::{
@@ -72,7 +76,7 @@ pub use mysql::{
     MySqlTransport, TcpMySqlTransport,
 };
 pub use opentsdb::{
-    extract_opentsdb_point, sanitize_opentsdb_string, serialize_telnet_lines,
+    extract_opentsdb_point, parse_telnet_addr, sanitize_opentsdb_string, serialize_telnet_lines,
     MockOpenTsdbTransport, NetworkOpenTsdbTransport, OpenTsdbCompression, OpenTsdbConfig,
     OpenTsdbConnector, OpenTsdbDataPoint, OpenTsdbProtocol, OpenTsdbSink, OpenTsdbSummaryResponse,
     OpenTsdbTransport,

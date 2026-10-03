@@ -3480,6 +3480,9 @@ mod tests {
                     batch_size: Some(1),
                     linger_ms: Some(50),
                     timeout_ms: None,
+                    mqtt_url: None,
+                    client_id: None,
+                    max_aliases: Some(10_000),
                 },
                 spb_transport.clone(),
             )

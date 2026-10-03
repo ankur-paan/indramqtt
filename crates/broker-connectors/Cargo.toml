@@ -113,3 +113,20 @@ redis = { version = "0.25", default-features = false, features = ["tokio-comp"] 
 [dev-dependencies]
 axum = { workspace = true }
 apache-avro = { version = "0.15" }
+broker-connectors-enterprise = { workspace = true }
+broker-rules = { workspace = true }
+# Qualification shim only: the enterprise sink owns the driver; this
+# dev-edge lets `-p broker-connectors --lib kinesis::tests::...`
+# name the shard-iterator type directly without a runtime dep cycle.
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# MSSQL qualification shim only: the enterprise sink owns the `tiberius`
+# driver; this dev-edge lets `-p broker-connectors --lib
+# mssql::tests::test_qualify_driver_write_path` drive the enterprise
+# sink without a runtime dep cycle.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+# Redshift qualification shim only: the enterprise sink owns the driver;
+# this dev-edge lets `-p broker-connectors --lib
+# redshift::tests::test_qualify_driver_write_path` drive the enterprise
+# sink without a runtime dep cycle.
+aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

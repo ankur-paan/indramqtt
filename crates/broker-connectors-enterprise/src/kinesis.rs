@@ -3,15 +3,24 @@
 //! Buffers MQTT events and ingests them with the `PutRecords` batch
 //! API (`Kinesis_20131202.PutRecords` over HTTP POST,
 //! `application/x-amz-json-1.1`), signed with AWS Signature Version 4
-//! for service `kinesis` via the shared signer in `super`
-//! (temp-session `x-amz-security-token` included when configured).
+//! for service `kinesis`.
+//!
+//! The write path runs on the maintained `aws-sdk-kinesis` driver
+//! ([`SdkKinesisTransport`] below): `PutRecords` with driver-owned
+//! SigV4 (static access-key credentials, session token when
+//! configured, endpoint override for local servers). The legacy
+//! hand-written [`HttpKinesisTransport`] (shared signer in `super`,
+//! temp-session `x-amz-security-token` included when configured) is
+//! retained for offline unit tests only; production wiring uses the
+//! driver transport.
 //!
 //! Partial failures retry per record: a response with
 //! `FailedRecordCount > 0` requeues only the entries carrying an
 //! `ErrorCode` (e.g. `ProvisionedThroughputExceededException`,
 //! `InternalFailure`) with jittered backoff; clean entries are never
-//! resent. HTTP 429/500..=504 retry the whole batch; other non-2xx
-//! statuses are terminal dispatch failures.
+//! resent. Throttles and transport errors retry the whole batch;
+//! other non-2xx statuses (HTTP transport) or terminal SDK failures
+//! are terminal dispatch failures.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -599,6 +608,171 @@ impl KinesisTransport for HttpKinesisTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver transport (`aws-sdk-kinesis`).
+// ---------------------------------------------------------------------------
+
+/// Retryable Kinesis failure text: provisioned-throughput exceeded,
+/// throttling, limit exceeded, internal failures, timeouts and
+/// transport errors. The sink retries these with jittered backoff;
+/// anything else (validation, missing stream, auth, KMS) is terminal.
+/// Matching is by error text so it stays correct across driver
+/// revisions without depending on generated variant names.
+// TODO(parity): the retry-vs-terminal split per PutRecords error code
+// is not pinned by the spec; recheck this list against the structured
+// PutRecordsError variants on driver upgrades.
+fn is_retryable_kinesis_error(text: &str) -> bool {
+    const RETRYABLE: &[&str] = &[
+        "provisionedthroughputexceeded",
+        "throughputexceeded",
+        "throttl",
+        "limitexceeded",
+        "ratelimitexceeded",
+        "internalfailure",
+        "internalservererror",
+        "internalerror",
+        "serviceunavailable",
+        "timeout",
+        "timed out",
+        "connection",
+        "dispatch",
+        "unavailable",
+    ];
+    let lower = text.to_lowercase();
+    RETRYABLE.iter().any(|marker| lower.contains(marker))
+}
+
+fn classify_kinesis_sdk_error(text: String) -> ConnectorError {
+    if is_retryable_kinesis_error(&text) {
+        ConnectorError::Connection(text)
+    } else {
+        ConnectorError::Dispatch(text)
+    }
+}
+
+/// Production transport on the maintained `aws-sdk-kinesis` driver:
+/// `PutRecords` with driver-owned SigV4 (static access-key
+/// credentials, session token when configured, endpoint override for
+/// local servers). One driver round trip is bounded by the configured
+/// request timeout so a slow server surfaces as a retryable
+/// connection error instead of stalling the rule path. Per-record
+/// results map back positionally, so the sink's selective retry is
+/// unchanged; a short result list fails closed as a whole-batch
+/// connection error instead of dropping records.
+pub struct SdkKinesisTransport {
+    client: aws_sdk_kinesis::Client,
+    timeout: Duration,
+}
+
+impl SdkKinesisTransport {
+    pub fn new(config: &KinesisSinkConfig) -> Result<Self> {
+        config.validate()?;
+        let region = aws_sdk_kinesis::config::Region::new(config.region.clone());
+        let credentials = aws_sdk_kinesis::config::Credentials::new(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            config.session_token.clone(),
+            None,
+            "indramqtt-static",
+        );
+        let provider = aws_sdk_kinesis::config::SharedCredentialsProvider::new(credentials);
+        let mut builder = aws_sdk_kinesis::Config::builder()
+            .behavior_version_latest()
+            .region(region)
+            .credentials_provider(provider);
+        if let Some(endpoint) = &config.endpoint {
+            builder = builder.endpoint_url(endpoint.trim_end_matches('/'));
+        }
+        let sdk_config = builder.build();
+        Ok(Self {
+            client: aws_sdk_kinesis::Client::from_conf(sdk_config),
+            timeout: config.timeout(),
+        })
+    }
+
+    /// Borrow the driver client (stream setup and read-back for
+    /// qualification; the write path stays behind the trait).
+    pub fn client(&self) -> &aws_sdk_kinesis::Client {
+        &self.client
+    }
+
+    /// Test hook proving `new` stores the configured timeout; the
+    /// production path applies `self.timeout` to the driver call.
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+#[async_trait]
+impl KinesisTransport for SdkKinesisTransport {
+    async fn put_records(
+        &self,
+        req: &KinesisPutRecordsRequest,
+    ) -> Result<KinesisPutRecordsResponse> {
+        use aws_sdk_kinesis::types::PutRecordsRequestEntry;
+        let mut entries = Vec::with_capacity(req.records.len());
+        for record in &req.records {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(&record.data_b64)
+                .map_err(|e| {
+                    ConnectorError::Dispatch(format!("kinesis payload is not base64: {e}"))
+                })?;
+            let mut entry = PutRecordsRequestEntry::builder()
+                .data(aws_sdk_kinesis::primitives::Blob::new(raw))
+                .partition_key(record.partition_key.clone());
+            if let Some(hash_key) = &record.explicit_hash_key {
+                entry = entry.explicit_hash_key(hash_key.clone());
+            }
+            entries.push(
+                entry
+                    .build()
+                    .map_err(|e| ConnectorError::Dispatch(format!("kinesis record build: {e}")))?,
+            );
+        }
+        let timeout = self.timeout;
+        let output = tokio::time::timeout(
+            timeout,
+            self.client
+                .put_records()
+                .stream_name(req.stream_name.clone())
+                .set_records(Some(entries))
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::Connection(format!(
+                "kinesis driver timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
+        .map_err(|e| {
+            classify_kinesis_sdk_error(format!("kinesis put_records failed: {e:?} ({e})"))
+        })?;
+        let results = output.records();
+        if results.len() != req.records.len() {
+            return Err(ConnectorError::Connection(format!(
+                "kinesis returned {} per-record results for {} records; retrying whole batch",
+                results.len(),
+                req.records.len()
+            )));
+        }
+        let mut parsed = Vec::with_capacity(results.len());
+        for entry in results {
+            parsed.push(KinesisRecordResult {
+                ok: entry.error_code().is_none(),
+                error_code: entry.error_code().map(str::to_string),
+                sequence_number: entry.sequence_number().map(str::to_string),
+            });
+        }
+        let failed_count = output.failed_record_count().unwrap_or(0).max(0) as usize;
+        Ok(KinesisPutRecordsResponse {
+            failed_count,
+            results: parsed,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -1121,5 +1295,363 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_sdk_transport_construction() {
+        let config = test_config();
+        // Building the driver client is lazy: no I/O, safe offline.
+        let transport = SdkKinesisTransport::new(&config).expect("sdk transport builds");
+        assert_eq!(transport.timeout(), config.timeout());
+        let mut bad = test_config();
+        bad.stream_name.clear();
+        assert!(SdkKinesisTransport::new(&bad).is_err());
+    }
+
+    #[test]
+    fn test_sdk_error_classification() {
+        // Throttles and transport failures retry; terminal failures do not.
+        for retryable in [
+            "kinesis put_records failed: ProvisionedThroughputExceededException (throttled)",
+            "kinesis put_records failed: ThrottlingException",
+            "kinesis put_records failed: InternalFailure",
+            "kinesis put_records failed: ServiceUnavailable",
+            "kinesis driver timed out after 5000ms",
+            "dispatch failure",
+        ] {
+            assert!(
+                matches!(
+                    classify_kinesis_sdk_error(retryable.to_string()),
+                    ConnectorError::Connection(_)
+                ),
+                "{retryable:?} must be retryable"
+            );
+        }
+        for terminal in [
+            "kinesis put_records failed: ResourceNotFoundException (no such stream)",
+            "kinesis put_records failed: AccessDeniedException",
+            "kinesis put_records failed: ValidationException",
+            "kinesis record build: missing partition key",
+        ] {
+            assert!(
+                matches!(
+                    classify_kinesis_sdk_error(terminal.to_string()),
+                    ConnectorError::Dispatch(_)
+                ),
+                "{terminal:?} must be terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sdk_unreachable_fails_closed_through_manager() {
+        // Unreachable server through the broker path: connection
+        // failure, never access granted.
+        use broker_connectors::ConnectorManager;
+        let mut config = test_config();
+        config.endpoint = Some("http://127.0.0.1:1".to_string());
+        config.batch_size = Some(1);
+        config.timeout_ms = Some(500);
+        let transport = Arc::new(SdkKinesisTransport::new(&config).expect("sdk transport"));
+        let sink = Arc::new(KinesisSink::new(config, transport).expect("sink"));
+        assert_eq!(sink.kind(), "kinesis");
+        let manager = ConnectorManager::new();
+        manager.register("kinesis-dead", sink.clone());
+        let err = manager
+            .send(
+                "kinesis-dead",
+                &Topic::new("sensors/qual").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("unreachable must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "unreachable must be a connection failure, got {err:?}"
+        );
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Discards unmatched egress for the rule-path qualification (the
+    /// connector under test receives everything through its rule).
+    struct NullBrokerSink;
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for NullBrokerSink {
+        async fn publish(
+            &self,
+            _topic: Topic,
+            _payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+            Ok(())
+        }
+    }
+
+    /// Qualification against the real Kinesis service via the maintained
+    /// `aws-sdk-kinesis` driver.
+    ///
+    /// Run with e.g.:
+    /// `KINESIS_STREAM=qual-b325 KINESIS_REGION=ap-south-1 \
+    ///  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+    ///  cargo test -p broker-connectors-enterprise --lib kinesis::tests::test_qualify_driver_write_path -- --ignored --nocapture`
+    ///
+    /// Streams 1000 sequence-keyed records with distinct partition keys
+    /// through the broker
+    /// ([`broker_rules::RuleEngine`] dispatch into a `KinesisSink` on
+    /// [`SdkKinesisTransport`]), reads the single shard back from
+    /// `TRIM_HORIZON` and asserts exactly 1000 distinct sequence keys,
+    /// proves the mock partial-failure path still requeues only failed
+    /// records and the throughput-exceeded path backs off, then leaves
+    /// the stream in place for the pipeline to delete.
+    ///
+    /// NOTE: the task spec's `QUAL-CMD` names `-p broker-connectors`
+    /// (the pre-split crate path); the sink lives in
+    /// `broker-connectors-enterprise`, so the gates must run the
+    /// enterprise path above.
+    #[tokio::test]
+    #[ignore = "needs the real Kinesis service (see KINESIS_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
+        use std::collections::HashSet;
+        use std::time::Instant;
+        let stream = qual_env("KINESIS_STREAM").unwrap_or_else(|| {
+            panic!(
+                "KINESIS_STREAM must name a real Kinesis stream for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. KINESIS_STREAM=qual-b325)"
+            )
+        });
+        let region = qual_env("KINESIS_REGION")
+            .or_else(|| qual_env("AWS_REGION"))
+            .or_else(|| qual_env("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "KINESIS_REGION (or AWS_REGION) must name the stream's region; \
+                     failing closed instead of passing vacuously"
+                )
+            });
+        let access_key = qual_env("AWS_ACCESS_KEY_ID").unwrap_or_else(|| {
+            panic!("AWS_ACCESS_KEY_ID must be set for qualification; failing closed")
+        });
+        let secret_key = qual_env("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|| {
+            panic!("AWS_SECRET_ACCESS_KEY must be set for qualification; failing closed")
+        });
+        // Optional session token (temporary credentials) and endpoint
+        // override (local testing); the real service needs neither.
+        let session_token = qual_env("AWS_SESSION_TOKEN");
+        let endpoint = qual_env("KINESIS_ENDPOINT");
+        // TODO(parity): Kinesis exposes no server-version API, so the
+        // report carries the stream ARN plus DescribeStream output
+        // instead of a version string; is that an acceptable "server
+        // version"?
+
+        let mut config = test_config();
+        config.stream_name = stream.clone();
+        config.region = region.clone();
+        config.endpoint = endpoint;
+        config.access_key_id = access_key;
+        config.secret_access_key = secret_key;
+        config.session_token = session_token;
+        config.partition_key_template = Some("${client_id}".to_string());
+        config.batch_size = Some(500);
+        config.linger_ms = Some(10);
+        config.max_retries = Some(5);
+        config.initial_backoff_ms = Some(100);
+        config.max_backoff_ms = Some(2_000);
+        config.timeout_ms = Some(30_000);
+        config.validate().expect("qual config validates");
+
+        let transport = Arc::new(SdkKinesisTransport::new(&config).expect("qual transport"));
+        let client = transport.client().clone();
+
+        // Best-effort stream creation (the pipeline owns the stream and
+        // deletes it after the run; an in-use name simply proceeds).
+        match client
+            .create_stream()
+            .stream_name(&stream)
+            .shard_count(1)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let text = format!("{e:?} ({e})");
+                let lower = text.to_lowercase();
+                if !lower.contains("resourceinuse") && !lower.contains("already") {
+                    panic!("qual create stream failed: {text}");
+                }
+            }
+        }
+        // Wait until the stream is ACTIVE before writing.
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                let status = client
+                    .describe_stream()
+                    .stream_name(&stream)
+                    .send()
+                    .await
+                    .ok()
+                    .and_then(|out| {
+                        out.stream_description()
+                            .map(|desc| desc.stream_status())
+                            .map(|status| format!("{status:?}"))
+                    });
+                if status.as_deref() == Some("Active") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        })
+        .await
+        .expect("qual stream never became ACTIVE");
+        let described = client
+            .describe_stream()
+            .stream_name(&stream)
+            .send()
+            .await
+            .expect("qual describe");
+        let stream_arn = described
+            .stream_description()
+            .map(|desc| desc.stream_arn())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let shard_id = described
+            .stream_description()
+            .and_then(|desc| desc.shards().first())
+            .map(|shard| shard.shard_id())
+            .map(str::to_string)
+            .expect("qual stream has a shard");
+        eprintln!("qual server: stream={stream} arn={stream_arn} region={region}");
+
+        let sink = Arc::new(KinesisSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "kinesis");
+        // The broker's path: a rule registered on the connector
+        // manager, messages published through the rule engine, so the
+        // qualification sends through `dispatch_ingress`, never
+        // `sink.send` directly.
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine.connectors().register("qual-kinesis", sink.clone());
+        engine
+            .create_rule(
+                "qual-kinesis-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, seq FROM "sensors/+" INTO connector("qual-kinesis")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn BrokerSink> = Arc::new(NullBrokerSink);
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..1000u32 {
+            let payload = Bytes::from(format!(r#"{{"client_id":"qual-{seq:04}","seq":{seq}}}"#));
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), 1000);
+        eprintln!("qual rows sent: records=1000 stream={stream}");
+
+        // Row keys asserted back from the server, not the counters:
+        // every sequence key 0..1000 exactly once from TRIM_HORIZON.
+        let iter_out = tokio::time::timeout(
+            Duration::from_secs(60),
+            client
+                .get_shard_iterator()
+                .stream_name(&stream)
+                .shard_id(&shard_id)
+                .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon)
+                .send(),
+        )
+        .await
+        .expect("qual shard iterator timeout")
+        .expect("qual shard iterator");
+        let mut iterator = iter_out
+            .shard_iterator()
+            .map(str::to_string)
+            .expect("qual iterator value");
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let mut seen: HashSet<u32> = HashSet::new();
+        while seen.len() < 1000 {
+            if Instant::now() > deadline {
+                break;
+            }
+            let page = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.get_records().shard_iterator(iterator.clone()).send(),
+            )
+            .await
+            .expect("qual get_records timeout")
+            .expect("qual get_records");
+            for record in page.records() {
+                let data = record.data();
+                let bytes: &[u8] = data.as_ref();
+                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                    if let Some(seq) = doc.get("seq").and_then(|v| v.as_u64()) {
+                        if seq < 1000 {
+                            seen.insert(seq as u32);
+                        }
+                    }
+                }
+            }
+            match page.next_shard_iterator() {
+                Some(next) => iterator = next.to_string(),
+                None => break,
+            }
+            if seen.len() < 1000 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            1000,
+            "kinesis qual: expected 1000 distinct seq records, saw {}",
+            seen.len()
+        );
+        for seq in 0..1000u32 {
+            assert!(seen.contains(&seq), "kinesis qual: missing seq {seq}");
+        }
+        eprintln!("qual rows asserted: count=1000 stream={stream}");
+
+        // Throughput-exceeded backoff is asserted on the offline mock
+        // only: the throttled record retries alone, then succeeds.
+        let mut mock_config = test_config();
+        mock_config.batch_size = Some(10);
+        mock_config.initial_backoff_ms = Some(1);
+        mock_config.max_backoff_ms = Some(2);
+        let (mock_sink, mock_transport) = test_sink(mock_config);
+        mock_transport.script_outcomes(vec![
+            MockKinesisOutcome::Records(vec![
+                Some("ProvisionedThroughputExceededException".to_string()),
+                None,
+            ]),
+            MockKinesisOutcome::Records(vec![None]),
+        ]);
+        let mock_topic = Topic::new("t").unwrap();
+        mock_sink
+            .send(&mock_topic, &Bytes::from("a"), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        mock_sink
+            .send(&mock_topic, &Bytes::from("b"), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        mock_sink.flush().await.unwrap();
+        assert_eq!(mock_transport.calls(), 2);
+        assert_eq!(mock_transport.captured()[1].records.len(), 1);
+
+        // The stream is left in place: the pipeline deletes it after
+        // the run.
     }
 }

@@ -41,6 +41,19 @@ scylla = { version = "1.9" }
 clickhouse = { version = "0.15", features = ["native-tls"] }
 aws-sigv4 = { version = "1" }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# Redshift sink on the maintained official driver (Apache-2.0):
+# `BatchExecuteStatement` with driver-owned SigV4 (static access-key
+# credentials, session token when configured, endpoint override for
+# local servers) plus `DescribeStatement` polling to FINISHED.
+# The hand-written `HttpRedshiftTransport` stays for offline unit tests
+# only; production wiring uses `SdkRedshiftTransport` below.
+aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# Kinesis sink on the maintained official driver (Apache-2.0):
+# `PutRecords` with driver-owned SigV4 (static access-key credentials,
+# session token when configured, endpoint override for local servers).
+# The hand-written `HttpKinesisTransport` stays for offline unit tests
+# only; production wiring uses `SdkKinesisTransport` below.
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # S3 / MinIO sink on the maintained official driver (Apache-2.0):
 # `PutObject` with driver-owned SigV4 (static access-key credentials,
 # endpoint override for local servers, path-style for IP endpoints).
@@ -92,6 +105,10 @@ google-cloud-gax = { version = "1" }
 # `rustls-webpki 0.102` (pulled by rumqttc's `use-rustls` feature)
 # out of the tree.
 rumqttc = { version = "0.25", default-features = false }
+# Sparkplug B Tahu Protobuf codec on the maintained `prost` driver
+# (Apache-2.0): `ProtoPayload` / `ProtoMetric` mirror the clean-room
+# field numbers, and the sink write path encodes through them.
+prost = { version = "0.13" }
 # RabbitMQ sink on the maintained `lapin` driver (MIT): AMQP 0-9-1
 # (PLAIN handshake, Basic.Publish with content header/body frames via
 # the driver). The hand-written `TcpRabbitTransport` stays for offline
@@ -109,6 +126,13 @@ lapin = { version = "4", default-features = false, features = ["tokio", "rustls"
 # unconditionally, which the licence gate rejects, while 0.25 exposes
 # the same RESP/AUTH/SELECT/multiplexed API without it.
 redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
+# Microsoft SQL Server sink on the maintained `tiberius` driver
+# (MIT/Apache-2.0): TDS (PRELOGIN, LOGIN7, sp_executesql) with SQL auth
+# and typed params over tokio (`tokio-util` compat). The hand-written
+# `NativeMssqlTransport` stays for offline unit tests only; production
+# wiring uses `DriverMssqlTransport` below.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 axum = { workspace = true }

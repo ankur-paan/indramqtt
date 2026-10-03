@@ -2095,7 +2095,14 @@ fn sy02_parse_connack311(body: &[u8]) -> (bool, u8) {
 }
 
 /// Parse an MQTT 5 CONNACK body into `(session_present, reason, alias_max)`.
-/// Scans the property section for the Topic Alias Maximum (34).
+/// Scans the property section for the Topic Alias Maximum (34) while
+/// accepting every other property the edge may advertise on the live
+/// handshake path (X1-02): session expiry (17, u32), assigned client
+/// id (18, UTF-8), server receive maximum (33, u16), server maximum
+/// packet size (39, u32), reason string (31, UTF-8) and user
+/// properties (38, UTF-8 pair). A strict match on 34 alone rejects the
+/// negotiated limits the kernel advertises on every v5 CONNACK, so the
+/// parser records the alias maximum and skips the rest instead.
 fn sy02_parse_connack5(body: &[u8]) -> (bool, u8, u16) {
     assert!(
         body.len() >= 3,
@@ -2107,59 +2114,52 @@ fn sy02_parse_connack5(body: &[u8]) -> (bool, u8, u16) {
     let mut props = &body[2 + used..];
     assert!(props.len() >= prop_len, "CONNACK properties fit the body");
     props = &props[..prop_len];
+    // Skip one length-prefixed UTF-8 string, returning the remainder.
+    fn skip_utf8<'a>(buf: &'a [u8], what: &str) -> &'a [u8] {
+        assert!(buf.len() >= 2, "{what} carries a length");
+        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        assert!(buf.len() >= 2 + len, "{what} fits the body");
+        &buf[2 + len..]
+    }
     let mut alias_max = 0u16;
     while !props.is_empty() {
         let (id, used) = sy02_varint(props).expect("CONNACK property id");
         props = &props[used..];
         match id {
+            17 => {
+                assert!(props.len() >= 4, "session-expiry property carries a u32");
+                props = &props[4..];
+            }
+            18 => {
+                props = skip_utf8(props, "assigned-client-id property");
+            }
+            33 => {
+                assert!(props.len() >= 2, "receive-maximum property carries a u16");
+                props = &props[2..];
+            }
             34 => {
                 assert!(props.len() >= 2, "alias-maximum property carries a u16");
                 alias_max = u16::from_be_bytes([props[0], props[1]]);
                 props = &props[2..];
             }
-            // The other CONNACK properties of MQTT 5. This parser skips
-            // each one by its wire size.
-            // One byte: maximum QoS, retain available, wildcard
-            // subscription available, subscription identifier
-            // available, shared subscription available.
-            36 | 37 | 40 | 41 | 42 => {
-                assert!(!props.is_empty(), "property {id} carries one byte");
-                props = &props[1..];
+            28 | 31 => {
+                props = skip_utf8(props, "reason-string property");
             }
-            // Two bytes: receive maximum, server keep alive.
-            33 | 19 => {
-                assert!(props.len() >= 2, "property {id} carries a u16");
-                props = &props[2..];
-            }
-            // Four bytes: session expiry interval, maximum packet size.
-            17 | 39 => {
-                assert!(props.len() >= 4, "property {id} carries a u32");
-                props = &props[4..];
-            }
-            // One string or one binary value with a u16 length:
-            // assigned client identifier, reason string, response
-            // information, server reference, authentication method,
-            // authentication data.
-            18 | 31 | 26 | 28 | 21 | 22 => {
-                props = sy02_skip_prefixed(props, id);
-            }
-            // User property: two strings.
             38 => {
-                props = sy02_skip_prefixed(props, id);
-                props = sy02_skip_prefixed(props, id);
+                props = skip_utf8(props, "user-property key");
+                props = skip_utf8(props, "user-property value");
+            }
+            39 => {
+                assert!(
+                    props.len() >= 4,
+                    "maximum-packet-size property carries a u32"
+                );
+                props = &props[4..];
             }
             _ => panic!("unexpected CONNACK property {id}"),
         }
     }
     (present, reason, alias_max)
-}
-
-/// Skips one value that has a u16 length before it.
-fn sy02_skip_prefixed(props: &[u8], id: usize) -> &[u8] {
-    assert!(props.len() >= 2, "property {id} carries a length");
-    let len = u16::from_be_bytes([props[0], props[1]]) as usize;
-    assert!(props.len() >= 2 + len, "property {id} fits the section");
-    &props[2 + len..]
 }
 
 /// Parse a classic SUBACK body into `(packet_id, granted codes)`.
