@@ -141,7 +141,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
             FieldDoc {
                 path: "listeners.ws.path",
                 setting_type: "string",
-                default: "\"/ws/mqtt\"",
+                default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving MQTT-over-WebSocket traffic.",
             },
@@ -162,7 +162,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
             FieldDoc {
                 path: "listeners.wss.path",
                 setting_type: "string",
-                default: "\"/ws/mqtt\"",
+                default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving secure WebSocket traffic.",
             },
@@ -883,7 +883,7 @@ fn default_ws_bind() -> String {
 }
 // Reason: single well-known path avoids per-deployment path negotiation.
 fn default_ws_path() -> String {
-    "/ws/mqtt".to_string()
+    "/mqtt".to_string()
 }
 
 impl Default for WsListenerConf {
@@ -2576,7 +2576,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 str_field(
                     "ws.path",
-                    "/ws/mqtt",
+                    "/mqtt",
                     "HTTP path serving MQTT-over-WebSocket traffic.",
                 ),
                 bool_field(
@@ -2591,7 +2591,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 str_field(
                     "wss.path",
-                    "/ws/mqtt",
+                    "/mqtt",
                     "HTTP path serving secure WebSocket traffic.",
                 ),
                 str_field(

@@ -29,7 +29,7 @@ data:
     [listeners.ws]
     enabled = true
     bind = "0.0.0.0:{{ .Values.service.wsPort }}"
-    path = "/ws/mqtt"
+    path = "/mqtt"
 
     [listeners.api]
     enabled = true

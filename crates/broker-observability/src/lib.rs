@@ -3,8 +3,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn init_tracing() {
+    init_tracing_with_level("info");
+}
+
+/// Start logging at the configured level (`logging.level`).
+///
+/// `RUST_LOG`, when set, still wins: it is the developer's per-module
+/// filter (`RUST_LOG=broker_router=trace`) and has no schema home.
+pub fn init_tracing_with_level(level: &str) {
     let _ = tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)))
         .with(tracing_subscriber::fmt::layer())
         .try_init();
 }

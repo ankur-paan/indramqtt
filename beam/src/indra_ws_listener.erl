@@ -49,6 +49,7 @@
 -define(TLS_HANDSHAKE_TIMEOUT_MS, 5000).
 
 -type ws_listen_opt() :: {port, inet:port_number()}
+                       | {ip, inet:ip_address()}
                        | {transport, tcp | ssl}
                        | {certfile, file:filename()}
                        | {keyfile, file:filename()}
@@ -126,6 +127,8 @@ init(Opts) ->
     MaxConns = proplists:get_value(max_connections, Opts,
                                    indra_ws:default_max_connections()),
     ConnOpts = proplists:get_value(conn, Opts, []),
+    %% `{ip, Addr}' binds one interface; absent binds every interface.
+    SockOpts = indra_listener:listen_sock_opts() ++ [{ip, Ip} || {ip, Ip} <- Opts],
     ListenResult = case Transport of
         ssl ->
             {ok, _} = application:ensure_all_started(ssl),
@@ -138,11 +141,10 @@ init(Opts) ->
                     %% defaults (TLS 1.2 + 1.3, default ciphers), no
                     %% client-certificate verification. Material is read
                     %% once here; rotation needs a restart.
-                    ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} |
-                                      indra_listener:listen_sock_opts()])
+                    ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} | SockOpts])
             end;
         _ ->
-            gen_tcp:listen(Port, indra_listener:listen_sock_opts())
+            gen_tcp:listen(Port, SockOpts)
     end,
     case ListenResult of
         {ok, LSock} ->
@@ -272,23 +274,29 @@ accept_loop(Server, Transport, LSock) ->
             accept_loop(Server, Transport, LSock)
     end.
 
-%% @private Accept one client socket. On `ssl' the TLS handshake runs
-%% first with the same 5 s bound as the TCP/TLS listener; any failure
-%% (including plaintext bytes on the `wss' port) logs its reason and
-%% fails the socket closed -- the bytes are never answered as MQTT.
+%% @private Accept one client socket.
 accept_one(tcp, LSock) ->
     gen_tcp:accept(LSock);
 accept_one(ssl, LSock) ->
-    case ssl:transport_accept(LSock) of
-        {ok, Sock} ->
-            case ssl:handshake(Sock, ?TLS_HANDSHAKE_TIMEOUT_MS) of
-                {ok, TLSSock} -> {ok, TLSSock};
-                {error, Reason} ->
-                    logger:warning("wss TLS handshake failed: ~p", [Reason]),
-                    catch ssl:close(Sock),
-                    {error, Reason}
-            end;
+    %% Only the transport accept runs here. The TLS handshake runs in the
+    %% per-connection handler (see `tls_upgrade/2'), so a client that
+    %% opens a socket and sends nothing holds one handler for the
+    %% handshake timeout and never stalls the accept loop.
+    ssl:transport_accept(LSock).
+
+%% @private Complete the TLS handshake on a `wss' socket inside its own
+%% handler process, bounded by the same 5 s as the TCP/TLS listener. A
+%% plaintext socket passes through. Any failure (including plaintext
+%% bytes on the `wss' port) logs its reason and fails the socket closed.
+tls_upgrade(tcp, Sock) ->
+    {ok, Sock};
+tls_upgrade(ssl, Sock) ->
+    case ssl:handshake(Sock, ?TLS_HANDSHAKE_TIMEOUT_MS) of
+        {ok, TLSSock} ->
+            {ok, TLSSock};
         {error, Reason} ->
+            logger:warning("wss TLS handshake failed: ~p", [Reason]),
+            catch ssl:close(Sock),
             {error, Reason}
     end.
 
@@ -308,7 +316,15 @@ wait_go(Transport, Path, HsTimeout, MaxFrame, ConnOpts, Server) ->
 %% connection count is released through the monitor. A TLS socket that
 %% reaches here already completed its handshake; the WS upgrade runs on
 %% the encrypted channel and a `wss' conn owns the TLS socket after.
-handle_client(Sock, Transport, Path, HsTimeout, MaxFrame, ConnOpts, Server) ->
+handle_client(Sock0, Transport, Path, HsTimeout, MaxFrame, ConnOpts, Server) ->
+    case tls_upgrade(Transport, Sock0) of
+        {ok, Sock} ->
+            upgrade_client(Sock, Transport, Path, HsTimeout, MaxFrame, ConnOpts, Server);
+        {error, _} ->
+            ok
+    end.
+
+upgrade_client(Sock, Transport, Path, HsTimeout, MaxFrame, ConnOpts, Server) ->
     case indra_ws:handshake(Sock, Transport, Path, HsTimeout) of
         ok ->
             WsConnOpts = lists:keystore(ws_max_frame_bytes, 1, ConnOpts,

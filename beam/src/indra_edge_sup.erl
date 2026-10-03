@@ -40,10 +40,26 @@ init([]) ->
     SupFlags = #{strategy => one_for_all,
                  intensity => 10,
                  period => 5},
+    %% Listener settings arrive as application environment. The kernel
+    %% prints them from the resolved configuration (`indramqtt
+    %% --print-edge-args'), so `indra.toml' is the one place an operator
+    %% sets a listener. `*_ip' is the bind address as a string; absent
+    %% binds every interface.
+    MqttEnabled = application:get_env(indra_edge, mqtt_enabled, true),
     MqttPort = application:get_env(indra_edge, mqtt_port, 1883),
+    MqttIp = application:get_env(indra_edge, mqtt_ip, undefined),
+    %% The TLS MQTT listener is opt-in like `wss': it cannot start
+    %% without certificate material.
+    TlsEnabled = application:get_env(indra_edge, tls_enabled, false),
+    TlsPort = application:get_env(indra_edge, tls_port, 8883),
+    TlsIp = application:get_env(indra_edge, tls_ip, undefined),
+    TlsCert = application:get_env(indra_edge, tls_certfile, undefined),
+    TlsKey = application:get_env(indra_edge, tls_keyfile, undefined),
     WsEnabled = application:get_env(indra_edge, ws_enabled, true),
     WsPort = application:get_env(indra_edge, ws_port, 8083),
     WsPath = application:get_env(indra_edge, ws_path, "/mqtt"),
+    WsIp = application:get_env(indra_edge, ws_ip, undefined),
+    WssIp = application:get_env(indra_edge, wss_ip, undefined),
     %% `wss' is opt-in (default disabled): without configured
     %% certificate material the listener cannot start, and a default-on
     %% listener would fail every boot that has no certs. The M1-03
@@ -68,24 +84,63 @@ init([]) ->
                     type => worker,
                     modules => [indra_conn_registry]}] ++
                  BrokerSpecs ++
-                 [#{id => indra_listener,
-                    start => {?MODULE, start_listener, [[{port, MqttPort}]]},
-                    restart => permanent,
-                    shutdown => 5000,
-                    type => worker,
-                    modules => [indra_listener]}] ++
-                 ws_child_spec(WsEnabled, WsPort, WsPath) ++
-                 wss_child_spec(WssEnabled, WssPort, WssPath, WssCert, WssKey),
+                 mqtt_child_spec(MqttEnabled, MqttPort, MqttIp) ++
+                 tls_child_spec(TlsEnabled, TlsPort, TlsIp, TlsCert, TlsKey) ++
+                 ws_child_spec(WsEnabled, WsPort, WsPath, WsIp) ++
+                 wss_child_spec(WssEnabled, WssPort, WssPath, WssCert, WssKey, WssIp),
     {ok, {SupFlags, ChildSpecs}}.
 
-%% @private WS listener child: runs beside TCP/TLS, never instead of
-%% them. Disabled only when the operator sets `ws_enabled' to false;
-%% the M1-03 schema owns the final option names.
-ws_child_spec(false, _Port, _Path) ->
+%% @private Bind-address option for a listener. Absent binds every
+%% interface (the historic behaviour); an address that does not parse
+%% fails the boot naming it, never a silent bind on every interface.
+ip_opt(undefined) ->
     [];
-ws_child_spec(_, Port, Path) ->
+ip_opt(Ip) when is_tuple(Ip) ->
+    [{ip, Ip}];
+ip_opt(Ip) when is_binary(Ip) ->
+    ip_opt(binary_to_list(Ip));
+ip_opt(Ip) when is_list(Ip) ->
+    case inet:parse_address(Ip) of
+        {ok, Addr} -> [{ip, Addr}];
+        {error, _} -> erlang:error({bad_listener_ip, Ip})
+    end.
+
+%% @private Plaintext MQTT listener child. Disabled only when the
+%% operator sets `mqtt_enabled' to false.
+mqtt_child_spec(false, _Port, _Ip) ->
+    [];
+mqtt_child_spec(_, Port, Ip) ->
+    [#{id => indra_listener,
+       start => {?MODULE, start_listener, [[{port, Port}] ++ ip_opt(Ip)]},
+       restart => permanent,
+       shutdown => 5000,
+       type => worker,
+       modules => [indra_listener]}].
+
+%% @private TLS MQTT listener child. Runs only when `tls_enabled' is
+%% set; missing certificate material fails the child (and the boot)
+%% closed, never as plaintext.
+tls_child_spec(false, _Port, _Ip, _Cert, _Key) ->
+    [];
+tls_child_spec(_, Port, Ip, Cert, Key) ->
+    Material = [{certfile, Cert} || Cert =/= undefined] ++
+               [{keyfile, Key} || Key =/= undefined],
+    [#{id => indra_tls_listener,
+       start => {?MODULE, start_listener,
+                 [[{transport, ssl}, {port, Port}] ++ Material ++ ip_opt(Ip)]},
+       restart => permanent,
+       shutdown => 5000,
+       type => worker,
+       modules => [indra_listener]}].
+
+%% @private WS listener child: runs beside TCP/TLS, never instead of
+%% them. Disabled only when the operator sets `ws_enabled' to false.
+ws_child_spec(false, _Port, _Path, _Ip) ->
+    [];
+ws_child_spec(_, Port, Path, Ip) ->
     [#{id => indra_ws_listener,
-       start => {?MODULE, start_ws_listener, [[{port, Port}, {path, Path}]]},
+       start => {?MODULE, start_ws_listener,
+                 [[{port, Port}, {path, Path}] ++ ip_opt(Ip)]},
        restart => permanent,
        shutdown => 5000,
        type => worker,
@@ -97,29 +152,15 @@ ws_child_spec(_, Port, Path) ->
 %% (and the boot) closed, never as plaintext. Certificate rotation
 %% needs a restart: neither this listener nor the TCP/TLS listener
 %% reloads material in place. The M1-03 schema owns the final names.
-wss_child_spec(false, _Port, _Path, _Cert, _Key) ->
+wss_child_spec(false, _Port, _Path, _Cert, _Key, _Ip) ->
     [];
-wss_child_spec(_, Port, Path, undefined, _Key) ->
+wss_child_spec(_, Port, Path, Cert, Key, Ip) ->
+    Material = [{certfile, Cert} || Cert =/= undefined] ++
+               [{keyfile, Key} || Key =/= undefined],
     [#{id => indra_wss_listener,
        start => {?MODULE, start_wss_listener,
-                 [[{transport, ssl}, {port, Port}, {path, Path}]]},
-       restart => permanent,
-       shutdown => 5000,
-       type => worker,
-       modules => [indra_ws_listener]}];
-wss_child_spec(_, Port, Path, _Cert, undefined) ->
-    [#{id => indra_wss_listener,
-       start => {?MODULE, start_wss_listener,
-                 [[{transport, ssl}, {port, Port}, {path, Path}]]},
-       restart => permanent,
-       shutdown => 5000,
-       type => worker,
-       modules => [indra_ws_listener]}];
-wss_child_spec(_, Port, Path, Cert, Key) ->
-    [#{id => indra_wss_listener,
-       start => {?MODULE, start_wss_listener,
-                 [[{transport, ssl}, {port, Port}, {path, Path},
-                   {certfile, Cert}, {keyfile, Key}]]},
+                 [[{transport, ssl}, {port, Port}, {path, Path}] ++
+                  Material ++ ip_opt(Ip)]},
        restart => permanent,
        shutdown => 5000,
        type => worker,
@@ -180,13 +221,20 @@ announce_shard(Pid) ->
 %% K > 1 hands `{broker, [Pid1, ..., PidK]}' so each connection can pin
 %% to one shard by `conn_id rem K'.
 start_listener(Opts) ->
+    %% A TLS listener hands TLS sockets to its connections, which must
+    %% be told so they read and write through `ssl'.
+    ConnExtra = case proplists:get_value(transport, Opts, tcp) of
+        ssl -> [{transport, ssl}];
+        _ -> []
+    end,
     case shard_count() of
         1 ->
             case whereis(?BROKERLINK) of
                 undefined ->
                     {error, brokerlink_not_running};
                 Broker ->
-                    indra_listener:start_link([{conn, [{broker, Broker}]} | Opts])
+                    indra_listener:start_link(
+                      [{conn, [{broker, Broker} | ConnExtra]} | Opts])
             end;
         K ->
             Brokers = [whereis(shard_name(N)) || N <- lists:seq(1, K)],
@@ -194,7 +242,8 @@ start_listener(Opts) ->
                 true ->
                     {error, brokerlink_not_running};
                 false ->
-                    indra_listener:start_link([{conn, [{broker, Brokers}]} | Opts])
+                    indra_listener:start_link(
+                      [{conn, [{broker, Brokers} | ConnExtra]} | Opts])
             end
     end.
 

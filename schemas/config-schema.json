@@ -315,7 +315,7 @@
               "type": "boolean"
             },
             "path": {
-              "default": "/ws/mqtt",
+              "default": "/mqtt",
               "description": "HTTP path serving MQTT-over-WebSocket traffic.",
               "type": "string"
             }
@@ -345,7 +345,7 @@
               "type": "string"
             },
             "path": {
-              "default": "/ws/mqtt",
+              "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
               "type": "string"
             }

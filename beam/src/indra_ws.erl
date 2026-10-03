@@ -154,8 +154,11 @@ handshake(Sock, Path, TimeoutMs) ->
 handshake(Sock, Transport, Path, TimeoutMs) when is_list(Path) ->
     handshake(Sock, Transport, list_to_binary(Path), TimeoutMs);
 handshake(Sock, Transport, Path, TimeoutMs)
-  when is_binary(Path), Transport =:= tcp; Transport =:= ssl ->
-    case recv_head(Sock, Transport, <<>>, TimeoutMs) of
+  when is_binary(Path), (Transport =:= tcp orelse Transport =:= ssl) ->
+    %% One deadline covers the whole upgrade request, so a client that
+    %% trickles bytes cannot hold a connection slot past `TimeoutMs'.
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    case recv_head(Sock, Transport, <<>>, Deadline) of
         {ok, Head} ->
             check_request(Sock, Transport, Head, Path);
         {error, _} = Err ->
@@ -198,7 +201,7 @@ feed(Buf, Frag, Max) when is_binary(Buf), is_integer(Max), Max > 0 ->
 %% Handshake internals
 %%====================================================================
 
-recv_head(Sock, Transport, Acc, TimeoutMs) ->
+recv_head(Sock, Transport, Acc, Deadline) ->
     case binary:match(Acc, <<"\r\n\r\n">>) of
         {Pos, 4} ->
             <<Head:Pos/binary, _/binary>> = Acc,
@@ -207,13 +210,19 @@ recv_head(Sock, Transport, Acc, TimeoutMs) ->
             send_status(Sock, Transport, 400, "Request head too large"),
             {error, head_too_large};
         nomatch ->
-            case ws_recv(Sock, Transport, 0, TimeoutMs) of
-                {ok, More} ->
-                    recv_head(Sock, Transport, <<Acc/binary, More/binary>>, TimeoutMs);
-                {error, timeout} ->
+            case Deadline - erlang:monotonic_time(millisecond) of
+                Left when Left =< 0 ->
                     {error, handshake_timeout};
-                {error, _} = Err ->
-                    Err
+                Left ->
+                    case ws_recv(Sock, Transport, 0, Left) of
+                        {ok, More} ->
+                            recv_head(Sock, Transport,
+                                      <<Acc/binary, More/binary>>, Deadline);
+                        {error, timeout} ->
+                            {error, handshake_timeout};
+                        {error, _} = Err ->
+                            Err
+                    end
             end
     end.
 

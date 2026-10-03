@@ -26,10 +26,10 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
 | `listeners.ws.enabled` | boolean | `true` | boolean | Whether the MQTT-over-WebSocket listener accepts connections. |
 | `listeners.ws.bind` | string | `0.0.0.0:8083` | string | Bind address for the MQTT-over-WebSocket listener. |
-| `listeners.ws.path` | string | `/ws/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |
+| `listeners.ws.path` | string | `/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |
 | `listeners.wss.enabled` | boolean | `false` | boolean | Whether the secure WebSocket listener accepts connections. |
 | `listeners.wss.bind` | string | `0.0.0.0:8084` | string | Bind address for the secure WebSocket listener. |
-| `listeners.wss.path` | string | `/ws/mqtt` | string | HTTP path serving secure WebSocket traffic. |
+| `listeners.wss.path` | string | `/mqtt` | string | HTTP path serving secure WebSocket traffic. |
 | `listeners.wss.cert_file` | string | `` | string | Path to the PEM server certificate for the secure WebSocket listener. |
 | `listeners.wss.key_file` | string | `` | string | Path to the PEM private key for the secure WebSocket listener. |
 | `listeners.api.enabled` | boolean | `true` | boolean | Whether the management REST API and dashboard serve requests. |

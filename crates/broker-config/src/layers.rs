@@ -931,9 +931,21 @@ fn load_error(file: impl Into<String>, reason: impl Into<String>) -> ConfigError
 /// variable) and unknown `INDRA_*` variables.
 pub fn load_layered(config_dir: &Path, cli: &CliOverrides) -> Result<LayeredConfig, ConfigError> {
     let env: Vec<(String, String)> = std::env::vars()
-        .filter(|(name, _)| name.starts_with(ENV_PREFIX))
+        .filter(|(name, _)| name.starts_with(ENV_PREFIX) && !is_credential_env(name))
         .collect();
     load_layered_from(config_dir, &env, cli)
+}
+
+/// `INDRA_*` variables that carry credentials rather than settings. They
+/// have no schema home (a key must never show up in `explain` or a config
+/// export), so the settings layer skips them instead of refusing startup
+/// on an unknown setting. `INDRA_API_KEYS` seeds the broker's operator
+/// API keys; `INDRA_API_KEY` is the key `indra ctl` presents, and is
+/// commonly exported in the same shell that starts the broker.
+pub const CREDENTIAL_ENV_VARS: &[&str] = &["INDRA_API_KEYS", "INDRA_API_KEY"];
+
+fn is_credential_env(name: &str) -> bool {
+    CREDENTIAL_ENV_VARS.contains(&name)
 }
 
 /// Resolve the startup configuration from an explicit environment list.
@@ -1662,6 +1674,25 @@ mod tests {
             err.to_string().contains("INDRA_NOPE__NOT_A_SETTING"),
             "error must name the variable, got: {err}"
         );
+        scrub(&dir);
+    }
+
+    #[test]
+    fn credential_env_variables_do_not_refuse_startup() {
+        let _serial = ENV_SERIAL.lock().expect("env serial");
+        let dir = unique_dir("credenv");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        let _env = EnvGuard::set(&[
+            ("INDRA_API_KEYS", "key-one,key-two"),
+            ("INDRA_API_KEY", "key-one"),
+        ]);
+        let layered = load_layered(&dir, &CliOverrides::default())
+            .expect("credential variables are not settings");
+        // Keys never become settings: nothing in the provenance names them.
+        assert!(layered
+            .provenance()
+            .values()
+            .all(|layer| !format!("{layer:?}").contains("INDRA_API_KEY")));
         scrub(&dir);
     }
 

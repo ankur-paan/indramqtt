@@ -33,7 +33,7 @@ bind = "0.0.0.0:1883"
 # MQTT-over-WebSocket listener (mapped to host port 8083).
 enabled = true
 bind = "0.0.0.0:8083"
-path = "/ws/mqtt"
+path = "/mqtt"
 
 [listeners.api]
 # Management API and `/healthz` readiness probe (mapped to host 18083).

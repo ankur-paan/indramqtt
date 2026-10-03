@@ -42,13 +42,13 @@ key_file = "/etc/indramqtt/certs/server.key"
 # `[listeners.websocket]`; it is accepted as an alias of `[listeners.ws]`)
 enabled = true
 bind = "0.0.0.0:8083"
-path = "/ws/mqtt"
+path = "/mqtt"
 
 [listeners.wss]
 # Secure WebSocket listener (disabled by default)
 enabled = false
 bind = "0.0.0.0:8084"
-path = "/ws/mqtt"
+path = "/mqtt"
 cert_file = ""
 key_file = ""
 

@@ -480,6 +480,13 @@ struct Args {
     /// disables the periodic tick (tests and one-shot runs).
     #[arg(long, default_value_t = DEFAULT_MONITOR_SAMPLE_SECS)]
     monitor_sample_secs: u64,
+
+    /// Print the edge's `erl` arguments for the resolved listener
+    /// settings, one argument per line, and exit. The edge holds the MQTT,
+    /// TLS and WebSocket sockets; starting it with these arguments makes
+    /// `indra.toml` the one place a listener is configured.
+    #[arg(long)]
+    print_edge_args: bool,
 }
 
 /// Default monitor sampling interval in seconds (F1-02, T-72). Ten seconds
@@ -3613,23 +3620,366 @@ fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError>
 /// lower layers. `--config-dir` is the bootstrap locator with no schema
 /// home. A missing directory or missing file starts on defaults; an
 /// unreadable, unparsable or invalid layer fails boot loudly.
-fn load_startup_config(args: &Args) -> Result<LayeredConfig, ConfigError> {
-    let cli = CliOverrides {
-        // SY-02: main's old-style flags given the typed-schema treatment.
-        // Each carries a `Schema home:` line on its clap field; an
-        // explicitly passed flag wins, otherwise the file, env and schema
-        // defaults apply with main's defaults unchanged.
+fn load_startup_config(
+    args: &Args,
+    matches: &clap::ArgMatches,
+) -> Result<LayeredConfig, ConfigError> {
+    broker_config::load_layered(
+        std::path::Path::new(&args.config_dir),
+        &cli_overrides(args, matches),
+    )
+}
+
+/// Split one listener bind (`ip:port`) for the edge. The edge binds
+/// sockets by IP address, so a host name is refused here by name instead
+/// of failing later inside the edge.
+fn edge_bind(setting: &str, bind: &str) -> Result<(std::net::IpAddr, u16), ConfigError> {
+    bind.parse::<std::net::SocketAddr>()
+        .map(|addr| (addr.ip(), addr.port()))
+        .map_err(|_| {
+            ConfigError::Invalid(format!(
+                "setting `{setting}` is invalid: `{bind}` must be an IP address and port, like 0.0.0.0:1883 (field `{setting}`)"
+            ))
+        })
+}
+
+/// The edge's application environment for the resolved configuration, as
+/// `erl` arguments (`-indra_edge <key> <Erlang term>` triples).
+///
+/// The edge reads these keys in `indra_edge_sup`. Strings are printed as
+/// quoted Erlang strings. A listener bound to every interface passes no
+/// address, which is the edge's own default.
+fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, ConfigError> {
+    fn quoted(text: &str) -> String {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut put = |key: &str, term: String| {
+        out.push("-indra_edge".to_string());
+        out.push(key.to_string());
+        out.push(term);
+    };
+    let listeners = &cfg.listeners;
+
+    let (ip, port) = edge_bind("node.brokerlink_bind", &cfg.node.brokerlink_bind)?;
+    // The edge dials the kernel; a kernel listening on every interface is
+    // reached over loopback.
+    let kernel_host = if ip.is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        ip.to_string()
+    };
+    put("kernel_host", quoted(&kernel_host));
+    put("kernel_port", port.to_string());
+
+    let mut listener = |prefix: &str,
+                        setting: &str,
+                        enabled: bool,
+                        bind: &str|
+     -> Result<(), ConfigError> {
+        put(&format!("{prefix}_enabled"), enabled.to_string());
+        let (ip, port) = edge_bind(setting, bind)?;
+        put(&format!("{prefix}_port"), port.to_string());
+        if !ip.is_unspecified() {
+            put(&format!("{prefix}_ip"), quoted(&ip.to_string()));
+        }
+        Ok(())
+    };
+    listener(
+        "mqtt",
+        "listeners.tcp.bind",
+        listeners.tcp.enabled,
+        &listeners.tcp.bind,
+    )?;
+    listener(
+        "tls",
+        "listeners.tls.bind",
+        listeners.tls.enabled,
+        &listeners.tls.bind,
+    )?;
+    listener(
+        "ws",
+        "listeners.ws.bind",
+        listeners.ws.enabled,
+        &listeners.ws.bind,
+    )?;
+    listener(
+        "wss",
+        "listeners.wss.bind",
+        listeners.wss.enabled,
+        &listeners.wss.bind,
+    )?;
+    put("ws_path", quoted(&listeners.ws.path));
+    put("wss_path", quoted(&listeners.wss.path));
+    for (key, value) in [
+        ("tls_certfile", &listeners.tls.cert_file),
+        ("tls_keyfile", &listeners.tls.key_file),
+        ("wss_certfile", &listeners.wss.cert_file),
+        ("wss_keyfile", &listeners.wss.key_file),
+    ] {
+        if !value.is_empty() {
+            put(key, quoted(value));
+        }
+    }
+    Ok(out)
+}
+
+/// The flags the operator actually typed, as the flag layer.
+///
+/// Most flags carry a clap default, so the parsed value alone cannot tell
+/// a typed flag from an absent one. `matches` can: only a value that came
+/// from the command line becomes an override, so an absent flag leaves its
+/// setting to the file, fragment and environment layers.
+fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
+    let typed = |id: &str| {
+        matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+    };
+    let text = |id: &str, value: &str| typed(id).then(|| value.to_string());
+    CliOverrides {
+        node_id: text("node_id", &args.node_id),
+        data_dir: text("data_dir", &args.data_dir),
+        brokerlink_bind: text("brokerlink_bind", &args.brokerlink_bind),
+        bind: text("bind", &args.bind),
+        api_bind: text("api_bind", &args.api_bind),
+        allow_anonymous: args.allow_anonymous,
+        qos0_backlog: typed("qos0_backlog").then_some(args.qos0_backlog),
+        license_key: args.license_key.clone(),
+        license_keys: text("license_keys", &args.license_keys),
+        licence_request_out: text("licence_request_out", &args.licence_request_out),
+        licence_install_file: text("licence_install_file", &args.licence_install_file),
+        licence_expiry_warn_days: typed("licence_expiry_warn_days")
+            .then_some(args.licence_expiry_warn_days),
+        cluster_seeds: args.cluster_seeds.clone(),
+        cluster_bind: text("cluster_bind", &args.cluster_bind),
+        coap_bind: text("coap_bind", &args.coap_bind),
+        stream_dir: text("stream_dir", &args.stream_dir),
+        ldap_url: text("ldap_url", &args.ldap_url),
+        ldap_base_dn: text("ldap_base_dn", &args.ldap_base_dn),
+        ldap_bind_dn: text("ldap_bind_dn", &args.ldap_bind_dn),
+        ldap_bind_password: text("ldap_bind_password", &args.ldap_bind_password),
+        ldap_user_filter: text("ldap_user_filter", &args.ldap_user_filter),
+        ldap_group_attribute: text("ldap_group_attribute", &args.ldap_group_attribute),
+        ldap_required_group: text("ldap_required_group", &args.ldap_required_group),
+        ldap_ca_cert: text("ldap_ca_cert", &args.ldap_ca_cert),
+        kerberos_keytab: text("kerberos_keytab", &args.kerberos_keytab),
+        kerberos_service_principal: text(
+            "kerberos_service_principal",
+            &args.kerberos_service_principal,
+        ),
+        kerberos_realm: text("kerberos_realm", &args.kerberos_realm),
+        kerberos_allowed_realms: text("kerberos_allowed_realms", &args.kerberos_allowed_realms),
+        kerberos_clock_skew_secs: typed("kerberos_clock_skew_secs")
+            .then_some(args.kerberos_clock_skew_secs),
+        kerberos_role_map: text("kerberos_role_map", &args.kerberos_role_map),
+        kerberos_replay_max: args.kerberos_replay_max,
         qos1_inflight_window: args.qos1_inflight_window,
         qos1_spill: args.qos1_spill,
         rule_spill_dir: args.rule_spill_dir.clone(),
-        kerberos_replay_max: args.kerberos_replay_max,
         jwks_url: args.jwks_url.clone(),
         jwks_issuer: args.jwks_issuer.clone(),
         jwks_audience: args.jwks_audience.clone(),
+        jwks_refresh_period_secs: typed("jwks_refresh_period_secs")
+            .then_some(args.jwks_refresh_period_secs),
+        jwks_fetch_timeout_ms: typed("jwks_fetch_timeout_ms").then_some(args.jwks_fetch_timeout_ms),
+        jwks_refresh_timeout_ms: typed("jwks_refresh_timeout_ms")
+            .then_some(args.jwks_refresh_timeout_ms),
+        jwks_cache_max_keys: typed("jwks_cache_max_keys").then_some(args.jwks_cache_max_keys),
+        jwks_cache_ttl_secs: typed("jwks_cache_ttl_secs").then_some(args.jwks_cache_ttl_secs),
+        jwks_clock_skew_secs: typed("jwks_clock_skew_secs").then_some(args.jwks_clock_skew_secs),
+        jwks_ca_cert: text("jwks_ca_cert", &args.jwks_ca_cert),
+        dbauth_postgres_url: text("dbauth_postgres_url", &args.dbauth_postgres_url),
+        dbauth_mysql_url: text("dbauth_mysql_url", &args.dbauth_mysql_url),
+        dbauth_redis_url: text("dbauth_redis_url", &args.dbauth_redis_url),
+        dbauth_mongodb_url: text("dbauth_mongodb_url", &args.dbauth_mongodb_url),
+        dbauth_pool_size: typed("dbauth_pool_size").then_some(args.dbauth_pool_size),
+        dbauth_connect_timeout_ms: typed("dbauth_connect_timeout_ms")
+            .then_some(args.dbauth_connect_timeout_ms),
+        dbauth_read_timeout_ms: typed("dbauth_read_timeout_ms")
+            .then_some(args.dbauth_read_timeout_ms),
+        dbauth_cache_size: typed("dbauth_cache_size").then_some(args.dbauth_cache_size),
+        dbauth_cache_ttl_secs: typed("dbauth_cache_ttl_secs").then_some(args.dbauth_cache_ttl_secs),
+        webhook_url: text("webhook_url", &args.webhook_url),
+        webhook_pool_size: typed("webhook_pool_size").then_some(args.webhook_pool_size),
+        webhook_timeout_ms: typed("webhook_timeout_ms").then_some(args.webhook_timeout_ms),
+        webhook_breaker_threshold: typed("webhook_breaker_threshold")
+            .then_some(args.webhook_breaker_threshold),
+        webhook_breaker_reset_ms: typed("webhook_breaker_reset_ms")
+            .then_some(args.webhook_breaker_reset_ms),
+        webhook_cache_size: typed("webhook_cache_size").then_some(args.webhook_cache_size),
+        webhook_cache_ttl_secs: typed("webhook_cache_ttl_secs")
+            .then_some(args.webhook_cache_ttl_secs),
+        delayed_max_secs: typed("delayed_max_secs").then_some(args.delayed_max_secs),
         topic_alias_maximum: args.topic_alias_maximum,
-        ..Default::default()
+        monitor_sample_secs: typed("monitor_sample_secs").then_some(args.monitor_sample_secs),
+    }
+}
+
+/// Make the resolved configuration the one the kernel boots from.
+///
+/// Every setting that a startup layer set (`indra.toml`, a `conf.d`
+/// fragment, an `INDRA_*` variable or a typed flag) is copied onto the
+/// field the boot path reads, so the value `explain` reports is the value
+/// in effect. A setting no layer touched keeps the flag's built-in
+/// default, which is what the kernel ran on before layered configuration.
+fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(), ConfigError> {
+    let root = toml::Value::try_from(layered.config()).map_err(|err| {
+        ConfigError::Invalid(format!("resolved configuration cannot be read back: {err}"))
+    })?;
+    let set_by_a_layer = |path: &str| layered.provenance().contains_key(path);
+    let lookup = |path: &str| -> Option<&toml::Value> {
+        path.split('.')
+            .try_fold(&root, |node, segment| node.get(segment))
     };
-    broker_config::load_layered(std::path::Path::new(&args.config_dir), &cli)
+    let wrong_type = |path: &str, want: &str| {
+        ConfigError::Invalid(format!(
+            "setting `{path}` is invalid: expected {want} (field `{path}`)"
+        ))
+    };
+    let text = |path: &str, slot: &mut String| -> Result<(), ConfigError> {
+        if !set_by_a_layer(path) {
+            return Ok(());
+        }
+        match lookup(path) {
+            Some(toml::Value::String(value)) => *slot = value.clone(),
+            // Lists resolve to the comma-separated form the flag takes.
+            Some(toml::Value::Array(entries)) => {
+                *slot = entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+            Some(_) => return Err(wrong_type(path, "a string")),
+            None => {}
+        }
+        Ok(())
+    };
+    let number = |path: &str| -> Result<Option<u64>, ConfigError> {
+        if !set_by_a_layer(path) {
+            return Ok(None);
+        }
+        match lookup(path) {
+            Some(toml::Value::Integer(value)) => u64::try_from(*value)
+                .map(Some)
+                .map_err(|_| wrong_type(path, "a non-negative integer")),
+            Some(_) => Err(wrong_type(path, "an integer")),
+            None => Ok(None),
+        }
+    };
+
+    text("node.id", &mut args.node_id)?;
+    text("node.data_dir", &mut args.data_dir)?;
+    text("node.brokerlink_bind", &mut args.brokerlink_bind)?;
+    text("listeners.tcp.bind", &mut args.bind)?;
+    text("listeners.api.bind", &mut args.api_bind)?;
+    if set_by_a_layer("auth.allow_anonymous") {
+        args.allow_anonymous = layered.config().auth.allow_anonymous;
+    }
+    if let Some(value) = number("session.max_qos0_backlog")? {
+        args.qos0_backlog = value as usize;
+    }
+    let mut optional = String::new();
+    text("licence.license_key", &mut optional)?;
+    if !optional.is_empty() {
+        args.license_key = Some(std::mem::take(&mut optional));
+    }
+    text("licence.trusted_keys_path", &mut args.license_keys)?;
+    text("licence.request_out", &mut args.licence_request_out)?;
+    text("licence.install_file", &mut args.licence_install_file)?;
+    if let Some(value) = number("licence.expiry_warn_days")? {
+        args.licence_expiry_warn_days = value;
+    }
+    text("cluster.seed_nodes", &mut optional)?;
+    if !optional.is_empty() {
+        args.cluster_seeds = Some(std::mem::take(&mut optional));
+    }
+    text("cluster.bind", &mut args.cluster_bind)?;
+    text("gateway.coap_bind", &mut args.coap_bind)?;
+    text("persistence.stream_dir", &mut args.stream_dir)?;
+    text("ldap.server_url", &mut args.ldap_url)?;
+    text("ldap.base_dn", &mut args.ldap_base_dn)?;
+    text("ldap.bind_dn", &mut args.ldap_bind_dn)?;
+    text("ldap.bind_password", &mut args.ldap_bind_password)?;
+    text("ldap.user_filter", &mut args.ldap_user_filter)?;
+    text("ldap.group_attribute", &mut args.ldap_group_attribute)?;
+    text("ldap.required_group", &mut args.ldap_required_group)?;
+    text("ldap.ca_cert_path", &mut args.ldap_ca_cert)?;
+    text("kerberos.keytab_path", &mut args.kerberos_keytab)?;
+    text(
+        "kerberos.service_principal",
+        &mut args.kerberos_service_principal,
+    )?;
+    text("kerberos.realm", &mut args.kerberos_realm)?;
+    text("kerberos.allowed_realms", &mut args.kerberos_allowed_realms)?;
+    if let Some(value) = number("kerberos.clock_skew_secs")? {
+        args.kerberos_clock_skew_secs = value;
+    }
+    text("kerberos.role_map", &mut args.kerberos_role_map)?;
+    if let Some(value) = number("jwks.refresh_period_secs")? {
+        args.jwks_refresh_period_secs = value;
+    }
+    if let Some(value) = number("jwks.fetch_timeout_ms")? {
+        args.jwks_fetch_timeout_ms = value;
+    }
+    if let Some(value) = number("jwks.refresh_timeout_ms")? {
+        args.jwks_refresh_timeout_ms = value;
+    }
+    if let Some(value) = number("jwks.cache_max_keys")? {
+        args.jwks_cache_max_keys = value as usize;
+    }
+    if let Some(value) = number("jwks.cache_ttl_secs")? {
+        args.jwks_cache_ttl_secs = value;
+    }
+    if let Some(value) = number("jwks.clock_skew_secs")? {
+        args.jwks_clock_skew_secs = value;
+    }
+    text("jwks.ca_cert", &mut args.jwks_ca_cert)?;
+    text("dbauth.postgres_url", &mut args.dbauth_postgres_url)?;
+    text("dbauth.mysql_url", &mut args.dbauth_mysql_url)?;
+    text("dbauth.redis_url", &mut args.dbauth_redis_url)?;
+    text("dbauth.mongodb_url", &mut args.dbauth_mongodb_url)?;
+    if let Some(value) = number("dbauth.pool_size")? {
+        args.dbauth_pool_size = value as usize;
+    }
+    if let Some(value) = number("dbauth.connect_timeout_ms")? {
+        args.dbauth_connect_timeout_ms = value;
+    }
+    if let Some(value) = number("dbauth.read_timeout_ms")? {
+        args.dbauth_read_timeout_ms = value;
+    }
+    if let Some(value) = number("dbauth.cache_size")? {
+        args.dbauth_cache_size = value as usize;
+    }
+    if let Some(value) = number("dbauth.cache_ttl_secs")? {
+        args.dbauth_cache_ttl_secs = value;
+    }
+    text("webhook.url", &mut args.webhook_url)?;
+    if let Some(value) = number("webhook.pool_size")? {
+        args.webhook_pool_size = value as usize;
+    }
+    if let Some(value) = number("webhook.timeout_ms")? {
+        args.webhook_timeout_ms = value;
+    }
+    if let Some(value) = number("webhook.breaker_threshold")? {
+        args.webhook_breaker_threshold = u32::try_from(value)
+            .map_err(|_| wrong_type("webhook.breaker_threshold", "a 32-bit integer"))?;
+    }
+    if let Some(value) = number("webhook.breaker_reset_ms")? {
+        args.webhook_breaker_reset_ms = value;
+    }
+    if let Some(value) = number("webhook.cache_size")? {
+        args.webhook_cache_size = value as usize;
+    }
+    if let Some(value) = number("webhook.cache_ttl_secs")? {
+        args.webhook_cache_ttl_secs = value;
+    }
+    if let Some(value) = number("delayed.max_secs")? {
+        args.delayed_max_secs = value;
+    }
+    if let Some(value) = number("observability.monitor_sample_secs")? {
+        args.monitor_sample_secs = value;
+    }
+    Ok(())
 }
 
 /// Install the configured tenant assignment rules (SY-02): `TenantsConf`
@@ -7330,15 +7680,28 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    broker_observability::init_tracing();
-    let args = Args::parse();
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|err| err.exit());
 
-    // SY-02: resolve the startup configuration through the typed-schema
-    // layers (defaults, `indra.toml`, `conf.d`, `INDRA_` env, flags).
-    // Every reader below uses the resolved value; an explicitly passed
-    // flag wins via `CliOverrides`, main's defaults stay unchanged.
-    let layered = load_startup_config(&args)?;
+    // Resolve the startup configuration through the typed-schema layers
+    // (defaults, `indra.toml`, `conf.d`, `INDRA_` env, typed flags), then
+    // copy the result onto the fields the boot path reads, so every
+    // reader below runs on the resolved value. A typed flag wins; a
+    // setting no layer touched keeps the flag's built-in default.
+    let layered = load_startup_config(&args, &matches)?;
+    apply_resolved_config(&mut args, &layered)?;
     let cfg = layered.config().clone();
+    if args.print_edge_args {
+        for arg in edge_args(&cfg)? {
+            println!("{arg}");
+        }
+        return Ok(());
+    }
+    // Logging starts after the configuration resolves so `logging.level`
+    // takes effect. A configuration error before this point is returned
+    // from `main` and printed on stderr.
+    broker_observability::init_tracing_with_level(&cfg.logging.level);
 
     info!(
         "Starting IndraMQTT Kernel v{} on {}",
