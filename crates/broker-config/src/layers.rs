@@ -1680,6 +1680,94 @@ mod tests {
         scrub(&dir);
     }
 
+    /// Each flag has a schema home. The file and the environment must
+    /// accept that home too. If the catalogue does not contain the home,
+    /// an operator can set the value with the flag only.
+    #[test]
+    fn every_flag_home_is_a_catalogued_setting() {
+        let cli = CliOverrides {
+            node_id: Some("n".into()),
+            data_dir: Some("d".into()),
+            brokerlink_bind: Some("127.0.0.1:1".into()),
+            bind: Some("127.0.0.1:1".into()),
+            api_bind: Some("127.0.0.1:1".into()),
+            allow_anonymous: true,
+            qos0_backlog: Some(1),
+            license_key: Some("k".into()),
+            license_keys: Some("p".into()),
+            licence_request_out: Some("p".into()),
+            licence_install_file: Some("p".into()),
+            licence_expiry_warn_days: Some(1),
+            cluster_seeds: Some("a:1".into()),
+            cluster_bind: Some("127.0.0.1:1".into()),
+            coap_bind: Some("127.0.0.1:1".into()),
+            stream_dir: Some("d".into()),
+            ldap_url: Some("u".into()),
+            ldap_base_dn: Some("b".into()),
+            ldap_bind_dn: Some("b".into()),
+            ldap_bind_password: Some("p".into()),
+            ldap_user_filter: Some("f".into()),
+            ldap_group_attribute: Some("g".into()),
+            ldap_required_group: Some("g".into()),
+            ldap_ca_cert: Some("c".into()),
+            kerberos_keytab: Some("k".into()),
+            kerberos_service_principal: Some("p".into()),
+            kerberos_realm: Some("r".into()),
+            kerberos_allowed_realms: Some("r".into()),
+            kerberos_clock_skew_secs: Some(1),
+            kerberos_role_map: Some("m".into()),
+            kerberos_replay_max: Some(16),
+            qos1_inflight_window: Some(1),
+            qos1_spill: Some(1),
+            rule_spill_dir: Some("d".into()),
+            jwks_url: Some("https://x".into()),
+            jwks_issuer: Some("i".into()),
+            jwks_audience: Some("a".into()),
+            jwks_refresh_period_secs: Some(1),
+            jwks_fetch_timeout_ms: Some(100),
+            jwks_refresh_timeout_ms: Some(100),
+            jwks_cache_max_keys: Some(1),
+            jwks_cache_ttl_secs: Some(1),
+            jwks_clock_skew_secs: Some(1),
+            jwks_ca_cert: Some("c".into()),
+            dbauth_postgres_url: Some("u".into()),
+            dbauth_mysql_url: Some("u".into()),
+            dbauth_redis_url: Some("u".into()),
+            dbauth_mongodb_url: Some("u".into()),
+            dbauth_pool_size: Some(1),
+            dbauth_connect_timeout_ms: Some(100),
+            dbauth_read_timeout_ms: Some(100),
+            dbauth_cache_size: Some(1),
+            dbauth_cache_ttl_secs: Some(1),
+            webhook_url: Some("u".into()),
+            webhook_pool_size: Some(1),
+            webhook_timeout_ms: Some(100),
+            webhook_breaker_threshold: Some(1),
+            webhook_breaker_reset_ms: Some(1000),
+            webhook_cache_size: Some(1),
+            webhook_cache_ttl_secs: Some(1),
+            delayed_max_secs: Some(1),
+            topic_alias_maximum: Some(1),
+            monitor_sample_secs: Some(1),
+        };
+        let mut table = toml::Table::new();
+        let mut provenance: HashMap<String, Layer> = HashMap::new();
+        cli.apply_to(&mut table, &mut provenance);
+        let catalogue = catalogue_kinds();
+        let mut missing: Vec<&String> = provenance
+            .keys()
+            .filter(|path| !catalogue.contains_key(path.as_str()))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these flag homes cannot be set from indra.toml or INDRA_* variables: {missing:?}"
+        );
+        // The struct literal above has no `..Default::default()`. A new
+        // flag field does not compile until this test contains it.
+        assert!(provenance.len() >= 60, "got {} homes", provenance.len());
+    }
+
     #[test]
     fn credential_env_variables_do_not_refuse_startup() {
         let _serial = ENV_SERIAL.lock().expect("env serial");

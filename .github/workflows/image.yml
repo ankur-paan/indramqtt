@@ -1,0 +1,53 @@
+name: Container image
+
+# This workflow builds the image and starts it with the compose file.
+# It runs when a change touches the image inputs, and on each push to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - deploy/**
+      - .github/workflows/image.yml
+
+jobs:
+  image:
+    name: Build and start the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t indramqtt/indramqtt:0.1.0 .
+
+      - name: Examine the image size (target is less than 250 MB)
+        run: |
+          size=$(docker image inspect indramqtt/indramqtt:0.1.0 --format '{{.Size}}')
+          echo "image size: $((size / 1000000)) MB"
+          test "$size" -lt 250000000
+
+      - name: Start the compose stack
+        run: docker compose up -d --no-build
+
+      - name: Wait for the health check
+        run: |
+          for _ in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' indramqtt-broker)
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          docker logs indramqtt-broker
+          exit 1
+
+      - name: Examine the MQTT listener, the WebSocket listener and the log level
+        run: bash tools/image_smoke.sh indramqtt-broker 1883 8083
+
+      - name: Stop the compose stack
+        if: always()
+        run: docker compose down -v

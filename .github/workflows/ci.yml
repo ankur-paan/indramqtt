@@ -60,6 +60,40 @@ jobs:
       - name: Run Deep Soak & Chaos Test Suite
         run: cargo test -p broker-node --test soak_chaos_suite -- --nocapture
 
+  boot-smoke:
+    # This job starts the built kernel and the edge from an indra.toml
+    # file. It examines the behaviour through the sockets. A setting that
+    # the broker accepts but does not apply fails this job.
+    name: Boot Smoke (kernel and edge from indra.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '26.2'
+
+      - name: Build the kernel and the operator CLI
+        run: cargo build -p broker-node --bins
+
+      - name: Compile the edge
+        working-directory: beam
+        run: |
+          mkdir -p ebin
+          erlc -o ebin src/*.erl
+          cp src/indra_edge.app.src ebin/indra_edge.app
+
+      - name: Run the boot test
+        run: bash tools/boot_smoke.sh target/debug beam/ebin
+
   beam-eunit:
     name: BEAM Network Edge (EUnit)
     runs-on: ubuntu-latest
