@@ -74,6 +74,31 @@ Two names from the shipped container files keep working as aliases:
 sets `listeners.api.bind`. The canonical `INDRA_LICENCE__LICENSE_KEY`
 and `INDRA_LISTENERS__API__BIND` forms win when both are set.
 
+Two `INDRA_` variables carry credentials and are not settings, so they
+have no schema home and never appear in `explain` or an export:
+`INDRA_API_KEYS` (comma-separated operator API keys the broker accepts,
+each at least 16 characters) and `INDRA_API_KEY` (the key `indra ctl`
+presents).
+
+## What the broker does with the result
+
+The kernel boots from the resolved values: the value `explain` reports
+for a setting is the value in effect. A setting that no file, variable
+or flag set runs on the flag's built-in default.
+
+`logging.level` sets the log level. `RUST_LOG`, when set, overrides it;
+it is a developer filter (`RUST_LOG=broker_router=trace`) with no schema
+home.
+
+The MQTT, TLS and WebSocket sockets are held by the edge, a separate
+process. `indramqtt --print-edge-args` prints the edge's start
+arguments for the resolved `listeners.*` and `node.brokerlink_bind`
+settings, one per line, and the container image starts the edge with
+them, so a listener is configured in `indra.toml` only. A listener bind
+must be an IP address and port. `listeners.tcp.max_connections` and
+`listeners.tcp.backlog` are accepted and reported but not yet enforced
+by the edge.
+
 ## Flags: one more layer, then the schema
 
 Each long flag feeds exactly one schema home. A flag that is not passed

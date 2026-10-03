@@ -608,6 +608,21 @@ fn clamp_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_LIMIT)
 }
 
+/// True when the endpoint host is this machine (`localhost` or a
+/// loopback address).
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // IPv6 hosts come back bracketed (`[::1]`).
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Clamp the request timeout to `1..=300` seconds.
 fn clamp_timeout(timeout: u64) -> u64 {
     timeout.clamp(1, MAX_TIMEOUT_SECS)
@@ -633,6 +648,13 @@ async fn request(
     let url = format!("{base}{path}");
     let parsed = reqwest::Url::parse(&url)
         .map_err(|e| CtlError::validation(format!("malformed endpoint URL: {e}")))?;
+    // The key is an administrator credential. Over plain http it is only
+    // safe on the machine itself, so any other host needs https.
+    if parsed.scheme() != "https" && !is_loopback_host(&parsed) {
+        return Err(CtlError::validation(
+            "refusing to send the API key over plain http to a remote host: use an https endpoint",
+        ));
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(clamp_timeout(ctl.timeout)))
         .build()
@@ -2036,7 +2058,7 @@ mod tests {
     use broker_router::Subscription;
     use std::sync::Arc;
 
-    const TEST_KEY: &str = "ctl-test-key-1";
+    const TEST_KEY: &str = "ctl-test-key-0001";
 
     /// Live management API over loopback backed by real broker state.
     ///

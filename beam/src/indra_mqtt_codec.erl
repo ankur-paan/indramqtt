@@ -943,9 +943,6 @@ v5_connect_defaults(AliasMax) ->
 
 %% CONNECT flag rules per MQTT 3.1.1 §3.1.2.3 (shared by v5: the
 %% flag byte is unchanged, only the properties section is new).
-decode_connect_flags(Flags, Keepalive, Payload) ->
-    decode_connect_flags(Flags, Keepalive, Payload, 4, 0).
-
 decode_connect_flags(Flags, Keepalive, Payload, Level, AliasMax) ->
     Username = (Flags band 16#80) =/= 0,
     Password = (Flags band 16#40) =/= 0,

@@ -19,7 +19,7 @@ install, connect.
 |---|---|---|
 | `image.repository` / `image.tag` | `indramqtt/indramqtt:0.1.0` (workspace version, pinned, never `:latest`) | Track releases. |
 | `service.type` | `ClusterIP` | `NodePort` or `LoadBalancer` to reach the broker from outside the cluster. |
-| `service.mqttPort` / `wsPort` / `apiPort` | `1883` / `8083` / `18083`, the same ports as the compose example | Change once here: the Service, container ports and args (`--api-bind` for the API port, overriding the image default), probes and the rendered `indra.toml` binds all follow the same value. |
+| `service.mqttPort` / `wsPort` / `apiPort` | `1883` / `8083` / `18083`, the same ports as the compose example | Change once here: the Service, container ports, probes and the rendered `indra.toml` binds all follow the same value. |
 | `storage.size` | `10Gi` | Grow for retained history or an enabled stream journal. |
 | `storage.storageClassName` | `""` (cluster default) | Name a class explicitly for production. |
 | `config.nodeId` | `indra-node-1` | Unique id per installation. |
@@ -70,11 +70,10 @@ needed for evaluation.
 ## 5. Prove the `INDRA_*` override wins over the file
 
 The ConfigMap file sets log level `info`, while `extraEnv` sets
-`INDRA_LOGGING__LEVEL=debug`. The environment wins per the M1-04
-precedence. The winning layer is reported by the authenticated
-`GET /api/v1/config/explain` endpoint (protected router behind
-`require_api_auth`: an unauthenticated curl fails closed with 401
-UNAUTHORIZED).
+`INDRA_LOGGING__LEVEL=debug`. The environment wins, so the broker logs
+at `debug` (`kubectl logs deploy/indra-indramqtt | grep -c DEBUG` is
+more than 0). The authenticated `GET /api/v1/config/explain` endpoint
+names the layer that set a value (an unauthenticated request gets 401).
 
 ```bash
 # Log in as the first-boot default admin, rotate the password (a

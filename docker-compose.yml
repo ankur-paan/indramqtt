@@ -21,14 +21,6 @@ services:
     image: indramqtt/indramqtt:0.1.0
     container_name: indramqtt-broker
     restart: unless-stopped
-    # Effective API bind: the image bakes `CMD ["--api-bind",
-    # "0.0.0.0:18083"]` (Dockerfile) and a passed flag wins over files and
-    # the environment (`crates/broker-node/src/main.rs`), so without this
-    # override a non-default `listeners.api.bind` in indra.toml would leave
-    # the effective bind at 18083 while the file and `ports:` moved. Keep
-    # this value, `listeners.api.bind` in deploy/compose/indra.toml, and
-    # the `ports:` mapping below in agreement; change all three together.
-    command: ["--api-bind", "0.0.0.0:18083"]
     ports:
       # Plaintext MQTT listener (`listeners.tcp.bind` in the mounted file).
       - "1883:1883"
@@ -37,7 +29,6 @@ services:
       # Management API and readiness probe (`listeners.api.bind`).
       - "18083:18083"
     environment:
-      - RUST_LOG=info
       # Canonical M1-04 override proving the layer works: the mounted file
       # below sets `[logging] level = "info"` and this variable wins over
       # it. Canonical double-underscore form (`INDRA_<SECTION>__<SETTING>`);

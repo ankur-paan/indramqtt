@@ -51,29 +51,33 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `session.max_offline_queue` | integer | `50000` | 1..=1000000 | Maximum queued offline messages per session. |
 | `session.max_inflight_messages` | integer | `65535` | 1..=65535 | Maximum inflight unacknowledged QoS 1 and QoS 2 messages. |
 | `session.max_qos0_backlog` | integer | `1000` | 1..=100000 | Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops. |
+| `session.max_qos1_inflight` | integer | `100` | 1..=100000 | Per-session QoS 1 inflight window bound. |
+| `session.max_qos1_spill` | integer | `1000` | 1..=100000 | Per-session QoS 1 spill bound past the window. |
+| `session.topic_alias_maximum` | integer | `10` | 0..=65535 | Inbound topic-alias maximum advertised in CONNACK. |
 | `session.keep_alive_grace` | number | `1.5` | 1.0..=5.0 | Keep-alive grace multiplier before disconnect. |
 
 ## logging
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `logging.level` | string | `info` | ["trace", "debug", "info", "warn", "error"] | Logging verbosity for the kernel (trace, debug, info, warn, error). |
+| `logging.level` | string | `info` | ["trace","debug","info","warn","error"] | Logging verbosity for the kernel (trace, debug, info, warn, error). |
 
 ## rules_engine
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `rules_engine.window_channel_depth` | integer | `65536` | 1..=1000000 | Ingress ring buffer channel depth for stateful window worker tasks. |
-| `rules_engine.backpressure_policy` | string | `DropOldest` | ["Block", "DropNewest", "DropOldest", "SpillToDisk", "RejectPublisher"] | Default memory backpressure policy when the rule buffer is full. |
+| `rules_engine.backpressure_policy` | string | `DropOldest` | ["Block","DropNewest","DropOldest","SpillToDisk","RejectPublisher"] | Default memory backpressure policy when the rule buffer is full. |
+| `rules_engine.spill_dir` | string | `` | string | Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total). |
 
 ## auth
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `auth.enabled` | boolean | `true` | boolean | Whether authentication checks apply to client connects. |
-| `auth.password_hash` | string | `sha256` | ["sha256", "bcrypt"] | Password hashing algorithm for stored credentials. |
+| `auth.password_hash` | string | `sha256` | ["sha256","bcrypt"] | Password hashing algorithm for stored credentials. |
 | `auth.allow_anonymous` | boolean | `false` | boolean | Whether anonymous connections are accepted while no users are configured. |
-| `auth.superusers` | array | `["admin", "root"]` | array | Superuser usernames bypassing ACL rules. |
+| `auth.superusers` | array | `["admin","root"]` | array | Superuser usernames bypassing ACL rules. |
 
 ## cluster
 
@@ -135,4 +139,57 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `kerberos.clock_skew_secs` | integer | `300` | 1..=3600 | Clock-skew allowance in seconds for ticket validity and authenticator timestamps. |
 | `kerberos.role_map` | string | `` | string | Comma-separated principal=role mappings for verified client principals. |
 | `kerberos.replay_max_entries` | integer | `1024` | 16..=8192 | Replay-cache bound for Kerberos authenticators. |
+
+## delayed
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `delayed.max_secs` | integer | `86400` | 1..=86400 | Upper bound for delayed deferrals in seconds. |
+
+## observability
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `observability.monitor_sample_secs` | integer | `10` | 0..=3600 | Monitor sampling interval in seconds. |
+
+## jwks
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `jwks.url` | string | `` | string | JWKS endpoint URL for JWT authentication. |
+| `jwks.issuer` | string | `` | string | Expected JWT issuer. |
+| `jwks.audience` | string | `` | string | Expected JWT audience. |
+| `jwks.refresh_period_secs` | integer | `300` | 1..=86400 | Seconds between background JWKS refreshes. |
+| `jwks.fetch_timeout_ms` | integer | `5000` | 100..=60000 | Timeout for one JWKS fetch in milliseconds. |
+| `jwks.refresh_timeout_ms` | integer | `5000` | 100..=60000 | Longest a CONNECT waits for a JWKS refresh in milliseconds. |
+| `jwks.cache_max_keys` | integer | `32` | 1..=256 | Most JWKS keys held in the cache. |
+| `jwks.cache_ttl_secs` | integer | `300` | 1..=86400 | Seconds a cached JWKS key stays valid. |
+| `jwks.clock_skew_secs` | integer | `60` | 0..=3600 | Clock skew tolerated when checking token times, in seconds. |
+| `jwks.ca_cert` | string | `` | string | Extra CA certificate trusted for the JWKS endpoint. |
+
+## dbauth
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `dbauth.postgres_url` | string | `` | string | PostgreSQL URL for database authentication. |
+| `dbauth.mysql_url` | string | `` | string | MySQL URL for database authentication. |
+| `dbauth.redis_url` | string | `` | string | Redis URL for database authentication. |
+| `dbauth.mongodb_url` | string | `` | string | MongoDB URL for database authentication. |
+| `dbauth.pool_size` | integer | `8` | 1..=32 | Connections kept per authentication database. |
+| `dbauth.connect_timeout_ms` | integer | `3000` | 100..=60000 | Timeout for connecting to an authentication database in milliseconds. |
+| `dbauth.read_timeout_ms` | integer | `3000` | 100..=60000 | Timeout for one authentication lookup in milliseconds. |
+| `dbauth.cache_size` | integer | `1024` | 0..=100000 | Cached database verdicts per source; 0 disables the cache. |
+| `dbauth.cache_ttl_secs` | integer | `60` | 0..=3600 | Seconds a cached database verdict stays valid. |
+
+## webhook
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `webhook.url` | string | `` | string | HTTP webhook verdict endpoint. |
+| `webhook.pool_size` | integer | `8` | 1..=32 | Concurrent requests allowed to the webhook endpoint. |
+| `webhook.timeout_ms` | integer | `2000` | 100..=60000 | Timeout for one webhook request in milliseconds. |
+| `webhook.breaker_threshold` | integer | `5` | 1..=100 | Consecutive webhook failures that open the circuit breaker. |
+| `webhook.breaker_reset_ms` | integer | `30000` | 1000..=600000 | Milliseconds an open circuit breaker waits before retrying the webhook. |
+| `webhook.cache_size` | integer | `1024` | 0..=100000 | Cached webhook verdicts; 0 disables the cache. |
+| `webhook.cache_ttl_secs` | integer | `60` | 0..=3600 | Seconds a cached webhook verdict stays valid. |
 

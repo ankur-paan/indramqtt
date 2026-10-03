@@ -38,14 +38,6 @@ spec:
         - name: indramqtt
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # The image bakes `CMD ["--api-bind", "0.0.0.0:18083"]`
-          # (Dockerfile) and a passed flag wins over files and the
-          # environment (`crates/broker-node/src/main.rs`), so without an
-          # override a non-default `service.apiPort` would leave the
-          # effective API bind at 18083 while the Service and indra.toml
-          # moved. These args keep the effective bind on the same value.
-          args:
-            - "--api-bind=0.0.0.0:{{ .Values.service.apiPort }}"
           ports:
             - name: mqtt
               containerPort: {{ .Values.service.mqttPort }}
@@ -54,8 +46,6 @@ spec:
             - name: api
               containerPort: {{ .Values.service.apiPort }}
           env:
-            - name: RUST_LOG
-              value: info
 {{- range .Values.extraEnv }}
             - name: {{ .name }}
               value: {{ .value | quote }}

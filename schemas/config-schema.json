@@ -71,11 +71,150 @@
       },
       "type": "object"
     },
+    "dbauth": {
+      "properties": {
+        "cache_size": {
+          "default": 1024,
+          "description": "Cached database verdicts per source; 0 disables the cache.",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 60,
+          "description": "Seconds a cached database verdict stays valid.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "connect_timeout_ms": {
+          "default": 3000,
+          "description": "Timeout for connecting to an authentication database in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "mongodb_url": {
+          "default": "",
+          "description": "MongoDB URL for database authentication.",
+          "type": "string"
+        },
+        "mysql_url": {
+          "default": "",
+          "description": "MySQL URL for database authentication.",
+          "type": "string"
+        },
+        "pool_size": {
+          "default": 8,
+          "description": "Connections kept per authentication database.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "postgres_url": {
+          "default": "",
+          "description": "PostgreSQL URL for database authentication.",
+          "type": "string"
+        },
+        "read_timeout_ms": {
+          "default": 3000,
+          "description": "Timeout for one authentication lookup in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "redis_url": {
+          "default": "",
+          "description": "Redis URL for database authentication.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "delayed": {
+      "properties": {
+        "max_secs": {
+          "default": 86400,
+          "description": "Upper bound for delayed deferrals in seconds.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "gateway": {
       "properties": {
         "coap_bind": {
           "default": "",
           "description": "CoAP gateway UDP listen address. Empty disables the gateway.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "jwks": {
+      "properties": {
+        "audience": {
+          "default": "",
+          "description": "Expected JWT audience.",
+          "type": "string"
+        },
+        "ca_cert": {
+          "default": "",
+          "description": "Extra CA certificate trusted for the JWKS endpoint.",
+          "type": "string"
+        },
+        "cache_max_keys": {
+          "default": 32,
+          "description": "Most JWKS keys held in the cache.",
+          "maximum": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 300,
+          "description": "Seconds a cached JWKS key stays valid.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "clock_skew_secs": {
+          "default": 60,
+          "description": "Clock skew tolerated when checking token times, in seconds.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fetch_timeout_ms": {
+          "default": 5000,
+          "description": "Timeout for one JWKS fetch in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "issuer": {
+          "default": "",
+          "description": "Expected JWT issuer.",
+          "type": "string"
+        },
+        "refresh_period_secs": {
+          "default": 300,
+          "description": "Seconds between background JWKS refreshes.",
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "refresh_timeout_ms": {
+          "default": 5000,
+          "description": "Longest a CONNECT waits for a JWKS refresh in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "url": {
+          "default": "",
+          "description": "JWKS endpoint URL for JWT authentication.",
           "type": "string"
         }
       },
@@ -392,6 +531,18 @@
       },
       "type": "object"
     },
+    "observability": {
+      "properties": {
+        "monitor_sample_secs": {
+          "default": 10,
+          "description": "Monitor sampling interval in seconds.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "persistence": {
       "properties": {
         "stream_dir": {
@@ -442,6 +593,11 @@
           ],
           "type": "string"
         },
+        "spill_dir": {
+          "default": "",
+          "description": "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+          "type": "string"
+        },
         "window_channel_depth": {
           "default": 65536,
           "description": "Ingress ring buffer channel depth for stateful window worker tasks.",
@@ -482,12 +638,85 @@
           "minimum": 1,
           "type": "integer"
         },
+        "max_qos1_inflight": {
+          "default": 100,
+          "description": "Per-session QoS 1 inflight window bound.",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_qos1_spill": {
+          "default": 1000,
+          "description": "Per-session QoS 1 spill bound past the window.",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_session_expiry_secs": {
           "default": 86400,
           "description": "Max session expiry interval in seconds.",
           "maximum": 2592000,
           "minimum": 0,
           "type": "integer"
+        },
+        "topic_alias_maximum": {
+          "default": 10,
+          "description": "Inbound topic-alias maximum advertised in CONNACK.",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "webhook": {
+      "properties": {
+        "breaker_reset_ms": {
+          "default": 30000,
+          "description": "Milliseconds an open circuit breaker waits before retrying the webhook.",
+          "maximum": 600000,
+          "minimum": 1000,
+          "type": "integer"
+        },
+        "breaker_threshold": {
+          "default": 5,
+          "description": "Consecutive webhook failures that open the circuit breaker.",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cache_size": {
+          "default": 1024,
+          "description": "Cached webhook verdicts; 0 disables the cache.",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "default": 60,
+          "description": "Seconds a cached webhook verdict stays valid.",
+          "maximum": 3600,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pool_size": {
+          "default": 8,
+          "description": "Concurrent requests allowed to the webhook endpoint.",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 2000,
+          "description": "Timeout for one webhook request in milliseconds.",
+          "maximum": 60000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "url": {
+          "default": "",
+          "description": "HTTP webhook verdict endpoint.",
+          "type": "string"
         }
       },
       "type": "object"

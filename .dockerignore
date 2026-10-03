@@ -30,5 +30,7 @@ erl_crash.dump
 scratch/
 benchmark_suite/benchmark_results_*.json
 
-# Deployment examples ship config text, not build inputs.
-deploy/
+# Deployment examples ship config text, not build inputs. The image's
+# start script under deploy/docker is a build input and stays.
+deploy/compose/
+deploy/helm/

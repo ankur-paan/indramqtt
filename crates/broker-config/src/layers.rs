@@ -156,7 +156,7 @@ impl ValueKind {
     fn from_setting_type(setting_type: &str) -> Self {
         match setting_type {
             "bool" => Self::Bool,
-            "u32" | "u64" | "usize" => Self::Integer,
+            "u16" | "u32" | "u64" | "usize" => Self::Integer,
             "f64" => Self::Float,
             "string list" => Self::StringList,
             _ => Self::Str,

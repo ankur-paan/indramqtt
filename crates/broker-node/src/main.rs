@@ -3518,7 +3518,7 @@ async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
     shared.metrics.inc_publish_sent_by(enqueued);
     shared.metrics.inc_delivered_by(enqueued);
     shared.metrics.inc_bytes_sent_by(enqueued_bytes);
-    forward_cluster(shared, &topic, qos, &payload).await;
+    forward_cluster(shared, &topic, qos, &payload, &entry.publisher_tenant).await;
     shared.delayed.note_delivered();
 }
 
@@ -5560,7 +5560,7 @@ async fn apply_publish(
         tenant,
     )
     .await;
-    forward_cluster(shared, &topic, qos, &frame.payload).await;
+    forward_cluster(shared, &topic, qos, &frame.payload, tenant).await;
 
     let ack = if qos == QoS::AtLeastOnce {
         let persist_failed = offline_persist_failed_before.is_some_and(|before| {
@@ -5634,7 +5634,7 @@ async fn apply_delayed_publish(
             publisher_tenant,
         )
         .await;
-        forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
+        forward_cluster(shared, &inner_topic, qos, &frame.payload, publisher_tenant).await;
         let ack = if qos == QoS::AtLeastOnce {
             let persist_failed = offline_persist_failed_before.is_some_and(|before| {
                 shared
@@ -5824,7 +5824,14 @@ async fn apply_qos2_pubrel(
                 &publisher_tenant,
             )
             .await;
-            forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
+            forward_cluster(
+                shared,
+                &inner_topic,
+                QoS::ExactlyOnce,
+                &stored.payload,
+                &publisher_tenant,
+            )
+            .await;
             let persist_failed = offline_persist_failed_before.is_some_and(|before| {
                 shared
                     .sessions
@@ -5893,7 +5900,14 @@ async fn apply_qos2_pubrel(
         &publisher_tenant,
     )
     .await;
-    forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
+    forward_cluster(
+        shared,
+        &stored.topic,
+        QoS::ExactlyOnce,
+        &stored.payload,
+        &publisher_tenant,
+    )
+    .await;
     let persist_failed = offline_persist_failed_before.is_some_and(|before| {
         shared
             .sessions
@@ -6121,11 +6135,21 @@ async fn ingress_pipeline_with_publisher(
     // Rules execute at ingress on this node, before local fan-out.
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
-    let rules_fired = shared
-        .engine
-        .dispatch_ingress(topic, payload, qos, &shared.sink)
-        .await;
-    shared.metrics.inc_rules_executed_by(rules_fired as u64);
+    //
+    // Rules, the CoAP observers below and cluster forwarding carry no
+    // tenant yet: rule output republishes into the default tenant and
+    // observers are default-tenant readers. Feeding them another tenant's
+    // publish would move its payload across the tenant boundary, so they
+    // see default-tenant traffic only until each of them carries a
+    // tenant. A default-only install takes the same path as before.
+    let default_tenant = is_default_tenant(publisher_tenant);
+    if default_tenant {
+        let rules_fired = shared
+            .engine
+            .dispatch_ingress(topic, payload, qos, &shared.sink)
+            .await;
+        shared.metrics.inc_rules_executed_by(rules_fired as u64);
+    }
 
     // Topic index (W1-15): remember the concrete publish topic so the
     // management list/detail reads observe edge publishes as well as
@@ -6161,13 +6185,34 @@ async fn ingress_pipeline_with_publisher(
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
     // returns after a length check, no spawn, no socket work.
-    maybe_notify_coap_observers(shared, topic.as_str(), payload);
+    if default_tenant {
+        maybe_notify_coap_observers(shared, topic.as_str(), payload);
+    }
     deliveries
+}
+
+/// True for the default tenant (the empty id is the default too).
+fn is_default_tenant(tenant: &str) -> bool {
+    tenant.is_empty() || tenant == broker_session::tenant::DEFAULT_TENANT_ID
 }
 
 /// Clustered mode: one forward per matching remote node; each remote
 /// fans out locally.
-async fn forward_cluster(shared: &Shared, topic: &Topic, qos: QoS, payload: &Bytes) {
+async fn forward_cluster(
+    shared: &Shared,
+    topic: &Topic,
+    qos: QoS,
+    payload: &Bytes,
+    publisher_tenant: &str,
+) {
+    // The cluster protocol carries no tenant, and a peer fans a forwarded
+    // message out in the default tenant. Forwarding another tenant's
+    // publish would hand it to default-tenant subscribers on the peer, so
+    // only default-tenant publishes leave this node until the protocol
+    // carries the tenant.
+    if !is_default_tenant(publisher_tenant) {
+        return;
+    }
     if let Some(cluster) = &shared.cluster {
         match cluster.resolve_route(topic).await {
             Ok(targets) => {
@@ -6218,7 +6263,14 @@ async fn apply_coap_publish(
         broker_session::tenant::DEFAULT_TENANT_ID,
     )
     .await;
-    forward_cluster(shared, &topic, QoS::AtMostOnce, payload).await;
+    forward_cluster(
+        shared,
+        &topic,
+        QoS::AtMostOnce,
+        payload,
+        broker_session::tenant::DEFAULT_TENANT_ID,
+    )
+    .await;
     Some(deliveries)
 }
 
@@ -7210,7 +7262,7 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         &tenant,
     )
     .await;
-    forward_cluster(shared, &will.topic, will.qos, &will.payload).await;
+    forward_cluster(shared, &will.topic, will.qos, &will.payload, &tenant).await;
     deliveries
 }
 
@@ -8312,6 +8364,104 @@ mod tests {
             "indramqtt-w019-datadir-{}-{nanos}-{slot}",
             std::process::id()
         ))
+    }
+
+    /// Parse a command line the way `main` does and resolve it against
+    /// the files in `config_dir`.
+    fn resolve_boot(config_dir: &std::path::Path, flags: &[&str]) -> Args {
+        let mut argv = vec![
+            "indramqtt".to_string(),
+            "--config-dir".to_string(),
+            config_dir.to_str().expect("temp path is UTF-8").to_string(),
+        ];
+        argv.extend(flags.iter().map(|flag| flag.to_string()));
+        let matches = <Args as clap::CommandFactory>::command().get_matches_from(argv);
+        let mut args =
+            <Args as clap::FromArgMatches>::from_arg_matches(&matches).expect("flags parse");
+        let layered = load_startup_config(&args, &matches).expect("config resolves");
+        apply_resolved_config(&mut args, &layered).expect("resolved config applies");
+        args
+    }
+
+    #[test]
+    fn boot_runs_on_file_settings_and_a_typed_flag_wins() {
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[node]\nid = \"from-file\"\n\
+             [listeners.api]\nbind = \"127.0.0.1:28099\"\n\
+             [session]\nmax_qos0_backlog = 7\n\
+             [auth]\nallow_anonymous = true\n\
+             [cluster]\nseed_nodes = [\"a:1\", \"b:2\"]\n\
+             [webhook]\nbreaker_threshold = 9\n",
+        )
+        .expect("write indra.toml");
+
+        // No flags: every file setting reaches the field the boot reads.
+        let args = resolve_boot(&dir, &[]);
+        assert_eq!(args.node_id, "from-file");
+        assert_eq!(args.api_bind, "127.0.0.1:28099");
+        assert_eq!(args.qos0_backlog, 7);
+        assert!(args.allow_anonymous);
+        assert_eq!(args.cluster_seeds.as_deref(), Some("a:1,b:2"));
+        assert_eq!(args.webhook_breaker_threshold, 9);
+        // A setting no layer touched keeps the flag's built-in default.
+        assert_eq!(args.brokerlink_bind, "127.0.0.1:18883");
+
+        // A typed flag wins over the file; the rest still comes from it.
+        let args = resolve_boot(&dir, &["--node-id", "from-flag", "--qos0-backlog", "3"]);
+        assert_eq!(args.node_id, "from-flag");
+        assert_eq!(args.qos0_backlog, 3);
+        assert_eq!(args.api_bind, "127.0.0.1:28099");
+
+        // A flag typed with its own default value still wins over the file.
+        let args = resolve_boot(&dir, &["--node-id", "indra-node-1"]);
+        assert_eq!(args.node_id, "indra-node-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edge_args_carry_the_resolved_listeners() {
+        let mut cfg = broker_config::schema::BrokerConfig::default();
+        let defaults = edge_args(&cfg).expect("defaults resolve");
+        let triple = |args: &[String], key: &str| -> Option<String> {
+            args.chunks(3)
+                .find(|chunk| chunk[0] == "-indra_edge" && chunk[1] == key)
+                .map(|chunk| chunk[2].clone())
+        };
+        assert_eq!(triple(&defaults, "mqtt_enabled").as_deref(), Some("true"));
+        assert_eq!(triple(&defaults, "mqtt_port").as_deref(), Some("1883"));
+        // Every interface is the edge's own default: no address is passed.
+        assert_eq!(triple(&defaults, "mqtt_ip"), None);
+        assert_eq!(triple(&defaults, "tls_enabled").as_deref(), Some("false"));
+        assert_eq!(triple(&defaults, "ws_path").as_deref(), Some("\"/mqtt\""));
+        assert_eq!(
+            triple(&defaults, "kernel_host").as_deref(),
+            Some("\"127.0.0.1\"")
+        );
+        assert_eq!(triple(&defaults, "kernel_port").as_deref(), Some("18883"));
+        assert_eq!(triple(&defaults, "tls_certfile"), None);
+
+        cfg.listeners.tcp.enabled = false;
+        cfg.listeners.tcp.bind = "10.0.0.5:11883".to_string();
+        cfg.listeners.wss.enabled = true;
+        cfg.listeners.wss.cert_file = "/etc/indramqtt/tls/cert.pem".to_string();
+        cfg.listeners.wss.key_file = "/etc/indramqtt/tls/key.pem".to_string();
+        let changed = edge_args(&cfg).expect("changed config resolves");
+        assert_eq!(triple(&changed, "mqtt_enabled").as_deref(), Some("false"));
+        assert_eq!(triple(&changed, "mqtt_port").as_deref(), Some("11883"));
+        assert_eq!(triple(&changed, "mqtt_ip").as_deref(), Some("\"10.0.0.5\""));
+        assert_eq!(triple(&changed, "wss_enabled").as_deref(), Some("true"));
+        assert_eq!(
+            triple(&changed, "wss_certfile").as_deref(),
+            Some("\"/etc/indramqtt/tls/cert.pem\"")
+        );
+
+        // The edge binds by address: a host name is refused by setting name.
+        cfg.listeners.ws.bind = "localhost:8083".to_string();
+        let err = edge_args(&cfg).expect_err("host names are refused");
+        assert!(err.to_string().contains("listeners.ws.bind"), "got: {err}");
     }
 
     #[test]

@@ -39,6 +39,12 @@ use crate::v5::auth::TokenInfo;
 /// nothing is evicted to make room.
 pub const MAX_API_KEYS: usize = 1024;
 
+/// Shortest accepted operator API key. Every key resolves as an
+/// administrator, so a guessable key is a full compromise; 16 characters
+/// keeps a random key out of reach of online guessing while staying easy
+/// to paste. Shorter keys are refused, never truncated or padded.
+pub const MIN_API_KEY_LEN: usize = 16;
+
 /// Environment variable seeding the store at boot. Comma-separated opaque
 /// key strings; blank entries are ignored so a trailing comma is harmless.
 pub const API_KEYS_ENV: &str = "INDRA_API_KEYS";
@@ -80,20 +86,39 @@ impl ApiKeyStore {
     pub fn from_env() -> Self {
         let store = Self::new();
         let raw = std::env::var(API_KEYS_ENV).unwrap_or_default();
+        let mut too_short = 0usize;
         for key in raw.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+            if key.len() < MIN_API_KEY_LEN {
+                too_short += 1;
+                continue;
+            }
             if store.keys.lock().unwrap().len() >= MAX_API_KEYS {
                 break;
             }
             store.keys.lock().unwrap().insert(key.to_string(), ());
         }
+        if too_short > 0 {
+            // Counted, never echoed: the value is a credential.
+            tracing::warn!(
+                ignored = too_short,
+                minimum_length = MIN_API_KEY_LEN,
+                "ignored operator API keys shorter than the minimum length"
+            );
+        }
         store
     }
 
     /// Insert one key. Fails when the store already holds
-    /// [`MAX_API_KEYS`] keys; empty keys are rejected as invalid.
+    /// [`MAX_API_KEYS`] keys; empty keys and keys shorter than
+    /// [`MIN_API_KEY_LEN`] are rejected as invalid.
     pub fn insert(&self, key: &str) -> Result<(), String> {
         if key.is_empty() {
             return Err("api key must not be empty".to_string());
+        }
+        if key.len() < MIN_API_KEY_LEN {
+            return Err(format!(
+                "api key must be at least {MIN_API_KEY_LEN} characters"
+            ));
         }
         let mut keys = self.keys.lock().unwrap();
         if keys.len() >= MAX_API_KEYS && !keys.contains_key(key) {
@@ -170,22 +195,27 @@ mod tests {
     #[test]
     fn inserted_key_resolves_as_operator_without_password_gate() {
         let store = ApiKeyStore::new();
-        store.insert("key-1").expect("insert");
-        let info = store.resolve("key-1").expect("resolves");
+        store.insert("operator-key-0001").expect("insert");
+        let info = store.resolve("operator-key-0001").expect("resolves");
         assert_eq!(info.username, API_KEY_USERNAME);
         assert_eq!(info.role, AdminRole::Administrator);
         assert!(!info.must_change_password);
         assert!(info.expires_at > Instant::now());
         // Wrong keys still fail closed.
-        assert!(store.resolve("key-2").is_none());
+        assert!(store.resolve("operator-key-0002").is_none());
         assert!(store.resolve("").is_none());
-        assert!(store.resolve("key-").is_none());
+        assert!(store.resolve("operator-key-000").is_none());
     }
 
     #[test]
     fn empty_key_is_rejected() {
         let store = ApiKeyStore::new();
         assert!(store.insert("").is_err());
+        // One character under the minimum is refused, never stored.
+        assert!(store.insert(&"k".repeat(MIN_API_KEY_LEN - 1)).is_err());
+        assert!(store.insert(&"k".repeat(MIN_API_KEY_LEN)).is_ok());
+        assert_eq!(store.len(), 1);
+        let store = ApiKeyStore::new();
         assert_eq!(store.len(), 0);
     }
 
@@ -193,12 +223,12 @@ mod tests {
     fn store_is_bounded_and_rejects_past_the_cap() {
         let store = ApiKeyStore::new();
         for i in 0..MAX_API_KEYS {
-            store.insert(&format!("k-{i}")).expect("insert under cap");
+            store.insert(&format!("operator-key-{i:06}")).expect("insert under cap");
         }
         assert_eq!(store.len(), MAX_API_KEYS);
-        assert!(store.insert("one-too-many").is_err());
+        assert!(store.insert("operator-key-one-too-many").is_err());
         // Re-inserting an existing key at the cap still succeeds (no growth).
-        assert!(store.insert("k-0").is_ok());
+        assert!(store.insert("operator-key-000000").is_ok());
         assert_eq!(store.len(), MAX_API_KEYS);
     }
 

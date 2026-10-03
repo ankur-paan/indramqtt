@@ -10,7 +10,7 @@ internals: adjust the named values below, then start and connect.
 | `[node] id` | `deploy/compose/indra.toml` | `"indra-node-1"` | Give each node a unique id (matters once clustering is used). |
 | `[auth] allow_anonymous` | `deploy/compose/indra.toml` | `true` | Set `false` for anything beyond evaluation, and create users first. |
 | `[logging] level` | `deploy/compose/indra.toml`, but `INDRA_LOGGING__LEVEL` in `docker-compose.yml` wins | file `info`, running `debug` | Change the environment entry to set the running level without editing the file. |
-| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change together with the matching `ports:` entry in `docker-compose.yml`; for the API bind also change the matching `command:` `--api-bind` entry there, because the image bakes `--api-bind 0.0.0.0:18083` and a passed flag wins over the file and the environment. |
+| Listener binds | `deploy/compose/indra.toml` (`listeners.tcp/ws/api`) | `1883` / `8083` / `18083` on all interfaces | Change together with the matching `ports:` entry in `docker-compose.yml`. The kernel passes the MQTT and WebSocket binds to the edge at start, so this file is the one place a listener is set. |
 | Image tag | `docker-compose.yml` (`image:`) | `indramqtt/indramqtt:0.1.0` (workspace version) | Track releases; never use `:latest` for a running deployment. |
 
 Every other setting keeps its schema default (see
@@ -51,17 +51,18 @@ no credentials are needed for evaluation.
 
 The mounted file sets `[logging] level = "info"`, while
 `docker-compose.yml` sets `INDRA_LOGGING__LEVEL=debug`. The environment
-wins per the M1-04 precedence. The winning layer is reported by the
-authenticated `GET /api/v1/config/explain` endpoint
-(`crates/broker-api/src/lib.rs` registers it on the protected router
-behind `require_api_auth`, so an unauthenticated curl fails closed
-with 401 UNAUTHORIZED).
+wins, so the broker logs at `debug`:
 
-The process log filter is not driven by this key: the subscriber is
-built from `RUST_LOG` only (`crates/broker-observability/src/lib.rs`,
-`docker-compose.yml` pins `RUST_LOG=info`), so `docker compose logs`
-stays at `info` and a `grep -i debug` proves nothing. Prove the layer
-win through `explain` instead:
+```bash
+docker compose logs indramqtt | grep -c DEBUG   # more than 0
+```
+
+`RUST_LOG`, when set, overrides `logging.level`; it is a developer
+filter (`RUST_LOG=broker_router=trace`) and the compose file leaves it
+unset.
+
+The authenticated `GET /api/v1/config/explain` endpoint names the layer
+that set a value (an unauthenticated request gets 401):
 
 ```bash
 # Log in as the first-boot default admin, rotate the password (a
