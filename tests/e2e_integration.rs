@@ -68,6 +68,10 @@ async fn test_e2e_router_and_rules_pipeline() {
             qos: QoS::AtLeastOnce,
             group: None,
             tenant: broker_router::DEFAULT_TENANT_ID.into(),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            subscription_id: 0,
         },
     );
 
@@ -1315,12 +1319,17 @@ fn shard_encode_publish_with_alias(
 /// Decode `PublishOut` metadata into `(topic, packet_id, qos, alias)`.
 /// The kernel always appends the B4-05 alias section, so the meta is
 /// `TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 | Dup:8 |
-/// Alias:16be`.
+/// Alias:16be`, optionally followed by the X1-03 subscription-identifier
+/// trailer `SubId:32be` (absent for version-4 deliveries) and the X1-03
+/// forwarded v5 section `Format:8 | Expiry:32be | users' (absent when
+/// the publish carried no properties).
 fn shard_decode_publish_out(meta: &[u8]) -> (String, u16, u8, u16) {
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
     let base = 2 + topic_len;
     assert!(
-        meta.len() == base + 2 + 3 + 2,
+        meta.len() == base + 2 + 3 + 2
+            || meta.len() == base + 2 + 3 + 2 + 4
+            || meta.len() >= base + 2 + 3 + 2 + 4 + 1 + 4 + 2,
         "PublishOut meta must carry the trailing alias section, got {} bytes",
         meta.len()
     );
@@ -2070,6 +2079,190 @@ fn sy02_puback(packet_id: u16) -> Vec<u8> {
     vec![0x40, 0x02, (packet_id >> 8) as u8, (packet_id & 0xff) as u8]
 }
 
+/// Encode a variable-byte integer (MQTT property lengths and ids).
+fn sy02_encode_varint(mut value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (value % 128) as u8;
+        value /= 128;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// MQTT 5 SUBSCRIBE with per-filter options plus the packet-wide
+/// subscription identifier (X1-03): `packet id | props | filters`.
+/// `sub_id` 0 sends an empty property section.
+fn sy02_subscribe_v5(packet_id: u16, subs: &[(&str, u8)], sub_id: u32) -> Vec<u8> {
+    let mut props = Vec::new();
+    if sub_id != 0 {
+        props.push(11u8);
+        props.extend_from_slice(&sy02_encode_varint(sub_id));
+    }
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&packet_id.to_be_bytes());
+    rest.extend_from_slice(&sy02_encode_varint(props.len() as u32));
+    rest.extend_from_slice(&props);
+    for (filter, opts) in subs {
+        rest.extend_from_slice(&sy02_mqtt_str(filter));
+        rest.push(*opts);
+    }
+    let mut packet = vec![0x82];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// MQTT 5 PUBLISH with forwarded properties (X1-03): payload format,
+/// message expiry and user properties ride the property section.
+/// `format`/`expiry` `None` omits the property; empty `users` omits it.
+fn sy02_publish5_with_props(
+    topic: &str,
+    qos: u8,
+    retain: bool,
+    format: Option<u8>,
+    expiry: Option<u32>,
+    users: &[(&str, &str)],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut props = Vec::new();
+    if let Some(f) = format {
+        props.push(1u8);
+        props.push(f);
+    }
+    if let Some(e) = expiry {
+        props.push(2u8);
+        props.extend_from_slice(&e.to_be_bytes());
+    }
+    for (k, v) in users {
+        props.push(38u8);
+        props.extend_from_slice(&sy02_mqtt_str(k));
+        props.extend_from_slice(&sy02_mqtt_str(v));
+    }
+    let mut rest = sy02_mqtt_str(topic);
+    // QoS 0 in this test: no packet id.
+    assert_eq!(qos, 0, "X1-03 edge test uses QoS 0");
+    rest.extend_from_slice(&sy02_encode_varint(props.len() as u32));
+    rest.extend_from_slice(&props);
+    rest.extend_from_slice(payload);
+    let mut flags = qos << 1;
+    if retain {
+        flags |= 0x01;
+    }
+    let mut packet = vec![0x30 | flags];
+    packet.extend_from_slice(&sy02_mqtt_rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// MQTT 5 DISCONNECT with a reason code (X1-03): `reason | props(empty)`.
+fn sy02_disconnect_v5(reason: u8) -> Vec<u8> {
+    let body = vec![reason, 0x00];
+    let mut packet = vec![0xE0];
+    packet.extend_from_slice(&sy02_mqtt_rl(body.len()));
+    packet.extend_from_slice(&body);
+    packet
+}
+
+/// Parse an MQTT 5 SUBACK body into `(packet_id, granted codes)`,
+/// skipping the property section.
+fn sy02_parse_suback5(body: &[u8]) -> (u16, Vec<u8>) {
+    assert!(body.len() >= 3, "v5 SUBACK carries packet id and props");
+    let packet_id = u16::from_be_bytes([body[0], body[1]]);
+    let (prop_len, used) = sy02_varint(&body[2..]).expect("SUBACK property length");
+    assert!(body.len() >= 2 + used + prop_len, "SUBACK props fit");
+    (packet_id, body[2 + used + prop_len..].to_vec())
+}
+
+/// One MQTT 5 PUBLISH as the edge delivers it, with forwarded props.
+struct Sy02Publish5 {
+    topic: String,
+    qos: u8,
+    sub_id: u32,
+    format: u8,
+    expiry: u32,
+    users: Vec<(String, String)>,
+    payload: Vec<u8>,
+}
+
+/// Parse an MQTT 5 PUBLISH body (QoS 0): topic, property section
+/// (subscription id 11, format 1, expiry 2, user 38, alias 35 skipped)
+/// and payload.
+fn sy02_parse_publish_v5(header: u8, body: &[u8]) -> Sy02Publish5 {
+    let qos = (header >> 1) & 0x03;
+    assert_eq!(qos, 0, "X1-03 edge test uses QoS 0");
+    assert!(body.len() >= 2, "PUBLISH carries a topic");
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let topic = std::str::from_utf8(&body[2..2 + topic_len])
+        .expect("topic UTF-8")
+        .to_string();
+    let mut rest = &body[2 + topic_len..];
+    let (prop_len, used) = sy02_varint(rest).expect("PUBLISH property length");
+    rest = &rest[used..];
+    assert!(rest.len() >= prop_len, "PUBLISH props fit");
+    let mut props = &rest[..prop_len];
+    let mut sub_id = 0u32;
+    let mut format = 0u8;
+    let mut expiry = 0u32;
+    let mut users = Vec::new();
+    while !props.is_empty() {
+        let (id, used) = sy02_varint(props).expect("property id");
+        props = &props[used..];
+        match id {
+            11 => {
+                let (v, used) = sy02_varint(props).expect("sub id varint");
+                sub_id = v as u32;
+                props = &props[used..];
+            }
+            1 => {
+                assert!(!props.is_empty(), "format carries a byte");
+                format = props[0];
+                props = &props[1..];
+            }
+            2 => {
+                assert!(props.len() >= 4, "expiry carries a u32");
+                expiry = u32::from_be_bytes([props[0], props[1], props[2], props[3]]);
+                props = &props[4..];
+            }
+            35 => {
+                assert!(props.len() >= 2, "alias carries a u16");
+                props = &props[2..];
+            }
+            38 => {
+                assert!(props.len() >= 2, "user key length");
+                let k_len = u16::from_be_bytes([props[0], props[1]]) as usize;
+                assert!(props.len() >= 2 + k_len + 2, "user key fits");
+                let k = std::str::from_utf8(&props[2..2 + k_len])
+                    .expect("user key UTF-8")
+                    .to_string();
+                let v_len = u16::from_be_bytes([props[2 + k_len], props[2 + k_len + 1]]) as usize;
+                assert!(props.len() >= 2 + k_len + 2 + v_len, "user value fits");
+                let v = std::str::from_utf8(&props[2 + k_len + 2..2 + k_len + 2 + v_len])
+                    .expect("user value UTF-8")
+                    .to_string();
+                users.push((k, v));
+                props = &props[2 + k_len + 2 + v_len..];
+            }
+            _ => panic!("unexpected v5 PUBLISH property {id}"),
+        }
+    }
+    Sy02Publish5 {
+        topic,
+        qos,
+        sub_id,
+        format,
+        expiry,
+        users,
+        payload: rest[prop_len..].to_vec(),
+    }
+}
+
 /// Decode one variable-byte integer, returning `(value, bytes used)`.
 fn sy02_varint(mut bytes: &[u8]) -> Option<(usize, usize)> {
     let mut value = 0usize;
@@ -2633,6 +2826,163 @@ async fn sy02_ws_mqtt5_will_fires_to_subscriber() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// X1-03: end-to-end through the edge with real MQTT 5 clients.
+///
+/// A version-5 subscriber connects with properties, subscribes with
+/// options plus a subscription identifier, and receives a version-5
+/// publish carrying the same user properties (plus the identifier) on
+/// delivery; the publisher disconnects with a reason code. The same
+/// scenario over version 4 still passes unchanged (proves 3.1.1 is
+/// untouched). Goes through the broker (edge codec, subscribe event,
+/// publish event, delivery to socket), never the store.
+#[tokio::test]
+async fn x103_v5_subscriptions_reasons_edge_e2e() {
+    use tokio::io::AsyncWriteExt;
+    let tag = format!(
+        "x103-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let bl_port = shard_ephemeral_port();
+    let (mut child, _addr) = shard_spawn_kernel(&[], &scratch, bl_port).await;
+    let edge = match sy02_spawn_edge(bl_port).await {
+        Some(edge) => edge,
+        None => {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+    };
+    sy02_mqtt_ready(edge.host(), edge.mqtt_port).await;
+    async fn dial(host: &str, port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(SHARD_E2E_STEP, tokio::net::TcpStream::connect((host, port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    async fn recv(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        tokio::time::timeout(SHARD_E2E_STEP, read_mqtt_packet(sock))
+            .await
+            .expect("packet in time")
+            .expect("packet")
+    }
+    async fn send(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
+        tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(bytes))
+            .await
+            .expect("send in time")
+            .expect("send");
+    }
+    // Version-5 leg: CONNECT with properties (alias maximum), SUBSCRIBE
+    // with options plus identifier, PUBLISH with user properties,
+    // DISCONNECT with a reason code.
+    let mut sub = dial(edge.host(), edge.mqtt_port).await;
+    send(
+        &mut sub,
+        &sy02_connect5("x103-v5-sub", true, 60, None, None, 10),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x20, "edge answers with CONNACK");
+    let (_, reason, _) = sy02_parse_connack5(&body);
+    assert_eq!(reason, 0, "v5 CONNECT accepted");
+    // Options: QoS 0, no-local 0, rap 0, retain-handling 0.
+    send(&mut sub, &sy02_subscribe_v5(7, &[("x103/v5/props", 0)], 42)).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x90, "edge answers with SUBACK");
+    let (packet_id, codes) = sy02_parse_suback5(&body);
+    assert_eq!(packet_id, 7);
+    assert_eq!(codes, vec![0u8], "v5 subscribe granted QoS 0");
+    let mut publisher = dial(edge.host(), edge.mqtt_port).await;
+    send(
+        &mut publisher,
+        &sy02_connect5("x103-v5-pub", true, 60, None, None, 10),
+    )
+    .await;
+    let (head, body) = recv(&mut publisher).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher CONNACK");
+    let (_, reason, _) = sy02_parse_connack5(&body);
+    assert_eq!(reason, 0);
+    send(
+        &mut publisher,
+        &sy02_publish5_with_props(
+            "x103/v5/props",
+            0,
+            false,
+            Some(1),
+            None,
+            &[("k", "v")],
+            b"hello-v5",
+        ),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let got = sy02_parse_publish_v5(head, &body);
+    assert_eq!(got.topic, "x103/v5/props");
+    assert_eq!(got.payload, b"hello-v5");
+    assert_eq!(got.qos, 0, "delivery keeps QoS 0");
+    assert_eq!(got.sub_id, 42, "delivery carries the subscription id");
+    assert_eq!(got.format, 1, "delivery forwards payload format");
+    assert_eq!(got.expiry, 0, "delivery forwards message expiry");
+    assert_eq!(
+        got.users,
+        vec![("k".to_string(), "v".to_string())],
+        "delivery forwards user properties"
+    );
+    // DISCONNECT with reason 0 succeeds (clean close, no will).
+    send(&mut publisher, &sy02_disconnect_v5(0)).await;
+    drop(publisher);
+    // A malformed option fails only its own filter: one good filter
+    // plus one with reserved bits set. The good filter grants QoS 0,
+    // the bad one answers 0x8F, and the good filter still delivers.
+    send(
+        &mut sub,
+        &sy02_subscribe_v5(8, &[("x103/v5/mixed", 0), ("x103/v5/bad", 0xC1)], 0),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x90, "edge answers mixed SUBACK");
+    let (packet_id, codes) = sy02_parse_suback5(&body);
+    assert_eq!(packet_id, 8);
+    assert_eq!(
+        codes,
+        vec![0u8, 0x8Fu8],
+        "good filter grants, bad filter fails alone"
+    );
+    // Version-4 leg unchanged: classic CONNECT/SUBSCRIBE/PUBLISH.
+    let mut sub4 = dial(edge.host(), edge.mqtt_port).await;
+    send(&mut sub4, &sy02_connect311("x103-v4-sub", true, 60, None)).await;
+    let (head, body) = recv(&mut sub4).await;
+    assert_eq!(head, 0x20, "v4 CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send(&mut sub4, &sy02_subscribe(1, &[("x103/v4/plain", 0)])).await;
+    let (head, body) = recv(&mut sub4).await;
+    assert_eq!(head & 0xF0, 0x90, "v4 SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![0u8]));
+    let mut pub4 = dial(edge.host(), edge.mqtt_port).await;
+    send(&mut pub4, &sy02_connect311("x103-v4-pub", true, 60, None)).await;
+    let (head, body) = recv(&mut pub4).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send(
+        &mut pub4,
+        &sy02_publish311("x103/v4/plain", 0, 0, false, b"hello-v4"),
+    )
+    .await;
+    let (head, body) = recv(&mut sub4).await;
+    assert_eq!(head & 0xF0, 0x30, "v4 downlink is PUBLISH");
+    let got4 = sy02_parse_publish_classic(head, &body);
+    assert_eq!(got4.topic, "x103/v4/plain");
+    assert_eq!(got4.payload, b"hello-v4");
+    edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// SY-02: the QoS 1 inflight window set through `indra.toml` and its
 /// `INDRA_` variable is enforced on real MQTT connections.
 ///
@@ -3041,7 +3391,10 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     }
     async fn subscribe_qos1(sock: &mut tokio::net::TcpStream, client_id: &str, filter: &str) {
         use tokio::io::AsyncWriteExt;
-        let subscribe = sy02_subscribe(1, &[(filter, 1)]);
+        // Speak MQTT 5 on a v5 socket. Options hold QoS 1
+        // with retain-as-published set, so retained replay
+        // keeps the retain flag like the old v4 path.
+        let subscribe = sy02_subscribe_v5(1, &[(filter, 9)], 0);
         tokio::time::timeout(SHARD_E2E_STEP, sock.write_all(&subscribe))
             .await
             .expect("SUBSCRIBE in time")
@@ -3050,9 +3403,9 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
             .await
             .expect("SUBACK in time")
             .expect("SUBACK");
-        assert_eq!(head, 0x90, "edge answers with SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "edge answers with SUBACK");
         assert_eq!(
-            sy02_parse_suback(&body),
+            sy02_parse_suback5(&body),
             (1, vec![1]),
             "QoS 1 subscription of {client_id} to {filter} must be granted"
         );

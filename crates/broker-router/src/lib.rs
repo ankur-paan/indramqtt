@@ -28,6 +28,13 @@ pub const MAX_TENANT_ID_LEN: usize = 128;
 /// `tenant` scopes the entry to one tenant's topic space (MT-02): the same
 /// topic string in two tenants is two independent spaces, and the same
 /// group name in two tenants balances independently.
+/// Largest subscription identifier carried on a subscription (X1-03):
+/// 268435455, the MQTT variable-byte-integer maximum. Reason: the wire
+/// encodes the identifier as a varint, so a larger value can never arrive
+/// as a single property; 0 means absent (no identifier advertised on
+/// delivery). One `u32` per subscription, no new unbounded state.
+pub const MAX_SUBSCRIPTION_ID: u32 = 268_435_455;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub client_id: Arc<str>,
@@ -42,6 +49,20 @@ pub struct Subscription {
     /// new lock and no per-message allocation beyond the result set the
     /// path already builds.
     pub tenant: Arc<str>,
+    /// X1-03 v5 subscription options, stored alongside the filter and
+    /// consulted on the delivery event with no new lock (fields ride the
+    /// already-cloned `Subscription`). All default to the 3.1.1 behaviour
+    /// (`false`/`0`), so version-4 subscribes behave bit for bit as before.
+    /// `no_local`: never deliver a client's own publish to its own
+    /// subscription. `retain_as_published`: preserve the publish retain
+    /// bit on delivery (cleared otherwise). `retain_handling`: 0 send
+    /// retained on every subscribe, 1 send only on a new subscription, 2
+    /// never send. `subscription_id`: 0 absent, else advertised on
+    /// delivery (bounded by [`MAX_SUBSCRIPTION_ID`]).
+    pub no_local: bool,
+    pub retain_as_published: bool,
+    pub retain_handling: u8,
+    pub subscription_id: u32,
 }
 
 impl Subscription {
@@ -53,6 +74,10 @@ impl Subscription {
             qos,
             group: None,
             tenant: Arc::from(DEFAULT_TENANT_ID),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            subscription_id: 0,
         }
     }
 
@@ -69,7 +94,76 @@ impl Subscription {
             qos,
             group: Some(group.into()),
             tenant: Arc::from(DEFAULT_TENANT_ID),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            subscription_id: 0,
         }
+    }
+
+    /// Plain subscription with explicit v5 options (X1-03, subscribe
+    /// event only). Values are already validated by the caller
+    /// (`retain_handling <= 2`, `subscription_id <= MAX_SUBSCRIPTION_ID`);
+    /// out-of-range inputs fall back to the 3.1.1 defaults (fail closed,
+    /// never a stored invalid option).
+    pub fn with_options(
+        client_id: impl Into<Arc<str>>,
+        conn_id: u64,
+        qos: QoS,
+        no_local: bool,
+        retain_as_published: bool,
+        retain_handling: u8,
+        subscription_id: u32,
+    ) -> Self {
+        let mut sub = Self::new(client_id, conn_id, qos);
+        sub.no_local = no_local;
+        sub.retain_as_published = retain_as_published;
+        sub.retain_handling = if retain_handling <= 2 {
+            retain_handling
+        } else {
+            0
+        };
+        sub.subscription_id = if subscription_id <= MAX_SUBSCRIPTION_ID {
+            subscription_id
+        } else {
+            0
+        };
+        sub
+    }
+
+    /// Decode one v5 subscription-options byte into
+    /// `(qos, no_local, retain_as_published, retain_handling)`. Layout per
+    /// the specification: bits 0-1 granted QoS, bit 2 no-local, bit 3
+    /// retain-as-published, bits 4-5 retain handling, bits 6-7 reserved
+    /// (must be 0). `None` on any reserved-bit, QoS or retain-handling
+    /// violation (fail closed: the caller fails only that filter).
+    pub fn decode_options_byte(opts: u8) -> Option<(QoS, bool, bool, u8)> {
+        if opts & 0xC0 != 0 {
+            return None;
+        }
+        let qos_raw = opts & 0x03;
+        let qos = QoS::try_from(qos_raw).ok()?;
+        let nl = opts & 0x04 != 0;
+        let rap = opts & 0x08 != 0;
+        let rh = (opts & 0x30) >> 4;
+        if rh > 2 {
+            return None;
+        }
+        Some((qos, nl, rap, rh))
+    }
+
+    /// Encode one v5 subscription-options byte from its fields (inverse
+    /// of [`Subscription::decode_options_byte`]).
+    pub fn encode_options_byte(qos: QoS, no_local: bool, rap: bool, rh: u8) -> u8 {
+        let mut opts = u8::from(qos) & 0x03;
+        if no_local {
+            opts |= 0x04;
+        }
+        if rap {
+            opts |= 0x08;
+        }
+        opts |= (rh.min(2) & 0x03) << 4;
+        opts
     }
 
     /// Plain (non-shared) subscription scoped to `tenant`. Overlong ids
@@ -504,7 +598,8 @@ pub const DEFAULT_QOS0_BACKLOG: usize = 1_000;
 /// True when `frame` is a QoS 0 `PublishOut` (the only sheddable shape).
 /// Parses the `PublishOut` meta `TopicLen:16be | Topic | PacketId:16be |
 /// QoS:8 | Retain:8 | Dup:8`, optionally followed by the B4-05 alias
-/// section `Alias:16be`; anything unparseable is not QoS 0 so a
+/// section `Alias:16be` and the X1-03 subscription-identifier trailer
+/// `SubId:32be`; anything unparseable is not QoS 0 so a
 /// malformed frame can never trigger a shed of guaranteed traffic.
 pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     if frame.header.opcode != OpCode::PublishOut {
@@ -516,7 +611,7 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
     let old_len = 2 + topic_len + 5;
-    if meta.len() != old_len && meta.len() != old_len + 2 {
+    if meta.len() != old_len && meta.len() != old_len + 2 && meta.len() != old_len + 2 + 4 {
         return false;
     }
     meta[2 + topic_len + 2] == 0

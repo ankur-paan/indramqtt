@@ -1943,16 +1943,17 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
         // subscription registers nothing (no session mirror) and counts
         // nothing as applied, so a failed subscribe changes no session
         // state.
-        let stored = shared.router.subscribe(
-            &filter,
-            Subscription {
-                client_id: client_id.into(),
-                conn_id,
-                qos,
-                group: None,
-                tenant: tenant.clone().into(),
-            },
+        let mut auto_sub = Subscription::with_options(
+            client_id,
+            conn_id,
+            qos,
+            entry.nl != 0,
+            entry.rap != 0,
+            entry.rh,
+            0,
         );
+        auto_sub.tenant = tenant.clone().into();
+        let stored = shared.router.subscribe(&filter, auto_sub);
         if !stored {
             continue;
         }
@@ -4706,7 +4707,29 @@ where
             }
         }
         OpCode::UnbindConnection => {
-            apply_unbind(&frame, shared);
+            // X1-03: a version-5 DISCONNECT with reason 0x04 requests
+            // will publication (handled like an ungraceful close);
+            // every other reason (or no reason/version-4) suppresses
+            // the will like a clean DISCONNECT. The reason rides the
+            // trailing unbind byte; absent means version-4.
+            if decode_unbind_reason(&frame.metadata) == Some(V5_DISCONNECT_WITH_WILL) {
+                let deliveries = apply_disconnect_with_unbind_meta(&frame, shared).await;
+                let mut enqueued = 0u64;
+                let mut enqueued_bytes = 0u64;
+                for (conn_id, routed) in deliveries {
+                    let len = routed.total_frame_len() as u64;
+                    if shared.conns.route(conn_id, routed) {
+                        enqueued += 1;
+                        enqueued_bytes += len;
+                    }
+                }
+                shared.metrics.inc_messages_forwarded_by(enqueued);
+                shared.metrics.inc_publish_sent_by(enqueued);
+                shared.metrics.inc_delivered_by(enqueued);
+                shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+            } else {
+                apply_unbind(&frame, shared);
+            }
             // Forget this transport's identities for the connection so a
             // long-lived shard never accumulates one entry per bind ever.
             // Each forgotten entry balances its bind's `inc_connections`
@@ -4766,7 +4789,16 @@ async fn apply_subscribe(
     };
 
     let mut codes = Vec::with_capacity(subs.len());
-    let mut granted: Vec<(TopicFilter, u8)> = Vec::with_capacity(subs.len());
+    // X1-03: granted entries carry their retain-handling decision plus
+    // the v5 options needed for retained replay (retain-as-published and
+    // subscription identifier ride retained deliveries too).
+    struct GrantedSub {
+        filter: TopicFilter,
+        qos: u8,
+        rap: bool,
+        sub_id: u32,
+    }
+    let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
     // Tenant scope (MT-02, MT-03): resolved once from the subscribing
     // connection's own session, before any authorization decision is
     // recorded, so the denial/grant below lands on the owning tenant's
@@ -4774,8 +4806,44 @@ async fn apply_subscribe(
     // a client id subscribe independently; a tenant mismatch at publish
     // time delivers nothing, counted, never an error to the publisher.
     let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
+    // X1-03: resolve the owning session without creating it.
+    // Production binds before subscribing, so the session exists.
+    // A missing session records no mirror and changes no state.
     let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
-    for (raw_filter_str, qos_raw) in subs {
+    for entry in subs {
+        let raw_filter_str = entry.filter;
+        // X1-03: decode the per-filter options. Legacy entries carry a
+        // plain QoS byte; extended entries carry the options byte plus a
+        // subscription identifier. Malformed options fail only this
+        // filter with 0x8F (topic filter invalid), never the whole packet.
+        let (qos_raw, no_local, rap, rh, sub_id) = if entry.has_options {
+            match Subscription::decode_options_byte(entry.opts_raw) {
+                Some((qos, nl, rap, rh)) => {
+                    if entry.subscription_id > broker_router::MAX_SUBSCRIPTION_ID {
+                        codes.push(V5_SUBACK_FILTER_INVALID);
+                        continue;
+                    }
+                    (u8::from(qos), nl, rap, rh, entry.subscription_id)
+                }
+                None => {
+                    codes.push(V5_SUBACK_FILTER_INVALID);
+                    continue;
+                }
+            }
+        } else {
+            match QoS::try_from(entry.opts_raw) {
+                // X1-03: version-4 subscribes carry no options byte. The
+                // 3.1.1 wire has no retain-as-published knob and always
+                // delivers the retain flag as published, so the legacy
+                // mirror preserves it (rap = true); only version-5
+                // RAP=0 clears it. Keeps v4 bytes and semantics identical.
+                Ok(qos) => (u8::from(qos), false, true, 0u8, 0u32),
+                Err(_) => {
+                    codes.push(V5_SUBACK_FILTER_INVALID);
+                    continue;
+                }
+            }
+        };
         // B4-04 ordered regex filter rewriting (subscribe scope): the
         // first matching subscribe/both rule wins and the router, the
         // session mirror, the cluster announce and retained replay all
@@ -4787,8 +4855,14 @@ async fn apply_subscribe(
             None => raw_filter_str,
         };
         // Delayed topics are publish-only markers, never subscriptions.
+        // Version-4 denies with 0x80 (bytes unchanged); version-5 with
+        // 0x8F (topic filter invalid), failing only this filter.
         if strip_delayed_prefix(&filter_str).is_some() {
-            codes.push(0x80);
+            codes.push(if entry.has_options {
+                V5_SUBACK_FILTER_INVALID
+            } else {
+                V5_SUBACK_UNSPECIFIED
+            });
             continue;
         }
         let parsed = TopicFilter::new(filter_str).ok().and_then(|filter| {
@@ -4799,10 +4873,25 @@ async fn apply_subscribe(
         let (filter, qos, group) = match parsed {
             Some(parts) => parts,
             None => {
-                codes.push(0x80);
+                codes.push(if entry.has_options {
+                    V5_SUBACK_FILTER_INVALID
+                } else {
+                    V5_SUBACK_UNSPECIFIED
+                });
                 continue;
             }
         };
+        // X1-03: no-local is forbidden on shared subscriptions (protocol
+        // error per the specification). Fail only this filter with 0x8F
+        // (topic filter invalid): the filter carries an option the
+        // specification forbids on shared subscriptions.
+        if no_local && group.is_some() {
+            codes.push(V5_SUBACK_FILTER_INVALID);
+            continue;
+        }
+        // X1-03: wildcard subscriptions are supported, so the
+        // wildcard-not-supported code never applies. No branch returns
+        // it while every filter class stays supported.
         // Tenant scope (MT-06): authorisation runs in the subscriber's
         // own tenant resolved above, so a rule in one tenant never
         // grants subscribe in another. Same single-guard discipline as
@@ -4821,7 +4910,7 @@ async fn apply_subscribe(
                 session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
             }
             // MQTT 5 style "Not Authorized"; registers nothing.
-            codes.push(0x87);
+            codes.push(V5_SUBACK_NOT_AUTHORIZED);
             continue;
         }
         // B5-03: database ACLs for users with no local record (same key
@@ -4844,11 +4933,18 @@ async fn apply_subscribe(
                     .await
                     .is_err()
                 {
-                    codes.push(0x87);
+                    codes.push(V5_SUBACK_NOT_AUTHORIZED);
                     continue;
                 }
             }
         }
+        // X1-03 retain-handling 1 needs the pre-existing state: a
+        // re-subscribe of an already-held filter suppresses retained
+        // replay, a new filter does not. One short session read on the
+        // subscribe event only; delivery never touches this lock.
+        let existed = owner
+            .as_ref()
+            .is_some_and(|session| session.subscriptions.read().contains_key(&filter));
         // Tenant scope (MT-02, MT-03): the subscription carries the
         // subscriber's tenant resolved above from the subscribing
         // connection's own session, so two tenants sharing a client id
@@ -4860,18 +4956,20 @@ async fn apply_subscribe(
         // no retained replay), never success for a subscription with no store.
         // TODO(parity): is 0x97 the observable reference behaviour for a
         // subscription-table bound, or does it answer 0x80 Unspecified error?
-        let stored = shared.router.subscribe(
-            &filter,
-            Subscription {
-                client_id: client_id.clone().into(),
-                conn_id: frame.header.conn_id,
-                qos,
-                group,
-                tenant: tenant.clone().into(),
-            },
+        let mut sub = Subscription::with_options(
+            client_id.clone(),
+            frame.header.conn_id,
+            qos,
+            no_local,
+            rap,
+            rh,
+            sub_id,
         );
+        sub.group = group;
+        sub.tenant = tenant.clone().into();
+        let stored = shared.router.subscribe(&filter, sub);
         if !stored {
-            codes.push(0x97);
+            codes.push(V5_SUBACK_QUOTA_EXCEEDED);
             continue;
         }
         // Per-client decision cache (W2-01): record the grant on the
@@ -4883,13 +4981,36 @@ async fn apply_subscribe(
         if let Some(session) = owner.as_ref() {
             session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
         }
-        // Mirror the grant on the owning tenant's session for
-        // observability (the router stays the routing authority).
-        // Another tenant's namesake session is never touched.
-        shared
-            .sessions
-            .add_subscription_in_tenant(&tenant, &client_id, filter.clone(), qos);
-        granted.push((filter, qos_raw));
+        // Mirror the grant with its full v5 options on the owning
+        // tenant's session for observability (the router stays the
+        // routing authority). Another tenant's namesake session is never
+        // touched.
+        shared.sessions.add_subscription_with_options_in_tenant(
+            &tenant,
+            &client_id,
+            filter.clone(),
+            qos,
+            u8::from(no_local),
+            u8::from(rap),
+            rh,
+        );
+        // X1-03 retain-handling: 2 never replays retained state for this
+        // grant; 1 replays only when the filter is new; 0 always replays.
+        // The decision is recorded here on the subscribe event so the
+        // replay loop below stays a straight filter walk.
+        let send_retained = match rh {
+            1 => !existed,
+            2 => false,
+            _ => true,
+        };
+        if send_retained {
+            granted.push(GrantedSub {
+                filter,
+                qos: qos_raw,
+                rap,
+                sub_id,
+            });
+        }
         codes.push(qos_raw);
     }
     if !granted.is_empty() {
@@ -4911,9 +5032,13 @@ async fn apply_subscribe(
     // Clustered mode: publish our route summary (filter-level only, never
     // individual subscriptions) so peers forward matching publishes here.
     if let Some(cluster) = &shared.cluster {
-        for (filter, _) in &granted {
-            if let Err(e) = cluster.announce_filter(filter).await {
-                warn!("Cluster announce failed for {}: {}", filter.as_str(), e);
+        for grant in &granted {
+            if let Err(e) = cluster.announce_filter(&grant.filter).await {
+                warn!(
+                    "Cluster announce failed for {}: {}",
+                    grant.filter.as_str(),
+                    e
+                );
             }
         }
     }
@@ -4929,7 +5054,9 @@ async fn apply_subscribe(
         .as_ref()
         .map(|session| session.tenant_id.read().clone())
         .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
-    for (filter, sub_qos) in &granted {
+    for grant in &granted {
+        let filter = &grant.filter;
+        let sub_qos = grant.qos;
         let matched = match shared
             .retained
             .find_matching_in_tenant(filter, &subscriber_tenant)
@@ -4942,7 +5069,7 @@ async fn apply_subscribe(
             }
         };
         for msg in matched {
-            let effective = std::cmp::min(*sub_qos, u8::from(msg.qos));
+            let effective = std::cmp::min(sub_qos, u8::from(msg.qos));
             // X1-02: retained replays are fresh deliveries toward this
             // connection, so the v5 CONNECT caps apply here exactly as
             // on live fan-out (shed with the documented code, counted,
@@ -5000,13 +5127,30 @@ async fn apply_subscribe(
                 }
             }
             let topic_str = msg.topic.as_str();
-            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+            // X1-03: retained replays carry the granting subscription's
+            // identifier (0 = absent, edge omits the property so v4
+            // bytes stay identical) alongside the full topic and
+            // alias 0. The replay honors retain-as-published: RAP=1
+            // keeps the retained flag, RAP=0 clears it, exactly like
+            // live delivery; legacy grants preserve (rap defaults
+            // true), so v4 retained replay still carries retain==1.
+            let replay_retain = grant.rap;
+            let sub_id = if grant.sub_id <= broker_router::MAX_SUBSCRIPTION_ID {
+                grant.sub_id
+            } else {
+                0
+            };
+            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3 + 2 + 4);
             meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
             meta.extend_from_slice(topic_str.as_bytes());
             meta.extend_from_slice(&downlink_id.to_be_bytes());
             meta.push(effective);
-            meta.push(1u8); // retain: replayed retained state
+            meta.push(u8::from(replay_retain)); // RAP-honoring retained flag
             meta.push(0u8);
+            meta.extend_from_slice(&protocol_v5::encode_topic_alias(0));
+            if sub_id != 0 {
+                meta.extend_from_slice(&sub_id.to_be_bytes());
+            }
             if let Ok(routed) = BrokerFrame::new(
                 OpCode::PublishOut,
                 frame.header.conn_id,
@@ -5244,7 +5388,7 @@ async fn apply_publish(
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
     shared.metrics.inc_publish_received();
-    let (raw_topic_str, packet_id, qos_raw, retain, alias, alias_present) =
+    let (raw_topic_str, packet_id, qos_raw, retain, alias, alias_present, v5_props) =
         match decode_publish_meta(&frame.metadata) {
             Some(parts) => parts,
             None => return (None, Vec::new()),
@@ -5561,7 +5705,7 @@ async fn apply_publish(
     let publisher = publisher_session
         .as_ref()
         .map(|session| session.client_id.clone());
-    let deliveries = ingress_pipeline_with_publisher(
+    let deliveries = ingress_pipeline_with_publisher_and_props(
         shared,
         &topic,
         qos,
@@ -5569,6 +5713,7 @@ async fn apply_publish(
         &frame.payload,
         publisher.as_deref(),
         tenant,
+        &v5_props,
     )
     .await;
     forward_cluster(shared, &topic, qos, &frame.payload, tenant).await;
@@ -6085,6 +6230,35 @@ async fn ingress_pipeline_with_publisher(
     publisher: Option<&str>,
     publisher_tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
+    let empty = PublishV5Props::default();
+    ingress_pipeline_with_publisher_and_props(
+        shared,
+        topic,
+        qos,
+        retain,
+        payload,
+        publisher,
+        publisher_tenant,
+        &empty,
+    )
+    .await
+}
+
+/// [`ingress_pipeline_with_publisher`] with X1-03 v5 properties.
+/// The MQTT ingress path passes the parsed inbound properties so
+/// version-5 deliveries observe what the publisher sent; all other
+/// ingress paths pass the default (no properties).
+#[allow(clippy::too_many_arguments)]
+async fn ingress_pipeline_with_publisher_and_props(
+    shared: &Shared,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
+    publisher_tenant: &str,
+    v5: &PublishV5Props,
+) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message. Enforces
     // the same configurable limits as the management publish path
@@ -6181,7 +6355,7 @@ async fn ingress_pipeline_with_publisher(
     // only for matching sessions.
     maybe_capture_trace(shared, publisher, topic, payload);
 
-    let deliveries = build_downlink_frames_with_publisher(
+    let deliveries = build_downlink_frames_with_publisher_and_props(
         &shared.router,
         &shared.sessions,
         &shared.metrics,
@@ -6191,6 +6365,7 @@ async fn ingress_pipeline_with_publisher(
         payload,
         publisher,
         publisher_tenant,
+        v5,
     );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
@@ -6661,6 +6836,38 @@ fn build_downlink_frames_with_publisher(
     publisher: Option<&str>,
     publisher_tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
+    let empty = PublishV5Props::default();
+    build_downlink_frames_with_publisher_and_props(
+        router,
+        sessions,
+        metrics,
+        topic,
+        qos,
+        retain,
+        payload,
+        publisher,
+        publisher_tenant,
+        &empty,
+    )
+}
+
+/// [`build_downlink_frames_with_publisher`] with X1-03 v5 properties.
+/// The MQTT ingress path passes the parsed inbound properties so each
+/// version-5 delivery carries them; every other fan-out passes the
+/// default (no properties, bytes unchanged).
+#[allow(clippy::too_many_arguments)]
+fn build_downlink_frames_with_publisher_and_props(
+    router: &Router,
+    sessions: &SessionManager,
+    metrics: &Metrics,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
+    publisher_tenant: &str,
+    v5: &PublishV5Props,
+) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
     // D1-03: share one payload buffer across all N subscribers.
@@ -6681,6 +6888,29 @@ fn build_downlink_frames_with_publisher(
     }
     for sub in matched {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
+        // X1-03 no-local (delivery event only): never deliver a client's
+        // own publish to its no-local subscription. Others' publishes
+        // still deliver. No new lock (fields ride the already-cloned
+        // `Subscription`); suppressed self-delivery is specified
+        // behaviour, never counted as loss.
+        if sub.no_local {
+            if let Some(publisher_id) = publisher {
+                if publisher_id == sub.client_id.as_ref() {
+                    continue;
+                }
+            }
+        }
+        // X1-03 retain-as-published (delivery event only): RAP=1
+        // preserves the publish retain bit on the wire; RAP=0 clears it.
+        // No new lock; the stored inflight/offline copy keeps the
+        // delivered flag so replay preserves what the wire carried.
+        // Retained replays honor the same flag via the granting
+        // subscription's stored RAP (legacy grants preserve).
+        let delivered_retain = if sub.retain_as_published {
+            retain
+        } else {
+            false
+        };
         // Session in the subscription's own tenant (MT-03): the same
         // client id in two tenants delivers from independent sessions
         // with independent queues and inflight state. A missing session
@@ -6741,7 +6971,7 @@ fn build_downlink_frames_with_publisher(
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
-                                retain,
+                                retain: delivered_retain,
                                 payload: shared.clone(),
                                 // FX-02: stamp delivery so the PUBACK event
                                 // can measure ack latency. One clock read
@@ -6768,7 +6998,7 @@ fn build_downlink_frames_with_publisher(
                             let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
-                                retain,
+                                retain: delivered_retain,
                                 payload: shared.clone(),
                                 rec_received: false,
                             });
@@ -6795,15 +7025,17 @@ fn build_downlink_frames_with_publisher(
                                 .or_else(|| session.assign_outbound_alias(topic))
                                 .unwrap_or(0)
                         };
-                        if let Some(frame) = encode_publish_out_with_dup(
+                        if let Some(frame) = encode_publish_out_full_with_props(
                             conn_id,
                             topic_str,
                             downlink_id,
                             effective,
-                            retain,
+                            delivered_retain,
                             false,
                             alias,
+                            sub.subscription_id,
                             &shared,
+                            v5,
                         ) {
                             deliveries.push((conn_id, frame));
                         }
@@ -6826,7 +7058,7 @@ fn build_downlink_frames_with_publisher(
                                 QueuedMessage {
                                     topic: topic.clone(),
                                     qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
-                                    retain,
+                                    retain: delivered_retain,
                                     payload: shared.clone(),
                                     publish_at_ms: None,
                                 },
@@ -6846,15 +7078,20 @@ fn build_downlink_frames_with_publisher(
             }
             None => {
                 // No session on record: legacy fallback to the
-                // router-registered conn_id.
+                // router-registered conn_id (same no-local/RAP/sub-id
+                // semantics as the session path above).
                 let downlink_id = if effective == 0 { 0u16 } else { 1u16 };
-                if let Some(frame) = encode_publish_out(
+                if let Some(frame) = encode_publish_out_full_with_props(
                     sub.conn_id,
                     topic_str,
                     downlink_id,
                     effective,
-                    retain,
+                    delivered_retain,
+                    false,
+                    0,
+                    sub.subscription_id,
                     &shared,
+                    v5,
                 ) {
                     deliveries.push((sub.conn_id, frame));
                 }
@@ -6953,7 +7190,9 @@ fn pub_ack_reply(frame: &BrokerFrame, packet_id: u16, return_code: u8) -> Option
 }
 
 /// Encode one `PublishOut` frame for `conn_id` (sequence stamped later
-/// per-destination by `ConnTable::route`).
+/// per-destination by `ConnTable::route`). Base alias-only form
+/// (`old_len + 2` with alias 0): the canonical encoding for deliveries
+/// without a subscription identifier, so version-4 bytes stay identical.
 fn encode_publish_out(
     conn_id: u64,
     topic: &str,
@@ -6962,7 +7201,29 @@ fn encode_publish_out(
     retain: bool,
     payload: &Bytes,
 ) -> Option<BrokerFrame> {
-    encode_publish_out_with_dup(conn_id, topic, packet_id, qos, retain, false, 0, payload)
+    let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3 + 2);
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(0u8);
+    meta.extend_from_slice(&protocol_v5::encode_topic_alias(0));
+    let frame = BrokerFrame::new(
+        OpCode::PublishOut,
+        conn_id,
+        0, // stamped per-destination by ConnTable::route
+        Bytes::from(meta),
+        payload.clone(),
+    )
+    .ok()?;
+    debug_assert_eq!(decode_publish_out_alias(&frame.metadata), Some(0));
+    debug_assert_eq!(decode_publish_out_sub_id(&frame.metadata), Some(0));
+    debug_assert_eq!(
+        decode_publish_out_props(&frame.metadata),
+        Some(PublishV5Props::default())
+    );
+    Some(frame)
 }
 
 /// Encode one `PublishOut` frame with explicit DUP (replays set DUP=1,
@@ -6987,6 +7248,14 @@ fn encode_publish_out_with_dup(
     alias: u16,
     payload: &Bytes,
 ) -> Option<BrokerFrame> {
+    if !dup && alias == 0 {
+        return encode_publish_out(conn_id, topic, packet_id, qos, retain, payload);
+    }
+    // X1-03: alias/dup form builds directly (no delegation to
+    // `encode_publish_out_full`, which delegates here when the
+    // subscription identifier is absent; mutual delegation recursed
+    // without bound and aborted the broker-node test binary with
+    // SIGABRT on any delivery carrying a nonzero alias).
     let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3 + 2);
     meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
     meta.extend_from_slice(topic.as_bytes());
@@ -7004,6 +7273,152 @@ fn encode_publish_out_with_dup(
     )
     .ok()?;
     debug_assert_eq!(decode_publish_out_alias(&frame.metadata), Some(alias));
+    debug_assert_eq!(decode_publish_out_sub_id(&frame.metadata), Some(0));
+    debug_assert_eq!(
+        decode_publish_out_props(&frame.metadata),
+        Some(PublishV5Props::default())
+    );
+    Some(frame)
+}
+
+/// Encode one `PublishOut` frame with its X1-03 subscription identifier
+/// (0 = absent, never encoded as a property on version-4 sockets; the
+/// edge omits the property when 0 so 3.1.1 bytes stay identical).
+/// `sub_id` is one matching subscription's identifier (bounded by
+/// [`broker_router::MAX_SUBSCRIPTION_ID`]); a delivery matching N
+/// filters fans out as N frames each carrying its own identifier, so one
+/// frame never accumulates an unbounded id list. One frame per match
+/// keeps the pre-v5 fan-out, so version-4 duplicates stay unchanged.
+#[allow(clippy::too_many_arguments)]
+fn encode_publish_out_full(
+    conn_id: u64,
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    dup: bool,
+    alias: u16,
+    sub_id: u32,
+    payload: &Bytes,
+) -> Option<BrokerFrame> {
+    let empty = PublishV5Props::default();
+    encode_publish_out_full_with_props(
+        conn_id, topic, packet_id, qos, retain, dup, alias, sub_id, payload, &empty,
+    )
+}
+
+/// Encode one `PublishOut` frame with its X1-03 subscription identifier
+/// plus the forwarded v5 properties (payload format, message expiry,
+/// user properties). Empty properties encode exactly like
+/// [`encode_publish_out_full`] (bytes identical); non-empty properties
+/// append `Format:8 | Expiry:32be | UserCount:16be | pairs' after the
+/// `SubId:32be` trailer. The edge omits the whole section toward
+/// version-4 sockets so 3.1.1 bytes stay identical, and version-5
+/// sockets observe what the publisher sent. User pairs are bounded by
+/// [`MAX_PUBLISH_V5_USERS`] / [`MAX_PUBLISH_V5_STRING`] (fail closed:
+/// over-bound properties fall back to no properties, never half a
+/// section).
+#[allow(clippy::too_many_arguments)]
+fn encode_publish_out_full_with_props(
+    conn_id: u64,
+    topic: &str,
+    packet_id: u16,
+    qos: u8,
+    retain: bool,
+    dup: bool,
+    alias: u16,
+    sub_id: u32,
+    payload: &Bytes,
+    v5: &PublishV5Props,
+) -> Option<BrokerFrame> {
+    if v5.is_empty() {
+        if sub_id == 0 || sub_id > broker_router::MAX_SUBSCRIPTION_ID {
+            return encode_publish_out_with_dup(
+                conn_id, topic, packet_id, qos, retain, dup, alias, payload,
+            );
+        }
+        let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3 + 2 + 4);
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.push(qos);
+        meta.push(u8::from(retain));
+        meta.push(u8::from(dup));
+        meta.extend_from_slice(&protocol_v5::encode_topic_alias(alias));
+        meta.extend_from_slice(&sub_id.to_be_bytes());
+        let frame = BrokerFrame::new(
+            OpCode::PublishOut,
+            conn_id,
+            0, // stamped per-destination by ConnTable::route
+            Bytes::from(meta),
+            payload.clone(),
+        )
+        .ok()?;
+        debug_assert_eq!(decode_publish_out_alias(&frame.metadata), Some(alias));
+        debug_assert_eq!(decode_publish_out_sub_id(&frame.metadata), Some(sub_id));
+        debug_assert_eq!(
+            decode_publish_out_props(&frame.metadata),
+            Some(PublishV5Props::default())
+        );
+        return Some(frame);
+    }
+    if v5.format != 0 && v5.format != 1 {
+        return encode_publish_out_full(
+            conn_id, topic, packet_id, qos, retain, dup, alias, sub_id, payload,
+        );
+    }
+    if v5.users.len() > MAX_PUBLISH_V5_USERS {
+        return encode_publish_out_full(
+            conn_id, topic, packet_id, qos, retain, dup, alias, sub_id, payload,
+        );
+    }
+    for (k, val) in &v5.users {
+        if k.is_empty() || k.len() > MAX_PUBLISH_V5_STRING || val.len() > MAX_PUBLISH_V5_STRING {
+            return encode_publish_out_full(
+                conn_id, topic, packet_id, qos, retain, dup, alias, sub_id, payload,
+            );
+        }
+        if std::str::from_utf8(k).is_err() || std::str::from_utf8(val).is_err() {
+            return encode_publish_out_full(
+                conn_id, topic, packet_id, qos, retain, dup, alias, sub_id, payload,
+            );
+        }
+    }
+    let mut meta =
+        Vec::with_capacity(2 + topic.len() + 2 + 3 + 2 + 4 + 1 + 4 + 2 + v5.users.len() * 8);
+    meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    meta.extend_from_slice(topic.as_bytes());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.push(qos);
+    meta.push(u8::from(retain));
+    meta.push(u8::from(dup));
+    meta.extend_from_slice(&protocol_v5::encode_topic_alias(alias));
+    let stored_sub = if sub_id == 0 || sub_id > broker_router::MAX_SUBSCRIPTION_ID {
+        0u32
+    } else {
+        sub_id
+    };
+    meta.extend_from_slice(&stored_sub.to_be_bytes());
+    meta.push(v5.format);
+    meta.extend_from_slice(&v5.expiry.to_be_bytes());
+    meta.extend_from_slice(&(v5.users.len() as u16).to_be_bytes());
+    for (k, val) in &v5.users {
+        meta.extend_from_slice(&(k.len() as u16).to_be_bytes());
+        meta.extend_from_slice(k);
+        meta.extend_from_slice(&(val.len() as u16).to_be_bytes());
+        meta.extend_from_slice(val);
+    }
+    let frame = BrokerFrame::new(
+        OpCode::PublishOut,
+        conn_id,
+        0, // stamped per-destination by ConnTable::route
+        Bytes::from(meta),
+        payload.clone(),
+    )
+    .ok()?;
+    debug_assert_eq!(decode_publish_out_alias(&frame.metadata), Some(alias));
+    debug_assert_eq!(decode_publish_out_sub_id(&frame.metadata), Some(stored_sub));
+    debug_assert_eq!(decode_publish_out_props(&frame.metadata), Some(v5.clone()));
     Some(frame)
 }
 
@@ -7150,6 +7565,38 @@ fn decode_disconnect_meta(meta: &[u8]) -> Option<String> {
 /// stay on the local ACL: they were authorized at their ingress node and
 /// re-asking the webhook without a client identity would invent a publish
 /// context the spec does not define.
+/// Handle one version-5 DISCONNECT with reason 0x04 arriving as an
+/// unbind frame (X1-03): strip the trailing reason byte and run the
+/// ungraceful-close path so the stored will publishes once. Every other
+/// unbind reason never reaches here (clean suppress path in the caller).
+/// Disconnect event only; never on the publish or delivery hot path.
+async fn apply_disconnect_with_unbind_meta(
+    frame: &BrokerFrame,
+    shared: &Shared,
+) -> Vec<(u64, BrokerFrame)> {
+    let Some((client_id, _)) = decode_unbind_meta_full(&frame.metadata) else {
+        shared.conns.unregister(frame.header.conn_id);
+        return Vec::new();
+    };
+    let mut stripped = Vec::with_capacity(2 + client_id.len());
+    stripped.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+    stripped.extend_from_slice(client_id.as_bytes());
+    let owned = BrokerFrame::new(
+        OpCode::DisconnectIn,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(stripped),
+        Bytes::new(),
+    );
+    match owned {
+        Ok(stripped_frame) => apply_disconnect(&stripped_frame, shared).await,
+        Err(_) => {
+            shared.conns.unregister(frame.header.conn_id);
+            Vec::new()
+        }
+    }
+}
+
 async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, BrokerFrame)> {
     let Some(client_id) = decode_disconnect_meta(&frame.metadata) else {
         shared.conns.unregister(frame.header.conn_id);
@@ -7370,10 +7817,42 @@ fn decode_credit_meta(meta: &[u8]) -> Option<(u32, u32)> {
     Some((used_frames, used_bytes))
 }
 
-/// Decoded `(packet_id, client_id, [(filter, qos)])` subscription metadata.
-type SubscribeMeta = (u16, String, Vec<(String, u8)>);
+/// One decoded subscription request (X1-03): the filter plus the raw
+/// v5 options byte and subscription identifier. `has_options` is true
+/// only for the extended form (options byte plus 4-byte identifier);
+/// the legacy form carries a plain QoS byte with identifier 0. An
+/// invalid options byte (reserved bits, QoS > 2, retain-handling > 2)
+/// or an over-maximum identifier is kept here and failed per-filter by
+/// the caller, never as a whole-packet malformed frame.
+#[derive(Debug, Clone)]
+struct SubscribeEntry {
+    filter: String,
+    opts_raw: u8,
+    subscription_id: u32,
+    has_options: bool,
+}
 
-/// Decode `SubscribeMeta` into `(packet_id, client_id, [(filter, qos)])`.
+/// Decoded `(packet_id, client_id, [entries])` subscription metadata.
+type SubscribeMeta = (u16, String, Vec<SubscribeEntry>);
+
+/// v5 SUBACK reason codes carried per filter (X1-03): granted QoS 0-2,
+/// unspecified error, not authorized, topic filter invalid and quota
+/// exceeded. Version-4 peers only ever observe 0-2 and 0x80; the wider
+/// set rides the same byte on version-5 bindings. A malformed filter or
+/// option byte answers 0x8F (topic filter invalid), failing only the
+/// affected filter.
+const V5_SUBACK_UNSPECIFIED: u8 = 0x80;
+const V5_SUBACK_NOT_AUTHORIZED: u8 = 0x87;
+const V5_SUBACK_FILTER_INVALID: u8 = 0x8F;
+const V5_SUBACK_QUOTA_EXCEEDED: u8 = 0x97;
+
+/// Decode `SubscribeMeta` into `(packet_id, client_id, [entries])`.
+/// Accepts the legacy form (`FilterLen | Filter | QoS`) and the X1-03
+/// extended form (`FilterLen | Filter | Opts | SubId:32be`) per filter.
+/// The extended form is detected by exact length: `N` extended entries
+/// consume 4 more bytes each than the legacy form. Structural truncation
+/// or bad UTF-8 fails the whole frame (`None`); per-filter option
+/// validity is left to the caller.
 fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
     if meta.len() < 6 {
         return None;
@@ -7390,6 +7869,11 @@ fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
     let mut cursor = 4 + id_len;
     let count = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
     cursor += 2;
+    // Try the extended form first when the length can hold it; fall back
+    // to the legacy form otherwise. Both consume exactly on success.
+    if let Some(entries) = decode_subscribe_entries_v5(meta, cursor, count) {
+        return Some((packet_id, client_id, entries));
+    }
     let mut subs = Vec::with_capacity(count);
     for _ in 0..count {
         if meta.len() < cursor + 3 {
@@ -7403,13 +7887,75 @@ fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
             .ok()?
             .to_string();
         let qos = meta[cursor + 2 + filter_len];
-        subs.push((filter, qos));
+        subs.push(SubscribeEntry {
+            filter,
+            opts_raw: qos,
+            subscription_id: 0,
+            has_options: false,
+        });
         cursor += 2 + filter_len + 1;
     }
     if cursor != meta.len() {
         return None;
     }
     Some((packet_id, client_id, subs))
+}
+
+/// Decode `count` extended entries (`FilterLen | Filter | Opts |
+/// SubId:32be`) from `meta` at `cursor`. `None` when the bytes do not
+/// frame exactly as the extended form (caller falls back to legacy).
+fn decode_subscribe_entries_v5(
+    meta: &[u8],
+    mut cursor: usize,
+    count: usize,
+) -> Option<Vec<SubscribeEntry>> {
+    let mut subs = Vec::with_capacity(count);
+    for _ in 0..count {
+        if meta.len() < cursor + 2 + 1 + 4 {
+            return None;
+        }
+        let filter_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if filter_len == 0 || meta.len() < cursor + 2 + filter_len + 1 + 4 {
+            return None;
+        }
+        let filter = std::str::from_utf8(&meta[cursor + 2..cursor + 2 + filter_len])
+            .ok()?
+            .to_string();
+        let opts = meta[cursor + 2 + filter_len];
+        let base = cursor + 2 + filter_len + 1;
+        let sub_id =
+            u32::from_be_bytes([meta[base], meta[base + 1], meta[base + 2], meta[base + 3]]);
+        subs.push(SubscribeEntry {
+            filter,
+            opts_raw: opts,
+            subscription_id: sub_id,
+            has_options: true,
+        });
+        cursor = base + 4;
+    }
+    if cursor != meta.len() {
+        return None;
+    }
+    Some(subs)
+}
+
+/// Encode one extended subscription entry for tests (mirror of the edge
+/// `encode_subscribe_meta` v5 contract).
+#[cfg(test)]
+fn encode_subscribe_meta_v5(packet_id: u16, client_id: &str, subs: &[(&str, u8, u32)]) -> Bytes {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+    for (filter, opts, sub_id) in subs {
+        meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        meta.extend_from_slice(filter.as_bytes());
+        meta.push(*opts);
+        meta.extend_from_slice(&sub_id.to_be_bytes());
+    }
+    Bytes::from(meta)
 }
 
 /// Decode `PublishMeta` into `(topic, packet_id, qos, retain, alias,
@@ -7424,16 +7970,60 @@ fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
 /// protocol error, DISCONNECT 0x94). A zero-length topic is accepted only
 /// when the alias section is present (alias-by-reference); otherwise the
 /// topic must be non-empty as before.
-fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16, bool)> {
+/// Largest v5 publish user-properties section accepted on the
+/// BrokerLink publish path (X1-03, bytes). Reason: one publish section
+/// must leave room for the topic, ids and alias inside the 65535-byte
+/// BrokerLink meta cap; 4 KiB covers realistic inbound properties while
+/// failing oversized blocks closed instead of routing half a publish.
+/// At most 16 pairs (mirrors the edge `MAX_V5_USER_PROPS` bound).
+const MAX_PUBLISH_V5_SECTION_LEN: usize = 4096;
+const MAX_PUBLISH_V5_USERS: usize = 16;
+const MAX_PUBLISH_V5_STRING: usize = 1024;
+
+/// X1-03 inbound v5 publish properties carried toward delivery.
+/// `format` is the payload-format indicator (0|1), `expiry` the
+/// message-expiry interval (seconds, carried without enforcement: the
+/// task scope is decode-and-forward), and `users` the bounded
+/// user-property pairs.
+/// Reason: the specification requires decode/forward of these
+/// properties; they ride the `PublishOut` meta trailing section so a
+/// version-5 subscriber observes what the publisher sent, while
+/// version-4 deliveries omit them (bytes identical).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PublishV5Props {
+    format: u8,
+    expiry: u32,
+    users: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl PublishV5Props {
+    fn is_empty(&self) -> bool {
+        self.format == 0 && self.expiry == 0 && self.users.is_empty()
+    }
+}
+
+fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16, bool, PublishV5Props)> {
     if meta.len() < 2 + 2 + 3 {
         return None;
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
     let old_len = 2 + topic_len + 2 + 3;
     let new_len = old_len + 2;
-    if meta.len() != old_len && meta.len() != new_len {
+    // X1-03: the edge v5 form appends `Format:8 | Expiry:32be |
+    // UserCount:16be | pairs' after the alias section. The kernel
+    // validates the section (fail closed on truncation or over-bound
+    // values) and routes on topic/qos/retain/alias exactly as before;
+    // inbound user properties are parsed and forwarded to version-5
+    // deliveries (never for routing). Message-expiry is carried
+    // without enforcement (no timer drop): the task scope is
+    // decode-and-forward.
+    let v5 = if meta.len() != old_len && meta.len() != new_len && meta.len() > new_len {
+        decode_publish_v5_section(meta, topic_len)?
+    } else if meta.len() != old_len && meta.len() != new_len {
         return None;
-    }
+    } else {
+        PublishV5Props::default()
+    };
     if meta.len() < 2 + topic_len + 2 + 3 {
         return None;
     }
@@ -7448,7 +8038,7 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16, bool)
     let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
     let qos = meta[base + 2];
     let retain = meta[base + 3] != 0;
-    let (alias, alias_present) = if meta.len() == new_len {
+    let (raw_alias, raw_present) = if meta.len() >= new_len {
         let raw = [meta[base + 5], meta[base + 6]];
         (
             protocol_v5::decode_topic_alias(&raw).unwrap_or(protocol_v5::NO_TOPIC_ALIAS),
@@ -7457,10 +8047,87 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16, bool)
     } else {
         (protocol_v5::NO_TOPIC_ALIAS, false)
     };
+    // X1-03 v5 form always carries the alias field.
+    // Alias 0 with a topic means absent here.
+    // Route it on the fast path with no table.
+    // Keep explicit 0 on the /6 form present.
+    // The caller then rejects it with 0x94.
+    let has_v5_section = meta.len() > new_len;
+    let (alias, alias_present) = if raw_present
+        && raw_alias == protocol_v5::NO_TOPIC_ALIAS
+        && has_v5_section
+        && topic_len != 0
+    {
+        (protocol_v5::NO_TOPIC_ALIAS, false)
+    } else {
+        (raw_alias, raw_present)
+    };
     if topic_len == 0 && !alias_present {
         return None;
     }
-    Some((topic, packet_id, qos, retain, alias, alias_present))
+    Some((topic, packet_id, qos, retain, alias, alias_present, v5))
+}
+
+/// Parse one X1-03 v5 publish trailing section (`Alias:16be |
+/// Format:8 | Expiry:32be | UserCount:16be | pairs') after the fixed
+/// publish head. `None` on any truncation or over-bound value.
+fn decode_publish_v5_section(meta: &[u8], topic_len: usize) -> Option<PublishV5Props> {
+    let old_len = 2 + topic_len + 2 + 3;
+    if meta.len() < old_len + 2 + 1 + 4 + 2 {
+        return None;
+    }
+    if meta.len() > old_len + 2 + MAX_PUBLISH_V5_SECTION_LEN {
+        return None;
+    }
+    let base = 2 + topic_len;
+    let format = meta[base + 7];
+    if format != 0 && format != 1 {
+        return None;
+    }
+    let expiry = u32::from_be_bytes([
+        meta[base + 8],
+        meta[base + 9],
+        meta[base + 10],
+        meta[base + 11],
+    ]);
+    let user_count = u16::from_be_bytes([meta[base + 12], meta[base + 13]]) as usize;
+    if user_count > MAX_PUBLISH_V5_USERS {
+        return None;
+    }
+    let mut cursor = base + 14;
+    let mut users = Vec::with_capacity(user_count);
+    for _ in 0..user_count {
+        if meta.len() < cursor + 2 {
+            return None;
+        }
+        let k_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if k_len == 0 || k_len > MAX_PUBLISH_V5_STRING || meta.len() < cursor + 2 + k_len + 2 {
+            return None;
+        }
+        let key = meta[cursor + 2..cursor + 2 + k_len].to_vec();
+        if std::str::from_utf8(&key).is_err() {
+            return None;
+        }
+        cursor += 2 + k_len;
+        let v_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if v_len > MAX_PUBLISH_V5_STRING || meta.len() < cursor + 2 + v_len {
+            return None;
+        }
+        let value = meta[cursor + 2..cursor + 2 + v_len].to_vec();
+        if std::str::from_utf8(&value).is_err() {
+            return None;
+        }
+        users.push((key, value));
+        cursor += 2 + v_len;
+    }
+    if cursor != meta.len() {
+        return None;
+    }
+    Some(PublishV5Props {
+        format,
+        expiry,
+        users,
+    })
 }
 
 /// Outcome of one inbound alias resolution (B4-05).
@@ -7479,13 +8146,21 @@ enum InboundAliasOutcome {
 ///
 /// Best-effort and idempotent: routes a `ConnClose` frame to the edge so
 /// the socket closes (the 3.1.1 edge closes without a wire reason code;
-/// a future v5 edge sends DISCONNECT 0x94 first), then detaches the
-/// session exactly like the management kick path (verified unbind plus
-/// router sweep) so the faulty connection holds no state. Unknown
-/// connections only count a drop inside `ConnTable::route`; PUBLISH-event
-/// only, never on the per-message fast path (rejects only).
+/// a version-5 edge sends DISCONNECT 0x94 first from the carried reason),
+/// then detaches the session exactly like the management kick path
+/// (verified unbind plus router sweep) so the faulty connection holds no
+/// state. Unknown connections only count a drop inside `ConnTable::route`;
+/// PUBLISH-event only, never on the per-message fast path (rejects only).
+/// The close reason is honestly 0x94 (never a reason string; the edge
+/// omits it when the broker has nothing to say).
 fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
-    if let Ok(close) = BrokerFrame::new(OpCode::ConnClose, conn_id, 0, Bytes::new(), Bytes::new()) {
+    if let Ok(close) = BrokerFrame::new(
+        OpCode::ConnClose,
+        conn_id,
+        0,
+        Bytes::from(vec![protocol_v5::REASON_TOPIC_ALIAS_INVALID]),
+        Bytes::new(),
+    ) {
         let _ = shared.conns.route(conn_id, close);
     }
     // Owner key first (MT-03), decoded id behind: a faulty connection in
@@ -7529,6 +8204,13 @@ fn resolve_inbound_alias_topic(
     raw: &str,
     alias: u16,
 ) -> InboundAliasOutcome {
+    // Explicit alias 0 is never valid on the wire.
+    // Absence never reaches this function.
+    // The caller uses the fast path when alias is absent.
+    // Reject so the caller answers 0x94 and disconnects.
+    if alias == protocol_v5::NO_TOPIC_ALIAS {
+        return InboundAliasOutcome::Reject;
+    }
     // Owner session first (MT-03), legacy lookup behind: alias tables are
     // per session, so a non-default tenant's aliases register and resolve
     // on its own session, never on the default-tenant namesake.
@@ -7570,7 +8252,10 @@ fn resolve_inbound_alias_topic(
 /// Read the outbound alias out of a `PublishOut` downlink frame.
 /// Pre-alias frames (old length) read as alias 0. Read by the edge on
 /// delivery, verified by the kernel write path (`encode_publish_out_with_dup`
-/// round-trips it back here), and by the B4-05 tests.
+/// round-trips it back here), and by the B4-05 tests. X1-03 frames carry
+/// a trailing subscription identifier (`old_len + 2 + 4`) and read the
+/// same alias bytes; X1-03 forwarded-property frames carry a further
+/// v5 section and read the same alias bytes.
 fn decode_publish_out_alias(meta: &[u8]) -> Option<u16> {
     if meta.len() < 7 {
         return None;
@@ -7580,25 +8265,163 @@ fn decode_publish_out_alias(meta: &[u8]) -> Option<u16> {
     if meta.len() == old_len {
         return Some(0);
     }
-    if meta.len() == old_len + 2 {
+    if meta.len() >= old_len + 2 {
+        if meta.len() < old_len + 2 {
+            return None;
+        }
         let base = 2 + topic_len;
+        if meta.len() < base + 7 {
+            return None;
+        }
         return Some(u16::from_be_bytes([meta[base + 5], meta[base + 6]]));
     }
     None
 }
 
+/// Read the X1-03 subscription identifier out of a `PublishOut`
+/// downlink frame. Pre-alias and alias-only frames read as 0 (absent,
+/// so version-4 sockets observe no property). Over-maximum values read
+/// as 0 (fail closed, never a stored invalid identifier). Forwarded
+/// v5-property frames read the same trailer bytes.
+fn decode_publish_out_sub_id(meta: &[u8]) -> Option<u32> {
+    if meta.len() < 7 {
+        return None;
+    }
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    let old_len = 2 + topic_len + 2 + 3;
+    if meta.len() == old_len || meta.len() == old_len + 2 {
+        return Some(0);
+    }
+    if meta.len() >= old_len + 2 + 4 {
+        let base = 2 + topic_len;
+        let raw = u32::from_be_bytes([
+            meta[base + 7],
+            meta[base + 8],
+            meta[base + 9],
+            meta[base + 10],
+        ]);
+        if raw > broker_router::MAX_SUBSCRIPTION_ID {
+            return Some(0);
+        }
+        return Some(raw);
+    }
+    None
+}
+
+/// Read the X1-03 forwarded v5 properties out of a `PublishOut`
+/// downlink frame. Pre-alias, alias-only and alias-plus-sub-id frames
+/// read as the default (no properties). Forwarded frames carry
+/// `Format:8 | Expiry:32be | UserCount:16be | pairs' after the
+/// `SubId:32be` trailer; truncation or over-bound values fail the
+/// frame (`None`).
+fn decode_publish_out_props(meta: &[u8]) -> Option<PublishV5Props> {
+    if meta.len() < 7 {
+        return None;
+    }
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    let old_len = 2 + topic_len + 2 + 3;
+    if meta.len() == old_len || meta.len() == old_len + 2 || meta.len() == old_len + 2 + 4 {
+        return Some(PublishV5Props::default());
+    }
+    if meta.len() < old_len + 2 + 4 + 1 + 4 + 2 {
+        return None;
+    }
+    if meta.len() > old_len + 2 + 4 + MAX_PUBLISH_V5_SECTION_LEN {
+        return None;
+    }
+    let base = 2 + topic_len;
+    let format = meta[base + 11];
+    if format != 0 && format != 1 {
+        return None;
+    }
+    let expiry = u32::from_be_bytes([
+        meta[base + 12],
+        meta[base + 13],
+        meta[base + 14],
+        meta[base + 15],
+    ]);
+    let user_count = u16::from_be_bytes([meta[base + 16], meta[base + 17]]) as usize;
+    if user_count > MAX_PUBLISH_V5_USERS {
+        return None;
+    }
+    let mut cursor = base + 18;
+    let mut users = Vec::with_capacity(user_count);
+    for _ in 0..user_count {
+        if meta.len() < cursor + 2 {
+            return None;
+        }
+        let k_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if k_len == 0 || k_len > MAX_PUBLISH_V5_STRING || meta.len() < cursor + 2 + k_len + 2 {
+            return None;
+        }
+        let key = meta[cursor + 2..cursor + 2 + k_len].to_vec();
+        if std::str::from_utf8(&key).is_err() {
+            return None;
+        }
+        cursor += 2 + k_len;
+        if meta.len() < cursor + 2 {
+            return None;
+        }
+        let v_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if v_len > MAX_PUBLISH_V5_STRING || meta.len() < cursor + 2 + v_len {
+            return None;
+        }
+        let value = meta[cursor + 2..cursor + 2 + v_len].to_vec();
+        if std::str::from_utf8(&value).is_err() {
+            return None;
+        }
+        users.push((key, value));
+        cursor += 2 + v_len;
+    }
+    if cursor != meta.len() {
+        return None;
+    }
+    Some(PublishV5Props {
+        format,
+        expiry,
+        users,
+    })
+}
+
 /// Decode `UnbindMeta` into the client id.
 fn decode_unbind_meta(meta: &[u8]) -> Option<String> {
+    decode_unbind_meta_full(meta).map(|(client_id, _)| client_id)
+}
+
+/// Decode `UnbindMeta` into `(client_id, v5_reason)`. Layout
+/// `IdLen:16be | ClientId` (version-4, bytes unchanged) optionally
+/// followed by one v5 DISCONNECT reason byte (`Reason:8`). The reason
+/// is `None` for version-4 unbinds; `Some(code)` for version-5
+/// DISCONNECTs (0x00 normal, 0x04 disconnect-with-will, others clean).
+/// Structural truncation or bad UTF-8 fails the frame (`None`). Reason
+/// strings and user properties stay on the edge: the task scope omits
+/// them toward the kernel (never invented), so the kernel stores none.
+fn decode_unbind_meta_full(meta: &[u8]) -> Option<(String, Option<u8>)> {
     if meta.len() < 2 {
         return None;
     }
     let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() != 2 + id_len {
+    if meta.len() != 2 + id_len && meta.len() != 2 + id_len + 1 {
         return None;
     }
-    std::str::from_utf8(&meta[2..2 + id_len])
-        .ok()
-        .map(str::to_string)
+    let client_id = std::str::from_utf8(&meta[2..2 + id_len]).ok()?.to_string();
+    let reason = if meta.len() == 2 + id_len + 1 {
+        Some(meta[2 + id_len])
+    } else {
+        None
+    };
+    Some((client_id, reason))
+}
+
+/// v5 DISCONNECT reason requesting will publication (X1-03): 0x04
+/// "Disconnect with Will Message" publishes the stored will like an
+/// ungraceful close; every other code (including absent/version-4)
+/// suppresses it like a clean DISCONNECT.
+const V5_DISCONNECT_WITH_WILL: u8 = 0x04;
+
+/// Decode the v5 DISCONNECT reason out of an unbind frame, if present.
+fn decode_unbind_reason(meta: &[u8]) -> Option<u8> {
+    decode_unbind_meta_full(meta).and_then(|(_, reason)| reason)
 }
 
 async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std::error::Error>> {
@@ -8664,6 +9487,40 @@ mod tests {
         (Bytes::from(meta), Bytes::from(payload.to_vec()))
     }
 
+    /// Encode `PublishMeta` with X1-03 v5 properties (test mirror of
+    /// the extended BEAM `encode_publish_meta_v5/7` contract).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_publish_meta_v5(
+        topic: &str,
+        packet_id: u16,
+        qos: u8,
+        retain: bool,
+        alias: u16,
+        format: u8,
+        expiry: u32,
+        users: &[(&str, &str)],
+        payload: &[u8],
+    ) -> (Bytes, Bytes) {
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.push(qos);
+        meta.push(u8::from(retain));
+        meta.push(0u8);
+        meta.extend_from_slice(&protocol_v5::encode_topic_alias(alias));
+        meta.push(format);
+        meta.extend_from_slice(&expiry.to_be_bytes());
+        meta.extend_from_slice(&(users.len() as u16).to_be_bytes());
+        for (k, v) in users {
+            meta.extend_from_slice(&(k.len() as u16).to_be_bytes());
+            meta.extend_from_slice(k.as_bytes());
+            meta.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            meta.extend_from_slice(v.as_bytes());
+        }
+        (Bytes::from(meta), Bytes::from(payload.to_vec()))
+    }
+
     /// Decode the B4-05 alias out of a `PublishOut` downlink frame (0 for
     /// pre-alias encodings).
     fn decode_publish_out_alias(meta: &[u8]) -> u16 {
@@ -9549,6 +10406,360 @@ mod tests {
         let (reply, retained) = apply_subscribe(&frame, &shared).await;
         assert!(reply.is_none());
         assert!(retained.is_empty());
+    }
+
+    /// X1-03: each subscription option round-trips through the extended
+    /// subscribe meta (options byte plus identifier) into the router copy
+    /// and the session mirror. Goes through the broker (`apply_subscribe`),
+    /// not only through the store.
+    #[tokio::test]
+    async fn subscribe_v5_options_round_trip() {
+        let shared = test_shared();
+        // Bind through the production entry before subscribing.
+        let bind_meta = encode_bind_meta("v5-opt", true, 60);
+        let bind_reply = apply_bind(&bind_frame(21, 1, bind_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        // Opts: QoS 1 | no-local | rap | RH 1 => 1 | 0x04 | 0x08 | 0x10.
+        let opts =
+            broker_router::Subscription::encode_options_byte(QoS::AtLeastOnce, true, true, 1);
+        let frame = subscribe_frame(
+            21,
+            4,
+            encode_subscribe_meta_v5(7, "v5-opt", &[(("sport/tennis"), opts, 42)]),
+        );
+        let (reply, _) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[0..2], &7u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[1u8]);
+        let matches = shared.router.matches(&Topic::new("sport/tennis").unwrap());
+        assert_eq!(matches.len(), 1);
+        let sub = matches.iter().next().unwrap();
+        assert!(sub.no_local);
+        assert!(sub.retain_as_published);
+        assert_eq!(sub.retain_handling, 1);
+        assert_eq!(sub.subscription_id, 42);
+        let session = shared.sessions.get("v5-opt").expect("session mirror");
+        let stored = session.subscriptions.read();
+        let filter = TopicFilter::new("sport/tennis").unwrap();
+        let mirror = stored.get(&filter).expect("mirror entry");
+        assert_eq!(mirror.nl, 1);
+        assert_eq!(mirror.rap, 1);
+        assert_eq!(mirror.rh, 1);
+    }
+
+    /// X1-03: no-local suppresses self-delivery but not others'
+    /// delivery. Two subscribers on one filter (one no-local, one
+    /// plain); a publish from the no-local client reaches only the
+    /// plain subscriber. Through the broker publish path.
+    #[tokio::test]
+    async fn subscribe_v5_no_local_suppresses_self_only() {
+        let shared = test_shared();
+        // Bind each client through the production entry first.
+        for (conn, client) in [(31u64, "nl-self"), (32u64, "nl-other")] {
+            let bind_meta = encode_bind_meta(client, true, 60);
+            let bind_reply = apply_bind(&bind_frame(conn, 1, bind_meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+            assert_eq!(bind_rc, 0);
+        }
+        let opts_nl =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, true, false, 0);
+        let opts_plain =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        for (conn, client, opts) in [(31u64, "nl-self", opts_nl), (32u64, "nl-other", opts_plain)] {
+            let frame = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta_v5(1, client, &[("nl/topic", opts, 0)]),
+            );
+            apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+            let (session, _) = shared.sessions.get_or_create(client, true);
+            *session.conn_id.write() = Some(conn);
+        }
+        // Publish from the no-local client through the broker path.
+        let (pub_session, _) = shared.sessions.get_or_create("nl-self", true);
+        *pub_session.conn_id.write() = Some(31);
+        shared.sessions.bind_session(&pub_session, 31);
+        let (meta, payload) = encode_publish_meta("nl/topic", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(31, 2, meta, payload), &shared).await;
+        let targets: Vec<u64> = deliveries.iter().map(|(conn, _)| *conn).collect();
+        assert!(
+            !targets.contains(&31),
+            "no-local suppresses self-delivery, got {targets:?}"
+        );
+        assert!(
+            targets.contains(&32),
+            "others' delivery still arrives, got {targets:?}"
+        );
+    }
+
+    /// X1-03: retain-handling 0/1/2 against a retained message. A
+    /// retained publish is stored; RH 0 replays on every subscribe, RH 2
+    /// never replays, and RH 1 replays only on the first (new)
+    /// subscribe. Through the broker subscribe path.
+    #[tokio::test]
+    async fn subscribe_v5_retain_handling_variants() {
+        let shared = test_shared();
+        // Store one retained message via the broker publish path.
+        let (meta, payload) = encode_publish_meta("rh/topic", 0, 0, true, b"kept");
+        apply_publish(&publish_frame(90, 1, meta, payload), &shared).await;
+        // Bind each subscriber through the production entry first.
+        for (conn, client) in [(91u64, "rh-zero"), (92u64, "rh-two"), (93u64, "rh-one")] {
+            let bind_meta = encode_bind_meta(client, true, 60);
+            let bind_reply = apply_bind(&bind_frame(conn, 1, bind_meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+            assert_eq!(bind_rc, 0);
+        }
+        for (conn, client, rh, expect_retained) in
+            [(91u64, "rh-zero", 0u8, true), (92u64, "rh-two", 2u8, false)]
+        {
+            let opts =
+                broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, rh);
+            let frame = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta_v5(1, client, &[("rh/topic", opts, 0)]),
+            );
+            let (_, retained) = apply_subscribe(&frame, &shared).await;
+            assert_eq!(
+                !retained.is_empty(),
+                expect_retained,
+                "RH {rh} replay expectation"
+            );
+        }
+        // RH 1: first subscribe replays, second (existing) does not.
+        let opts1 =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 1);
+        let first = subscribe_frame(
+            93,
+            1,
+            encode_subscribe_meta_v5(1, "rh-one", &[("rh/topic", opts1, 0)]),
+        );
+        let (_, retained_first) = apply_subscribe(&first, &shared).await;
+        assert!(!retained_first.is_empty(), "RH 1 new subscription replays");
+        let second = subscribe_frame(
+            93,
+            2,
+            encode_subscribe_meta_v5(2, "rh-one", &[("rh/topic", opts1, 0)]),
+        );
+        let (_, retained_second) = apply_subscribe(&second, &shared).await;
+        assert!(
+            retained_second.is_empty(),
+            "RH 1 existing subscription suppresses replay"
+        );
+    }
+
+    /// X1-03: malformed options fail only the affected filter with 0x8F.
+    /// One filter carries a reserved-bit options byte, the other is
+    /// valid; the valid grant registers while the bad one reports 0x8F.
+    #[tokio::test]
+    async fn subscribe_v5_malformed_opts_fail_only_filter() {
+        let shared = test_shared();
+        // Bind through the production entry before subscribing.
+        let bind_meta = encode_bind_meta("v5-mixed", true, 60);
+        let bind_reply = apply_bind(&bind_frame(21, 1, bind_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        let bad_opts = 0xC1u8; // reserved bits set (plus QoS 1).
+        let good_opts =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        let frame = subscribe_frame(
+            21,
+            4,
+            encode_subscribe_meta_v5(
+                7,
+                "v5-mixed",
+                &[("good/topic", good_opts, 0), ("bad/topic", bad_opts, 0)],
+            ),
+        );
+        let (reply, _) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[0..2], &7u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[0u8, V5_SUBACK_FILTER_INVALID]);
+        let matches = shared.router.matches(&Topic::new("good/topic").unwrap());
+        assert_eq!(matches.len(), 1);
+        let bad = shared.router.matches(&Topic::new("bad/topic").unwrap());
+        assert!(bad.is_empty());
+    }
+
+    /// X1-03: the delivery carries the subscription identifier. A v5
+    /// subscriber with identifier 7 receives a PublishOut whose trailing
+    /// identifier reads back as 7; a version-4 subscriber reads 0.
+    /// Through the broker publish-to-delivery path.
+    #[tokio::test]
+    async fn publish_v5_delivery_carries_subscription_id() {
+        let shared = test_shared();
+        let opts =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        let frame = subscribe_frame(
+            61,
+            1,
+            encode_subscribe_meta_v5(1, "sub-id-1", &[("id/topic", opts, 7)]),
+        );
+        apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+        let (session, _) = shared.sessions.get_or_create("sub-id-1", true);
+        *session.conn_id.write() = Some(61);
+        let (meta, payload) = encode_publish_meta("id/topic", 0, 0, false, b"v");
+        let (_, deliveries) = apply_publish(&publish_frame(62, 1, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        let sub_id =
+            decode_publish_out_sub_id(&deliveries[0].1.metadata).expect("downlink meta decodes");
+        assert_eq!(sub_id, 7);
+    }
+
+    /// X1-03: inbound v5 properties forward to version-5 deliveries.
+    /// A publish carrying payload-format, message-expiry and user
+    /// properties fans out with the same values on the downlink meta;
+    /// a property-less publish still delivers with defaults. Through
+    /// the broker publish-to-delivery path.
+    #[tokio::test]
+    async fn publish_v5_delivery_forwards_properties() {
+        let shared = test_shared();
+        let opts =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        let frame = subscribe_frame(
+            61,
+            1,
+            encode_subscribe_meta_v5(1, "sub-props", &[("props/topic", opts, 9)]),
+        );
+        apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+        let (session, _) = shared.sessions.get_or_create("sub-props", true);
+        *session.conn_id.write() = Some(61);
+        let (meta, payload) = encode_publish_meta_v5(
+            "props/topic",
+            0,
+            0,
+            false,
+            0,
+            1,
+            3600,
+            &[("k", "v")],
+            b"hello",
+        );
+        let (_, deliveries) = apply_publish(&publish_frame(62, 1, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        let props =
+            super::decode_publish_out_props(&deliveries[0].1.metadata).expect("props decode");
+        assert_eq!(props.format, 1);
+        assert_eq!(props.expiry, 3600);
+        assert_eq!(props.users.len(), 1);
+        assert_eq!(props.users[0].0, b"k".to_vec());
+        assert_eq!(props.users[0].1, b"v".to_vec());
+        let sub_id =
+            decode_publish_out_sub_id(&deliveries[0].1.metadata).expect("downlink meta decodes");
+        assert_eq!(sub_id, 9);
+    }
+
+    /// X1-03: v5 DISCONNECT with reason 0x04 publishes the stored will;
+    /// a normal reason suppresses it. Drives the unbind/disconnect
+    /// events through the broker.
+    #[tokio::test]
+    async fn disconnect_v5_with_will_reason_publishes_will() {
+        let shared = test_shared();
+        // Subscriber for the will topic.
+        let sub = subscribe_frame(
+            71,
+            1,
+            encode_subscribe_meta(1, "will-watcher", &[("will/v5", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        let (watch_session, _) = shared.sessions.get_or_create("will-watcher", true);
+        *watch_session.conn_id.write() = Some(71);
+        // Publisher session with a stored will, bound to conn 70.
+        let (pub_session, _) = shared.sessions.get_or_create("will-pub", true);
+        *pub_session.conn_id.write() = Some(70);
+        shared.sessions.bind_session(&pub_session, 70);
+        pub_session.set_last_will(Some(broker_session::StoredWill {
+            tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+            topic: Topic::new("will/v5").unwrap(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            payload: Bytes::from_static(b"bye"),
+        }));
+        // DISCONNECT with 0x04 arrives as an unbind with reason.
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&("will-pub".len() as u16).to_be_bytes());
+        meta.extend_from_slice(b"will-pub");
+        meta.push(V5_DISCONNECT_WITH_WILL);
+        let frame = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            70,
+            2,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("unbind frame");
+        // Route through the test-visible helper (same event as the live path).
+        let deliveries = apply_disconnect_with_unbind_meta(&frame, &shared).await;
+        assert!(!deliveries.is_empty(), "0x04 must publish the stored will");
+    }
+
+    /// X1-03: no path leaves a tenant. Two tenants hold the same filter
+    /// with v5 options (no-local plus identifiers in A, plain plus an
+    /// identifier in B). A publish in A reaches only A (and no-local
+    /// still suppresses the self copy); a publish in B reaches only B
+    /// with its own identifier. Through the broker bind, subscribe,
+    /// publish and delivery events.
+    #[tokio::test]
+    async fn subscribe_v5_options_isolate_two_tenants_through_broker() {
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+        for (conn, client, user) in [(111u64, "x103-a1", "alice"), (112u64, "x103-b1", "bob")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let opts_a =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, true, false, 0);
+        let opts_b =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        for (conn, client, opts, sub_id) in [
+            (111u64, "x103-a1", opts_a, 5u32),
+            (112u64, "x103-b1", opts_b, 6u32),
+        ] {
+            let frame = subscribe_frame(
+                conn,
+                2,
+                encode_subscribe_meta_v5(1, client, &[("x103/two-tenant", opts, sub_id)]),
+            );
+            apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+        }
+        // Publish in A from its own subscriber: no-local suppresses the
+        // self copy, and B never observes A.
+        let before = shared.metrics.tenant_mismatch_dropped();
+        let (meta, payload) = encode_publish_meta("x103/two-tenant", 0, 0, false, b"from-a");
+        let (_, deliveries) = apply_publish(&publish_frame(111, 3, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "A self-publish stays suppressed, B sees nothing"
+        );
+        assert!(
+            shared.metrics.tenant_mismatch_dropped() > before,
+            "B's copy is counted, never delivered"
+        );
+        // Publish in B: only B delivers, carrying its own identifier.
+        let (meta, payload) = encode_publish_meta("x103/two-tenant", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(112, 4, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "B delivers once");
+        assert_eq!(deliveries[0].0, 112, "B's publish stays in B");
+        let sub_id =
+            decode_publish_out_sub_id(&deliveries[0].1.metadata).expect("downlink meta decodes");
+        assert_eq!(sub_id, 6, "delivery carries B's identifier, never A's");
     }
 
     #[tokio::test]
@@ -12958,6 +14169,10 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -13084,6 +14299,10 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
         let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -13107,6 +14326,10 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -13224,6 +14447,10 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
         let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -13244,6 +14471,10 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
         let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
@@ -14482,6 +15713,10 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
     }

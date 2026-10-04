@@ -162,6 +162,10 @@ fn build_router(subscriptions: usize) -> Router {
                 qos: QoS::AtMostOnce,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
     }
@@ -178,6 +182,10 @@ fn build_router(subscriptions: usize) -> Router {
                 qos,
                 group: None,
                 tenant: broker_router::DEFAULT_TENANT_ID.into(),
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                subscription_id: 0,
             },
         );
     }

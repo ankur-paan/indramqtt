@@ -1958,6 +1958,10 @@ mod tests {
                     qos: QoS::AtMostOnce,
                     group: None,
                     tenant: tenant.into(),
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: 0,
+                    subscription_id: 0,
                 },
             );
         }

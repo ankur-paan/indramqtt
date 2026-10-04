@@ -776,6 +776,74 @@ publish_meta_alias_roundtrip_test() ->
                  indra_brokerlink:encode_publish_meta(<<>>, 0, 0, false, false)).
 
 %%====================================================================
+%% v5 subscription metadata contracts (X1-03)
+%%====================================================================
+
+subscribe_meta_v5_roundtrip_test() ->
+    %% Extended form carries the options byte plus the packet-wide
+    %% identifier; legacy decoders see the same filters via fallback.
+    Subs = [{<<"a/b">>, 16#15}, {<<"c">>, 0}],
+    Meta = indra_brokerlink:encode_subscribe_meta_v5(7, <<"dev-1">>, Subs, 42),
+    {ok, Dec} = indra_brokerlink:decode_subscribe_meta(Meta),
+    ?assertEqual(7, maps:get(packet_id, Dec)),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(Subs, maps:get(subscriptions, Dec)),
+    ?assertEqual(42, maps:get(sub_id, Dec)),
+    %% Legacy form still decodes with sub_id 0.
+    Legacy = indra_brokerlink:encode_subscribe_meta(7, <<"dev-1">>,
+                                                    [{<<"a">>, 1}]),
+    {ok, LDec} = indra_brokerlink:decode_subscribe_meta(Legacy),
+    ?assertEqual(0, maps:get(sub_id, LDec)).
+
+publish_meta_v5_sub_id_roundtrip_test() ->
+    %% Kernel downlinks append SubId:32 after the alias; version-4
+    %% readers see alias 0/sub 0 on legacy forms.
+    Base = indra_brokerlink:encode_publish_meta(<<"t">>, 1, 1, false, false, 0),
+    WithId = <<Base/binary, 7:32/big>>,
+    {ok, Dec} = indra_brokerlink:decode_publish_meta(WithId),
+    ?assertEqual(7, maps:get(sub_id, Dec)),
+    ?assertEqual(0, maps:get(alias, Dec)).
+
+publish_meta_v5_forwarded_roundtrip_test() ->
+    %% Forwarded form appends SubId:32 plus Format/Expiry/users after
+    %% the alias; the edge decodes every field for v5 delivery.
+    Base = indra_brokerlink:encode_publish_meta(<<"t">>, 1, 1, false, false, 0),
+    WithProps = <<Base/binary, 7:32/big, 1:8, 0:32/big, 1:16/big,
+                  1:16/big, "k", 1:16/big, "v">>,
+    {ok, Dec} = indra_brokerlink:decode_publish_meta(WithProps),
+    ?assertEqual(7, maps:get(sub_id, Dec)),
+    ?assertEqual(1, maps:get(format, Dec)),
+    ?assertEqual([{<<"k">>, <<"v">>}], maps:get(users, Dec)).
+
+subscribe_meta_v5_sub_ids_roundtrip_test() ->
+    %% Differing per-filter ids keep the first packet-wide with the
+    %% remainder in `sub_ids'.
+    Meta = <<7:16/big, 5:16/big, "dev-1", 2:16/big,
+             1:16/big, "a", 16#00:8, 10:32/big,
+             1:16/big, "b", 16#00:8, 20:32/big>>,
+    {ok, Dec} = indra_brokerlink:decode_subscribe_meta(Meta),
+    ?assertEqual(10, maps:get(sub_id, Dec)),
+    ?assertEqual([10, 20], maps:get(sub_ids, Dec)).
+
+unbind_meta_v5_reason_roundtrip_test() ->
+    %% Plain unbinds stay byte-identical; v5 carries one reason byte.
+    Plain = indra_brokerlink:encode_unbind_meta(<<"dev-9">>),
+    ?assertEqual({ok, #{client_id => <<"dev-9">>}},
+                 indra_brokerlink:decode_unbind_meta(Plain)),
+    WithReason = indra_brokerlink:encode_unbind_meta(<<"dev-9">>, 16#04),
+    {ok, RDec} = indra_brokerlink:decode_unbind_meta(WithReason),
+    ?assertEqual(<<"dev-9">>, maps:get(client_id, RDec)),
+    ?assertEqual(16#04, maps:get(reason_code, RDec)).
+
+connclose_meta_v5_reason_roundtrip_test() ->
+    %% Empty closes stay byte-identical; one reason byte rides v5 closes.
+    ?assertEqual({ok, #{}},
+                 indra_brokerlink:decode_connclose_meta(
+                   indra_brokerlink:encode_connclose_meta())),
+    {ok, RDec} = indra_brokerlink:decode_connclose_meta(<<16#94>>),
+    ?assertEqual(16#94, maps:get(reason_code, RDec)).
+
+%%====================================================================
 %% Inbound dispatch through the connection registry (Sprint 3)
 %%====================================================================
 

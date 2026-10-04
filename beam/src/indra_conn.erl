@@ -520,7 +520,12 @@ handle_event(cast, {broker_frame, Header, Meta, Payload}, connected, Data) ->
         ?CONN_CLOSE ->
             %% Kernel-ordered close (W0-25): the kernel already unbound
             %% session state; the edge only closes the socket. terminate/3
-            %% closes the socket and unregisters the conn id.
+            %% closes the socket and unregisters the conn id. X1-03: a
+            %% version-5 socket sends DISCONNECT with the carried reason
+            %% first (honest code, no reason string — the broker omits it
+            %% when there is nothing to say); version-4 closes bare
+            %% (bytes identical).
+            send_disconnect_for_close(Meta, Data),
             stop_with(Data, kernel_close);
         _ ->
             %% Late duplicates or future opcodes: ignore for now.
@@ -1550,17 +1555,38 @@ handle_rebind_binding(Meta, Data) ->
 %% `quiet_subs` and are swallowed on arrival.
 resubscribe_all(#{subs := Subs, broker := Broker, conn_id := ConnId,
                   seq := Seq, client_id := ClientId} = Data) ->
+    ProtoLevel = maps:get(proto_level, Data, 4),
     try
         Seq1 = maps:fold(
-            fun(Filter, {QoS, PacketId}, SAcc) ->
-                Meta = indra_brokerlink:encode_subscribe_meta(PacketId, ClientId,
-                                                              [{Filter, QoS}]),
+            fun(Filter, TrackedVal, SAcc) ->
+                {Opts, PacketId, SubId} = case TrackedVal of
+                    {O, P, S} -> {O, P, S};
+                    {O, P} -> {O, P, 0}
+                end,
+                Meta = case ProtoLevel of
+                    5 ->
+                        indra_brokerlink:encode_subscribe_meta_v5(
+                          PacketId, ClientId, [{Filter, Opts}], SubId);
+                    _ ->
+                        %% Version-4 rebinds carry the granted QoS only;
+                        %% a v5 options byte never reaches here (the
+                        %% legacy encoder validates 0..2).
+                        QoS = Opts band 16#03,
+                        indra_brokerlink:encode_subscribe_meta(
+                          PacketId, ClientId, [{Filter, QoS}])
+                end,
                 ok = indra_brokerlink:send(Broker, ?SUBSCRIBE_IN, ConnId, SAcc + 1,
                                            Meta, <<>>),
                 SAcc + 1
             end, Seq, Subs),
         Quiet = maps:fold(
-            fun(_Filter, {_QoS, PacketId}, Acc) -> Acc#{PacketId => true} end,
+            fun(_Filter, TrackedVal, Acc) ->
+                {_O, PacketId, _S} = case TrackedVal of
+                    {O, P, S} -> {O, P, S};
+                    {O, P} -> {O, P, 0}
+                end,
+                Acc#{PacketId => true}
+            end,
             #{}, Subs),
         {ok, Data#{seq => Seq1, quiet_subs => Quiet}}
     catch
@@ -1627,8 +1653,8 @@ handle_mqtt_packet(#{type := 12}, #{sock := Sock, sockmod := Mod} = Data) ->
         ok -> {ok, Data};
         {error, _} -> stop_with(bump_send_failed(Data), send_failed)
     end;
-handle_mqtt_packet(#{type := 14}, Data) ->
-    handle_disconnect(Data);
+handle_mqtt_packet(#{type := 14, payload := Payload}, Data) ->
+    handle_disconnect(Payload, Data);
 handle_mqtt_packet(#{type := 4, payload := Payload}, Data) ->
     %% Inbound PUBACK for a QoS 1 downstream delivery: forward the
     %% packet id to the kernel (PubAckIn) so it releases the matching
@@ -1654,20 +1680,36 @@ handle_mqtt_packet(_Other, Data) ->
     stop_with(Data, protocol_error).
 
 handle_subscribe_packet(Payload, Data) ->
-    case indra_mqtt_codec:decode_subscribe(Payload) of
-        {ok, #{packet_id := PacketId, subscriptions := Subs}} ->
+    ProtoLevel = maps:get(proto_level, Data, 4),
+    case indra_mqtt_codec:decode_subscribe(Payload, ProtoLevel) of
+        {ok, SubMap} ->
+            #{packet_id := PacketId, subscriptions := Subs} = SubMap,
+            %% X1-03: the packet-wide subscription identifier rides the
+            %% v5 SUBSCRIBE properties (0 when absent) and applies to
+            %% every filter in the packet; version-4 subscribes carry
+            %% none and stay byte-identical.
+            SubId = maps:get(sub_id, SubMap, 0),
             #{broker := Broker, conn_id := ConnId, seq := Seq,
               client_id := ClientId, subs_pending := Pending,
               subs := Tracked} = Data,
-            Meta = indra_brokerlink:encode_subscribe_meta(PacketId, ClientId, Subs),
+            Meta = case ProtoLevel of
+                5 ->
+                    indra_brokerlink:encode_subscribe_meta_v5(
+                      PacketId, ClientId, Subs, SubId);
+                _ ->
+                    indra_brokerlink:encode_subscribe_meta(PacketId, ClientId, Subs)
+            end,
             case catch indra_brokerlink:send(Broker, ?SUBSCRIBE_IN, ConnId, Seq + 1, Meta, <<>>) of
                 ok ->
                     Tracked1 = lists:foldl(
-                        fun({Filter, QoS}, Acc) -> Acc#{Filter => {QoS, PacketId}} end,
+                        fun({Filter, Opts}, Acc) ->
+                            Acc#{Filter => {Opts, PacketId, SubId}}
+                        end,
                         Tracked, Subs),
                     {ok, Data#{seq => Seq + 1,
                                subs_pending => Pending#{PacketId => true},
-                               subs => Tracked1}};
+                               subs => Tracked1,
+                               proto_level => ProtoLevel}};
                 Other ->
                     stop_with(Data, classify_send_error(Other))
             end;
@@ -1678,9 +1720,18 @@ handle_subscribe_packet(Payload, Data) ->
 handle_publish_packet(Payload, Flags, Data) ->
     ProtoLevel = maps:get(proto_level, Data, 4),
     case indra_mqtt_codec:decode_publish(Payload, Flags, ProtoLevel) of
-        {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-               retain := Retain, dup := Dup, payload := AppPayload,
-               alias := Alias, alias_present := AliasPresent}} ->
+        {ok, PubMap} ->
+            #{topic := Topic, packet_id := PacketId, qos := QoS,
+              retain := Retain, dup := Dup, payload := AppPayload,
+              alias := Alias, alias_present := AliasPresent} = PubMap,
+            %% X1-03: v5 PUBLISH properties (payload format, message
+            %% expiry, user properties) ride the extended publish meta
+            %% toward the kernel; 3.1.1 publishes use the legacy forms
+            %% (bytes identical). The alias rule from B4-05 stays: absent
+            %% via /5, never an explicit 0 section.
+            Format = maps:get(payload_format, PubMap, 0),
+            Expiry = maps:get(message_expiry, PubMap, 0),
+            Users = maps:get(user_properties, PubMap, []),
             #{broker := Broker, conn_id := ConnId, seq := Seq,
               pubs_pending := Pending, qos2_pending := Qos2Pending} = Data,
             %% B4-05: the alias rides the PUBLISH alias property on v5
@@ -1692,12 +1743,21 @@ handle_publish_packet(Payload, Flags, Data) ->
             %% distinguishable on the wire. The kernel checks the alias
             %% against the CONNACK-negotiated maximum on the PUBLISH
             %% event, where the inbound table is written.
-            Meta = case AliasPresent of
-                false ->
-                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup);
-                true ->
-                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup,
-                                                         Alias)
+            Meta = case ProtoLevel of
+                5 ->
+                    AliasVal = case AliasPresent of true -> Alias; false -> 0 end,
+                    indra_brokerlink:encode_publish_meta_v5(
+                      Topic, PacketId, QoS, Retain, Dup, AliasVal,
+                      #{format => Format, expiry => Expiry, users => Users});
+                _ ->
+                    case AliasPresent of
+                        false ->
+                            indra_brokerlink:encode_publish_meta(
+                              Topic, PacketId, QoS, Retain, Dup);
+                        true ->
+                            indra_brokerlink:encode_publish_meta(
+                              Topic, PacketId, QoS, Retain, Dup, Alias)
+                    end
             end,
             case catch indra_brokerlink:send(Broker, ?PUBLISH_IN, ConnId, Seq + 1, Meta, AppPayload) of
                 ok when QoS =:= 1 ->
@@ -1724,12 +1784,33 @@ handle_publish_packet(Payload, Flags, Data) ->
             stop_with(Data, protocol_error)
     end.
 
-handle_disconnect(#{broker := Broker, conn_id := ConnId, seq := Seq,
+handle_disconnect(Payload, #{broker := Broker, conn_id := ConnId, seq := Seq,
                     client_id := ClientId} = Data) ->
-    %% Fire-and-forget unbind: the socket closes regardless.
-    Meta = indra_brokerlink:encode_unbind_meta(ClientId),
-    catch indra_brokerlink:send(Broker, ?UNBIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>),
-    stop_with(Data, client_disconnect).
+    %% X1-03: version-5 DISCONNECT carries a reason code (0 normal, 16#04
+    %% disconnect-with-will, others clean). The reason rides the trailing
+    %% unbind byte so the kernel publishes the will only on 16#04;
+    %% version-4 DISCONNECTs (empty payload) stay byte-identical. Reason
+    %% strings and user properties are validated on the socket and omitted
+    %% toward the kernel (never invented). Malformed v5 bodies fail closed
+    %% as protocol errors (will fires via the ungraceful path).
+    ProtoLevel = maps:get(proto_level, Data, 4),
+    case ProtoLevel of
+        5 ->
+            case indra_mqtt_codec:decode_disconnect_v5(Payload) of
+                {ok, #{reason_code := RC}} ->
+                    Meta = indra_brokerlink:encode_unbind_meta(ClientId, RC),
+                    catch indra_brokerlink:send(
+                      Broker, ?UNBIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>),
+                    stop_with(Data, client_disconnect);
+                {error, _} ->
+                    stop_with(Data, protocol_error)
+            end;
+        _ ->
+            %% Fire-and-forget unbind: the socket closes regardless.
+            Meta = indra_brokerlink:encode_unbind_meta(ClientId),
+            catch indra_brokerlink:send(Broker, ?UNBIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>),
+            stop_with(Data, client_disconnect)
+    end.
 
 %% @private Forward one subscriber PUBACK to the kernel so it releases
 %% the matching inflight entry (T-31). The kernel owns the store; the
@@ -1820,7 +1901,18 @@ handle_suback(Meta, #{sock := Sock, sockmod := Mod, subs_pending := Pending,
                             %% Unsolicited SubAck: ignore.
                             {keep_state, Data};
                         true ->
-                            Suback = indra_mqtt_codec:encode_suback(PacketId, Codes),
+                            %% X1-03: version-5 sockets get the v5 SUBACK
+                            %% shape (reason codes plus empty properties —
+                            %% the broker never invents a reason string);
+                            %% version-4 sockets keep the fixed shape.
+                            ProtoLevel = maps:get(proto_level, Data, 4),
+                            Suback = case ProtoLevel of
+                                5 ->
+                                    indra_mqtt_codec:encode_suback_v5(
+                                      PacketId, Codes, #{});
+                                _ ->
+                                    indra_mqtt_codec:encode_suback(PacketId, Codes)
+                            end,
                             case sock_send(Mod, Sock, Suback) of
                                 ok ->
                                     {keep_state, Data#{subs_pending =>
@@ -1909,15 +2001,31 @@ emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
     case maps:get(opcode, Header, undefined) of
         ?PUBLISH_OUT ->
             case indra_brokerlink:decode_publish_meta(Meta) of
-                {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-                       retain := Retain, dup := Dup, alias := Alias}} ->
-                    %% B4-05: the kernel-assigned alias rides the PUBLISH
-                    %% alias property toward v5 subscribers (0 means full
-                    %% topic, no alias). The meta value is already the
-                    %% wire value, framed directly with no round-trip.
-                    Packet = indra_mqtt_codec:encode_publish(Topic, PacketId, QoS,
-                                                             Retain, Dup, Payload,
-                                                             Alias),
+                {ok, PubMeta} ->
+                    #{topic := Topic, packet_id := PacketId, qos := QoS,
+                      retain := Retain, dup := Dup, alias := Alias} = PubMeta,
+                    %% X1-03: the kernel-assigned alias, subscription
+                    %% identifier and forwarded v5 properties ride the v5
+                    %% PUBLISH properties toward v5 subscribers (0/empty
+                    %% means absent, omitted). Version-4 sockets keep the
+                    %% alias-only shape (3.1.1 bytes identical); version-5
+                    %% sockets get identifier, format, expiry and user
+                    %% properties next to the alias.
+                    SubId = maps:get(sub_id, PubMeta, 0),
+                    Format = maps:get(format, PubMeta, 0),
+                    Expiry = maps:get(expiry, PubMeta, 0),
+                    Users = maps:get(users, PubMeta, []),
+                    ProtoLevel = maps:get(proto_level, Data, 4),
+                    Packet = case ProtoLevel of
+                        5 ->
+                            indra_mqtt_codec:encode_publish_v5_full(
+                              Topic, PacketId, QoS, Retain, Dup, Payload,
+                              Alias, SubId, Format, Expiry, Users);
+                        _ ->
+                            indra_mqtt_codec:encode_publish(
+                              Topic, PacketId, QoS, Retain, Dup, Payload,
+                              Alias)
+                    end,
                     emit_frames(Rest, Data, [Packet | Pending], N + 1,
                                 B + byte_size(Meta) + byte_size(Payload));
                 {error, _} ->
@@ -2003,6 +2111,7 @@ emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
             case flush_pending(Data, Pending, N, B, Rest) of
                 {ok, Data1} ->
                     count_evaporated(Rest),
+                    send_disconnect_for_close(Meta, Data1),
                     stop_with(Data1, kernel_close);
                 {stop, _, _} = Stop ->
                     Stop
@@ -2170,6 +2279,27 @@ handle_pubcomp_out(Meta, #{sock := Sock, sockmod := Mod,
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)
+    end.
+
+%% @private Send a server-initiated DISCONNECT before a kernel-ordered
+%% close (X1-03). Version-4 sockets close bare (bytes identical, no wire
+%% reason); version-5 sockets send DISCONNECT with the carried reason
+%% code and no reason string (the broker omits it when there is nothing
+%% to say, never invents one). Empty closes carry no reason and close
+%% bare on either version. Best-effort: a failed send still closes.
+send_disconnect_for_close(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
+    case maps:get(proto_level, Data, 4) of
+        5 ->
+            case indra_brokerlink:decode_connclose_meta(Meta) of
+                {ok, #{reason_code := RC}} ->
+                    catch sock_send(Mod, Sock,
+                                    indra_mqtt_codec:encode_disconnect_v5(RC, <<>>)),
+                    ok;
+                _ ->
+                    ok
+            end;
+        _ ->
+            ok
     end.
 
 keepalive_action(#{keepalive := 0}) ->
