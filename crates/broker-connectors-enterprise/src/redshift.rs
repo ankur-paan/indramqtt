@@ -544,6 +544,260 @@ impl RedshiftTransport for HttpRedshiftTransport {
     }
 }
 
+/// Retryable-vs-terminal mapping for the Redshift Data driver.
+/// Throttles, quota/active-limit rejections, internal failures and
+/// transport/timeout text retry as connections; auth, validation and
+/// query failures are terminal dispatches (fail closed, never retried
+/// with the same statement).
+fn is_retryable_redshift_error(text: &str) -> bool {
+    const RETRYABLE: &[&str] = &[
+        "throttl",
+        "too many",
+        "toomany",
+        "active statements exceeded",
+        "active sessions exceeded",
+        "active waiting requests exceeded",
+        // CamelCase SDK exception names carry no spaces
+        // (e.g. ActiveStatementsExceededException), so match the
+        // space-stripped forms too. Reason: Redshift Data quota /
+        // concurrency rejections are throttle-like and safe to retry.
+        "activestatements",
+        "activesessions",
+        "activewaiting",
+        "internalservererror",
+        // Bare InternalServerException (no "Error" suffix) is the same
+        // transient server failure. Reason: vendor transient fault.
+        "internalserver",
+        "internalfailure",
+        "serviceunavailable",
+        "timeout",
+        "timed out",
+        "connection",
+        "unavailable",
+    ];
+    let lower = text.to_lowercase();
+    RETRYABLE.iter().any(|marker| lower.contains(marker))
+}
+
+fn classify_redshift_sdk_error(text: String) -> ConnectorError {
+    if is_retryable_redshift_error(&text) {
+        ConnectorError::Connection(text)
+    } else {
+        ConnectorError::Dispatch(text)
+    }
+}
+
+/// Polls per batch execution (default 180): 180 x 1 s is a 3 min upper
+/// bound per batch so one slow Serverless workgroup cannot stall a
+/// flush forever; past the bound the sink retry loop re-executes the
+/// batch (at-least-once, like the sibling batch sinks). Reason:
+/// Serverless cold starts plus 100-statement batches run for tens of
+/// seconds while compute is billed, so the bound covers a cold batch
+/// without letting a stuck statement hold the rule path.
+const DEFAULT_MAX_POLLS: usize = 180;
+/// Delay between status polls (default 1000 ms): batches run for
+/// seconds and the Data API bills per call, so faster polling only
+/// burns quota. Reason: vendor per-call billing plus second-scale
+/// batch latency.
+const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+
+/// Maximum `Sqls` per `BatchExecuteStatement` call (40): the vendor
+/// rejects larger arrays with `ValidationException`, so bigger sink
+/// batches are split into sequential calls. Reason: vendor API limit
+/// (`BatchExecuteStatement` `Sqls` min 1 / max 40, statements run
+/// serially as one transaction per call).
+pub const REDSHIFT_MAX_SQLS_PER_BATCH: usize = 40;
+
+/// Production transport on the maintained `aws-sdk-redshiftdata`
+/// driver: `BatchExecuteStatement` with driver-owned SigV4 (static
+/// access-key credentials, session token when configured, endpoint
+/// override for local servers) plus `DescribeStatement` polling to
+/// FINISHED. One driver round trip is bounded by the configured
+/// request timeout so a slow workgroup surfaces as a retryable
+/// connection error instead of stalling the rule path. `FAILED` /
+/// `ABORTED` outcomes are terminal dispatches that carry the failed
+/// statement text, so a syntax error names the statement that broke.
+pub struct SdkRedshiftTransport {
+    client: aws_sdk_redshiftdata::Client,
+    timeout: Duration,
+    poll_interval: Duration,
+    max_polls: usize,
+}
+
+impl SdkRedshiftTransport {
+    pub fn new(config: &RedshiftSinkConfig) -> Result<Self> {
+        Self::with_polling(
+            config,
+            Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            DEFAULT_MAX_POLLS,
+        )
+    }
+
+    /// Constructor with explicit polling bounds (qualification and
+    /// tests; cold Serverless workgroups take minutes, loopback fakes
+    /// take none).
+    pub fn with_polling(
+        config: &RedshiftSinkConfig,
+        poll_interval: Duration,
+        max_polls: usize,
+    ) -> Result<Self> {
+        config.validate()?;
+        let region = aws_sdk_redshiftdata::config::Region::new(config.region.clone());
+        let credentials = aws_sdk_redshiftdata::config::Credentials::new(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            config.session_token.clone(),
+            None,
+            "indramqtt-static",
+        );
+        let provider = aws_sdk_redshiftdata::config::SharedCredentialsProvider::new(credentials);
+        let mut builder = aws_sdk_redshiftdata::Config::builder()
+            .behavior_version_latest()
+            .region(region)
+            .credentials_provider(provider);
+        if let Some(endpoint) = &config.endpoint {
+            builder = builder.endpoint_url(endpoint.trim_end_matches('/'));
+        }
+        let sdk_config = builder.build();
+        Ok(Self {
+            client: aws_sdk_redshiftdata::Client::from_conf(sdk_config),
+            timeout: config.timeout(),
+            poll_interval,
+            max_polls: max_polls.max(1),
+        })
+    }
+
+    /// Borrow the driver client (table setup and read-back for
+    /// qualification; the write path stays behind the trait).
+    pub fn client(&self) -> &aws_sdk_redshiftdata::Client {
+        &self.client
+    }
+
+    /// Test hook proving `new` stores the configured timeout; the
+    /// production path applies `self.timeout` to every driver call.
+    #[cfg(test)]
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Poll one batch id to a terminal state. `FINISHED` completes;
+    /// `FAILED` / `ABORTED` are terminal dispatches carrying the
+    /// failed statement text; exhaustion is retryable so the sink
+    /// re-executes the batch at-least-once.
+    async fn poll_to_finished(&self, id: &str, statements: &[String]) -> Result<()> {
+        for _ in 0..self.max_polls {
+            tokio::time::sleep(self.poll_interval).await;
+            let timeout = self.timeout;
+            let described = tokio::time::timeout(
+                timeout,
+                self.client
+                    .describe_statement()
+                    .set_id(Some(id.to_string()))
+                    .send(),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "redshift driver timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            })?
+            .map_err(|e| {
+                classify_redshift_sdk_error(format!(
+                    "redshift describe statement failed: {e:?} ({e})"
+                ))
+            })?;
+            let status = described.status().map(|s| s.as_str()).unwrap_or("");
+            match status {
+                "FINISHED" => return Ok(()),
+                "FAILED" | "ABORTED" => {
+                    let server_error = described.error().unwrap_or("unknown error");
+                    let query = described.query_string().unwrap_or("");
+                    let mut detail = format!("redshift statement {id} {status}: {server_error}");
+                    if !query.is_empty() {
+                        detail.push_str(&format!(" :: {query}"));
+                    }
+                    let mut saw_sub_failure = false;
+                    for sub in described.sub_statements() {
+                        let sub_status = sub.status().map(|s| s.as_str()).unwrap_or("");
+                        if sub_status == "FAILED" || sub_status == "ABORTED" {
+                            saw_sub_failure = true;
+                            let sub_error = sub.error().unwrap_or("");
+                            let sub_query = sub.query_string().unwrap_or("");
+                            detail.push_str(&format!(
+                                "; sub-statement {sub_status}: {sub_error} :: {sub_query}"
+                            ));
+                        }
+                    }
+                    if query.is_empty() && !saw_sub_failure {
+                        if let Some(first) = statements.first() {
+                            detail.push_str(&format!(" :: {first}"));
+                        }
+                    }
+                    return Err(ConnectorError::Dispatch(detail));
+                }
+                _ => {}
+            }
+        }
+        Err(ConnectorError::Connection(format!(
+            "redshift statement {id} still pending after {} polls",
+            self.max_polls
+        )))
+    }
+}
+
+#[async_trait]
+impl RedshiftTransport for SdkRedshiftTransport {
+    async fn execute_batch(&self, req: &RedshiftBatchRequest) -> Result<RedshiftBatchResponse> {
+        if req.statements.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "redshift batch has no statements".to_string(),
+            ));
+        }
+        let mut last_id = String::new();
+        // Split oversized batches so no single `BatchExecuteStatement`
+        // exceeds the vendor `Sqls` max (40); chunks run serially and
+        // each polls to FINISHED, so a 100-row sink batch becomes
+        // 40 + 40 + 20 without a validation failure.
+        for chunk in req.statements.chunks(REDSHIFT_MAX_SQLS_PER_BATCH) {
+            let mut builder = self
+                .client
+                .batch_execute_statement()
+                .set_database(Some(req.database.clone()))
+                .set_sqls(Some(chunk.to_vec()));
+            if let Some(cluster) = &req.cluster_identifier {
+                builder = builder.set_cluster_identifier(Some(cluster.clone()));
+            }
+            if let Some(workgroup) = &req.workgroup_name {
+                builder = builder.set_workgroup_name(Some(workgroup.clone()));
+            }
+            if let Some(user) = &req.db_user {
+                builder = builder.set_db_user(Some(user.clone()));
+            }
+            let timeout = self.timeout;
+            let output = tokio::time::timeout(timeout, builder.send())
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "redshift driver timed out after {}ms",
+                        timeout.as_millis()
+                    ))
+                })?
+                .map_err(|e| {
+                    classify_redshift_sdk_error(format!(
+                        "redshift batch execute failed: {e:?} ({e})"
+                    ))
+                })?;
+            let id = output.id().map(str::to_string).ok_or_else(|| {
+                ConnectorError::Dispatch("redshift response lacks Id".to_string())
+            })?;
+            self.poll_to_finished(&id, chunk).await?;
+            last_id = id;
+        }
+        Ok(RedshiftBatchResponse { id: last_id })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
@@ -1022,5 +1276,501 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[test]
+    fn test_sdk_transport_construction() {
+        let config = test_config();
+        // Building the driver client is lazy: no I/O, safe offline.
+        let transport = SdkRedshiftTransport::new(&config).expect("sdk transport builds");
+        assert_eq!(transport.timeout(), config.timeout());
+        let mut bad = test_config();
+        bad.database.clear();
+        assert!(SdkRedshiftTransport::new(&bad).is_err());
+    }
+
+    #[test]
+    fn test_sdk_batch_splitting_respects_vendor_limit() {
+        // Vendor `BatchExecuteStatement` `Sqls` max is 40: a 100-row
+        // sink batch must ride 40 + 40 + 20, never one call of 100.
+        assert_eq!(REDSHIFT_MAX_SQLS_PER_BATCH, 40);
+        let statements: Vec<String> = (0..100).map(|n| format!("SELECT {n}")).collect();
+        let chunks: Vec<&[String]> = statements.chunks(REDSHIFT_MAX_SQLS_PER_BATCH).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 40);
+        assert_eq!(chunks[1].len(), 40);
+        assert_eq!(chunks[2].len(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_sdk_empty_batch_fails_closed() {
+        // Empty batches never touch the driver: terminal dispatch,
+        // safe offline.
+        let transport = SdkRedshiftTransport::new(&test_config()).expect("sdk transport builds");
+        let req = RedshiftBatchRequest {
+            database: "analytics".to_string(),
+            cluster_identifier: None,
+            workgroup_name: Some("iot-workgroup".to_string()),
+            db_user: None,
+            statements: vec![],
+        };
+        let err = transport
+            .execute_batch(&req)
+            .await
+            .expect_err("empty batch must fail");
+        assert!(matches!(err, ConnectorError::Dispatch(_)));
+    }
+
+    #[test]
+    fn test_sdk_error_classification() {
+        // Throttles, quota and transport failures retry; terminal
+        // failures (auth, validation, query errors) do not.
+        for retryable in [
+            "redshift batch execute failed: ThrottlingException (throttled)",
+            "redshift batch execute failed: ActiveStatementsExceededException",
+            "redshift batch execute failed: InternalServerException",
+            "redshift batch execute failed: ServiceUnavailable",
+            "redshift driver timed out after 5000ms",
+            "redshift describe statement failed: connection reset (dispatch failure)",
+        ] {
+            assert!(
+                matches!(
+                    classify_redshift_sdk_error(retryable.to_string()),
+                    ConnectorError::Connection(_)
+                ),
+                "{retryable:?} must be retryable"
+            );
+        }
+        for terminal in [
+            "redshift batch execute failed: AccessDeniedException",
+            "redshift batch execute failed: ValidationException (unknown workgroup)",
+            "redshift statement stmt-1 FAILED: syntax error :: THIS IS NOT SQL",
+        ] {
+            assert!(
+                matches!(
+                    classify_redshift_sdk_error(terminal.to_string()),
+                    ConnectorError::Dispatch(_)
+                ),
+                "{terminal:?} must be terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sdk_unreachable_fails_closed_through_manager() {
+        // Unreachable server through the broker path: connection
+        // failure, never access granted.
+        use broker_connectors::ConnectorManager;
+        let mut config = test_config();
+        config.endpoint = Some("http://127.0.0.1:1".to_string());
+        config.batch_size = Some(1);
+        config.timeout_ms = Some(500);
+        let transport = Arc::new(SdkRedshiftTransport::new(&config).expect("sdk transport"));
+        let sink = Arc::new(RedshiftSink::new(config, transport).expect("sink"));
+        assert_eq!(sink.kind(), "redshift");
+        let manager = ConnectorManager::new();
+        manager.register("redshift-dead", sink.clone());
+        let err = manager
+            .send(
+                "redshift-dead",
+                &Topic::new("sensors/qual").unwrap(),
+                &Bytes::from_static(br#"{"client_id":"d"}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("unreachable must fail");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "unreachable must be a connection failure, got {err:?}"
+        );
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn qual_require(name: &str) -> String {
+        qual_env(name).unwrap_or_else(|| {
+            panic!(
+                "{name} must name a real Amazon Redshift server for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. REDSHIFT_WORKGROUP=qual-wg)"
+            )
+        })
+    }
+
+    fn qual_identifier(name: &str, value: &str) -> String {
+        assert!(
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "qual {name} must match [A-Za-z0-9_]+, got {value:?} (failing closed)"
+        );
+        value.to_string()
+    }
+
+    /// Discards unmatched egress for the rule-path qualification (the
+    /// connector under test receives everything through its rule).
+    struct NullBrokerSink;
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for NullBrokerSink {
+        async fn publish(
+            &self,
+            _topic: Topic,
+            _payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+            Ok(())
+        }
+    }
+
+    fn field_to_string(field: &aws_sdk_redshiftdata::types::Field) -> String {
+        use aws_sdk_redshiftdata::types::Field;
+        match field {
+            Field::StringValue(text) => text.clone(),
+            Field::LongValue(n) => n.to_string(),
+            Field::DoubleValue(d) => d.to_string(),
+            Field::BooleanValue(b) => b.to_string(),
+            Field::IsNull(_) => String::new(),
+            _ => format!("{field:?}"),
+        }
+    }
+
+    /// Run one SQL statement through the driver and poll
+    /// `DescribeStatement` to FINISHED, returning the statement id.
+    /// `FAILED` / `ABORTED` surface the server error plus the
+    /// statement text as a terminal dispatch error.
+    async fn qual_run_sql(
+        client: &aws_sdk_redshiftdata::Client,
+        database: &str,
+        workgroup: Option<&str>,
+        cluster: Option<&str>,
+        db_user: Option<&str>,
+        sql: &str,
+        timeout: Duration,
+    ) -> String {
+        let mut builder = client
+            .execute_statement()
+            .set_database(Some(database.to_string()))
+            .set_sql(Some(sql.to_string()));
+        if let Some(cluster) = cluster {
+            builder = builder.set_cluster_identifier(Some(cluster.to_string()));
+        }
+        if let Some(workgroup) = workgroup {
+            builder = builder.set_workgroup_name(Some(workgroup.to_string()));
+        }
+        if let Some(user) = db_user {
+            builder = builder.set_db_user(Some(user.to_string()));
+        }
+        let id = tokio::time::timeout(timeout, builder.send())
+            .await
+            .expect("qual execute timed out")
+            .unwrap_or_else(|e| panic!("qual execute failed: {e:?} ({e})"))
+            .id()
+            .map(str::to_string)
+            .expect("qual execute lacks Id");
+        // Poll to a terminal state (cold Serverless workgroups resume
+        // for minutes; 300 x 2 s is a 10 min upper bound per setup
+        // statement, matching the sink's bounded polling).
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let described = tokio::time::timeout(
+                timeout,
+                client.describe_statement().set_id(Some(id.clone())).send(),
+            )
+            .await
+            .expect("qual describe timed out")
+            .unwrap_or_else(|e| panic!("qual describe failed: {e:?} ({e})"));
+            let status = described.status().map(|s| s.as_str()).unwrap_or("");
+            match status {
+                "FINISHED" => return id,
+                "FAILED" | "ABORTED" => {
+                    let server_error = described.error().unwrap_or("unknown error");
+                    let query = described.query_string().unwrap_or("");
+                    panic!("qual statement {id} {status}: {server_error} :: {query}");
+                }
+                _ => {}
+            }
+        }
+        panic!("qual statement {id} still pending after 300 polls");
+    }
+
+    /// Fetch every result row for a finished statement id,
+    /// following pagination tokens to the end.
+    async fn qual_fetch_all(
+        client: &aws_sdk_redshiftdata::Client,
+        id: &str,
+        timeout: Duration,
+    ) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let mut builder = client.get_statement_result().set_id(Some(id.to_string()));
+            if let Some(token) = next {
+                builder = builder.set_next_token(Some(token));
+            }
+            let page = tokio::time::timeout(timeout, builder.send())
+                .await
+                .expect("qual fetch timed out")
+                .unwrap_or_else(|e| panic!("qual fetch failed: {e:?} ({e})"));
+            for record in page.records() {
+                rows.push(record.iter().map(field_to_string).collect());
+            }
+            match page.next_token() {
+                Some(token) => next = Some(token.to_string()),
+                None => break,
+            }
+        }
+        rows
+    }
+
+    /// Qualification against a real Amazon Redshift Serverless
+    /// workgroup through the Redshift Data API on the maintained
+    /// `aws-sdk-redshiftdata` driver.
+    ///
+    /// Run with e.g.:
+    /// `REDSHIFT_WORKGROUP=qual-wg REDSHIFT_DATABASE=dev REDSHIFT_REGION=ap-south-1 \
+    ///  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+    ///  cargo test -p broker-connectors-enterprise --lib redshift::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates a table, streams 500 sequence-keyed rows through the
+    /// broker ([`broker_rules::RuleEngine`] dispatch into a
+    /// [`RedshiftSink`] on [`SdkRedshiftTransport`], never `sink.send`
+    /// directly) in few `BatchExecuteStatement` calls, polls each
+    /// statement to FINISHED, asserts `COUNT(*)` returns 500 with
+    /// every key present, proves a syntax error surfaces the
+    /// statement text, then drops the table it created. Panics when
+    /// its environment is missing (fail closed, never skips).
+    ///
+    /// NOTE: the task spec's `QUAL-CMD` names `-p broker-connectors`
+    /// (the pre-split crate path); the sink lives in
+    /// `broker-connectors-enterprise`, so the gates must run the
+    /// enterprise path above (a shim under `-p broker-connectors`
+    /// drives the same sink through the same rule path).
+    #[tokio::test]
+    #[ignore = "needs a real Amazon Redshift server (see REDSHIFT_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+        use std::collections::HashSet;
+
+        const ROWS: usize = 500;
+
+        let workgroup = qual_require("REDSHIFT_WORKGROUP");
+        let database = qual_require("REDSHIFT_DATABASE");
+        let region = qual_require("REDSHIFT_REGION");
+        let table = qual_identifier(
+            "table",
+            &qual_env("REDSHIFT_TABLE").unwrap_or_else(|| "qual_b338".to_string()),
+        );
+        let access_key = qual_env("AWS_ACCESS_KEY_ID").unwrap_or_else(|| {
+            panic!("AWS_ACCESS_KEY_ID must be set for qualification; failing closed")
+        });
+        let secret_key = qual_env("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|| {
+            panic!("AWS_SECRET_ACCESS_KEY must be set for qualification; failing closed")
+        });
+        let session_token = qual_env("AWS_SESSION_TOKEN");
+        // Optional database user (temporary-credential mapping); the
+        // real service needs none when the IAM identity maps directly.
+        let db_user = qual_env("REDSHIFT_DB_USER");
+        // TODO(parity): the Data API exposes no dedicated server-version
+        // call, so the report carries `SELECT version()` output plus the
+        // workgroup/region instead of a version string; is that an
+        // acceptable "server version"?
+
+        let mut config = test_config();
+        config.database = database.clone();
+        config.table_template = table.clone();
+        config.cluster_identifier = None;
+        config.workgroup_name = Some(workgroup.clone());
+        config.region = region.clone();
+        config.endpoint = None;
+        config.access_key_id = access_key;
+        config.secret_access_key = secret_key;
+        config.session_token = session_token;
+        config.db_user = db_user.clone();
+        config.sql_template = None;
+        // Few billed statements: 500 rows in 5 batches of 100.
+        config.batch_size = Some(100);
+        config.batch_bytes = Some(1_048_576);
+        config.linger_ms = Some(60_000); // explicit flushes only; keeps auto-batches exact
+        config.max_retries = Some(5);
+        config.initial_backoff_ms = Some(100);
+        config.max_backoff_ms = Some(2_500);
+        config.timeout_ms = Some(30_000);
+        config.validate().expect("qual config validates");
+
+        // Cold Serverless workgroups resume for minutes: the
+        // per-batch poll bound is generous (5 min) so the first batch
+        // survives a resume without stalling the rule path forever.
+        let transport = Arc::new(
+            SdkRedshiftTransport::with_polling(&config, Duration::from_secs(1), 300)
+                .expect("qual transport"),
+        );
+        let client = transport.client().clone();
+        let admin_timeout = Duration::from_secs(60);
+
+        // Server version for the report (connectivity is already
+        // proved by the call below; the version string is context).
+        let version_id = qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            "SELECT version()",
+            admin_timeout,
+        )
+        .await;
+        let version_rows = qual_fetch_all(&client, &version_id, admin_timeout).await;
+        let version = version_rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or_default();
+        eprintln!("qual server: version={version} workgroup={workgroup} region={region}");
+
+        qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            &format!("DROP TABLE IF EXISTS {table}"),
+            admin_timeout,
+        )
+        .await;
+        qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            &format!(
+                "CREATE TABLE {table} (\
+                 time_ms BIGINT NOT NULL, \
+                 topic VARCHAR(256) NOT NULL, \
+                 client_id VARCHAR(256) NOT NULL, \
+                 qos INTEGER NOT NULL, \
+                 payload VARCHAR(65535) NOT NULL)"
+            ),
+            admin_timeout,
+        )
+        .await;
+        eprintln!("qual table created: {table} (BIGINT/VARCHAR/INTEGER)");
+
+        // The broker's path: a rule registered on the connector
+        // manager, messages published through the rule engine, so the
+        // qualification sends through `dispatch_ingress`, never
+        // `sink.send` directly.
+        let sink = Arc::new(RedshiftSink::new(config, transport.clone()).expect("qual sink"));
+        assert_eq!(sink.kind(), "redshift");
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine.connectors().register("qual-redshift", sink.clone());
+        engine
+            .create_rule(
+                "qual-redshift-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, seq FROM "sensors/+" INTO connector("qual-redshift")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"client_id":"qual-{seq:06}","seq":{seq}}}"#));
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), ROWS as u64, "qual sent records");
+        eprintln!("qual rows sent: records={ROWS} table={table}");
+
+        // Row count asserted back from the server, not the counters.
+        let count_id = qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            &format!("SELECT COUNT(*) FROM {table}"),
+            admin_timeout,
+        )
+        .await;
+        let count_rows = qual_fetch_all(&client, &count_id, admin_timeout).await;
+        let count: i64 = count_rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.parse().ok())
+            .expect("qual count value");
+        assert_eq!(count, ROWS as i64, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={table}");
+
+        // Every key asserted back from the server (at-least-once
+        // permits duplicates, never loss).
+        let keys_id = qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            &format!("SELECT client_id FROM {table}"),
+            admin_timeout,
+        )
+        .await;
+        let key_rows = qual_fetch_all(&client, &keys_id, admin_timeout).await;
+        let seen: HashSet<String> = key_rows
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect();
+        assert_eq!(seen.len(), ROWS, "qual distinct keys mismatch");
+        for seq in 0..ROWS {
+            let key = format!("qual-{seq:06}");
+            assert!(seen.contains(&key), "qual missing key {key}");
+        }
+        eprintln!("qual keys asserted: keys={ROWS} table={table}");
+
+        // A syntax error surfaces the statement text (terminal
+        // dispatch, never a silent drop).
+        let probe = "THIS IS NOT VALID SQL __qual_syntax_probe__";
+        let bad_request = RedshiftBatchRequest {
+            database: database.clone(),
+            cluster_identifier: None,
+            workgroup_name: Some(workgroup.clone()),
+            db_user: db_user.clone(),
+            statements: vec![probe.to_string()],
+        };
+        let err = transport
+            .execute_batch(&bad_request)
+            .await
+            .expect_err("syntax error must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "syntax error must be terminal, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("__qual_syntax_probe__"),
+            "syntax error must surface the statement text, got {err:?}"
+        );
+        eprintln!("qual syntax asserted: statement text surfaces ({err})");
+
+        // Cleanup the table we created.
+        qual_run_sql(
+            &client,
+            &database,
+            Some(&workgroup),
+            None,
+            db_user.as_deref(),
+            &format!("DROP TABLE IF EXISTS {table}"),
+            admin_timeout,
+        )
+        .await;
+        eprintln!("qual cleanup: dropped table {table}");
     }
 }

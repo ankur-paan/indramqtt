@@ -59,8 +59,12 @@ connclose_opcode_round_trip_test() ->
     ?assertEqual(<<>>, GotMeta),
     ?assertEqual(<<>>, GotPayload),
     ?assertEqual({ok, #{}}, indra_brokerlink:decode_connclose_meta(GotMeta)),
+    %% X1-03: one reason byte is a v5 close reason (the edge sends
+    %% DISCONNECT first); two bytes stay malformed.
+    ?assertEqual({ok, #{reason_code => $x}},
+                 indra_brokerlink:decode_connclose_meta(<<"x">>)),
     ?assertEqual({error, malformed_connclose_meta},
-                 indra_brokerlink:decode_connclose_meta(<<"x">>)).
+                 indra_brokerlink:decode_connclose_meta(<<"xy">>)).
 
 %%====================================================================
 %% Helpers

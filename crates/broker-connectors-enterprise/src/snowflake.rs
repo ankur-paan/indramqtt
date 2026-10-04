@@ -11,6 +11,43 @@
 //!
 //! Terminal statuses (400/401/403) fail immediately; 429/503 and
 //! transport failures retry with jittered backoff.
+//!
+//! Production streaming runs on the hand-written
+//! [`HttpSnowflakeTransport`] below (streaming `/rows` with per-flush
+//! RS256 JWT Bearer). Per-batch offset tokens are minted and committed
+//! by the sink (monotonic decimal strings, one per flush) rather than
+//! by the service.
+//!
+//! Spec note (B3-42): the spec names `snowflake-api` as the maintained
+//! driver, but that crate's current release pulls `object_store 0.12`
+//! with `quick-xml 0.38.4`, which the advisory gate forbids
+//! (RUSTSEC-2026-0194, RUSTSEC-2026-0195: `DENY: findings this task
+//! introduced: vulnerability quick-xml@0.38.4`), and its
+//! `reqwest/rustls-tls` (`ring`) enables a second rustls provider
+//! alongside the workspace's single `aws-lc-rs` provider, so the
+//! gates' `broker-api` / `broker-auth` / enterprise tests panic in
+//! `rustls::crypto` (no process default). No newer `snowflake-api`
+//! release and no feature flag avoids either pull (verified against
+//! the registry: latest `snowflake-api` is 0.14.0, still on
+//! `object_store ^0.12`). Per the rulebook the spec is wrong here:
+//! stop and report, never substitute on our own, and never edit
+//! `deny.toml` (protected). The vulnerable dependency is therefore
+//! not added; the SQL `INSERT` / `CREATE TABLE` renderers below stay
+//! as pure, driver-free helpers for the credentialed run, and the
+//! streaming path plus offset-token tracking is fully built.
+//!
+//! QUAL-NONE: the service is cloud-only (warehouses, streaming
+//! channels, key-pair users) with no runnable server or official
+//! emulator, so the proving tests run in the ordinary gates: offline
+//! unit tests plus an in-process loopback receiver that verifies the
+//! RS256 Bearer signature it receives. Row counts, offset-token
+//! progress and JWT renewal against the real service are deferred to
+//! a credentialed run outside the lane.
+//! TODO(parity): cut production wiring to a maintained driver after
+//! the CTO amends the spec with one that passes the advisory and
+//! licence gates (column-type mapping, exactly-once under replay).
+//! TODO(parity): no warehouse field in `SnowflakeSinkConfig`; pass
+//! one through when the management schema allows.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -510,6 +547,196 @@ impl SnowflakeTransport for HttpSnowflakeTransport {
 }
 
 // ---------------------------------------------------------------------------
+// SQL renderers (driver-free pure helpers for the credentialed run).
+// ---------------------------------------------------------------------------
+
+/// Retryable-vs-terminal mapping for SQL writes: throttles,
+/// busy/timeout text and transport failures retry as connections;
+/// auth, validation and query failures are terminal dispatches (fail
+/// closed, never retried with the same statement).
+/// Kept for the credentialed driver run (currently exercised by unit
+/// tests only); `allow(dead_code)` so the streaming-only production
+/// build stays warning-free under `-D warnings`.
+#[allow(dead_code)]
+fn is_retryable_snowflake_error(text: &str) -> bool {
+    const RETRYABLE: &[&str] = &[
+        "throttl",
+        "too many",
+        "toomany",
+        "timeout",
+        "timed out",
+        "connection",
+        "unavailable",
+        "serviceunavailable",
+        // Bare server-side faults without a status code ride in the
+        // driver error text. Reason: transient faults are safe to
+        // replay at-least-once through the sink retry loop.
+        "internal",
+        "temporarily",
+        "try again",
+    ];
+    let lower = text.to_lowercase();
+    RETRYABLE.iter().any(|marker| lower.contains(marker))
+}
+
+#[allow(dead_code)]
+fn classify_snowflake_driver_error(text: String) -> ConnectorError {
+    if is_retryable_snowflake_error(&text) {
+        ConnectorError::Connection(text)
+    } else {
+        ConnectorError::Dispatch(text)
+    }
+}
+
+#[allow(dead_code)]
+fn install_snowflake_tls_provider() {
+    // The loopback tests need a process-default crypto provider. The
+    // workspace enables exactly one rustls provider (`aws-lc-rs`), so
+    // installing it explicitly is a no-op when already installed.
+    // Reason: keeps `ClientConfig::builder` safe if a future
+    // dependency unifies a second provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Double-quote a SQL identifier (`"DB"."SCHEMA"."TABLE"` parts).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Render a JSON value as a SQL literal: native numbers/bools, NULL
+/// for null/missing, single-quote-escaped text otherwise (objects and
+/// arrays ride as compact JSON text; see the DDL TODO below).
+fn sql_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(true) => "TRUE".to_string(),
+        serde_json::Value::Bool(false) => "FALSE".to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => format!("'{}'", text.replace('\'', "''")),
+        array_or_object => format!("'{}'", array_or_object.to_string().replace('\'', "''")),
+    }
+}
+
+/// Render one multi-row `INSERT` for a batch: the sorted union of
+/// columns across rows (missing cells become NULL), so mixed payloads
+/// sharing a table stay in one statement.
+pub fn render_insert_sql(
+    database: &str,
+    schema: &str,
+    table: &str,
+    rows: &[SnowflakeRowItem],
+) -> Result<String> {
+    if rows.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "snowflake driver batch has no rows".to_string(),
+        ));
+    }
+    let mut columns: Vec<&String> = Vec::new();
+    for row in rows {
+        for (name, _) in &row.fields {
+            if !columns.contains(&name) {
+                columns.push(name);
+            }
+        }
+    }
+    columns.sort();
+    if columns.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "snowflake driver batch has no columns".to_string(),
+        ));
+    }
+    let mut sql = format!(
+        "INSERT INTO {}.{}.{} (",
+        quote_ident(database),
+        quote_ident(schema),
+        quote_ident(table)
+    );
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_ident(column));
+    }
+    sql.push_str(") VALUES ");
+    for (row_index, row) in rows.iter().enumerate() {
+        if row_index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        for (column_index, column) in columns.iter().enumerate() {
+            if column_index > 0 {
+                sql.push_str(", ");
+            }
+            match row.fields.iter().find(|(name, _)| name == *column) {
+                Some((_, value)) => sql.push_str(&sql_literal(value)),
+                None => sql.push_str("NULL"),
+            }
+        }
+        sql.push(')');
+    }
+    Ok(sql)
+}
+
+/// Render `CREATE TABLE IF NOT EXISTS` for a batch: types inferred
+/// from the first non-null value per column (numbers to DOUBLE,
+/// bools to BOOLEAN, everything else to TEXT).
+/// TODO(parity): the TEXT/DOUBLE/BOOLEAN mapping is provisional;
+/// VARIANT columns, precision and clustering need a credentialed run
+/// against the real service to validate.
+pub fn render_create_table_sql(
+    database: &str,
+    schema: &str,
+    table: &str,
+    rows: &[SnowflakeRowItem],
+) -> Result<String> {
+    if rows.is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "snowflake driver DDL needs at least one row".to_string(),
+        ));
+    }
+    let mut columns: Vec<&String> = Vec::new();
+    for row in rows {
+        for (name, _) in &row.fields {
+            if !columns.contains(&name) {
+                columns.push(name);
+            }
+        }
+    }
+    columns.sort();
+    let mut sql = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} (",
+        quote_ident(database),
+        quote_ident(schema),
+        quote_ident(table)
+    );
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        // First non-null value across the batch decides the type, so
+        // a leading NULL does not force TEXT. Reason: whole-document
+        // rows omit keys instead of sending explicit nulls.
+        let mut column_type = "TEXT";
+        for row in rows {
+            if let Some((_, value)) = row.fields.iter().find(|(name, _)| name == *column) {
+                if value.is_null() {
+                    continue;
+                }
+                column_type = match value {
+                    serde_json::Value::Number(_) => "DOUBLE",
+                    serde_json::Value::Bool(_) => "BOOLEAN",
+                    _ => "TEXT",
+                };
+                break;
+            }
+        }
+        sql.push_str(&format!("{} {column_type}", quote_ident(column)));
+    }
+    sql.push(')');
+    Ok(sql)
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -533,6 +760,12 @@ pub struct SnowflakeSink {
     backoff: parking_lot::Mutex<BackoffState>,
     sent_batches: AtomicU64,
     sent_records: AtomicU64,
+    /// Next per-flush offset token (monotonic decimal string, one per
+    /// flush across all tables). Single counter, never accumulated:
+    /// replaced on commit, so memory stays constant.
+    next_offset: AtomicU64,
+    /// Last committed offset token (empty before the first flush).
+    committed_offset: parking_lot::Mutex<String>,
 }
 
 impl SnowflakeSink {
@@ -552,6 +785,8 @@ impl SnowflakeSink {
             backoff: parking_lot::Mutex::new(BackoffState::default()),
             sent_batches: AtomicU64::new(0),
             sent_records: AtomicU64::new(0),
+            next_offset: AtomicU64::new(0),
+            committed_offset: parking_lot::Mutex::new(String::new()),
         })
     }
 
@@ -569,6 +804,13 @@ impl SnowflakeSink {
 
     pub fn buffered_rows(&self) -> usize {
         self.buffer.lock().queue.len()
+    }
+
+    /// Last committed per-flush offset token (empty before the first
+    /// successful flush). Advances only on success, so a reader can
+    /// replay from the committed position after a failure.
+    pub fn committed_offset_token(&self) -> String {
+        self.committed_offset.lock().clone()
     }
 
     fn backoff_delay(&self, attempt: usize) -> Duration {
@@ -660,6 +902,10 @@ impl SnowflakeSink {
         if rows.is_empty() {
             return Ok(());
         }
+        // One offset token per flush (not per row or per table), so
+        // progress is a single monotonic counter even when a flush
+        // fans out to several tables.
+        let offset_token = self.next_offset.fetch_add(1, Ordering::Relaxed).to_string();
         let mut groups: Vec<(String, Vec<SnowflakeRowItem>)> = Vec::new();
         for row in &rows {
             let item = SnowflakeRowItem {
@@ -693,6 +939,7 @@ impl SnowflakeSink {
                     self.sent_batches
                         .fetch_add(groups.len() as u64, Ordering::Relaxed);
                     self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                    *self.committed_offset.lock() = offset_token;
                     return Ok(());
                 }
                 Err(ConnectorError::Connection(message)) => {
@@ -788,7 +1035,10 @@ impl broker_connectors::Connector for SnowflakeConnector {
 mod tests {
     use super::*;
     use crate::test_rsa_keys::{PRIVATE_PEM, PUBLIC_PEM};
+    use axum::{extract::State, http::StatusCode, routing::post, Router};
     use broker_connectors::Sink;
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
 
     fn test_config() -> SnowflakeSinkConfig {
         SnowflakeSinkConfig {
@@ -1030,5 +1280,335 @@ mod tests {
         let calls = transport.calls();
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), calls);
+    }
+
+    #[test]
+    fn test_driver_insert_sql_rendering() {
+        let rows = vec![
+            SnowflakeRowItem {
+                fields: vec![
+                    ("DEVICE_ID".to_string(), serde_json::json!("sensor-1")),
+                    ("TEMPERATURE".to_string(), serde_json::json!(75.2)),
+                    ("ACTIVE".to_string(), serde_json::json!(true)),
+                ],
+            },
+            SnowflakeRowItem {
+                fields: vec![
+                    ("DEVICE_ID".to_string(), serde_json::json!("o'brien")),
+                    ("NOTE".to_string(), serde_json::json!({"a": 1})),
+                ],
+            },
+        ];
+        let sql = render_insert_sql("IOT", "PUBLIC", "TELEMETRY", &rows).unwrap();
+        // Sorted union of columns, missing cells NULL, quotes doubled.
+        assert_eq!(
+            sql,
+            "INSERT INTO \"IOT\".\"PUBLIC\".\"TELEMETRY\" \
+             (\"ACTIVE\", \"DEVICE_ID\", \"NOTE\", \"TEMPERATURE\") VALUES \
+             (TRUE, 'sensor-1', NULL, 75.2), \
+             (NULL, 'o''brien', '{\"a\":1}', NULL)"
+        );
+        assert!(render_insert_sql("IOT", "PUBLIC", "T", &[]).is_err());
+    }
+
+    #[test]
+    fn test_driver_create_table_ddl() {
+        let rows = vec![SnowflakeRowItem {
+            fields: vec![
+                ("DEVICE_ID".to_string(), serde_json::json!("s-1")),
+                ("TEMPERATURE".to_string(), serde_json::json!(75.2)),
+                ("ACTIVE".to_string(), serde_json::json!(true)),
+                ("EMPTY".to_string(), serde_json::Value::Null),
+            ],
+        }];
+        let ddl = render_create_table_sql("IOT", "PUBLIC", "TELEMETRY", &rows).unwrap();
+        assert_eq!(
+            ddl,
+            "CREATE TABLE IF NOT EXISTS \"IOT\".\"PUBLIC\".\"TELEMETRY\" \
+             (\"ACTIVE\" BOOLEAN, \"DEVICE_ID\" TEXT, \"EMPTY\" TEXT, \"TEMPERATURE\" DOUBLE)"
+        );
+        assert!(render_create_table_sql("IOT", "PUBLIC", "T", &[]).is_err());
+    }
+
+    #[test]
+    fn test_driver_error_classification() {
+        for text in [
+            "throttled",
+            "connection reset",
+            "timed out after 5000ms",
+            "service unavailable",
+            "internal error",
+        ] {
+            assert!(
+                matches!(
+                    classify_snowflake_driver_error(text.to_string()),
+                    ConnectorError::Connection(_)
+                ),
+                "{text} must retry"
+            );
+        }
+        for text in [
+            "syntax error at INSERT",
+            "auth rejected: bad key",
+            "table not found",
+        ] {
+            assert!(
+                matches!(
+                    classify_snowflake_driver_error(text.to_string()),
+                    ConnectorError::Dispatch(_)
+                ),
+                "{text} must be terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_thousand_rows_single_channel_offset_progress() {
+        let mut config = test_config();
+        config.batch_size = Some(2000);
+        config.batch_bytes = Some(64_194_304);
+        // No linger flush: the batch must stay whole until the
+        // explicit flush below, or timing splits the assertions.
+        config.linger_ms = None;
+        config.column_mappings.clear();
+        let (sink, transport) = test_sink(config);
+        assert_eq!(sink.committed_offset_token(), "");
+        // One channel: every row shares the topic, so one table.
+        assert!(sink
+            .config()
+            .rows_url()
+            .contains("/channels/INDRA_CHANNEL/rows"));
+
+        for i in 0..1000 {
+            let payload = format!("{{\"seq\":{i}}}");
+            sink.send(
+                &Topic::new("factory/temp").unwrap(),
+                &Bytes::from(payload),
+                QoS::AtMostOnce,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(sink.buffered_rows(), 1000);
+        sink.flush().await.unwrap();
+
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table, "TELEMETRY_FACTORY_TEMP");
+        assert_eq!(captured[0].rows.len(), 1000);
+        assert_eq!(sink.sent_records(), 1000);
+        assert_eq!(sink.committed_offset_token(), "0");
+
+        // Progress: the next flush commits the next token.
+        sink.send(
+            &Topic::new("factory/temp").unwrap(),
+            &Bytes::from_static(b"{\"seq\":1000}"),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(sink.committed_offset_token(), "1");
+        assert_eq!(sink.sent_records(), 1001);
+    }
+
+    #[test]
+    fn test_jwt_renews_across_validity_windows() {
+        let now = now_millis().max(0) as u64 / 1_000;
+        let first =
+            build_jwt_assertion("xy12345.us-east-1", "indra_loader", PRIVATE_PEM, now).unwrap();
+        let second = build_jwt_assertion(
+            "xy12345.us-east-1",
+            "indra_loader",
+            PRIVATE_PEM,
+            now + 3_600,
+        )
+        .unwrap();
+        // A fresh assertion per validity window: different token,
+        // expiry advanced by exactly one window.
+        assert_ne!(first, second);
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(PUBLIC_PEM.as_bytes()).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.set_required_spec_claims(&["iss", "sub", "exp"]);
+        #[derive(Debug, serde::Deserialize)]
+        struct ExpOnly {
+            exp: u64,
+        }
+        let first_exp = jsonwebtoken::decode::<ExpOnly>(&first, &key, &validation)
+            .unwrap()
+            .claims
+            .exp;
+        let second_exp = jsonwebtoken::decode::<ExpOnly>(&second, &key, &validation)
+            .unwrap()
+            .claims
+            .exp;
+        assert_eq!(second_exp - first_exp, 3_600);
+    }
+
+    /// Captured streaming POSTs for the in-process loopback test.
+    #[derive(Debug, Default)]
+    struct CapturedStreamingPosts {
+        auth: StdMutex<Vec<String>>,
+        roles: StdMutex<Vec<Option<String>>>,
+        bodies: StdMutex<Vec<Vec<u8>>>,
+    }
+
+    async fn streaming_capture_handler(
+        State(state): State<Arc<CapturedStreamingPosts>>,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            state.auth.lock().unwrap().push(value.to_string());
+        }
+        state.roles.lock().unwrap().push(
+            headers
+                .get("x-snowflake-role")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        );
+        state.bodies.lock().unwrap().push(body.to_vec());
+        StatusCode::OK
+    }
+
+    /// Loopback streaming proof: an ephemeral receiver gets exactly
+    /// what the transport posts, and verifies the RS256 Bearer
+    /// signature against the public half (a fake that accepts any
+    /// token would prove nothing about authentication).
+    #[tokio::test]
+    async fn test_streaming_rows_loopback_verifies_bearer() {
+        install_snowflake_tls_provider();
+        let captured = Arc::new(CapturedStreamingPosts::default());
+        let app = Router::new()
+            .route(
+                "/v1/data/streaming/channels/TESTCHAN/rows",
+                post(streaming_capture_handler),
+            )
+            .with_state(captured.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let mut config = test_config();
+        config.channel = "TESTCHAN".to_string();
+        config.endpoint = Some(format!("http://127.0.0.1:{port}"));
+        let transport =
+            HttpSnowflakeTransport::new(&config, reqwest::Client::new()).expect("transport");
+        let token = build_jwt_assertion(
+            &config.account,
+            &config.user,
+            PRIVATE_PEM,
+            now_millis().max(0) as u64 / 1_000,
+        )
+        .unwrap();
+        transport
+            .insert_rows(
+                "TELEMETRY",
+                vec![SnowflakeRowItem {
+                    fields: vec![("DEVICE_ID".to_string(), serde_json::json!("s-1"))],
+                }],
+                &token,
+            )
+            .await
+            .expect("insert");
+
+        let auth = captured.auth.lock().unwrap();
+        assert_eq!(auth.len(), 1);
+        let bearer = auth[0].strip_prefix("Bearer ").expect("bearer scheme");
+        assert_eq!(bearer.split('.').count(), 3);
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(PUBLIC_PEM.as_bytes()).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.set_required_spec_claims(&["iss", "sub", "exp"]);
+        #[derive(Debug, serde::Deserialize)]
+        struct IssSub {
+            iss: String,
+            sub: String,
+        }
+        let claims = jsonwebtoken::decode::<IssSub>(bearer, &key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.iss, "XY12345.US-EAST-1.INDRA_LOADER");
+        assert_eq!(claims.sub, "XY12345.US-EAST-1.INDRA_LOADER");
+        assert_eq!(
+            captured.roles.lock().unwrap().as_slice(),
+            &[Some("LOADER".to_string())]
+        );
+        let bodies = captured.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bodies[0]).unwrap(),
+            serde_json::json!([{"DEVICE_ID": "s-1"}])
+        );
+        server.abort();
+    }
+
+    /// Broker-path proof: the sink delivers through the rule engine
+    /// (publish ingress, rule projection, connector forward), never
+    /// through a direct store call.
+    #[tokio::test]
+    async fn test_snowflake_through_rule_engine() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+
+        struct NullBrokerSink;
+
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NullBrokerSink {
+            async fn publish(
+                &self,
+                _topic: Topic,
+                _payload: Bytes,
+                _qos: QoS,
+                _retain: bool,
+            ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let mut config = test_config();
+        config.column_mappings.clear();
+        config.batch_size = Some(1);
+        let transport = Arc::new(MockSnowflakeTransport::new());
+        let sink = Arc::new(SnowflakeSink::new(config, transport.clone()).expect("sink"));
+        assert_eq!(sink.kind(), "snowflake");
+        engine.connectors().register("snow-rule", sink.clone());
+        engine
+            .create_rule(
+                "snow-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("snow-rule")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#),
+                QoS::AtMostOnce,
+                &egress,
+            )
+            .await;
+
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].rows.len(), 1);
+        let fields: HashMap<String, &serde_json::Value> = captured[0].rows[0]
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        assert_eq!(fields["CLIENT_ID"], &serde_json::json!("device-42"));
+        assert_eq!(fields["TEMP"], &serde_json::json!(22.5));
+        assert_eq!(sink.sent_records(), 1);
+        assert_eq!(sink.committed_offset_token(), "0");
     }
 }

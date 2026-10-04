@@ -65,11 +65,13 @@
 %% no alias). An empty topic is accepted only with a nonzero alias
 %% (alias-by-reference).
 -export([encode_subscribe_meta/3,
+         encode_subscribe_meta_v5/4,
          decode_subscribe_meta/1,
          encode_suback_meta/2,
          decode_suback_meta/1,
          encode_publish_meta/5,
          encode_publish_meta/6,
+         encode_publish_meta_v5/7,
          decode_publish_meta/1,
          encode_puback_meta/2,
          decode_puback_meta/1,
@@ -81,9 +83,13 @@
          encode_pubcomp_meta/1,
          decode_pubcomp_meta/1,
           encode_unbind_meta/1,
+          encode_unbind_meta/2,
           decode_unbind_meta/1,
           encode_disconnect_meta/1,
           decode_disconnect_meta/1]).
+-define(MAX_SUB_ID, 268435455).
+-define(MAX_V5_META_USERS, 16).
+-define(MAX_V5_META_STRING, 1024).
 
 %% BrokerLink metadata contract (egress stage 1: edge -> kernel Credit).
 %% Snapshot layout `UsedFrames:32be | UsedBytes:32be' (mirrored by the
@@ -1589,15 +1595,21 @@ decode_session_present(_, _, _, _) ->
 
 -type subscribe_meta() :: #{packet_id := 1..65535,
                             client_id := binary(),
-                            subscriptions := [{binary(), 0..2}]}.
+                            subscriptions := [{binary(), 0..255}],
+                            sub_id => 0..268435455,
+                            sub_ids => [0..268435455]}.
 -type suback_meta() :: #{packet_id := 1..65535,
-                         codes := [0..2 | 16#80]}.
+                         codes := [0..255]}.
 -type publish_meta() :: #{topic := binary(),
                           packet_id := 0..65535,
                           qos := 0..2,
                           retain := boolean(),
                           dup := boolean(),
-                          alias := 0..65535}.
+                          alias := 0..65535,
+                          sub_id => 0..4294967295,
+                          format => 0..1,
+                          expiry => 0..4294967295,
+                          users => [{binary(), binary()}]}.
 -type puback_meta() :: #{packet_id := 1..65535,
                          return_code := 0..255}.
 
@@ -1614,19 +1626,55 @@ encode_subscribe_meta(PacketId, ClientId, Subs)
     <<PacketId:16/big, (byte_size(ClientId)):16/big, ClientId/binary,
       (length(Subs)):16/big, SubBin/binary>>.
 
-%% @doc Decode SubscribeIn metadata.
+%% @doc Encode SubscribeIn metadata with v5 options (X1-03).
+%% `Subs' is `[{Filter, Opts}]' (raw options byte per filter, riding
+%% through even when reserved bits are set; the kernel fails only that
+%% filter) and `SubId' is the packet-wide subscription identifier (0 =
+%% absent). Version-4 callers use {@link encode_subscribe_meta/3}
+%% (byte-identical legacy form).
+-spec encode_subscribe_meta_v5(1..65535, binary(), [{binary(), 0..255}], 0..268435455) -> binary().
+encode_subscribe_meta_v5(PacketId, ClientId, Subs, SubId)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_binary(ClientId), is_list(Subs),
+       is_integer(SubId), SubId >= 0, SubId =< ?MAX_SUB_ID ->
+    ok = validate_meta_subs_v5(Subs),
+    SubBin = lists:foldl(
+        fun({Filter, Opts}, Acc) ->
+            <<Acc/binary, (byte_size(Filter)):16/big, Filter/binary,
+              Opts:8, SubId:32/big>>
+        end, <<>>, Subs),
+    <<PacketId:16/big, (byte_size(ClientId)):16/big, ClientId/binary,
+      (length(Subs)):16/big, SubBin/binary>>.
+
+%% @doc Decode SubscribeIn metadata (legacy plus X1-03 extended form).
+%% The extended form (`Filter | Opts | SubId:32be' per entry) is tried
+%% first by exact length; the legacy form (`Filter | QoS') behind. Both
+%% return `subscriptions' as `{Filter, Opts}' pairs plus `sub_id' (0 for
+%% legacy; packet-wide first id for extended — per-filter ids that
+%% differ keep the first with the remainder in `sub_ids').
 -spec decode_subscribe_meta(binary()) -> {ok, subscribe_meta()} | {error, term()}.
 decode_subscribe_meta(<<PacketId:16/big, IdLen:16/big, Rest/binary>>)
   when PacketId =/= 0 ->
     case Rest of
         <<ClientId:IdLen/binary, N:16/big, Tail/binary>> ->
-            case decode_meta_subs(Tail, N, []) of
-                {ok, Subs} ->
+            case decode_meta_subs_v5(Tail, N, []) of
+                {ok, Subs, SubId, SubIds} ->
                     {ok, #{packet_id => PacketId,
                            client_id => ClientId,
-                           subscriptions => Subs}};
-                {error, _} = Err ->
-                    Err
+                           subscriptions => Subs,
+                           sub_id => SubId,
+                           sub_ids => SubIds}};
+                {error, _} ->
+                    case decode_meta_subs(Tail, N, []) of
+                        {ok, Subs} ->
+                            {ok, #{packet_id => PacketId,
+                                   client_id => ClientId,
+                                   subscriptions => Subs,
+                                   sub_id => 0,
+                                   sub_ids => []}};
+                        {error, _} = Err ->
+                            Err
+                    end
             end;
         _ ->
             {error, malformed_subscribe_meta}
@@ -1684,9 +1732,53 @@ encode_publish_meta(Topic, PacketId, QoS, Retain, Dup, Alias)
     <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8,
       Alias:16/big>>.
 
+%% @doc Encode PublishMeta with v5 user properties (X1-03 inbound
+%% forward). `Props' carries `format' (0|1), `expiry' (u32) and
+%% `users' ([{Key, Value}], bounded). The base alias section rides as in
+%% {@link encode_publish_meta/6}; the v5 section appends
+%% `Format:8 | Expiry:32be | UserCount:16be | pairs'. Version-4 callers
+%% use /5 or /6 (byte-identical legacy forms).
+-spec encode_publish_meta_v5(binary(), 0..65535, 0..2, boolean(), boolean(),
+                             0..65535, map()) -> binary().
+encode_publish_meta_v5(Topic, PacketId, QoS, Retain, Dup, Alias, Props)
+  when is_binary(Topic),
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup),
+       is_integer(Alias), Alias >= 0, Alias =< 65535, is_map(Props) ->
+    true = (byte_size(Topic) >= 1 orelse Alias =/= 0) orelse erlang:error(badarg),
+    R = case Retain of true -> 1; false -> 0 end,
+    D = case Dup of true -> 1; false -> 0 end,
+    Format = maps:get(format, Props, 0),
+    Expiry = maps:get(expiry, Props, 0),
+    Users = maps:get(users, Props, []),
+    true = (Format =:= 0 orelse Format =:= 1) orelse erlang:error(badarg),
+    true = (is_integer(Expiry) andalso Expiry >= 0 andalso Expiry =< 16#FFFFFFFF)
+        orelse erlang:error(badarg),
+    UsersBin = encode_meta_users(Users),
+    <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8,
+      Alias:16/big, Format:8, Expiry:32/big,
+      (length(Users)):16/big, UsersBin/binary>>.
+
+%% @private Encode bounded user-property pairs for the v5 publish section.
+encode_meta_users([]) -> <<>>;
+encode_meta_users(Users) when is_list(Users) ->
+    true = (length(Users) =< ?MAX_V5_META_USERS) orelse erlang:error(badarg),
+    lists:foldl(
+      fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                             byte_size(K) >= 1,
+                             byte_size(K) =< ?MAX_V5_META_STRING,
+                             byte_size(V) =< ?MAX_V5_META_STRING ->
+              <<Acc/binary, (byte_size(K)):16/big, K/binary,
+                (byte_size(V)):16/big, V/binary>>;
+         (_, _) -> erlang:error(badarg)
+      end, <<>>, Users).
+
 %% @doc Decode PublishMeta (pre-alias form decodes with alias 0, B4-05
-%% form carries the trailing alias; an empty topic is accepted only with
-%% a nonzero alias).
+%% form carries the trailing alias, X1-03 forms append `SubId:32be'
+%% and/or the v5 user section, and the forwarded form carries both
+%% (`SubId:32be | Format:8 | Expiry:32be | users'); an empty topic is
+%% accepted only with a nonzero alias).
 -spec decode_publish_meta(binary()) -> {ok, publish_meta()} | {error, term()}.
 decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) ->
     case Rest of
@@ -1699,7 +1791,11 @@ decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) ->
                    qos => QoS,
                    retain => R =:= 1,
                    dup => D =:= 1,
-                   alias => 0}};
+                   alias => 0,
+                   sub_id => 0,
+                   format => 0,
+                   expiry => 0,
+                   users => []}};
         <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8, Alias:16/big>>
           when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
                (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
@@ -1709,11 +1805,95 @@ decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) ->
                    qos => QoS,
                    retain => R =:= 1,
                    dup => D =:= 1,
-                   alias => Alias}};
+                   alias => Alias,
+                   sub_id => 0,
+                   format => 0,
+                   expiry => 0,
+                   users => []}};
+        <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8,
+          Alias:16/big, SubId:32/big>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
+               (TopicLen > 0 orelse Alias =/= 0) ->
+            {ok, #{topic => Topic,
+                   packet_id => PacketId,
+                   qos => QoS,
+                   retain => R =:= 1,
+                   dup => D =:= 1,
+                   alias => Alias,
+                   sub_id => SubId,
+                   format => 0,
+                   expiry => 0,
+                   users => []}};
+        <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8,
+          Alias:16/big, SubId:32/big, Format:8, Expiry:32/big,
+          UserCount:16/big, Tail/binary>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
+               (TopicLen > 0 orelse Alias =/= 0),
+               (Format =:= 0 orelse Format =:= 1),
+               UserCount =< ?MAX_V5_META_USERS ->
+            case decode_meta_users(Tail, UserCount, []) of
+                {ok, Users, <<>>} ->
+                    {ok, #{topic => Topic,
+                           packet_id => PacketId,
+                           qos => QoS,
+                           retain => R =:= 1,
+                           dup => D =:= 1,
+                           alias => Alias,
+                           sub_id => SubId,
+                           format => Format,
+                           expiry => Expiry,
+                           users => Users}};
+                _ ->
+                    {error, malformed_publish_meta}
+            end;
+        <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8,
+          Alias:16/big, Format:8, Expiry:32/big, UserCount:16/big, Tail/binary>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
+               (TopicLen > 0 orelse Alias =/= 0),
+               (Format =:= 0 orelse Format =:= 1),
+               UserCount =< ?MAX_V5_META_USERS ->
+            case decode_meta_users(Tail, UserCount, []) of
+                {ok, Users, <<>>} ->
+                    {ok, #{topic => Topic,
+                           packet_id => PacketId,
+                           qos => QoS,
+                           retain => R =:= 1,
+                           dup => D =:= 1,
+                           alias => Alias,
+                           sub_id => 0,
+                           format => Format,
+                           expiry => Expiry,
+                           users => Users}};
+                _ ->
+                    {error, malformed_publish_meta}
+            end;
         _ ->
             {error, malformed_publish_meta}
     end;
 decode_publish_meta(_) ->
+    {error, malformed_publish_meta}.
+
+%% @private Decode bounded user pairs, returning pairs plus tail.
+decode_meta_users(Tail, 0, Acc) ->
+    {ok, lists:reverse(Acc), Tail};
+decode_meta_users(<<KLen:16/big, Rest/binary>>, N, Acc)
+  when N > 0, KLen >= 1, KLen =< ?MAX_V5_META_STRING ->
+    case Rest of
+        <<K:KLen/binary, VLen:16/big, Rest1/binary>>
+          when VLen =< ?MAX_V5_META_STRING ->
+            case Rest1 of
+                <<V:VLen/binary, Tail/binary>> ->
+                    decode_meta_users(Tail, N - 1, [{K, V} | Acc]);
+                _ ->
+                    {error, malformed_publish_meta}
+            end;
+        _ ->
+            {error, malformed_publish_meta}
+    end;
+decode_meta_users(_, _, _) ->
     {error, malformed_publish_meta}.
 
 %% @doc Encode PubAckOut metadata.
@@ -1790,12 +1970,22 @@ decode_pubcomp_meta(_) ->
 encode_unbind_meta(ClientId) when is_binary(ClientId) ->
     <<(byte_size(ClientId)):16/big, ClientId/binary>>.
 
-%% @doc Decode UnbindConnection metadata.
--spec decode_unbind_meta(binary()) -> {ok, #{client_id := binary()}} | {error, term()}.
+%% @doc Encode UnbindConnection metadata with a v5 DISCONNECT reason
+%% (X1-03): `IdLen | ClientId | Reason:8'. Reason 0 is normal, 16#04
+%% requests will publication; version-4 callers use /1 (byte-identical).
+-spec encode_unbind_meta(binary(), 0..255) -> binary().
+encode_unbind_meta(ClientId, Reason)
+  when is_binary(ClientId), is_integer(Reason), Reason >= 0, Reason =< 255 ->
+    <<(encode_unbind_meta(ClientId))/binary, Reason:8>>.
+
+%% @doc Decode UnbindConnection metadata (plain plus v5 reason form).
+-spec decode_unbind_meta(binary()) -> {ok, map()} | {error, term()}.
 decode_unbind_meta(<<IdLen:16/big, Rest/binary>>) ->
     case Rest of
         <<ClientId:IdLen/binary>> ->
             {ok, #{client_id => ClientId}};
+        <<ClientId:IdLen/binary, Reason:8>> ->
+            {ok, #{client_id => ClientId, reason_code => Reason}};
         _ ->
             {error, malformed_unbind_meta}
     end;
@@ -1820,10 +2010,13 @@ decode_disconnect_meta(Meta) ->
 encode_connclose_meta() ->
     <<>>.
 
-%% @doc Decode ConnClose metadata (only empty is valid).
--spec decode_connclose_meta(binary()) -> {ok, #{}} | {error, term()}.
+%% @doc Decode ConnClose metadata (empty, or one X1-03 reason byte for
+%% version-5 edges to send DISCONNECT first; version-4 closes bare).
+-spec decode_connclose_meta(binary()) -> {ok, map()} | {error, term()}.
 decode_connclose_meta(<<>>) ->
     {ok, #{}};
+decode_connclose_meta(<<Reason:8>>) ->
+    {ok, #{reason_code => Reason}};
 decode_connclose_meta(_) ->
     {error, malformed_connclose_meta}.
 
@@ -1872,6 +2065,46 @@ decode_meta_subs(<<FilterLen:16/big, Rest/binary>>, N, Acc) when FilterLen > 0, 
             {error, malformed_subscribe_meta}
     end;
 decode_meta_subs(_, _, _) ->
+    {error, malformed_subscribe_meta}.
+
+validate_meta_subs_v5([]) -> erlang:error(badarg);
+validate_meta_subs_v5(Subs) -> validate_meta_subs_v5(Subs, 0).
+
+validate_meta_subs_v5([], N) when N > 0, N =< 65535 -> ok;
+validate_meta_subs_v5([], _) -> erlang:error(badarg);
+validate_meta_subs_v5([{Filter, Opts} | Rest], N)
+  when is_binary(Filter), byte_size(Filter) > 0,
+       is_integer(Opts), Opts >= 0, Opts =< 255 ->
+    validate_meta_subs_v5(Rest, N + 1);
+validate_meta_subs_v5(_, _) -> erlang:error(badarg).
+
+%% @private Decode extended entries, returning `{ok, Subs, FirstSubId,
+%% SubIds}'. Every entry carries its own 4-byte identifier; differing
+%% ids keep the first packet-wide with the remainder in `SubIds' (the
+%% encoder always writes one packet-wide id per entry, so differing ids
+%% only arise from hand-built frames). Exact consumption or nothing.
+decode_meta_subs_v5(Rest, 0, Acc) ->
+    case Rest of
+        <<>> ->
+            Subs = lists:reverse(Acc),
+            {SubId, SubIds} = case Subs of
+                [] -> {0, []};
+                [{_, _, First} | _] ->
+                    {First, [Id || {_, _, Id} <- Subs]}
+            end,
+            {ok, [{F, O} || {F, O, _} <- Subs], SubId, SubIds};
+        _ -> {error, malformed_subscribe_meta}
+    end;
+decode_meta_subs_v5(<<FilterLen:16/big, Rest/binary>>, N, Acc)
+  when FilterLen > 0, N > 0 ->
+    case Rest of
+        <<Filter:FilterLen/binary, Opts:8, SubId:32/big, Tail/binary>>
+          when SubId =< ?MAX_SUB_ID ->
+            decode_meta_subs_v5(Tail, N - 1, [{Filter, Opts, SubId} | Acc]);
+        _ ->
+            {error, malformed_subscribe_meta}
+    end;
+decode_meta_subs_v5(_, _, _) ->
     {error, malformed_subscribe_meta}.
 
 %%=============================================================%% gen_server IPC client API

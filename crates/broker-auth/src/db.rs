@@ -2087,7 +2087,10 @@ mod tests {
 
     #[test]
     fn cache_expires_and_evicts_oldest() {
-        let mut cache = BoundedTtlCache::new(2, Duration::from_millis(50));
+        // Eviction uses a long TTL. Reason: wall-clock expiry must not
+        // race the eviction asserts when the host stalls scheduling.
+        // 60 s matches the default cache TTL order.
+        let mut cache = BoundedTtlCache::new(2, Duration::from_secs(60));
         cache.put("a".to_string(), 1u32);
         cache.put("b".to_string(), 2u32);
         assert_eq!(cache.get("a"), Some(1));
@@ -2096,9 +2099,15 @@ mod tests {
         // FIFO: `a` was inserted first, so it evicts past the bound.
         assert_eq!(cache.get("a"), None);
         assert_eq!(cache.get("b"), Some(2));
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(cache.get("b"), None, "TTL expiry must drop the entry");
-        assert!(cache.is_empty() || cache.len() <= 2);
+        // Expiry uses its own short-TTL cache. Reason: 200 ms TTL with
+        // a 500 ms sleep leaves margin for scheduler jitter on a
+        // loaded host while it keeps the test fast.
+        let mut expiring = BoundedTtlCache::new(2, Duration::from_millis(200));
+        expiring.put("k".to_string(), 7u32);
+        assert_eq!(expiring.get("k"), Some(7));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(expiring.get("k"), None, "TTL expiry must drop the entry");
+        assert!(expiring.is_empty() || expiring.len() <= 2);
     }
 
     #[tokio::test]

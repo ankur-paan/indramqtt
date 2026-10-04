@@ -18,3 +18,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 broker-connectors = { workspace = true }
+
+[features]
+# X1-09: mirrors the community `s3` gate so the S3 e2e below builds both
+# with default features (test absent) and with `--features s3` (test runs).
+default = []
+s3 = ["broker-connectors/s3"]

@@ -412,7 +412,7 @@ fn resolve_params_secrets_in_place(
 ///
 /// Removed ids are unregistered (their sinks are held in `undo` for
 /// rollback). Added ids go through the same probe-then-register path as
-/// boot (`probe_connector_reachable` + `register_live_sink`): reachable
+/// boot (`probe_connector_reachable` + `try_register_live_sink`): reachable
 /// targets get a live sink immediately; unreachable ones stay
 /// persist-only (versioned, replayed by the boot probe) and are reported
 /// in `pending_live`. Secret references in the stored params resolve at
@@ -475,8 +475,24 @@ async fn apply_connectors_live(
             pending_live.push(entry.id.clone());
             continue;
         }
-        super::v5::rules::register_live_sink(engine, &entry.connector_type, &entry.id, &params)
-            .await;
+        // A disabled Cargo feature fails closed here: the entry stays
+        // persist-only and the missing feature is logged naming it.
+        if let Err(feature_error) = super::v5::rules::try_register_live_sink(
+            engine,
+            &entry.connector_type,
+            &entry.id,
+            &params,
+        )
+        .await
+        {
+            tracing::warn!(
+                connector = %entry.id,
+                kind = %entry.connector_type,
+                "{feature_error}"
+            );
+            pending_live.push(entry.id.clone());
+            continue;
+        }
         if engine.connectors().get(&entry.id).is_some() {
             undo.added.push(entry.id.clone());
             undo.added

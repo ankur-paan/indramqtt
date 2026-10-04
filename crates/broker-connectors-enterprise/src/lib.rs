@@ -14,12 +14,27 @@
 //! keep working.
 //!
 //! Licence: `LicenseRef-Indra-Enterprise` (see `LICENSE-ENTERPRISE`).
+//!
+//! Default build (no features): every module except the X1-09 first half
+//! is compiled in. The gated kinds are absent from the build and the
+//! binary unless their Cargo feature is enabled: `aws_iot` (feature
+//! `aws_iot`), `azure_blob` (feature `azure_blob`), `azure_eventhubs`
+//! (feature `azure_eventhubs`), `azure_iot` (feature `azure_iot`),
+//! `bigquery` (feature `bigquery`), `dynamodb` (feature `dynamodb`),
+//! `gcp_iot` (feature `gcp_iot`). Unresolvable kinds under a disabled
+//! feature fail registration closed with an error naming the missing
+//! feature.
 
 pub mod alloydb;
+#[cfg(feature = "aws_iot")]
 pub mod aws_iot;
+#[cfg(feature = "azure_blob")]
 pub mod azure_blob;
+#[cfg(feature = "azure_eventhubs")]
 pub mod azure_eventhubs;
+#[cfg(feature = "azure_iot")]
 pub mod azure_iot;
+#[cfg(feature = "bigquery")]
 pub mod bigquery;
 pub mod cassandra;
 pub mod cockroachdb;
@@ -28,7 +43,9 @@ pub mod couchbase;
 pub mod databricks;
 pub mod datalayers;
 pub mod doris;
+#[cfg(feature = "dynamodb")]
 pub mod dynamodb;
+#[cfg(feature = "gcp_iot")]
 pub mod gcp_iot;
 pub mod gcp_pubsub;
 pub mod iotdb;
@@ -55,29 +72,34 @@ pub use alloydb::{
     AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
     CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport, TcpAlloydbTransport,
 };
+#[cfg(feature = "aws_iot")]
 pub use aws_iot::{
     shadow_update_document, sign_websocket_url, sigv4_signature_via_sdk, sigv4_signing_key_manual,
     sigv4_signing_key_via_sdk, AwsIotAuth, AwsIotConfig, AwsIotConnector, AwsIotFrame, AwsIotSink,
     AwsIotTransport, BridgeDirection, BridgeTopicMapping, MockAwsIotOutcome, MockAwsIotTransport,
     ShadowSyncConfig, ShadowTopics, TlsAwsIotTransport,
 };
+#[cfg(feature = "azure_blob")]
 pub use azure_blob::{
     azure_error_code, canonicalized_resource, classify_blob_status, container_string_to_sign,
     shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AzureBlobAuth,
     AzureBlobCompression, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
     AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
 };
+#[cfg(feature = "azure_eventhubs")]
 pub use azure_eventhubs::{
     render_batch_body as render_azure_batch_body, sas_token, AzureEventHubsConnector,
     AzureEventHubsSink, AzureEventHubsSinkConfig, AzureEventHubsTransport, AzureEventItem,
     CapturedAzureBatch, HttpAzureEventHubsTransport, MockAzureEventHubsTransport, MockAzureOutcome,
 };
+#[cfg(feature = "azure_iot")]
 pub use azure_iot::{
     d2c_topic, parse_property_bag, sas_expiry, sas_token as azure_iot_sas_token, AzureIotAuth,
     AzureIotConfig, AzureIotConnectTransport, AzureIotPublish, AzureIotSink, AzureIotTransport,
     CapturedAzureIotPublish, MockAzureIotOutcome, MockAzureIotTransport, TlsAzureIotTransport,
     TwinTopics,
 };
+#[cfg(feature = "bigquery")]
 pub use bigquery::{
     classify_driver_response, classify_insert_errors, driver_insert_request,
     render_insert_body as render_bigquery_body, BigQueryConnector, BigQueryInsertResponse,
@@ -135,6 +157,7 @@ pub use doris::{
     DorisHeaders, DorisLoadResult, DorisSink, DorisSinkConfig, DorisTransport, HttpDorisTransport,
     MockDorisOutcome, MockDorisTransport,
 };
+#[cfg(feature = "dynamodb")]
 pub use dynamodb::{
     attribute_value_from_dynamodb_json, build_item_body, dynamodb_attribute,
     item_body_to_attribute_map, parse_unprocessed, render_batch_body as render_dynamodb_batch_body,
@@ -142,6 +165,7 @@ pub use dynamodb::{
     DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome,
     MockDynamoDbTransport, SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
 };
+#[cfg(feature = "gcp_iot")]
 pub use gcp_iot::{
     build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
     state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
@@ -162,7 +186,8 @@ pub use iotdb::{
 pub use kinesis::{
     HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
     KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
-    MockKinesisOutcome, MockKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
+    MockKinesisOutcome, MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE,
+    KINESIS_TARGET,
 };
 pub use mongodb::{
     decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
@@ -172,9 +197,9 @@ pub use mongodb::{
 };
 pub use mssql::{
     days_from_civil, encode_datetimeoffset, encode_executesql, obscure_password,
-    parse_reply_tokens, CapturedMssqlBatch, MockMssqlOutcome, MockMssqlTransport, MssqlAuth,
-    MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink, MssqlSinkConfig, MssqlTransport,
-    NativeMssqlTransport, TdsReply,
+    parse_reply_tokens, CapturedMssqlBatch, DriverMssqlTransport, MockMssqlOutcome,
+    MockMssqlTransport, MssqlAuth, MssqlConnector, MssqlQueryMode, MssqlRowItem, MssqlSink,
+    MssqlSinkConfig, MssqlTransport, NativeMssqlTransport, TdsReply,
 };
 pub use oci_streaming::{
     authorization_header, content_sha256_b64, failed_positions, parse_rsa_key, render_put_messages,
@@ -206,7 +231,7 @@ pub use redshift::{
     default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
     render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
     MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
-    RedshiftSink, RedshiftSinkConfig, RedshiftTransport,
+    RedshiftSink, RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
 };
 pub use rocketmq::{
     authorization_header as rocketmq_authorization,
@@ -227,14 +252,17 @@ pub use s3_tables::{
     S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
 };
 pub use snowflake::{
-    build_jwt_assertion as build_snowflake_jwt, render_rows_body as render_snowflake_rows,
+    build_jwt_assertion as build_snowflake_jwt,
+    render_create_table_sql as render_snowflake_create_table,
+    render_insert_sql as render_snowflake_insert, render_rows_body as render_snowflake_rows,
     CapturedSnowflakeInsert, HttpSnowflakeTransport, MockSnowflakeOutcome, MockSnowflakeTransport,
     SnowflakeConnector, SnowflakeRowItem, SnowflakeSink, SnowflakeSinkConfig, SnowflakeTransport,
 };
 pub use sparkplug_b::{
-    decode_metric, decode_payload, decode_varint, encode_metric, encode_payload, encode_varint,
-    payload_from_json, payload_to_json, tier, MemorySparkplugTransport, SparkplugBConnector,
-    SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
+    decode_metric, decode_payload, decode_payload_prost, decode_varint, encode_metric,
+    encode_payload, encode_payload_prost, encode_varint, payload_from_json, payload_to_json, tier,
+    MemorySparkplugTransport, ProtoMetric, ProtoPayload, RumqttcSparkplugTransport,
+    SparkplugBConnector, SparkplugBSink, SparkplugFrame, SparkplugMessageType, SparkplugSinkConfig,
     SparkplugStateMachine, SparkplugTopic, SparkplugTransport, SpbAnomaly, SpbDataType,
     SpbIngestOutcome, SpbMetric, SpbPayload, SpbValue, SPARKPLUG_TIER,
 };
@@ -249,9 +277,10 @@ pub use tablestore::{
     TablestoreTransport, BATCH_WRITE_ROW_PATH, OTS_API_VERSION,
 };
 pub use tdengine::{
-    parse_rest_response, render_insert, CapturedTdengineSql, HttpTdengineTransport,
-    MockTdengineOutcome, MockTdengineTransport, TdengineAuth, TdengineConnector, TdengineResponse,
-    TdengineRow, TdengineSink, TdengineSinkConfig, TdengineTransport,
+    parse_rest_response, render_insert, CapturedTdengineSql, DriverTdengineTransport,
+    HttpTdengineTransport, MockTdengineOutcome, MockTdengineTransport, TdengineAuth,
+    TdengineConnector, TdengineResponse, TdengineRow, TdengineSink, TdengineSinkConfig,
+    TdengineTransport,
 };
 pub use timestream::{
     render_write_records_body, HttpTimestreamTransport, MockTimestreamOutcome,
@@ -266,6 +295,7 @@ pub use timestream::{
 pub use broker_connectors::connector_tier;
 pub use broker_connectors::ConnectorError;
 pub use broker_connectors::Result;
+pub use broker_connectors::Sink;
 
 /// Test-only RSA keypair (generated with openssl, never deployed).
 /// Shared by the GCP/Snowflake/BigQuery JWT tests so the PEMs live in

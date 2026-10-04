@@ -28,6 +28,13 @@ pub const MAX_TENANT_ID_LEN: usize = 128;
 /// `tenant` scopes the entry to one tenant's topic space (MT-02): the same
 /// topic string in two tenants is two independent spaces, and the same
 /// group name in two tenants balances independently.
+/// Largest subscription identifier carried on a subscription (X1-03):
+/// 268435455, the MQTT variable-byte-integer maximum. Reason: the wire
+/// encodes the identifier as a varint, so a larger value can never arrive
+/// as a single property; 0 means absent (no identifier advertised on
+/// delivery). One `u32` per subscription, no new unbounded state.
+pub const MAX_SUBSCRIPTION_ID: u32 = 268_435_455;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub client_id: Arc<str>,
@@ -42,6 +49,20 @@ pub struct Subscription {
     /// new lock and no per-message allocation beyond the result set the
     /// path already builds.
     pub tenant: Arc<str>,
+    /// X1-03 v5 subscription options, stored alongside the filter and
+    /// consulted on the delivery event with no new lock (fields ride the
+    /// already-cloned `Subscription`). All default to the 3.1.1 behaviour
+    /// (`false`/`0`), so version-4 subscribes behave bit for bit as before.
+    /// `no_local`: never deliver a client's own publish to its own
+    /// subscription. `retain_as_published`: preserve the publish retain
+    /// bit on delivery (cleared otherwise). `retain_handling`: 0 send
+    /// retained on every subscribe, 1 send only on a new subscription, 2
+    /// never send. `subscription_id`: 0 absent, else advertised on
+    /// delivery (bounded by [`MAX_SUBSCRIPTION_ID`]).
+    pub no_local: bool,
+    pub retain_as_published: bool,
+    pub retain_handling: u8,
+    pub subscription_id: u32,
 }
 
 impl Subscription {
@@ -53,6 +74,10 @@ impl Subscription {
             qos,
             group: None,
             tenant: Arc::from(DEFAULT_TENANT_ID),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            subscription_id: 0,
         }
     }
 
@@ -69,7 +94,76 @@ impl Subscription {
             qos,
             group: Some(group.into()),
             tenant: Arc::from(DEFAULT_TENANT_ID),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            subscription_id: 0,
         }
+    }
+
+    /// Plain subscription with explicit v5 options (X1-03, subscribe
+    /// event only). Values are already validated by the caller
+    /// (`retain_handling <= 2`, `subscription_id <= MAX_SUBSCRIPTION_ID`);
+    /// out-of-range inputs fall back to the 3.1.1 defaults (fail closed,
+    /// never a stored invalid option).
+    pub fn with_options(
+        client_id: impl Into<Arc<str>>,
+        conn_id: u64,
+        qos: QoS,
+        no_local: bool,
+        retain_as_published: bool,
+        retain_handling: u8,
+        subscription_id: u32,
+    ) -> Self {
+        let mut sub = Self::new(client_id, conn_id, qos);
+        sub.no_local = no_local;
+        sub.retain_as_published = retain_as_published;
+        sub.retain_handling = if retain_handling <= 2 {
+            retain_handling
+        } else {
+            0
+        };
+        sub.subscription_id = if subscription_id <= MAX_SUBSCRIPTION_ID {
+            subscription_id
+        } else {
+            0
+        };
+        sub
+    }
+
+    /// Decode one v5 subscription-options byte into
+    /// `(qos, no_local, retain_as_published, retain_handling)`. Layout per
+    /// the specification: bits 0-1 granted QoS, bit 2 no-local, bit 3
+    /// retain-as-published, bits 4-5 retain handling, bits 6-7 reserved
+    /// (must be 0). `None` on any reserved-bit, QoS or retain-handling
+    /// violation (fail closed: the caller fails only that filter).
+    pub fn decode_options_byte(opts: u8) -> Option<(QoS, bool, bool, u8)> {
+        if opts & 0xC0 != 0 {
+            return None;
+        }
+        let qos_raw = opts & 0x03;
+        let qos = QoS::try_from(qos_raw).ok()?;
+        let nl = opts & 0x04 != 0;
+        let rap = opts & 0x08 != 0;
+        let rh = (opts & 0x30) >> 4;
+        if rh > 2 {
+            return None;
+        }
+        Some((qos, nl, rap, rh))
+    }
+
+    /// Encode one v5 subscription-options byte from its fields (inverse
+    /// of [`Subscription::decode_options_byte`]).
+    pub fn encode_options_byte(qos: QoS, no_local: bool, rap: bool, rh: u8) -> u8 {
+        let mut opts = u8::from(qos) & 0x03;
+        if no_local {
+            opts |= 0x04;
+        }
+        if rap {
+            opts |= 0x08;
+        }
+        opts |= (rh.min(2) & 0x03) << 4;
+        opts
     }
 
     /// Plain (non-shared) subscription scoped to `tenant`. Overlong ids
@@ -504,7 +598,8 @@ pub const DEFAULT_QOS0_BACKLOG: usize = 1_000;
 /// True when `frame` is a QoS 0 `PublishOut` (the only sheddable shape).
 /// Parses the `PublishOut` meta `TopicLen:16be | Topic | PacketId:16be |
 /// QoS:8 | Retain:8 | Dup:8`, optionally followed by the B4-05 alias
-/// section `Alias:16be`; anything unparseable is not QoS 0 so a
+/// section `Alias:16be` and the X1-03 subscription-identifier trailer
+/// `SubId:32be`; anything unparseable is not QoS 0 so a
 /// malformed frame can never trigger a shed of guaranteed traffic.
 pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     if frame.header.opcode != OpCode::PublishOut {
@@ -516,7 +611,14 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
     let old_len = 2 + topic_len + 5;
-    if meta.len() != old_len && meta.len() != old_len + 2 {
+    // Longer frames carry the forwarded MQTT 5 properties after the
+    // subscription identifier. They have the same fixed head, thus a
+    // QoS 0 publish with user properties is sheddable too.
+    let known_len = meta.len() == old_len
+        || meta.len() == old_len + 2
+        || meta.len() == old_len + 2 + 4
+        || meta.len() >= old_len + 2 + 4 + 7;
+    if !known_len {
         return false;
     }
     meta[2 + topic_len + 2] == 0
@@ -2617,6 +2719,63 @@ mod tests {
     }
 
     #[test]
+    fn conn_table_labels_carry_the_owning_tenant() {
+        // MT-07: connection-table labels carry the owning tenant stamped
+        // at bind; tenant-filtered queries return only the owning
+        // tenant's connections. Unlabelled connections fail closed to
+        // the default tenant, never to another tenant's scope, and
+        // `unregister` sweeps the label with the slot.
+        let table = ConnTable::default();
+        let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_c, _rx_c) = tokio::sync::mpsc::unbounded_channel();
+        table.register(501, tx_a);
+        table.register(502, tx_b);
+        table.register(503, tx_c);
+        table.set_client_label_in_tenant(501, "dup", "tenant-a");
+        table.set_client_label_in_tenant(502, "dup", "tenant-b");
+        table.set_client_label(503, "plain");
+
+        assert_eq!(
+            table.client_label_for(501).as_deref(),
+            Some("dup"),
+            "client label rides alongside the tenant label"
+        );
+        assert_eq!(table.tenant_for(501).as_deref(), Some("tenant-a"));
+        assert_eq!(table.tenant_for(502).as_deref(), Some("tenant-b"));
+        assert_eq!(
+            table.tenant_for(503).as_deref(),
+            Some(DEFAULT_TENANT_ID),
+            "unlabelled connections fail closed to the default tenant"
+        );
+        assert!(
+            table.tenant_for(9999).is_none(),
+            "unknown connections report nothing"
+        );
+        assert_eq!(table.conns_in_tenant("tenant-a"), vec![501]);
+        assert_eq!(table.conns_in_tenant("tenant-b"), vec![502]);
+        assert_eq!(table.conns_in_tenant(DEFAULT_TENANT_ID), vec![503]);
+        assert!(table.conns_in_tenant("tenant-zz").is_empty());
+
+        // Re-binds overwrite both labels together.
+        table.set_client_label_in_tenant(501, "dup", "tenant-b");
+        assert_eq!(table.tenant_for(501).as_deref(), Some("tenant-b"));
+        assert_eq!(table.conns_in_tenant("tenant-a"), Vec::<u64>::new());
+
+        // Empty and overlong tenant ids fall back to the default
+        // tenant, never to another tenant's scope.
+        table.set_tenant_label(502, "");
+        assert_eq!(table.tenant_for(502).as_deref(), Some(DEFAULT_TENANT_ID));
+        table.set_tenant_label(502, &"t".repeat(MAX_TENANT_ID_LEN + 1));
+        assert_eq!(table.tenant_for(502).as_deref(), Some(DEFAULT_TENANT_ID));
+
+        // Disconnect sweeps the label with the slot.
+        table.unregister(501);
+        assert!(table.tenant_for(501).is_none());
+        assert!(table.conns_in_tenant("tenant-b").is_empty());
+    }
+
+    #[test]
     fn route_reports_dead_mailbox_and_prunes_it() {
         let table = ConnTable::default();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2768,6 +2927,19 @@ mod tests {
         assert!(!super::is_qos0_publish_out(&BrokerFrame::ping(1, 0)));
         assert!(super::is_qos0_publish_out(&qos0_frame(1, 9)));
         assert!(!super::is_qos0_publish_out(&qos1_frame(1, 9)));
+        // A QoS 0 frame with the alias, the subscription identifier and
+        // forwarded MQTT 5 properties (format, expiry, one user pair) is
+        // sheddable too.
+        let mut meta = qos0_frame(1, 9).metadata.to_vec();
+        meta.extend_from_slice(&0u16.to_be_bytes());
+        meta.extend_from_slice(&7u32.to_be_bytes());
+        meta.push(1);
+        meta.extend_from_slice(&0u32.to_be_bytes());
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&[0, 1, b'k', 0, 1, b'v']);
+        let with_props = BrokerFrame::new(brokerlink::OpCode::PublishOut, 1, 0, meta, vec![9u8])
+            .expect("valid frame");
+        assert!(super::is_qos0_publish_out(&with_props));
     }
 
     #[test]
@@ -3122,6 +3294,19 @@ struct ConnSlot {
     /// back to the global shed counter alone when unset (tests that
     /// never bind still count every drop).
     client: RwLock<Option<Arc<str>>>,
+    /// Tenant owning this connection (MT-07). Set by
+    /// [`ConnTable::set_tenant_label`] on bind alongside the client
+    /// label, from the session record the bind hook just stamped (the
+    /// single source of truth, never re-rendered here); `unregister`
+    /// drops the whole slot so the label is swept with the connection.
+    /// Read only by management-plane tenant-filtered queries
+    /// ([`ConnTable::tenant_for`], [`ConnTable::conns_in_tenant`]); the
+    /// publish and deliver paths never touch it, so fan-out pays no new
+    /// lock and no new allocation. Stored tags are clamped to
+    /// [`MAX_TENANT_ID_LEN`]: empty or overlong ids fall back to the
+    /// default tenant (fail closed, never another tenant's), matching
+    /// [`normalize_tenant`].
+    tenant: RwLock<Option<Arc<str>>>,
     /// Per-transport wakeup for QoS 0 arrivals (D1-02). The owning edge
     /// task sets its own [`Notify`] via [`ConnTable::set_waker`] on
     /// bind; `route`/`route_qos0` signal exactly this task
@@ -3155,6 +3340,7 @@ impl ConnTable {
                 next_seq: AtomicU64::new(1),
                 qos0: Mutex::new(VecDeque::new()),
                 client: RwLock::new(None),
+                tenant: RwLock::new(None),
                 waker: RwLock::new(None),
             },
         );
@@ -3169,6 +3355,85 @@ impl ConnTable {
         if let Some(slot) = shard.get(&conn_id) {
             *slot.client.write() = Some(Arc::<str>::from(client_id));
         }
+    }
+
+    /// Remember which tenant owns `conn_id` (MT-07). Called on
+    /// bind/connect after [`ConnTable::register`] with the tenant the
+    /// kernel bind hook just stamped on the session record; re-binds
+    /// overwrite. Unknown connections are ignored. Empty or overlong
+    /// ids fall back to the default tenant (fail closed, never another
+    /// tenant's). Bind/disconnect paths only: one short shard read plus
+    /// one short slot write, and the entry dies with the slot in
+    /// `unregister`, so no sweep beyond the existing removal is needed.
+    pub fn set_tenant_label(&self, conn_id: u64, tenant: &str) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.tenant.write() = Some(normalize_tenant(tenant));
+        }
+    }
+
+    /// Remember which client in which tenant owns `conn_id` (MT-07):
+    /// exactly [`ConnTable::set_client_label`] plus
+    /// [`ConnTable::set_tenant_label`] in one shard visit. Called on
+    /// bind/connect after [`ConnTable::register`]; re-binds overwrite.
+    /// Unknown connections are ignored.
+    pub fn set_client_label_in_tenant(&self, conn_id: u64, client_id: &str, tenant: &str) {
+        let shard = self.shard(conn_id).lock();
+        if let Some(slot) = shard.get(&conn_id) {
+            *slot.client.write() = Some(Arc::<str>::from(client_id));
+            *slot.tenant.write() = Some(normalize_tenant(tenant));
+        }
+    }
+
+    /// Client id owning `conn_id`, if labelled. Management-plane hook
+    /// for tests and operators; the deliver path never calls it.
+    pub fn client_label_for(&self, conn_id: u64) -> Option<Arc<str>> {
+        let shard = self.shard(conn_id).lock();
+        shard
+            .get(&conn_id)
+            .and_then(|slot| slot.client.read().clone())
+    }
+
+    /// Tenant owning `conn_id` (MT-07): the label stamped at bind, or
+    /// the default tenant when the connection was registered but never
+    /// labelled (fail closed to the pre-tenancy scope, never another
+    /// tenant's). `None` only for unknown connections. Management-plane
+    /// hook for tests and operators; the publish and deliver paths never
+    /// call it.
+    pub fn tenant_for(&self, conn_id: u64) -> Option<Arc<str>> {
+        let shard = self.shard(conn_id).lock();
+        shard.get(&conn_id).map(|slot| {
+            slot.tenant
+                .read()
+                .clone()
+                .unwrap_or_else(|| Arc::from(DEFAULT_TENANT_ID))
+        })
+    }
+
+    /// Every live connection id labelled with `tenant` (MT-07).
+    /// Management-plane read only (tenant-filtered client listings for
+    /// the later management API): visits each bucket once and clones at
+    /// most one small integer per matching connection, so the snapshot
+    /// is bounded by the live connection count; never called on the
+    /// publish or deliver path, so fan-out pays no full scan.
+    pub fn conns_in_tenant(&self, tenant: &str) -> Vec<u64> {
+        let want = normalize_tenant(tenant);
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.lock();
+            for (conn_id, slot) in guard.iter() {
+                let held = slot
+                    .tenant
+                    .read()
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(DEFAULT_TENANT_ID));
+                if held.as_ref() == want.as_ref() {
+                    out.push(*conn_id);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Remember which edge task owns `conn_id` for directed QoS 0

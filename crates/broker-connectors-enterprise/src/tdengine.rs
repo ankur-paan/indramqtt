@@ -1,16 +1,27 @@
 //! TDengine time-series sink (INDRA-173).
 //!
-//! Buffers MQTT events as super-table rows and writes them with the
-//! REST SQL API (`POST /rest/sql/{database}`): one multi-table
-//! `INSERT INTO <sub> USING <stable> TAGS (...) VALUES (...)` statement
-//! per flush. Sub-table names, tags and metric values render from
-//! strict templates over the event (unknown variables fail loudly);
-//! identifiers are validated to `[A-Za-z0-9_]` so no template can
-//! inject SQL.
+//! Buffers MQTT events as super-table rows and writes them with
+//! `INSERT INTO <sub> USING <stable> TAGS (...) VALUES (...)`
+//! statements (one multi-table statement per flush). Sub-table names,
+//! tags and metric values render from strict templates over the event
+//! (unknown variables fail loudly); identifiers are validated to
+//! `[A-Za-z0-9_]` so no template can inject SQL.
 //!
-//! A `{"code": 0}` response is success; transport failures and HTTP
-//! 429/5xx retry with jittered backoff; other outcomes are terminal
-//! dispatch failures (syntax/table mismatches must not loop).
+//! Two transports speak the same `INSERT INTO ... USING ... TAGS ...`
+//! SQL text over the REST SQL API. [`DriverTdengineTransport`] is the
+//! production path for Basic + plaintext endpoints on the maintained
+//! `reqwest` driver (`POST /rest/sql/{database}`, Basic auth, driver
+//! owned connection setup). [`HttpTdengineTransport`] speaks the same
+//! REST SQL API and stays for token auth and TLS endpoints plus
+//! offline unit tests (see [`TdengineSinkConfig::use_driver`] for the
+//! split). The spec named the official `taos` client, but every `taos`
+//! 0.12 line pulls denied `ring` 0.16.20 and `parse_duration` 2.1.1,
+//! so the spec cannot pass the licence gate and the driver stays on
+//! `reqwest`.
+//!
+//! Transport failures and throttles retry with jittered backoff; other
+//! outcomes are terminal dispatch failures (syntax/table mismatches and
+//! auth failures must not loop).
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -72,26 +83,51 @@ impl TdengineAuth {
 }
 
 fn default_batch_size() -> Option<usize> {
+    // Reason: 500 rows keep one multi-table INSERT a single small HTTP
+    // / WebSocket request (typical rows are tens of bytes) while
+    // amortising per-request overhead across the batch.
     Some(500)
 }
 
 fn default_batch_bytes() -> Option<usize> {
+    // Reason: 4 MiB caps one INSERT statement far below any server
+    // request-size surprise while still fitting hundreds of telemetry
+    // rows per flush.
     Some(4_194_304)
 }
 
 fn default_linger_ms() -> Option<u64> {
+    // Reason: 20 ms lets a batch fill under burst while keeping
+    // interactive flush latency far below one MQTT keep-alive tick.
     Some(20)
 }
 
+/// Default outer backlog ceiling: 10_000 rows (about twenty 500-row
+/// flushes) so a burst or a stalled server cannot grow the queue
+/// without bound while backoff is engaged, while steady throughput
+/// still fits in memory (10_000 small template-rendered rows stay well
+/// under tens of MiB). Reason: the connector's send path runs behind
+/// the rule engine's bounded queue, so this is a backstop, not new
+/// work on the publish path.
+fn default_buffer_capacity_10k() -> Option<usize> {
+    Some(10_000)
+}
+
 fn default_max_retries() -> Option<usize> {
+    // Reason: 4 retries ride out transient throttle bursts without
+    // retrying forever against a persistently failing batch.
     Some(4)
 }
 
 fn default_initial_backoff_ms() -> Option<u64> {
+    // Reason: 100 ms first delay is longer than a single scheduler
+    // quantum so a hot server gets breathing room.
     Some(100)
 }
 
 fn default_max_backoff_ms() -> Option<u64> {
+    // Reason: 3 s ceiling keeps the retry loop interactive while the
+    // fail-fast breaker covers longer outages.
     Some(3_000)
 }
 
@@ -102,11 +138,17 @@ fn is_td_identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// TDengine sink configuration. All depths are optional (`None` =
-/// unbounded) with zero clamped ceilings.
+/// TDengine sink configuration. Batch depths are optional: `None` on
+/// the batch knobs below is an explicit operator opt-in to unbounded
+/// (the code never chooses it), with zero clamped ceilings. The outer
+/// backlog (`buffer_capacity`) is always bounded: `None` means the
+/// finite default below, never unlimited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TdengineSinkConfig {
-    /// REST endpoint, e.g. `http://localhost:6041/rest/sql`.
+    /// REST endpoint, e.g. `http://localhost:6041/rest/sql`. The driver
+    /// transport posts to `{scheme://host:port}/rest/sql/{database}`
+    /// derived from the same value, so a bare adapter endpoint
+    /// (`http://host:6041`) and a full REST endpoint land on one URL.
     pub endpoint: String,
     /// Target database, e.g. `power`.
     pub database: String,
@@ -123,16 +165,32 @@ pub struct TdengineSinkConfig {
     /// Metric column → payload-field template (sorted by column).
     #[serde(default)]
     pub metrics_template: HashMap<String, String>,
-    /// Rows per INSERT (default 500).
+    /// Rows per INSERT (default 500: one multi-table statement stays a
+    /// single small request; `None` is an explicit operator opt-in to
+    /// unbounded, never the code's choice).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Batch byte limit over SQL text (default 4 MiB).
+    /// Batch byte limit over SQL text (default 4 MiB: caps one INSERT
+    /// far below any server request-size surprise; `None` is an
+    /// explicit operator opt-in to unbounded, never the code's choice).
     #[serde(default = "default_batch_bytes")]
     pub batch_bytes: Option<usize>,
-    /// Linger flush window in ms (default 20).
+    /// Linger flush window in ms (default 20: fills a batch under burst
+    /// while keeping interactive flush latency far below one MQTT
+    /// keep-alive tick).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
-    /// Retries on transient failures (default 4, `None` unbounded).
+    /// In-memory row backlog ceiling (`None` = default 10_000 rows:
+    /// about twenty 500-row flushes, bounding worst-case backlog memory
+    /// while absorbing bursts; an old stored configuration without this
+    /// field parses to the same default, so stored configuration keeps
+    /// working. When full the sink fails closed with a connection error
+    /// instead of growing without bound or shedding rows silently).
+    #[serde(default = "default_buffer_capacity_10k")]
+    pub buffer_capacity: Option<usize>,
+    /// Retries on transient failures (default 4: rides out throttle
+    /// bursts without retrying forever; `None` is an explicit operator
+    /// opt-in to unbounded, never the code's choice).
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<usize>,
     /// First retry delay in ms (default 100).
@@ -148,7 +206,19 @@ pub struct TdengineSinkConfig {
 
 impl TdengineSinkConfig {
     pub fn timeout(&self) -> Duration {
+        // Reason: 5 s per-request ceiling so an unreachable server fails
+        // closed instead of stalling the rule worker.
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+    }
+
+    /// Whether this configuration rides the maintained driver transport.
+    /// The driver posts REST SQL on the maintained `reqwest` client
+    /// with Basic credentials over plaintext; token auth and TLS
+    /// endpoints stay on the REST transport so stored configuration
+    /// keeps working. Both transports speak the same `INSERT INTO ...
+    /// USING ... TAGS` text; this predicate is the documented split.
+    pub fn use_driver(&self) -> bool {
+        matches!(self.auth, TdengineAuth::Basic { .. }) && self.endpoint.starts_with("http://")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -200,6 +270,11 @@ impl TdengineSinkConfig {
                 "tdengine batch_bytes must be >= 1".to_string(),
             ));
         }
+        if self.buffer_capacity == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "tdengine buffer_capacity must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -209,11 +284,22 @@ impl TdengineSinkConfig {
     }
 
     pub fn effective_batch_size(&self) -> usize {
+        // `None` is an explicit operator opt-in to unbounded, never the
+        // code's choice; the outer `buffer_capacity` below still bounds
+        // worst-case memory.
         self.batch_size.unwrap_or(usize::MAX).max(1)
     }
 
     pub fn effective_batch_bytes(&self) -> usize {
+        // Same opt-in contract as `effective_batch_size`.
         self.batch_bytes.unwrap_or(usize::MAX).max(1)
+    }
+
+    /// Outer backlog ceiling (default 10_000 rows: about twenty 500-row
+    /// flushes, bounding worst-case backlog memory while absorbing
+    /// bursts; `None` means this finite default, never unlimited).
+    pub fn effective_buffer_capacity(&self) -> usize {
+        self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
     pub fn effective_linger(&self) -> Duration {
@@ -530,6 +616,331 @@ impl TdengineTransport for HttpTdengineTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Driver transport (production path for Basic + plaintext endpoints).
+// ---------------------------------------------------------------------------
+
+/// Split a validated `http(s)://host[:port][/...]` endpoint into
+/// `(tls, host, port)`. The port defaults to 6041: the adapter port
+/// serving the REST SQL interface.
+fn split_driver_endpoint(endpoint: &str) -> Result<(bool, String, u16)> {
+    let (tls, rest) = if let Some(rest) = endpoint.strip_prefix("http://") {
+        (false, rest)
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        (true, rest)
+    } else {
+        return Err(ConnectorError::Dispatch(format!(
+            "tdengine endpoint must be http(s): {endpoint:?}"
+        )));
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    if host_port.is_empty() || host_port.contains('@') {
+        return Err(ConnectorError::Dispatch(format!(
+            "tdengine endpoint has no host: {endpoint:?}"
+        )));
+    }
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port_text)) => {
+            if host.is_empty() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "tdengine endpoint has no host: {endpoint:?}"
+                )));
+            }
+            let port: u16 = port_text.parse().map_err(|_| {
+                ConnectorError::Dispatch(format!("tdengine endpoint has a bad port: {endpoint:?}"))
+            })?;
+            (host.to_string(), port)
+        }
+        // Reason: 6041 is the adapter port serving the REST SQL
+        // interface, so a bare host means the default adapter.
+        None => (host_port.to_string(), 6041),
+    };
+    Ok((tls, host, port))
+}
+
+/// Build the REST SQL URL for this configuration:
+/// `{base}/rest/sql` without a database (for `CREATE DATABASE` and other
+/// admin statements that must run before the database exists), or
+/// `{base}/rest/sql/{database}` with one. `{base}` is the
+/// `scheme://host:port` from [`split_driver_endpoint`], so both a bare
+/// adapter endpoint (`http://host:6041`, as the qualification env
+/// provides) and a full REST endpoint (`http://host:6041/rest/sql`, as
+/// stored configuration carries) land on the same URL.
+fn rest_url_for(endpoint: &str, database_override: Option<&str>) -> Result<String> {
+    let (tls, host, port) = split_driver_endpoint(endpoint)?;
+    let scheme = if tls { "https" } else { "http" };
+    // Reason: 6041 is the adapter port (REST SQL lives under it), so the
+    // base is always explicit here rather than inherited from the config
+    // string's path.
+    let base = format!("{scheme}://{host}:{port}");
+    match database_override {
+        Some(database) => {
+            if !is_td_identifier(database) {
+                return Err(ConnectorError::Dispatch(format!(
+                    "tdengine database must match [A-Za-z0-9_]+: {database:?}"
+                )));
+            }
+            Ok(format!("{base}/rest/sql/{database}"))
+        }
+        None => Ok(format!("{base}/rest/sql")),
+    }
+}
+
+/// Classify a driver error string. Timeouts, refused connections and
+/// throttled servers retry as connection failures; authentication and
+/// syntax failures are terminal dispatch errors (a wrong password or a
+/// bad statement must fail closed, never loop). Anything unrecognised
+/// fails closed as terminal too: an unknown error must not spin the
+/// retry loop.
+fn map_driver_error(context: &str, message: &str) -> ConnectorError {
+    let folded = message.to_lowercase();
+    if folded.contains("timed out")
+        || folded.contains("timeout")
+        || folded.contains("connection refused")
+        || folded.contains("connection reset")
+        || folded.contains("network")
+        || folded.contains("temporar")
+        || folded.contains("throttl")
+        || folded.contains("busy")
+        || folded.contains("429")
+        || folded.contains("503")
+        || folded.contains("500")
+    {
+        return ConnectorError::Connection(format!("tdengine driver {context}: {message}"));
+    }
+    if folded.contains("auth")
+        || folded.contains("unauthor")
+        || folded.contains("login")
+        || folded.contains("password")
+        || folded.contains("denied")
+        || folded.contains("401")
+        || folded.contains("403")
+    {
+        return ConnectorError::Dispatch(format!("tdengine driver auth {context}: {message}"));
+    }
+    ConnectorError::Dispatch(format!("tdengine driver {context}: {message}"))
+}
+
+/// Decode a TDengine REST SQL `SELECT` body into rows of `T`.
+/// `column_meta` names the columns, `data` carries the rows
+/// positionally; zipping them into objects lets `T`'s named fields (the
+/// statement's column aliases) deserialise.
+fn decode_rest_rows<T>(doc: &serde_json::Value) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let empty = Vec::new();
+    let metas = doc
+        .get("column_meta")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let names: Vec<String> = metas
+        .iter()
+        .filter_map(|col| {
+            col.as_array()
+                .and_then(|parts| parts.first())
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let data = doc
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(data.len());
+    for values in data {
+        let cells = values.as_array().cloned().unwrap_or_default();
+        let mut map = serde_json::Map::with_capacity(names.len());
+        for (index, name) in names.iter().enumerate() {
+            let cell = cells.get(index).cloned().unwrap_or(serde_json::Value::Null);
+            map.insert(name.clone(), cell);
+        }
+        let row: T = serde_json::from_value(serde_json::Value::Object(map))
+            .map_err(|e| map_driver_error("query", &format!("decode row: {e}")))?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+/// Production transport on the maintained `reqwest` REST SQL driver.
+///
+/// Holds the validated config and posts the same `INSERT INTO ...
+/// USING ... TAGS ...` text the REST path sends, to
+/// `{base}/rest/sql/{database}` with Basic auth. `new` is sync (so
+/// management wiring stays sync like the other driver transports);
+/// the client owns its connection pool.
+/// PERF(parity): a pooled client already serves all flushes; no extra
+/// setup runs per call.
+pub struct DriverTdengineTransport {
+    config: TdengineSinkConfig,
+    client: reqwest::Client,
+}
+
+impl DriverTdengineTransport {
+    pub fn new(config: &TdengineSinkConfig) -> Result<Self> {
+        config.validate()?;
+        // The driver path posts REST SQL with Basic credentials over
+        // plaintext. Token auth and TLS endpoints stay on the REST
+        // transport (see `TdengineSinkConfig::use_driver`): rejecting
+        // them here fails closed instead of silently sending with the
+        // wrong credential.
+        if !config.use_driver() {
+            return Err(ConnectorError::Dispatch(
+                "tdengine driver needs Basic auth with a plaintext http endpoint; \
+                 token auth and https endpoints stay on the REST transport"
+                    .to_string(),
+            ));
+        }
+        // Fail closed at construction when the URL itself cannot build
+        // (bad host, bad database), with no I/O.
+        let _ = rest_url_for(&config.endpoint, Some(config.database.as_str()))?;
+        let _ = rest_url_for(&config.endpoint, None)?;
+        let client = reqwest::Client::builder()
+            .timeout(config.timeout())
+            .build()
+            .map_err(|e| {
+                ConnectorError::Connection(format!("tdengine driver client failed: {e}"))
+            })?;
+        Ok(Self {
+            config: config.clone(),
+            client,
+        })
+    }
+
+    async fn run_exec(&self, database: Option<&str>, sql: &str) -> Result<usize> {
+        let url = rest_url_for(&self.config.endpoint, database)?;
+        let auth = self.config.auth.header_value()?;
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .body(sql.to_string())
+            .send()
+            .await
+            .map_err(|e| map_driver_error("exec", &e.to_string()))?;
+        let status = response.status().as_u16();
+        if status == 429 || (500..=504).contains(&status) {
+            return Err(ConnectorError::Connection(format!(
+                "tdengine driver exec throttled with {status}"
+            )));
+        }
+        if status == 401 || status == 403 {
+            return Err(ConnectorError::Dispatch(format!(
+                "tdengine driver auth exec failed with {status}"
+            )));
+        }
+        if !(200..=299).contains(&status) {
+            return Err(map_driver_error(
+                "exec",
+                &format!("request failed with {status}"),
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| map_driver_error("exec", &e.to_string()))?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            ConnectorError::Connection(format!("tdengine driver bad response JSON: {e}"))
+        })?;
+        let code = doc.get("code").and_then(|v| v.as_i64()).ok_or_else(|| {
+            ConnectorError::Connection("tdengine driver response lacks code".to_string())
+        })?;
+        if code != 0 {
+            let desc = doc.get("desc").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(map_driver_error(
+                "exec",
+                &format!("SQL failed with code {code} {desc}"),
+            ));
+        }
+        let rows = doc.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok(rows as usize)
+    }
+
+    async fn run_query<T>(&self, database: Option<&str>, sql: &str) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let url = rest_url_for(&self.config.endpoint, database)?;
+        let auth = self.config.auth.header_value()?;
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .body(sql.to_string())
+            .send()
+            .await
+            .map_err(|e| map_driver_error("query", &e.to_string()))?;
+        let status = response.status().as_u16();
+        if status == 429 || (500..=504).contains(&status) {
+            return Err(ConnectorError::Connection(format!(
+                "tdengine driver query throttled with {status}"
+            )));
+        }
+        if status == 401 || status == 403 {
+            return Err(ConnectorError::Dispatch(format!(
+                "tdengine driver auth query failed with {status}"
+            )));
+        }
+        if !(200..=299).contains(&status) {
+            return Err(map_driver_error(
+                "query",
+                &format!("request failed with {status}"),
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| map_driver_error("query", &e.to_string()))?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            ConnectorError::Connection(format!("tdengine driver bad response JSON: {e}"))
+        })?;
+        let code = doc.get("code").and_then(|v| v.as_i64()).ok_or_else(|| {
+            ConnectorError::Connection("tdengine driver response lacks code".to_string())
+        })?;
+        if code != 0 {
+            let desc = doc.get("desc").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(map_driver_error(
+                "query",
+                &format!("SQL failed with code {code} {desc}"),
+            ));
+        }
+        decode_rest_rows(&doc)
+    }
+
+    /// Execute one admin statement without a database context
+    /// (`CREATE DATABASE`, `CREATE STABLE`, `DROP ...`): the target
+    /// database may not exist yet, so the URL carries none and the
+    /// statement names it explicitly.
+    pub async fn exec_admin(&self, sql: &str) -> Result<usize> {
+        self.run_exec(None, sql).await
+    }
+
+    /// Query through the driver, deserialising each row into `T`
+    /// (named fields match the statement's column aliases).
+    /// `database` selects the REST URL database; `None` queries without one.
+    pub async fn query_rows<T>(&self, database: Option<&str>, sql: &str) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.run_query(database, sql).await
+    }
+}
+
+#[async_trait]
+impl TdengineTransport for DriverTdengineTransport {
+    async fn execute_sql(&self, database: &str, sql: &str, auth: &TdengineAuth) -> Result<usize> {
+        // The sink passes its own auth back in; a caller swapping the
+        // credential mid-stream must fail closed, never execute with a
+        // different identity than the transport was built for.
+        if auth != &self.config.auth {
+            return Err(ConnectorError::Dispatch(
+                "tdengine driver auth mismatch: failing closed".to_string(),
+            ));
+        }
+        self.run_exec(Some(database), sql).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -732,6 +1143,15 @@ impl TdengineSink {
         let millis = now_millis();
         let (row, bytes) = self.build_row(topic, payload, qos, millis)?;
         let mut buffer = self.buffer.lock();
+        // Bounded backlog: past the effective capacity the sink fails
+        // closed with a connection error instead of growing without
+        // bound; buffered rows are kept, nothing is shed.
+        if buffer.queue.len() >= self.config.effective_buffer_capacity() {
+            return Err(ConnectorError::Connection(format!(
+                "tdengine buffer full ({} rows): failing closed",
+                self.config.effective_buffer_capacity()
+            )));
+        }
         let full = buffer.queue.push(TdRow { row });
         buffer.bytes = buffer.bytes.saturating_add(bytes);
         Ok(full || buffer.bytes >= self.config.effective_batch_bytes())
@@ -807,6 +1227,7 @@ mod tests {
             batch_size: Some(500),
             batch_bytes: Some(4_194_304),
             linger_ms: Some(20),
+            buffer_capacity: None,
             max_retries: Some(4),
             initial_backoff_ms: Some(100),
             max_backoff_ms: Some(3_000),
@@ -859,11 +1280,220 @@ mod tests {
 
         config.batch_size = Some(0);
         assert!(config.validate().is_err());
-        // Unbounded + huge depths accepted: zero clamped ceilings.
+        // Explicit unbounded opt-in on the batch knobs stays accepted
+        // (the code never chooses it); the outer backlog stays
+        // always-bounded with its finite default.
         config.batch_size = None;
         config.batch_bytes = Some(10_000_000);
         config.max_retries = None;
         assert!(config.validate().is_ok());
+        config.buffer_capacity = Some(0);
+        assert!(config.validate().is_err());
+        config.buffer_capacity = None;
+        assert_eq!(config.effective_buffer_capacity(), 10_000);
+    }
+
+    #[test]
+    fn test_buffer_capacity_default_and_use_driver() {
+        // A stored configuration without the field parses to the finite
+        // default, so old configuration keeps working and the code never
+        // chooses unbounded.
+        let stored = serde_json::json!({
+            "endpoint": "http://127.0.0.1:6041/rest/sql",
+            "database": "power",
+            "stable_name": "meters",
+            "subtable_template": "d_${client_id}",
+        });
+        let cfg: TdengineSinkConfig = serde_json::from_value(stored).expect("stored config parses");
+        assert_eq!(cfg.buffer_capacity, Some(10_000));
+        assert_eq!(cfg.effective_buffer_capacity(), 10_000);
+        assert!(cfg.validate().is_ok());
+        // Basic + plaintext rides the driver; token auth and TLS stay
+        // on REST so stored configuration keeps working.
+        assert!(cfg.use_driver());
+        let mut token = cfg.clone();
+        token.auth = TdengineAuth::Token {
+            token: "abc".to_string(),
+        };
+        assert!(!token.use_driver());
+        let mut tls = cfg.clone();
+        tls.endpoint = "https://127.0.0.1:6041/rest/sql".to_string();
+        assert!(!tls.use_driver());
+    }
+
+    #[test]
+    fn test_driver_rest_url_shapes() {
+        // A full REST endpoint and a bare adapter host land on the same
+        // URL; trailing slashes and extra path segments never leak in.
+        assert_eq!(
+            rest_url_for("http://127.0.0.1:6041/rest/sql", Some("power")).unwrap(),
+            "http://127.0.0.1:6041/rest/sql/power"
+        );
+        assert_eq!(
+            rest_url_for("http://127.0.0.1:6041", Some("power")).unwrap(),
+            "http://127.0.0.1:6041/rest/sql/power"
+        );
+        assert_eq!(
+            rest_url_for("http://dbhost/rest/sql/", Some("power")).unwrap(),
+            "http://dbhost:6041/rest/sql/power"
+        );
+        // Admin statements run without a database context.
+        assert_eq!(
+            rest_url_for("http://127.0.0.1:6041/rest/sql", None).unwrap(),
+            "http://127.0.0.1:6041/rest/sql"
+        );
+        // TLS endpoints select the secure scheme.
+        assert_eq!(
+            rest_url_for("https://dbhost:16041/x", Some("power")).unwrap(),
+            "https://dbhost:16041/rest/sql/power"
+        );
+        assert!(rest_url_for("127.0.0.1:6041", Some("power")).is_err());
+        assert!(rest_url_for("http://127.0.0.1:6041", Some("has space")).is_err());
+    }
+
+    #[test]
+    fn test_decode_rest_rows_select_shape() {
+        // The REST `SELECT` body carries columns in `column_meta` and
+        // rows positionally in `data`; decoding zips them by alias.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Row {
+            n: i64,
+        }
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"code":0,"column_meta":[["n","BIGINT",8]],"data":[[2000]],"rows":1}"#,
+        )
+        .unwrap();
+        let rows: Vec<Row> = decode_rest_rows(&doc).unwrap();
+        assert_eq!(rows, vec![Row { n: 2000 }]);
+        // A missing `data` array decodes to no rows (never a failure).
+        let empty: serde_json::Value = serde_json::from_str(r#"{"code":0}"#).unwrap();
+        let rows: Vec<Row> = decode_rest_rows(&empty).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_driver_transport_construction() {
+        // Basic + plaintext is the qualified driver path.
+        assert!(DriverTdengineTransport::new(&test_config()).is_ok());
+        // Token auth and TLS fail closed at construction: they stay on
+        // the REST transport instead of sending with a wrong credential.
+        let mut token = test_config();
+        token.auth = TdengineAuth::Token {
+            token: "abc".to_string(),
+        };
+        assert!(DriverTdengineTransport::new(&token).is_err());
+        let mut tls = test_config();
+        tls.endpoint = "https://127.0.0.1:6041/rest/sql".to_string();
+        assert!(DriverTdengineTransport::new(&tls).is_err());
+    }
+
+    #[test]
+    fn test_driver_rest_url_builds() {
+        // The driver posts REST SQL. A full REST endpoint and a bare
+        // adapter host land on the same URL.
+        let cfg = test_config();
+        assert_eq!(
+            rest_url_for(&cfg.endpoint, Some("power")).unwrap(),
+            "http://127.0.0.1:6041/rest/sql/power"
+        );
+        assert_eq!(
+            rest_url_for(&cfg.endpoint, None).unwrap(),
+            "http://127.0.0.1:6041/rest/sql"
+        );
+        let bare = "http://127.0.0.1:6041".to_string();
+        assert_eq!(
+            rest_url_for(&bare, Some("power")).unwrap(),
+            "http://127.0.0.1:6041/rest/sql/power"
+        );
+        // The driver transport builds without I/O here.
+        assert!(DriverTdengineTransport::new(&cfg).is_ok());
+        assert!(rest_url_for(&cfg.endpoint, Some("has space")).is_err());
+    }
+
+    #[test]
+    fn test_map_driver_error_classification() {
+        // Authentication failures are terminal: a wrong password must
+        // fail closed, never spin the retry loop.
+        for message in [
+            "Authentication failure",
+            "unauthorized",
+            "login failed",
+            "wrong password",
+            "access denied",
+            "code 0x26000: auth error",
+        ] {
+            assert!(
+                matches!(
+                    map_driver_error("exec", message),
+                    ConnectorError::Dispatch(_)
+                ),
+                "auth must be terminal, got {message:?}"
+            );
+        }
+        // Timeouts, refused connections and throttles retry.
+        for message in [
+            "timed out after 5s",
+            "connection refused",
+            "network unreachable",
+            "server busy",
+            "temporarily unavailable",
+            "throttled with 503",
+        ] {
+            assert!(
+                matches!(
+                    map_driver_error("exec", message),
+                    ConnectorError::Connection(_)
+                ),
+                "transient must retry, got {message:?}"
+            );
+        }
+        // Syntax and everything unknown fail closed as terminal: an
+        // unknown error must not spin the retry loop.
+        for message in ["syntax error near INTO", "table does not exist", "weird?!"] {
+            assert!(
+                matches!(
+                    map_driver_error("exec", message),
+                    ConnectorError::Dispatch(_)
+                ),
+                "unknown must be terminal, got {message:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_fails_closed_when_buffer_full() {
+        let mut cfg = test_config();
+        cfg.batch_size = Some(10);
+        cfg.buffer_capacity = Some(2);
+        let (sink, _) = test_sink(cfg);
+        let topic = Topic::new("sensors/temp").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"client_id":"s1","current":1.0,"voltage":2.0}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("first row fits");
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"client_id":"s2","current":1.0,"voltage":2.0}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("second row fits");
+        let err = sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"client_id":"s3","current":1.0,"voltage":2.0}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect_err("full buffer must fail closed");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "buffer-full must be a connection error, got {err:?}"
+        );
+        assert_eq!(sink.buffered_rows(), 2);
     }
 
     #[test]

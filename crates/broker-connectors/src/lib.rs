@@ -1,6 +1,21 @@
 #![allow(unknown_lints)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
+//! Community connectors: light sinks with no vendor SDK.
+//!
+//! Default build (no features): `postgres`, `mysql`, `redis`,
+//! `mqtt_bridge`, `http`, `disk_log`, `clickhouse`, `kafka`,
+//! `rabbitmq`, `elasticsearch`, `influxdb`, `greptimedb`, `opentsdb`,
+//! `timescaledb`, `cloud_tls` and the `webhook`/`console`/`test` shims.
+//! The `s3` sink is in the build only with the Cargo feature `s3`.
+//! With the feature off, the registration of that kind fails with an
+//! error that names the feature. Release builds use the `full` feature
+//! of `broker-node`, which adds all gated kinds.
+//!
+//! The modules `kinesis`, `mssql`, `redshift`, `sparkplug_b` and
+//! `tdengine` in this crate contain tests only. Those sinks are in
+//! `broker-connectors-enterprise`.
+
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
@@ -20,13 +35,19 @@ pub mod greptimedb;
 pub mod http;
 pub mod influxdb;
 pub mod kafka;
+pub mod kinesis;
 pub mod mqtt_bridge;
+pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;
 pub mod postgres;
 pub mod rabbitmq;
 pub mod redis;
+pub mod redshift;
+#[cfg(feature = "s3")]
 pub mod s3;
+pub mod sparkplug_b;
+pub mod tdengine;
 pub mod timescaledb;
 
 pub use clickhouse::{
@@ -72,7 +93,7 @@ pub use mysql::{
     MySqlTransport, TcpMySqlTransport,
 };
 pub use opentsdb::{
-    extract_opentsdb_point, sanitize_opentsdb_string, serialize_telnet_lines,
+    extract_opentsdb_point, parse_telnet_addr, sanitize_opentsdb_string, serialize_telnet_lines,
     MockOpenTsdbTransport, NetworkOpenTsdbTransport, OpenTsdbCompression, OpenTsdbConfig,
     OpenTsdbConnector, OpenTsdbDataPoint, OpenTsdbProtocol, OpenTsdbSink, OpenTsdbSummaryResponse,
     OpenTsdbTransport,
@@ -89,6 +110,7 @@ pub use redis::{
     DriverRedisTransport, MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply,
     RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport,
 };
+#[cfg(feature = "s3")]
 pub use s3::{
     HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
     S3Transport, SdkS3Transport, SigV4Request,

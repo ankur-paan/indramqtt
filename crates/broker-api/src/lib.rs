@@ -1120,6 +1120,11 @@ async fn build_connector(
                 Ok(("influxdb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "s3"))]
+            "s3" | "minio" => Err(
+                "connector kind 's3' needs cargo feature 's3' (disabled in this build)".to_string(),
+            ),
+            #[cfg(feature = "s3")]
             "s3" | "minio" => {
                 let config: broker_connectors::S3SinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1228,11 +1233,24 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
-                // Frames are captured in-process; production MQTT
-                // delivery rides the mqtt_bridge connector.
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::MemorySparkplugTransport::new(),
-                );
+                // The sink sends to the MQTT server that `mqtt_url`
+                // names, through the `rumqttc` driver transport.
+                let transport: std::sync::Arc<dyn broker_connectors_enterprise::SparkplugTransport> =
+                    match config.mqtt_url.clone().filter(|url| !url.trim().is_empty()) {
+                        Some(url) => std::sync::Arc::new(
+                            broker_connectors_enterprise::RumqttcSparkplugTransport::new(
+                                &url,
+                                config.client_id.as_deref(),
+                            )
+                            .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?,
+                        ),
+                        // Without a server there is no destination. A sink
+                        // that keeps the frames in memory would report
+                        // success and deliver nothing.
+                        None => {
+                            return Err("invalid sparkplug_b sink: `mqtt_url` is necessary".to_string())
+                        }
+                    };
                 let sink = broker_connectors_enterprise::SparkplugBSink::new(config, transport)
                     .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?;
                 Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
@@ -1246,7 +1264,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid kinesis config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpKinesisTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::SdkKinesisTransport::new(&config)
                         .map_err(|e| format!("invalid kinesis transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::KinesisSink::new(config, transport)
@@ -1270,6 +1288,12 @@ async fn build_connector(
                 Ok(("gcp_pubsub".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "azure_eventhubs"))]
+            "azure_eventhubs" | "azure" | "eventhubs" => Err(
+                "connector kind 'azure_eventhubs' needs cargo feature 'azure_eventhubs' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "azure_eventhubs")]
             "azure_eventhubs" | "azure" | "eventhubs" => {
                 let config: broker_connectors_enterprise::AzureEventHubsSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1324,6 +1348,12 @@ async fn build_connector(
                 Ok(("oci_streaming".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "aws_iot"))]
+            "aws_iot" | "aws_iot_core" => Err(
+                "connector kind 'aws_iot' needs cargo feature 'aws_iot' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "aws_iot")]
             "aws_iot" | "aws_iot_core" => {
                 let config: broker_connectors_enterprise::AwsIotConfig =
                     serde_json::from_value(req.config.clone())
@@ -1340,6 +1370,12 @@ async fn build_connector(
                 Ok(("aws_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "azure_iot"))]
+            "azure_iot" | "azure_iothub" | "iothub" => Err(
+                "connector kind 'azure_iot' needs cargo feature 'azure_iot' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "azure_iot")]
             "azure_iot" | "azure_iothub" | "iothub" => {
                 let config: broker_connectors_enterprise::AzureIotConfig =
                     serde_json::from_value(req.config.clone())
@@ -1356,6 +1392,12 @@ async fn build_connector(
                 Ok(("azure_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "gcp_iot"))]
+            "gcp_iot" | "gcp_iot_core" | "cloud_iot" => Err(
+                "connector kind 'gcp_iot' needs cargo feature 'gcp_iot' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "gcp_iot")]
             "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
                 let config: broker_connectors_enterprise::GcpIotConfig =
                     serde_json::from_value(req.config.clone())
@@ -1388,6 +1430,12 @@ async fn build_connector(
                 Ok(("opc_ua".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "azure_blob"))]
+            "azure_blob" | "azureblob" | "azblob" => Err(
+                "connector kind 'azure_blob' needs cargo feature 'azure_blob' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "azure_blob")]
             "azure_blob" | "azureblob" | "azblob" => {
                 let config: broker_connectors_enterprise::AzureBlobSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1498,7 +1546,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid mssql config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::NativeMssqlTransport::new(&config)
+                    broker_connectors_enterprise::DriverMssqlTransport::new(&config)
                         .map_err(|e| format!("invalid mssql transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::MssqlSink::new(config, transport)
@@ -1545,14 +1593,32 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid tdengine config: {e}"))?;
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpTdengineTransport::new(&config, reqwest::Client::new())
+                // Production split: Basic + plaintext rides the maintained
+                // driver; token auth and TLS endpoints stay on REST so
+                // stored configuration keeps working. Either way the kind
+                // stays `tdengine`.
+                if config.use_driver() {
+                    let transport = std::sync::Arc::new(
+                        broker_connectors_enterprise::DriverTdengineTransport::new(&config)
+                            .map_err(|e| format!("invalid tdengine transport: {e}"))?,
+                    );
+                    let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
+                        .map_err(|e| format!("invalid tdengine sink: {e}"))?;
+                    Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
+                        as std::sync::Arc<dyn broker_connectors::Sink>))
+                } else {
+                    let transport = std::sync::Arc::new(
+                        broker_connectors_enterprise::HttpTdengineTransport::new(
+                            &config,
+                            reqwest::Client::new(),
+                        )
                         .map_err(|e| format!("invalid tdengine transport: {e}"))?,
-                );
-                let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
-                    .map_err(|e| format!("invalid tdengine sink: {e}"))?;
-                Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
-                    as std::sync::Arc<dyn broker_connectors::Sink>))
+                    );
+                    let sink = broker_connectors_enterprise::TdengineSink::new(config, transport)
+                        .map_err(|e| format!("invalid tdengine sink: {e}"))?;
+                    Ok(("tdengine".to_string(), std::sync::Arc::new(sink)
+                        as std::sync::Arc<dyn broker_connectors::Sink>))
+                }
             }
             "iotdb" | "iot_db" => {
                 let config: broker_connectors_enterprise::IotDbSinkConfig =
@@ -1586,6 +1652,12 @@ async fn build_connector(
                 Ok(("timestream".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "dynamodb"))]
+            "dynamodb" | "dynamo" | "ddb" => Err(
+                "connector kind 'dynamodb' needs cargo feature 'dynamodb' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "dynamodb")]
             "dynamodb" | "dynamo" | "ddb" => {
                 let config: broker_connectors_enterprise::DynamoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1656,6 +1728,12 @@ async fn build_connector(
                 Ok(("doris".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "bigquery"))]
+            "bigquery" | "bq" | "gbq" => Err(
+                "connector kind 'bigquery' needs cargo feature 'bigquery' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "bigquery")]
             "bigquery" | "bq" | "gbq" => {
                 let config: broker_connectors_enterprise::BigQuerySinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1680,7 +1758,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid redshift config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpRedshiftTransport::new(&config, reqwest::Client::new())
+                    broker_connectors_enterprise::SdkRedshiftTransport::new(&config)
                         .map_err(|e| format!("invalid redshift transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::RedshiftSink::new(config, transport)
@@ -5942,6 +6020,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("influxdb"));
 
         // S3 sink: validated without touching any object store.
+        // X1-09: `s3` gated behind Cargo feature `s3`; disabled builds
+        // fail closed naming the feature.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -5958,8 +6038,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("s3"));
+        if cfg!(feature = "s3") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("s3"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("s3"),
+                "disabled s3 must name the feature, got: {created}"
+            );
+        }
 
         // Elasticsearch sink: validated without touching any cluster.
         let (status, created) = server
@@ -6062,13 +6150,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("disk_log"));
         std::fs::remove_dir_all(&disk_dir).ok();
 
-        // Sparkplug B sink: enterprise tier validated without any broker.
+        // Sparkplug B sink: the driver connects at the first write, thus
+        // the create step does not need a server.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "spb-1",
                        "kind": "sparkplug_b",
                        "config": {"topic_prefix": "spBv1.0/plant1",
+                                  "mqtt_url": "mqtt://127.0.0.1:1883",
                                   "tier": "enterprise",
                                   "batch_size": 50,
                                   "linger_ms": 25}}),
@@ -6123,6 +6213,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("gcp_pubsub"));
 
         // Azure Event Hubs sink: validated without touching Azure.
+        // X1-09: gated behind Cargo feature `azure_eventhubs`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6142,8 +6233,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("azure_eventhubs"));
+        if cfg!(feature = "azure_eventhubs") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("azure_eventhubs"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("azure_eventhubs"),
+                "disabled azure_eventhubs must name the feature, got: {created}"
+            );
+        }
 
         // Pulsar sink: validated without opening any socket.
         let (status, created) = server
@@ -6338,6 +6440,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("timestream"));
 
         // DynamoDB sink: validated without touching AWS.
+        // X1-09: gated behind Cargo feature `dynamodb`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6358,8 +6461,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("dynamodb"));
+        if cfg!(feature = "dynamodb") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("dynamodb"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("dynamodb"),
+                "disabled dynamodb must name the feature, got: {created}"
+            );
+        }
 
         // Snowflake sink: key-pair validated without touching Snowflake.
         // Test-only RSA key (openssl-generated, never deployed).
@@ -6437,6 +6548,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("doris"));
 
         // BigQuery sink: validated without touching Google.
+        // X1-09: gated behind Cargo feature `bigquery`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6457,8 +6569,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("bigquery"));
+        if cfg!(feature = "bigquery") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("bigquery"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("bigquery"),
+                "disabled bigquery must name the feature, got: {created}"
+            );
+        }
 
         // Redshift sink: validated without touching AWS.
         let (status, created) = server
@@ -6513,6 +6633,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // AWS IoT Core sink: mTLS-only build, validated without opening any socket.
         // SigV4/WebSocket is intentionally not built (no licence-compliant
         // WebSocket client); SigV4 configs are rejected at registration.
+        // X1-09: gated behind Cargo feature `aws_iot`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6534,10 +6655,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("aws_iot"));
+        if cfg!(feature = "aws_iot") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("aws_iot"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("aws_iot"),
+                "disabled aws_iot must name the feature, got: {created}"
+            );
+        }
 
         // Azure IoT Hub sink: validated without opening any socket.
+        // X1-09: gated behind Cargo feature `azure_iot`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6558,10 +6688,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("azure_iot"));
+        if cfg!(feature = "azure_iot") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("azure_iot"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("azure_iot"),
+                "disabled azure_iot must name the feature, got: {created}"
+            );
+        }
 
         // GCP IoT Core sink: validated without opening any socket.
+        // X1-09: gated behind Cargo feature `gcp_iot`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6581,8 +6723,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("gcp_iot"));
+        if cfg!(feature = "gcp_iot") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("gcp_iot"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("gcp_iot"),
+                "disabled gcp_iot must name the feature, got: {created}"
+            );
+        }
 
         // OPC-UA sink: validated without opening any socket.
         let (status, created) = server
@@ -6606,6 +6756,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("opc_ua"));
 
         // Azure Blob sink: validated without touching Azure.
+        // X1-09: gated behind Cargo feature `azure_blob`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -6623,8 +6774,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("azure_blob"));
+        if cfg!(feature = "azure_blob") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("azure_blob"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("azure_blob"),
+                "disabled azure_blob must name the feature, got: {created}"
+            );
+        }
 
         // Tablestore sink: validated without touching Alibaba Cloud.
         let (status, created) = server
@@ -6820,57 +6982,80 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(
-            body,
-            json!([{"id": "alloydb-1", "kind": "alloydb", "tier": "enterprise"},
-                    {"id": "aws-iot-1", "kind": "aws_iot", "tier": "enterprise"},
-                    {"id": "azblob-1", "kind": "azure_blob", "tier": "enterprise"},
-                    {"id": "azure-1", "kind": "azure_eventhubs", "tier": "enterprise"},
-                    {"id": "azure-iot-1", "kind": "azure_iot", "tier": "enterprise"},
-                   {"id": "bigquery-1", "kind": "bigquery", "tier": "enterprise"},
-                   {"id": "bridge-1", "kind": "mqtt_bridge", "tier": "community"},
-                   {"id": "cassandra-1", "kind": "cassandra", "tier": "enterprise"},
-                    {"id": "ch-sink-1", "kind": "clickhouse", "tier": "community"},
-                    {"id": "cockroach-1", "kind": "cockroachdb", "tier": "enterprise"},
-                    {"id": "confluent-1", "kind": "confluent", "tier": "enterprise"},
-                   {"id": "couchbase-1", "kind": "couchbase", "tier": "enterprise"},
-                   {"id": "databricks-1", "kind": "databricks", "tier": "enterprise"},
-                   {"id": "datalayers-1", "kind": "datalayers", "tier": "enterprise"},
-                   {"id": "diag", "kind": "console", "tier": "community"},
-                   {"id": "disk-1", "kind": "disk_log", "tier": "community"},
-                   {"id": "doris-1", "kind": "doris", "tier": "enterprise"},
-                   {"id": "dynamodb-1", "kind": "dynamodb", "tier": "enterprise"},
-                   {"id": "es-sink-1", "kind": "elasticsearch", "tier": "community"},
-                    {"id": "gcp-1", "kind": "gcp_pubsub", "tier": "enterprise"},
-                    {"id": "gcp-iot-1", "kind": "gcp_iot", "tier": "enterprise"},
-                    {"id": "greptimedb-1", "kind": "greptimedb", "tier": "community"},
-                   {"id": "hook-1", "kind": "webhook", "tier": "community"},
-                   {"id": "influx-sink-1", "kind": "influxdb", "tier": "community"},
-                   {"id": "iotdb-1", "kind": "iotdb", "tier": "enterprise"},
-                   {"id": "kafka-sink-1", "kind": "kafka", "tier": "community"},
-                   {"id": "kinesis-1", "kind": "kinesis", "tier": "enterprise"},
-                   {"id": "mongo-1", "kind": "mongodb", "tier": "enterprise"},
-                   {"id": "mssql-1", "kind": "mssql", "tier": "enterprise"},
-                    {"id": "mysql-sink-1", "kind": "mysql", "tier": "community"},
-                    {"id": "oci-1", "kind": "oci_streaming", "tier": "enterprise"},
-                     {"id": "opcua-1", "kind": "opc_ua", "tier": "enterprise"},
-                     {"id": "opentsdb-1", "kind": "opentsdb", "tier": "community"},
-                     {"id": "oracle-1", "kind": "oracle", "tier": "enterprise"},
-                     {"id": "ots-1", "kind": "tablestore", "tier": "enterprise"},
-                    {"id": "pg-sink-1", "kind": "postgres", "tier": "community"},
-                   {"id": "pulsar-1", "kind": "pulsar", "tier": "enterprise"},
-                   {"id": "rabbit-sink-1", "kind": "rabbitmq", "tier": "community"},
-                   {"id": "redis-sink-1", "kind": "redis", "tier": "community"},
-                    {"id": "redshift-1", "kind": "redshift", "tier": "enterprise"},
-                    {"id": "rmq-1", "kind": "rocketmq", "tier": "enterprise"},
-                    {"id": "s3-sink-1", "kind": "s3", "tier": "community"},
-                    {"id": "s3t-1", "kind": "s3_tables", "tier": "enterprise"},
-                   {"id": "snowflake-1", "kind": "snowflake", "tier": "enterprise"},
-                   {"id": "spb-1", "kind": "sparkplug_b", "tier": "enterprise"},
-                   {"id": "tdengine-1", "kind": "tdengine", "tier": "enterprise"},
-                   {"id": "timestream-1", "kind": "timestream", "tier": "enterprise"},
-                   {"id": "ts-sink-1", "kind": "timescaledb", "tier": "community"}])
-        );
+        // X1-09: the eight gated kinds are present only when their Cargo
+        // feature is enabled; otherwise creation above failed closed and
+        // the list omits them. Assert presence conditionally.
+        {
+            let list = body.as_array().expect("connector list");
+            let ids: std::collections::HashSet<&str> =
+                list.iter().filter_map(|e| e["id"].as_str()).collect();
+            for always in [
+                "alloydb-1",
+                "bridge-1",
+                "cassandra-1",
+                "ch-sink-1",
+                "cockroach-1",
+                "confluent-1",
+                "couchbase-1",
+                "databricks-1",
+                "datalayers-1",
+                "diag",
+                "disk-1",
+                "doris-1",
+                "es-sink-1",
+                "gcp-1",
+                "greptimedb-1",
+                "hook-1",
+                "influx-sink-1",
+                "iotdb-1",
+                "kafka-sink-1",
+                "kinesis-1",
+                "mongo-1",
+                "mssql-1",
+                "mysql-sink-1",
+                "oci-1",
+                "opcua-1",
+                "opentsdb-1",
+                "oracle-1",
+                "ots-1",
+                "pg-sink-1",
+                "pulsar-1",
+                "rabbit-sink-1",
+                "redis-sink-1",
+                "redshift-1",
+                "rmq-1",
+                "s3t-1",
+                "snowflake-1",
+                "spb-1",
+                "tdengine-1",
+                "timestream-1",
+                "ts-sink-1",
+            ] {
+                assert!(ids.contains(always), "connector {always} must be listed");
+            }
+            for (id, enabled) in [
+                ("s3-sink-1", cfg!(feature = "s3")),
+                ("azure-1", cfg!(feature = "azure_eventhubs")),
+                ("dynamodb-1", cfg!(feature = "dynamodb")),
+                ("bigquery-1", cfg!(feature = "bigquery")),
+                ("aws-iot-1", cfg!(feature = "aws_iot")),
+                ("azure-iot-1", cfg!(feature = "azure_iot")),
+                ("gcp-iot-1", cfg!(feature = "gcp_iot")),
+                ("azblob-1", cfg!(feature = "azure_blob")),
+            ] {
+                assert_eq!(ids.contains(id), enabled, "gated connector {id} presence");
+            }
+            let expected = 40
+                + (cfg!(feature = "s3") as usize)
+                + (cfg!(feature = "azure_eventhubs") as usize)
+                + (cfg!(feature = "dynamodb") as usize)
+                + (cfg!(feature = "bigquery") as usize)
+                + (cfg!(feature = "aws_iot") as usize)
+                + (cfg!(feature = "azure_iot") as usize)
+                + (cfg!(feature = "gcp_iot") as usize)
+                + (cfg!(feature = "azure_blob") as usize);
+            assert_eq!(list.len(), expected, "connector count");
+        }
 
         // Unknown kinds and invalid configs are 400s that store nothing.
         for payload in [
@@ -7082,7 +7267,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_array().expect("list").len(), 48);
+        // X1-09: count follows the enabled gated features (40 always + 8 gated).
+        let expected = 40
+            + (cfg!(feature = "s3") as usize)
+            + (cfg!(feature = "azure_eventhubs") as usize)
+            + (cfg!(feature = "dynamodb") as usize)
+            + (cfg!(feature = "bigquery") as usize)
+            + (cfg!(feature = "aws_iot") as usize)
+            + (cfg!(feature = "azure_iot") as usize)
+            + (cfg!(feature = "gcp_iot") as usize)
+            + (cfg!(feature = "azure_blob") as usize);
+        assert_eq!(body.as_array().expect("list").len(), expected);
     }
 
     #[tokio::test]
@@ -7140,8 +7335,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         assert!(state.engine.connectors().get("s101-gcp-no-key").is_none());
 
-        // gcp_iot with a key is 201 and live.
-        let (status, _) = server
+        // gcp_iot with a key is 201 and live when the feature is
+        // enabled; X1-09 disabled builds fail closed naming the feature.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
                 json!({"name": "s101-gcp-1", "type": "gcp_iot",
@@ -7151,8 +7347,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-gcp-1").is_some());
+        if cfg!(feature = "gcp_iot") {
+            assert_eq!(status, 201);
+            assert!(state.engine.connectors().get("s101-gcp-1").is_some());
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                body["message"].as_str().unwrap_or("").contains("gcp_iot"),
+                "disabled gcp_iot must name the feature, got: {body}"
+            );
+            assert!(state.engine.connectors().get("s101-gcp-1").is_none());
+        }
 
         // snowflake without a key is 400 naming the field.
         let (status, body) = server
@@ -7369,8 +7574,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         assert!(state.engine.connectors().get("s101-eh-no-key").is_none());
 
-        // azure_eventhubs with a key is 201 and live.
-        let (status, _) = server
+        // azure_eventhubs with a key is 201 and live when enabled;
+        // X1-09 disabled builds fail closed naming the feature.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
                 json!({"name": "s101-eh-1", "type": "azure_eventhubs",
@@ -7380,8 +7586,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-eh-1").is_some());
+        if cfg!(feature = "azure_eventhubs") {
+            assert_eq!(status, 201);
+            assert!(state.engine.connectors().get("s101-eh-1").is_some());
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("azure_eventhubs"),
+                "disabled azure_eventhubs must name the feature, got: {body}"
+            );
+            assert!(state.engine.connectors().get("s101-eh-1").is_none());
+        }
 
         // azure_iot without a key is 400 naming the field.
         let (status, body) = server
@@ -7403,8 +7621,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         assert!(state.engine.connectors().get("s101-aiot-no-key").is_none());
 
-        // azure_iot with a key is 201 and live.
-        let (status, _) = server
+        // azure_iot with a key is 201 and live when enabled;
+        // X1-09 disabled builds fail closed naming the feature.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
                 json!({"name": "s101-aiot-1", "type": "azure_iot",
@@ -7414,8 +7633,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-aiot-1").is_some());
+        if cfg!(feature = "azure_iot") {
+            assert_eq!(status, 201);
+            assert!(state.engine.connectors().get("s101-aiot-1").is_some());
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                body["message"].as_str().unwrap_or("").contains("azure_iot"),
+                "disabled azure_iot must name the feature, got: {body}"
+            );
+            assert!(state.engine.connectors().get("s101-aiot-1").is_none());
+        }
     }
 
     #[tokio::test]

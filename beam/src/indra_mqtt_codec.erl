@@ -18,19 +18,29 @@
          decode_connack_v5/1,
          connack_return_code/1,
           decode_subscribe/1,
+          decode_subscribe/2,
           encode_suback/2,
+          encode_suback_v5/3,
+          decode_suback_v5/1,
           decode_publish/2,
           decode_publish/3,
           encode_publish/4,
-         encode_publish/6,
-         encode_publish/7,
-         encode_puback/1,
-         encode_pubrec/1,
-         encode_pubrec/2,
-         encode_pubrel/1,
-         encode_pubcomp/1,
-         packet_type_atom/1,
-         packet_type_code/1]).
+          encode_publish/6,
+          encode_publish/7,
+          encode_puback/1,
+          encode_pubrec/1,
+          encode_pubrec/2,
+          encode_pubrel/1,
+          encode_pubcomp/1,
+          encode_publish_v5/8,
+          encode_publish_v5_full/11,
+          decode_disconnect_v5/1,
+          encode_disconnect_v5/2,
+          encode_disconnect_v5/3,
+          decode_subscribe_opts/1,
+          encode_subscribe_opts/4,
+          packet_type_atom/1,
+          packet_type_code/1]).
 
 %% Topic-alias property helpers (B4-05, CONNECT/CONNACK/PUBLISH only).
 %% The edge decodes 3.1.1 plus the MQTT 5 alias properties (34/35) so a
@@ -67,6 +77,30 @@
 -define(PROP_USER_PROPERTY, 38).
 -define(PROP_MAX_PACKET_SIZE, 39).
 -define(PROP_ASSIGNED_CLIENT_ID, 18).
+%% X1-03 v5 SUBSCRIBE/PUBLISH/DISCONNECT property identifiers.
+-define(PROP_PAYLOAD_FORMAT, 1).
+-define(PROP_MSG_EXPIRY, 2).
+-define(PROP_SUB_ID, 11).
+%% Largest subscription identifier on the wire (varint maximum). Reason:
+%% the identifier rides a variable-byte integer, so a larger value can
+%% never arrive as a single property; 0 means absent and is never valid
+%% on the wire. One u32 per subscription, no new unbounded state.
+-define(MAX_SUB_ID, 268435455).
+%% Largest v5 SUBSCRIBE/SUBACK/DISCONNECT properties block the edge
+%% accepts (bytes). Reason: one properties block must fit the 65535-byte
+%% BrokerLink meta cap downstream once framed; a larger block fails the
+%% packet closed instead of registering half a subscription.
+-define(MAX_V5_SUB_PROPS_LEN, 65535).
+%% Most subscription identifiers carried per PUBLISH delivery (count).
+%% Reason: one delivery fans out as one frame per match, each carrying
+%% its own single identifier, so the wire property count stays 0 or 1;
+%% the bound covers the single-id fast path with no new unbounded state.
+-define(MAX_V5_SUB_IDS, 1).
+%% v5 SUBACK reason codes carried per filter (granted QoS 0-2 plus the
+%% documented refusals). Version-4 peers only ever observe 0-2 and 16#80.
+-define(SUBACK_RC_FILTER_INVALID, 16#8F).
+-define(SUBACK_RC_NOT_AUTHORIZED, 16#87).
+-define(SUBACK_RC_QUOTA_EXCEEDED, 16#97).
 %% Largest CONNECT properties block the edge accepts (bytes). Reason: one
 %% CONNECT properties block must fit the 65535-byte BrokerLink meta cap
 %% downstream once framed into a bind; a larger block fails closed instead
@@ -130,8 +164,15 @@
                             user_properties := [{binary(), binary()}]}.
 %% Note: when the kernel inbound alias maximum (property 34) rides the
 %% CONNACK, `decode_connack_v5/1' additionally returns `alias_max'.
+%% X1-03 v5 subscriptions carry per-filter options: `{Filter, Opts}'
+%% where `Opts' is the raw subscription-options byte (bits 0-1 QoS, bit
+%% 2 no-local, bit 3 retain-as-published, bits 4-5 retain handling,
+%% bits 6-7 reserved). The edge passes the byte through even when
+%% reserved bits are set; the kernel fails only that filter with 16#8F.
+%% `sub_id' is the packet-wide subscription identifier (0 when absent).
 -type subscribe_map() :: #{packet_id := 1..65535,
-                           subscriptions := [{binary(), 0..2}]}.
+                           subscriptions := [{binary(), 0..255}],
+                           sub_id => 0..268435455}.
 -type publish_map() :: #{topic := binary(),
                          packet_id := 0..65535,
                          qos := 0..2,
@@ -139,7 +180,18 @@
                          dup := boolean(),
                          alias := 0..65535,
                          alias_present := boolean(),
+                         payload_format => 0..1,
+                         message_expiry => 0..4294967295,
+                         sub_ids => [0..268435455],
+                         user_properties => [{binary(), binary()}],
                          payload := binary()}.
+-type suback_v5_map() :: #{packet_id := 1..65535,
+                           codes := [0..255],
+                           reason_string => binary(),
+                           user_properties => [{binary(), binary()}]}.
+-type disconnect_v5_map() :: #{reason_code := 0..255,
+                               reason_string => binary(),
+                               user_properties => [{binary(), binary()}] }.
 
 %%=============================================================%% Public API
 %%=============================================================
@@ -530,9 +582,28 @@ connack_return_code(_) -> 3.       %% server unavailable, busy or over quota
 %%
 %% Takes the {@code payload} slice from {@code decode_packet/1}.
 %% Each subscription is a {@code {Filter, QoS}} pair; binaries reference
-%% the input (no copying).
+%% the input (no copying). This is the 3.1.1 form (protocol level 4):
+%% strict validation, whole-packet errors, bytes identical to before.
 -spec decode_subscribe(binary()) -> {ok, subscribe_map()} | {error, term()}.
-decode_subscribe(<<PacketId:16/big, Rest/binary>>) when PacketId =/= 0 ->
+decode_subscribe(Bin) ->
+    decode_subscribe(Bin, 4).
+
+%% @doc Decode an MQTT SUBSCRIBE payload for the given protocol level
+%% (X1-03: 4 or 5).
+%%
+%% Level 4 behaves exactly like the previous {@link decode_subscribe/1}.
+%% Level 5 parses the property section (`PacketId | PropsLen | Props |
+%% filters'). It extracts the subscription identifier (property 11,
+%% 0 when absent). It then reads one options byte per filter (bits 0-1
+%% QoS, bit 2 no-local, bit 3 retain-as-published, bits 4-5 retain
+%% handling). The options byte rides through even when reserved bits
+%% are set. The kernel fails only that filter with 16#8F.
+%% Structural truncation fails the whole packet.
+%% The identifier is packet-wide: the specification carries one
+%% subscription-identifier property per SUBSCRIBE packet, so one value
+%% applies to every filter in the packet.
+-spec decode_subscribe(binary(), 4 | 5) -> {ok, subscribe_map()} | {error, term()}.
+decode_subscribe(<<PacketId:16/big, Rest/binary>>, 4) when PacketId =/= 0 ->
     case decode_sub_list(Rest, []) of
         {ok, []} ->
             {error, empty_subscribe};
@@ -541,8 +612,145 @@ decode_subscribe(<<PacketId:16/big, Rest/binary>>) when PacketId =/= 0 ->
         {error, _} = Err ->
             Err
     end;
-decode_subscribe(_) ->
+decode_subscribe(<<PacketId:16/big, Rest/binary>>, 5) when PacketId =/= 0 ->
+    case decode_varint(Rest) of
+        {ok, PropLen, Rest1} when PropLen =< ?MAX_V5_SUB_PROPS_LEN ->
+            case byte_size(Rest1) < PropLen of
+                true ->
+                    {error, truncated_subscribe};
+                false ->
+                    <<Props:PropLen/binary, Tail/binary>> = Rest1,
+                    case parse_subscribe_props(Props) of
+                        {ok, SubId} ->
+                            case decode_sub_list_v5(Tail, []) of
+                                {ok, []} ->
+                                    {error, empty_subscribe};
+                                {ok, Subs} ->
+                                    {ok, #{packet_id => PacketId,
+                                            subscriptions => Subs,
+                                            sub_id => SubId}};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        _ ->
+            {error, malformed_subscribe}
+    end;
+decode_subscribe(_, _) ->
     {error, malformed_subscribe}.
+
+%% @private Parse a v5 SUBSCRIBE property block, returning the packet-wide
+%% subscription identifier (0 when absent). A zero identifier, a duplicate
+%% identifier or an over-maximum value fails the packet closed; user
+%% properties are length-checked and skipped (bounded by
+%% `MAX_V5_USER_PROPS'); other known properties are skipped by length.
+parse_subscribe_props(Props) ->
+    parse_subscribe_props(Props, undefined, 0).
+
+parse_subscribe_props(<<>>, undefined, _) ->
+    {ok, 0};
+parse_subscribe_props(<<>>, {ok, SubId}, _) ->
+    {ok, SubId};
+parse_subscribe_props(Bin, Seen, UserCount) ->
+    case decode_varint(Bin) of
+        {ok, ?PROP_SUB_ID, Rest} ->
+            case Seen of
+                undefined ->
+                    case decode_varint(Rest) of
+                        {ok, 0, _} ->
+                            {error, malformed_subscribe};
+                        {ok, SubId, Tail} when SubId >= 1, SubId =< ?MAX_SUB_ID ->
+                            parse_subscribe_props(Tail, {ok, SubId}, UserCount);
+                        _ ->
+                            {error, malformed_subscribe}
+                    end;
+                _ ->
+                    {error, malformed_subscribe}
+            end;
+        {ok, ?PROP_USER_PROPERTY, Rest} ->
+            case UserCount >= ?MAX_V5_USER_PROPS of
+                true ->
+                    {error, malformed_subscribe};
+                false ->
+                    case take_prop_utf8(Rest) of
+                        {ok, _, Rest1} ->
+                            case take_prop_utf8(Rest1) of
+                                {ok, _, Tail} ->
+                                    parse_subscribe_props(Tail, Seen, UserCount + 1);
+                                {error, _} ->
+                                    {error, truncated_subscribe}
+                            end;
+                        {error, _} ->
+                            {error, truncated_subscribe}
+                    end
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} ->
+                    parse_subscribe_props(Tail, Seen, UserCount);
+                {error, _} = Err ->
+                    case Err of
+                        {error, {unknown_property, _}} ->
+                            {error, malformed_subscribe};
+                        _ ->
+                            Err
+                    end
+            end;
+        {error, _} ->
+            {error, malformed_subscribe}
+    end.
+
+%% @private Decode a v5 filter list: `FilterLen | Filter | Opts' per
+%% entry. FilterLen 0 is accepted structurally (the kernel fails that
+%% filter with 16#8F); the options byte rides through unvalidated so one
+%% bad byte never fails the whole packet.
+decode_sub_list_v5(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_sub_list_v5(<<FilterLen:16/big, Rest/binary>>, Acc) ->
+    case Rest of
+        <<Filter:FilterLen/binary, Opts:8, Tail/binary>> ->
+            decode_sub_list_v5(Tail, [{Filter, Opts} | Acc]);
+        _ ->
+            {error, truncated_subscribe}
+    end;
+decode_sub_list_v5(_, _) ->
+    {error, malformed_subscribe}.
+
+%% @doc Decode one v5 subscription-options byte into its fields.
+%% Returns `{ok, {QoS, NoLocal, Rap, RetainHandling}}' or `error' when
+%% reserved bits are set, QoS > 2 or retain handling > 2 (fail closed:
+%% the caller fails only that filter).
+-spec decode_subscribe_opts(0..255) ->
+    {ok, {0..2, boolean(), boolean(), 0..2}} | {error, term()}.
+decode_subscribe_opts(Opts) when is_integer(Opts), Opts >= 0, Opts =< 255 ->
+    case Opts band 16#C0 of
+        0 ->
+            QoS = Opts band 16#03,
+            RH = (Opts band 16#30) bsr 4,
+            case QoS =< 2 andalso RH =< 2 of
+                true ->
+                    {ok, {QoS, (Opts band 16#04) =/= 0,
+                          (Opts band 16#08) =/= 0, RH}};
+                false ->
+                    {error, {invalid_subscribe_opts, Opts}}
+            end;
+        _ ->
+            {error, {invalid_subscribe_opts, Opts}}
+    end.
+
+%% @doc Encode one v5 subscription-options byte from its fields.
+-spec encode_subscribe_opts(0..2, boolean(), boolean(), 0..2) -> 0..255.
+encode_subscribe_opts(QoS, NoLocal, Rap, RH)
+  when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(NoLocal), is_boolean(Rap),
+       (RH =:= 0 orelse RH =:= 1 orelse RH =:= 2) ->
+    (QoS band 16#03)
+    bor (case NoLocal of true -> 16#04; false -> 0 end)
+    bor (case Rap of true -> 16#08; false -> 0 end)
+    bor (RH bsl 4).
 
 %% @doc Encode an MQTT SUBACK packet from a packet id and granted codes.
 %%
@@ -557,6 +765,58 @@ encode_suback(PacketId, Codes)
     Body = <<PacketId:16/big, (list_to_binary(Codes))/binary>>,
     RL = encode_remaining_length(byte_size(Body)),
     <<16#90, RL/binary, Body/binary>>.
+
+%% @doc Encode an MQTT 5 SUBACK packet (X1-03, v5 subscribers only).
+%% Wire form: `SUBACK | Remaining | PacketId:16be | PropsLen:varint |
+%% Props | Codes'. Codes ride unmapped (granted QoS 0-2, 16#80
+%% unspecified, 16#87 not authorized, 16#8F filter invalid, 16#97 quota
+%% exceeded). Props carries the reason string (property 28, omitted when
+%% empty) plus user properties (property 38, omitted when empty); the
+%% broker never invents a reason string, so success SUBACKs carry empty
+%% properties. The caller must gate on the negotiated protocol level and
+%% use {@link encode_suback/2} for 3.1.1 peers.
+-spec encode_suback_v5(1..65535, [0..255], map()) -> binary().
+encode_suback_v5(PacketId, Codes, Opts)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_list(Codes), is_map(Opts) ->
+    ok = validate_suback_v5_codes(Codes),
+    Props = encode_suback_v5_props(Opts),
+    true = (byte_size(Props) =< ?MAX_V5_SUB_PROPS_LEN) orelse erlang:error(badarg),
+    PropLen = encode_varint(byte_size(Props)),
+    Body = <<PacketId:16/big, PropLen/binary, Props/binary,
+             (list_to_binary(Codes))/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#90, RL/binary, Body/binary>>.
+
+%% @doc Decode an MQTT 5 SUBACK body back into its fields (EUnit vectors
+%% and any future v5 client path; the edge accept path only encodes).
+-spec decode_suback_v5(binary()) -> {ok, suback_v5_map()} | {error, term()}.
+decode_suback_v5(<<PacketId:16/big, Rest/binary>>) when PacketId =/= 0 ->
+    case decode_varint(Rest) of
+        {ok, PropLen, Rest1} ->
+            case byte_size(Rest1) < PropLen of
+                true ->
+                    {error, truncated_suback};
+                false ->
+                    <<Props:PropLen/binary, Codes/binary>> = Rest1,
+                    case Codes of
+                        <<>> ->
+                            {error, empty_suback};
+                        _ ->
+                            case parse_suback_props(Props) of
+                                {ok, Parsed} ->
+                                    {ok, Parsed#{packet_id => PacketId,
+                                                 codes => binary_to_list(Codes)}};
+                                {error, _} = Err ->
+                                    Err
+                            end
+                    end
+            end;
+        {error, _} ->
+            {error, malformed_suback}
+    end;
+decode_suback_v5(_) ->
+    {error, malformed_suback}.
 
 %% @doc Decode an MQTT PUBLISH payload with its fixed-header flags.
 %%
@@ -671,6 +931,313 @@ encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload, Alias)
         bor (case Retain of true -> 16#01; false -> 0 end),
     RL = encode_remaining_length(byte_size(Body)),
     <<3:4, Flags:4, RL/binary, Body/binary>>.
+
+%% @private Validate v5 SUBACK codes (granted QoS plus the documented
+%% refusals). Anything else is a caller bug (never a half packet).
+validate_suback_v5_codes([]) -> erlang:error(badarg);
+validate_suback_v5_codes(Codes) when is_list(Codes) ->
+    case lists:all(fun(C) ->
+        C =:= 0 orelse C =:= 1 orelse C =:= 2 orelse
+        C =:= 16#80 orelse C =:= ?SUBACK_RC_NOT_AUTHORIZED orelse
+        C =:= ?SUBACK_RC_FILTER_INVALID orelse
+        C =:= ?SUBACK_RC_QUOTA_EXCEEDED orelse C =:= 16#83
+    end, Codes) of
+        true -> ok;
+        false -> erlang:error(badarg)
+    end.
+
+%% @private Encode a v5 SUBACK property block (reason string + user
+%% properties, both omitted when empty so success SUBACKs stay small).
+encode_suback_v5_props(Opts) ->
+    Reason = maps:get(reason_string, Opts, <<>>),
+    Users = maps:get(user_properties, Opts, []),
+    RBin = case Reason of
+        <<>> -> <<>>;
+        S when is_binary(S), byte_size(S) >= 1,
+               byte_size(S) =< ?MAX_V5_PROP_STRING_LEN ->
+            <<?PROP_REASON_STRING:8, (byte_size(S)):16/big, S/binary>>;
+        _ -> erlang:error(badarg)
+    end,
+    UBin = case Users of
+        [] -> <<>>;
+        Pairs when is_list(Pairs) ->
+            true = (length(Pairs) =< ?MAX_V5_USER_PROPS) orelse erlang:error(badarg),
+            lists:foldl(
+              fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                                     byte_size(K) >= 1,
+                                     byte_size(K) =< ?MAX_V5_PROP_STRING_LEN,
+                                     byte_size(V) =< ?MAX_V5_PROP_STRING_LEN ->
+                      <<Acc/binary, ?PROP_USER_PROPERTY:8,
+                        (byte_size(K)):16/big, K/binary,
+                        (byte_size(V)):16/big, V/binary>>;
+                 (_, _) -> erlang:error(badarg)
+              end, <<>>, Pairs);
+        _ -> erlang:error(badarg)
+    end,
+    <<RBin/binary, UBin/binary>>.
+
+%% @private Parse a v5 SUBACK property block (reason string once, user
+%% properties accumulated, others skipped by length).
+parse_suback_props(Props) ->
+    parse_suback_props(Props, #{reason_string => <<>>, user_properties => []}, #{}).
+
+parse_suback_props(<<>>, Acc, _Seen) ->
+    {ok, Acc};
+parse_suback_props(Bin, Acc, Seen) ->
+    case decode_varint(Bin) of
+        {ok, ?PROP_REASON_STRING, Rest} ->
+            case maps:is_key(?PROP_REASON_STRING, Seen) of
+                true -> {error, malformed_suback};
+                false ->
+                    case take_prop_utf8(Rest) of
+                        {ok, S, Tail} ->
+                            parse_suback_props(Tail, Acc#{reason_string => S},
+                                               Seen#{?PROP_REASON_STRING => true});
+                        {error, _} -> {error, truncated_suback}
+                    end
+            end;
+        {ok, ?PROP_USER_PROPERTY, Rest} ->
+            case take_prop_utf8(Rest) of
+                {ok, K, Rest1} ->
+                    case take_prop_utf8(Rest1) of
+                        {ok, V, Tail} ->
+                            Got = maps:get(user_properties, Acc),
+                            case length(Got) >= ?MAX_V5_USER_PROPS of
+                                true -> {error, malformed_suback};
+                                false ->
+                                    parse_suback_props(
+                                      Tail, Acc#{user_properties => Got ++ [{K, V}]}, Seen)
+                            end;
+                        {error, _} -> {error, truncated_suback}
+                    end;
+                {error, _} -> {error, truncated_suback}
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} -> parse_suback_props(Tail, Acc, Seen);
+                {error, _} -> {error, malformed_suback}
+            end;
+        {error, _} ->
+            {error, malformed_suback}
+    end.
+
+%% @doc Encode an outgoing MQTT 5 PUBLISH packet with a subscription
+%% identifier (0 = no identifier). The packet always has the property
+%% length, because MQTT 5 requires it. The caller must use this function
+%% only for a socket that negotiated protocol level 5.
+-spec encode_publish_v5(binary(), 0..65535, 0..2, boolean(), boolean(),
+                        binary(), 0..65535, 0..268435455) -> binary().
+encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, SubId) ->
+    encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
+                           Alias, SubId, 0, 0, []).
+
+%% @doc Encode an outgoing MQTT 5 PUBLISH packet with subscription
+%% identifier plus forwarded v5 properties (X1-03 deliveries).
+%% `Format' is 0|1, `Expiry' a u32 message-expiry interval, `Users' a
+%% bounded `[{Key, Value}]' user-property list. Empty properties
+%% encode as a property length of zero; a
+%% version-4 peer never reaches here (the caller gates on the
+%% negotiated level). Over-bound inputs fail with `badarg' (fail
+%% closed: the caller falls back to the property-less form).
+-spec encode_publish_v5_full(binary(), 0..65535, 0..2, boolean(), boolean(),
+                             binary(), 0..65535, 0..268435455,
+                             0..1, 0..4294967295, [{binary(), binary()}]) -> binary().
+encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
+                       Alias, SubId, Format, Expiry, Users)
+  when is_binary(Topic), byte_size(Topic) >= 1, byte_size(Topic) =< ?MAX_TOPIC_LEN,
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup), is_binary(Payload),
+       is_integer(Alias), Alias >= 0, Alias =< ?MAX_TOPIC_ALIAS,
+       is_integer(SubId), SubId >= 0, SubId =< ?MAX_SUB_ID,
+       (Format =:= 0 orelse Format =:= 1),
+       is_integer(Expiry), Expiry >= 0, Expiry =< 16#FFFFFFFF,
+       is_list(Users) ->
+    ok = validate_publish_id(QoS, PacketId),
+    true = (length(Users) =< ?MAX_V5_USER_PROPS) orelse erlang:error(badarg),
+    %% One delivery carries at most one identifier.
+    IdCount = case SubId of 0 -> 0; _ -> 1 end,
+    true = (IdCount =< ?MAX_V5_SUB_IDS) orelse erlang:error(badarg),
+    AliasProps = case Alias of
+        0 -> <<>>;
+        _ -> <<?TOPIC_ALIAS_PROPERTY_ID:8, (encode_topic_alias(Alias))/binary>>
+    end,
+    SubProps = case SubId of
+        0 -> <<>>;
+        _ -> <<?PROP_SUB_ID:8, (encode_varint(SubId))/binary>>
+    end,
+    FormatProps = case Format of
+        0 -> <<>>;
+        1 -> <<?PROP_PAYLOAD_FORMAT:8, 1:8>>
+    end,
+    ExpiryProps = case Expiry of
+        0 -> <<>>;
+        _ -> <<?PROP_MSG_EXPIRY:8, Expiry:32/big>>
+    end,
+    UserProps = lists:foldl(
+      fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                             byte_size(K) >= 1,
+                             byte_size(K) =< ?MAX_V5_PROP_STRING_LEN,
+                             byte_size(V) =< ?MAX_V5_PROP_STRING_LEN ->
+              <<Acc/binary, ?PROP_USER_PROPERTY:8,
+                (byte_size(K)):16/big, K/binary,
+                (byte_size(V)):16/big, V/binary>>;
+         (_, _) -> erlang:error(badarg)
+      end, <<>>, Users),
+    Props = <<AliasProps/binary, SubProps/binary, FormatProps/binary,
+              ExpiryProps/binary, UserProps/binary>>,
+    %% MQTT 5 requires the property length in each PUBLISH. An empty
+    %% property section is one zero byte.
+    PropLen = encode_varint(byte_size(Props)),
+    Header = case QoS of
+        0 -> <<(byte_size(Topic)):16/big, Topic/binary, PropLen/binary, Props/binary>>;
+        _ -> <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big,
+               PropLen/binary, Props/binary>>
+    end,
+    Body = <<Header/binary, Payload/binary>>,
+    Flags = (case Dup of true -> 16#08; false -> 0 end)
+        bor (QoS bsl 1)
+        bor (case Retain of true -> 16#01; false -> 0 end),
+    RL = encode_remaining_length(byte_size(Body)),
+    <<3:4, Flags:4, RL/binary, Body/binary>>.
+
+%% @doc Decode an MQTT 5 DISCONNECT body (X1-03): reason code plus
+%% properties (reason string + user properties, bounded). Empty body
+%% means normal disconnection (code 0, no properties). A truncated
+%% property section fails closed.
+-spec decode_disconnect_v5(binary()) -> {ok, disconnect_v5_map()} | {error, term()}.
+decode_disconnect_v5(<<>>) ->
+    {ok, #{reason_code => 0, reason_string => <<>>, user_properties => []}};
+decode_disconnect_v5(<<RC:8>>) ->
+    {ok, #{reason_code => RC, reason_string => <<>>, user_properties => []}};
+decode_disconnect_v5(<<RC:8, Rest/binary>>) ->
+    case decode_varint(Rest) of
+        {ok, PropLen, Rest1} ->
+            case byte_size(Rest1) < PropLen of
+                true ->
+                    {error, truncated_disconnect};
+                false ->
+                    <<Props:PropLen/binary, Tail/binary>> = Rest1,
+                    case Tail of
+                        <<>> ->
+                            case parse_disconnect_props(Props) of
+                                {ok, Parsed} ->
+                                    {ok, Parsed#{reason_code => RC}};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        _ ->
+                            {error, trailing_disconnect_bytes}
+                    end
+            end;
+        {error, _} ->
+            {error, malformed_disconnect}
+    end;
+decode_disconnect_v5(_) ->
+    {error, malformed_disconnect}.
+
+%% @private Parse a v5 DISCONNECT property block (reason string once,
+%% user properties accumulated, others skipped by length). The broker
+%% never invents a reason string; an absent one decodes as empty.
+parse_disconnect_props(Props) ->
+    parse_disconnect_props(Props, #{reason_string => <<>>, user_properties => []}, #{}).
+
+parse_disconnect_props(<<>>, Acc, _Seen) ->
+    {ok, Acc};
+parse_disconnect_props(Bin, Acc, Seen) ->
+    case decode_varint(Bin) of
+        {ok, ?PROP_REASON_STRING, Rest} ->
+            case maps:is_key(?PROP_REASON_STRING, Seen) of
+                true -> {error, malformed_disconnect};
+                false ->
+                    case take_prop_utf8(Rest) of
+                        {ok, S, Tail} ->
+                            parse_disconnect_props(Tail, Acc#{reason_string => S},
+                                                   Seen#{?PROP_REASON_STRING => true});
+                        {error, _} -> {error, truncated_disconnect}
+                    end
+            end;
+        {ok, ?PROP_USER_PROPERTY, Rest} ->
+            case take_prop_utf8(Rest) of
+                {ok, K, Rest1} ->
+                    case take_prop_utf8(Rest1) of
+                        {ok, V, Tail} ->
+                            Got = maps:get(user_properties, Acc),
+                            case length(Got) >= ?MAX_V5_USER_PROPS of
+                                true -> {error, malformed_disconnect};
+                                false ->
+                                    parse_disconnect_props(
+                                      Tail, Acc#{user_properties => Got ++ [{K, V}]}, Seen)
+                            end;
+                        {error, _} -> {error, truncated_disconnect}
+                    end;
+                {error, _} -> {error, truncated_disconnect}
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} -> parse_disconnect_props(Tail, Acc, Seen);
+                {error, _} -> {error, malformed_disconnect}
+            end;
+        {error, _} ->
+            {error, malformed_disconnect}
+    end.
+
+%% @doc Encode an MQTT 5 DISCONNECT packet (X1-03). Code 0 with empty
+%% properties encodes as the 2-byte 3.1.1 shape (no reason, no
+%% properties) so version-4 peers see no change; any other code or a
+%% non-empty reason string carries the reason plus a property block.
+%% The broker never invents a reason string: callers pass `<<>>' when
+%% there is nothing to say and the property is omitted.
+-spec encode_disconnect_v5(0..255, binary()) -> binary().
+encode_disconnect_v5(RC, Reason) ->
+    encode_disconnect_v5(RC, Reason, []).
+
+%% @doc Encode an MQTT 5 DISCONNECT packet with user properties.
+-spec encode_disconnect_v5(0..255, binary(), [{binary(), binary()}]) -> binary().
+encode_disconnect_v5(0, <<>>, []) ->
+    <<16#E0, 16#00>>;
+encode_disconnect_v5(0, <<>>, Users) when is_list(Users), Users =/= [] ->
+    Props = encode_disconnect_props(<<>>, Users),
+    PropLen = encode_varint(byte_size(Props)),
+    Body = <<0:8, PropLen/binary, Props/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#E0, RL/binary, Body/binary>>;
+encode_disconnect_v5(RC, Reason, Users)
+  when is_integer(RC), RC >= 0, RC =< 255, is_binary(Reason), is_list(Users) ->
+    Props = encode_disconnect_props(Reason, Users),
+    PropLen = encode_varint(byte_size(Props)),
+    Body = <<RC:8, PropLen/binary, Props/binary>>,
+    RL = encode_remaining_length(byte_size(Body)),
+    <<16#E0, RL/binary, Body/binary>>.
+
+%% @private Encode a DISCONNECT property block (reason string omitted
+%% when empty, user properties bounded).
+encode_disconnect_props(<<>>, []) -> <<>>;
+encode_disconnect_props(Reason, Users) ->
+    RBin = case Reason of
+        <<>> -> <<>>;
+        S when is_binary(S), byte_size(S) >= 1,
+               byte_size(S) =< ?MAX_V5_PROP_STRING_LEN ->
+            <<?PROP_REASON_STRING:8, (byte_size(S)):16/big, S/binary>>;
+        _ -> erlang:error(badarg)
+    end,
+    UBin = case Users of
+        [] -> <<>>;
+        Pairs when is_list(Pairs) ->
+            true = (length(Pairs) =< ?MAX_V5_USER_PROPS) orelse erlang:error(badarg),
+            lists:foldl(
+              fun({K, V}, Acc) when is_binary(K), is_binary(V),
+                                     byte_size(K) >= 1,
+                                     byte_size(K) =< ?MAX_V5_PROP_STRING_LEN,
+                                     byte_size(V) =< ?MAX_V5_PROP_STRING_LEN ->
+                      <<Acc/binary, ?PROP_USER_PROPERTY:8,
+                        (byte_size(K)):16/big, K/binary,
+                        (byte_size(V)):16/big, V/binary>>;
+                 (_, _) -> erlang:error(badarg)
+              end, <<>>, Pairs);
+        _ -> erlang:error(badarg)
+    end,
+    <<RBin/binary, UBin/binary>>.
 
 %% @doc Encode an MQTT PUBACK packet for a QoS 1 delivery.
 -spec encode_puback(1..65535) -> binary().
@@ -888,6 +1455,14 @@ decode_publish_v5_tail(Qos, Topic, TopicLen, Dup, Retain, Tail) ->
     end.
 
 %% @private Parse the v5 property section and build the publish map.
+%% X1-03 extracts the Topic Alias (35) plus payload-format (1),
+%% message-expiry (2) and user properties (38, bounded); a
+%% subscription identifier (11) from a client is a protocol error
+%% (only the server sends it on delivery), failing the PUBLISH closed.
+%% Inbound user properties ride into the map for the BrokerLink forward;
+%% message-expiry and format ride along. The task scope is
+%% decode-and-forward, so the edge forwards the expiry value without
+%% enforcing it: no message is dropped on a timer the task never built.
 decode_publish_v5_props(Qos, PacketId, Topic, TopicLen, Dup, Retain, Tail) ->
     case decode_varint(Tail) of
         {ok, PropLen, Rest} ->
@@ -896,8 +1471,8 @@ decode_publish_v5_props(Qos, PacketId, Topic, TopicLen, Dup, Retain, Tail) ->
                     {error, truncated_publish};
                 false ->
                     <<Props:PropLen/binary, AppPayload/binary>> = Rest,
-                    case parse_publish_alias(Props) of
-                        {ok, Alias, AliasPresent} ->
+                    case parse_publish_v5(Props) of
+                        {ok, Alias, AliasPresent, Format, Expiry, Users} ->
                             case TopicLen =:= 0 andalso not AliasPresent of
                                 true ->
                                     {error, malformed_publish_topic};
@@ -909,6 +1484,10 @@ decode_publish_v5_props(Qos, PacketId, Topic, TopicLen, Dup, Retain, Tail) ->
                                            dup => Dup,
                                            alias => Alias,
                                            alias_present => AliasPresent,
+                                           payload_format => Format,
+                                           message_expiry => Expiry,
+                                           user_properties => Users,
+                                           sub_ids => [],
                                            payload => AppPayload}}
                             end;
                         {error, _} = Err ->
@@ -917,6 +1496,85 @@ decode_publish_v5_props(Qos, PacketId, Topic, TopicLen, Dup, Retain, Tail) ->
             end;
         {error, _} = Err ->
             Err
+    end.
+
+%% @private Full v5 PUBLISH properties parse (inbound: alias + format +
+%% expiry + user properties; subscription identifiers rejected).
+parse_publish_v5(Props) ->
+    parse_publish_v5(Props, undefined, undefined, undefined, []).
+
+parse_publish_v5(<<>>, AliasSeen, FormatSeen, ExpirySeen, Users) ->
+    {Alias, Present} = case AliasSeen of
+        undefined -> {0, false};
+        {ok, A} -> {A, true}
+    end,
+    Format = case FormatSeen of undefined -> 0; {ok, F} -> F end,
+    Expiry = case ExpirySeen of undefined -> 0; {ok, E} -> E end,
+    {ok, Alias, Present, Format, Expiry, Users};
+parse_publish_v5(Bin, AliasSeen, FormatSeen, ExpirySeen, Users) ->
+    case decode_varint(Bin) of
+        {ok, 35, Rest} ->
+            case Rest of
+                <<Alias:16/big, Tail/binary>> ->
+                    case AliasSeen of
+                        undefined -> parse_publish_v5(Tail, {ok, Alias}, FormatSeen, ExpirySeen, Users);
+                        _ -> {error, malformed_publish_properties}
+                    end;
+                _ ->
+                    {error, truncated_publish}
+            end;
+        {ok, 1, Rest} ->
+            case Rest of
+                <<F:8, Tail/binary>> when F =:= 0; F =:= 1 ->
+                    case FormatSeen of
+                        undefined -> parse_publish_v5(Tail, AliasSeen, {ok, F}, ExpirySeen, Users);
+                        _ -> {error, malformed_publish_properties}
+                    end;
+                <<_:8, _/binary>> ->
+                    {error, malformed_publish_properties};
+                _ ->
+                    {error, truncated_publish}
+            end;
+        {ok, 2, Rest} ->
+            case Rest of
+                <<E:32/big, Tail/binary>> ->
+                    case ExpirySeen of
+                        undefined -> parse_publish_v5(Tail, AliasSeen, FormatSeen, {ok, E}, Users);
+                        _ -> {error, malformed_publish_properties}
+                    end;
+                _ ->
+                    {error, truncated_publish}
+            end;
+        {ok, 11, _Rest} ->
+            %% Subscription identifiers flow server-to-client only; a
+            %% client sending one fails closed (protocol error).
+            {error, malformed_publish_properties};
+        {ok, 38, Rest} ->
+            case take_prop_utf8(Rest) of
+                {ok, K, Rest1} ->
+                    case take_prop_utf8(Rest1) of
+                        {ok, V, Tail} ->
+                            case length(Users) >= ?MAX_V5_USER_PROPS of
+                                true -> {error, malformed_publish_properties};
+                                false -> parse_publish_v5(Tail, AliasSeen, FormatSeen, ExpirySeen,
+                                                          Users ++ [{K, V}])
+                            end;
+                        {error, _} -> {error, truncated_publish}
+                    end;
+                {error, _} -> {error, truncated_publish}
+            end;
+        {ok, Id, Rest} ->
+            case skip_property(Id, Rest) of
+                {ok, Tail} ->
+                    parse_publish_v5(Tail, AliasSeen, FormatSeen, ExpirySeen, Users);
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            case Err of
+                {error, truncated_connect} -> {error, truncated_publish};
+                _ -> Err
+            end
     end.
 
 validate_publish_id(0, _) -> ok;
@@ -1277,43 +1935,6 @@ take_prop_binary(<<Len:16/big, Rest/binary>>) ->
     end;
 take_prop_binary(_) ->
     {error, truncated_connect}.
-
-%% @private Extract the Topic Alias (property 35, u16) from a PUBLISH
-%% properties block. Returns `{ok, Alias, Present}': absent means
-%% `{ok, 0, false}', an explicit on-wire 0 means `{ok, 0, true}'
-%% (a protocol error the kernel rejects with DISCONNECT 0x94).
-parse_publish_alias(Props) ->
-    parse_publish_alias(Props, undefined).
-
-parse_publish_alias(<<>>, undefined) ->
-    {ok, 0, false};
-parse_publish_alias(<<>>, {ok, Alias}) ->
-    {ok, Alias, true};
-parse_publish_alias(Bin, Seen) ->
-    case decode_varint(Bin) of
-        {ok, 35, Rest} ->
-            case Rest of
-                <<Alias:16/big, Tail/binary>> ->
-                    case Seen of
-                        undefined -> parse_publish_alias(Tail, {ok, Alias});
-                        _ -> {error, malformed_publish_properties}
-                    end;
-                _ ->
-                    {error, truncated_publish}
-            end;
-        {ok, Id, Rest} ->
-            case skip_property(Id, Rest) of
-                {ok, Tail} ->
-                    parse_publish_alias(Tail, Seen);
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            case Err of
-                {error, truncated_connect} -> {error, truncated_publish};
-                _ -> Err
-            end
-    end.
 
 %% @private Skip one property value by its identifier. Lengths follow
 %% MQTT 5.0 §2.2.2: u8, u16, u32, variable-byte integer, UTF-8 string,

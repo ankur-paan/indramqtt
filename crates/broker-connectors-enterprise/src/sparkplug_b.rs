@@ -7,6 +7,15 @@
 //! Sparkplug telemetry), and an edge/node state machine tracking
 //! online status, birth alias caches and cyclical sequence health.
 //!
+//! Transport: the maintained `rumqttc` driver (Apache-2.0) publishes
+//! frames to a real MQTT server carrying Sparkplug Protobuf
+//! (`RumqttcSparkplugTransport`); the hand-written
+//! `MemorySparkplugTransport` stays for offline unit tests only.
+//! Protobuf encoding on the write path goes through the maintained
+//! `prost` driver (Apache-2.0): `ProtoPayload` / `ProtoMetric` mirror
+//! the clean-room field numbers below, and `encode_payload_prost`
+//! agrees byte-for-byte with `encode_payload` on the covered vectors.
+//!
 //! Tier classification: Sparkplug processing is an Enterprise
 //! capability, gated under `RuleTier::Enterprise` in broker-rules
 //! (see [`SPARKPLUG_TIER`]); Community deployments must not register
@@ -760,6 +769,152 @@ pub fn decode_payload(buf: &[u8]) -> Result<SpbPayload> {
 }
 
 // ---------------------------------------------------------------------------
+// Maintained-driver Protobuf codec (`prost`, Apache-2.0).
+// ---------------------------------------------------------------------------
+
+/// Tahu Payload mirror on the maintained `prost` driver. Field numbers
+/// are identical to the clean-room codec above (`timestamp = 1`,
+/// `metrics = 2`, `seq = 3`, `uuid = 4`, `body = 5`) so both encoders
+/// agree on the wire.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProtoPayload {
+    #[prost(uint64, optional, tag = "1")]
+    pub timestamp: Option<u64>,
+    #[prost(message, repeated, tag = "2")]
+    pub metrics: Vec<ProtoMetric>,
+    #[prost(uint64, optional, tag = "3")]
+    pub seq: Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub uuid: Option<String>,
+    #[prost(bytes, optional, tag = "5")]
+    pub body: Option<Vec<u8>>,
+}
+
+/// Tahu Metric mirror on the maintained `prost` driver. Value fields
+/// reuse the clean-room numbers (`int = 10`, `uint = 11`,
+/// `float = 12`, `double = 13`, `boolean = 14`, `string = 15`,
+/// `bytes = 16`); signed integers ride two's complement `u64` exactly
+/// like `encode_metric`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProtoMetric {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(uint64, optional, tag = "2")]
+    pub alias: Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub timestamp: Option<u64>,
+    #[prost(uint32, optional, tag = "4")]
+    pub datatype: Option<u32>,
+    #[prost(uint64, optional, tag = "10")]
+    pub int_value: Option<u64>,
+    #[prost(uint64, optional, tag = "11")]
+    pub uint_value: Option<u64>,
+    #[prost(float, optional, tag = "12")]
+    pub float_value: Option<f32>,
+    #[prost(double, optional, tag = "13")]
+    pub double_value: Option<f64>,
+    #[prost(bool, optional, tag = "14")]
+    pub boolean_value: Option<bool>,
+    #[prost(string, optional, tag = "15")]
+    pub string_value: Option<String>,
+    #[prost(bytes, optional, tag = "16")]
+    pub bytes_value: Option<Vec<u8>>,
+}
+
+impl From<&SpbMetric> for ProtoMetric {
+    fn from(metric: &SpbMetric) -> Self {
+        let mut proto = Self {
+            name: metric.name.clone(),
+            alias: metric.alias,
+            timestamp: metric.timestamp,
+            datatype: Some(metric.datatype as u32),
+            int_value: None,
+            uint_value: None,
+            float_value: None,
+            double_value: None,
+            boolean_value: None,
+            string_value: None,
+            bytes_value: None,
+        };
+        match &metric.value {
+            SpbValue::Int(v) => proto.int_value = Some(*v as u64),
+            SpbValue::UInt(v) => proto.uint_value = Some(*v),
+            SpbValue::Float(v) => proto.float_value = Some(*v),
+            SpbValue::Double(v) => proto.double_value = Some(*v),
+            SpbValue::Bool(v) => proto.boolean_value = Some(*v),
+            SpbValue::Text(v) => proto.string_value = Some(v.clone()),
+            SpbValue::Bytes(v) => proto.bytes_value = Some(v.clone()),
+            SpbValue::Null => {}
+        }
+        proto
+    }
+}
+
+impl From<&SpbPayload> for ProtoPayload {
+    fn from(payload: &SpbPayload) -> Self {
+        Self {
+            timestamp: payload.timestamp,
+            metrics: payload.metrics.iter().map(ProtoMetric::from).collect(),
+            seq: payload.seq,
+            uuid: payload.uuid.clone(),
+            body: payload.body.clone(),
+        }
+    }
+}
+
+fn proto_metric_to_metric(proto: &ProtoMetric) -> Result<SpbMetric> {
+    let datatype = SpbDataType::from_u32(proto.datatype.unwrap_or(0));
+    let raw = RawMetricValue {
+        int: proto.int_value,
+        uint: proto.uint_value,
+        float_bits: proto.float_value.map(f32::to_bits),
+        double_bits: proto.double_value.map(f64::to_bits),
+        boolean: proto.boolean_value.map(u64::from),
+        text: proto.string_value.clone().map(String::into_bytes),
+        bytes: proto.bytes_value.clone(),
+    };
+    Ok(SpbMetric {
+        name: proto.name.clone(),
+        alias: proto.alias,
+        timestamp: proto.timestamp,
+        datatype,
+        value: resolve_value(datatype, &raw)?,
+    })
+}
+
+/// Encode one payload through the maintained `prost` driver. This is
+/// the sink write path (`buffer_row`); the clean-room `encode_payload`
+/// stays as the offline reference and both must agree (see
+/// `test_prost_codec_agrees_with_clean_room`).
+pub fn encode_payload_prost(payload: &SpbPayload) -> Vec<u8> {
+    use ::prost::Message;
+    ProtoPayload::from(payload).encode_to_vec()
+}
+
+/// Decode one `prost`-encoded payload back into a payload.
+pub fn decode_payload_prost(buf: &[u8]) -> Result<SpbPayload> {
+    use ::prost::Message;
+    // Empty input decodes to a default payload so bare DDEATH frames
+    // still process, mirroring `decode_payload`.
+    if buf.is_empty() {
+        return Ok(SpbPayload::default());
+    }
+    let proto = ProtoPayload::decode(buf)
+        .map_err(|e| ConnectorError::Dispatch(format!("sparkplug prost decode failed: {e}")))?;
+    Ok(SpbPayload {
+        timestamp: proto.timestamp,
+        metrics: proto
+            .metrics
+            .iter()
+            .map(proto_metric_to_metric)
+            .collect::<Result<Vec<_>>>()?,
+        seq: proto.seq,
+        uuid: proto.uuid,
+        body: proto.body,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Normalized JSON translation.
 // ---------------------------------------------------------------------------
 
@@ -1118,6 +1273,145 @@ impl SparkplugTransport for MemorySparkplugTransport {
     }
 }
 
+/// rumqttc driver request-channel bound. The sink buffer in front of
+/// it already bounds rows (`batch_size`, default 100); this second
+/// queue must also be finite when the sink is configured unbounded,
+/// so it clamps to the same 10,000-row default as the sibling MQTT
+/// bridge driver instead of growing without limit.
+fn driver_channel_cap(batch_size: Option<usize>) -> usize {
+    batch_size.unwrap_or(10_000).clamp(1, 10_000)
+}
+
+/// Production transport on the maintained `rumqttc` driver
+/// (Apache-2.0): CONNECT auth, driver-owned packet-id tracking,
+/// MQTT 3.1.1 framing, QoS 1 publishes. Plain TCP only in this build
+/// (`rumqttc` without its TLS feature): `mqtts://` endpoints fail
+/// closed with a clear error until a TLS backend lands (terminate TLS
+/// in a sidecar proxy meanwhile). The [`MemorySparkplugTransport`]
+/// stays for offline unit tests only; production wiring uses this
+/// transport.
+///
+/// Bound: one driver request channel of [`driver_channel_cap`]
+/// entries plus the sink buffer in front of it; no background queue.
+pub struct RumqttcSparkplugTransport {
+    endpoint: broker_connectors::BridgeEndpoint,
+    client_id: String,
+    channel_cap: usize,
+    state: tokio::sync::Mutex<Option<RumqttcSparkplugInner>>,
+}
+
+struct RumqttcSparkplugInner {
+    client: rumqttc::AsyncClient,
+    _pump: tokio::task::JoinHandle<()>,
+}
+
+impl RumqttcSparkplugTransport {
+    pub fn new(mqtt_url: &str, client_id: Option<&str>) -> Result<Self> {
+        let endpoint = broker_connectors::parse_bridge_address(mqtt_url)?;
+        if endpoint.tls {
+            return Err(ConnectorError::Dispatch(
+                "sparkplug mqtts TLS transport not enabled in this build; use mqtt:// \
+                 or terminate TLS in a sidecar proxy"
+                    .to_string(),
+            ));
+        }
+        // Per-process default client id: two kernels with the same
+        // configured id would evict each other on every CONNECT, so an
+        // unset id derives one from the process id instead of sharing
+        // a constant.
+        let client_id = client_id
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("indra-spb-{}", std::process::id()));
+        Ok(Self {
+            endpoint,
+            client_id,
+            channel_cap: driver_channel_cap(None),
+            state: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    pub fn with_channel_cap(mut self, cap: usize) -> Self {
+        self.channel_cap = cap.clamp(1, 10_000);
+        self
+    }
+
+    async fn ensure_connected(&self) -> Result<()> {
+        if self.state.lock().await.is_some() {
+            return Ok(());
+        }
+        let mut options = rumqttc::MqttOptions::new(
+            self.client_id.clone(),
+            self.endpoint.host.clone(),
+            self.endpoint.port,
+        );
+        // 30s keep-alive: the protocol requirement is a bounded
+        // liveness probe, not a specific value; 30s keeps a
+        // birth/data/rebirth run well inside one interval.
+        options.set_keep_alive(Duration::from_secs(30));
+        options.set_clean_session(true);
+        // 10,000-message inflight ceiling: the protocol packet id is a
+        // nonzero u16, so a larger sink-side cap cannot widen the wire
+        // window; it only grows the local buffer.
+        options.set_inflight(10_000);
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(options, self.channel_cap);
+        // Drive CONNECT/CONNACK once inline so auth refusals and
+        // unreachable servers fail here instead of hiding behind the
+        // background pump. 5s matches the sibling bridge dial timeout:
+        // the protocol requirement is a bounded handshake, not a
+        // specific value.
+        tokio::time::timeout(Duration::from_secs(5), eventloop.poll())
+            .await
+            .map_err(|_| {
+                ConnectorError::Connection(format!(
+                    "sparkplug connect timeout: {}:{}",
+                    self.endpoint.host, self.endpoint.port
+                ))
+            })?
+            .map_err(|e| ConnectorError::Connection(format!("sparkplug connect failed: {e}")))?;
+        let pump = tokio::spawn(async move {
+            loop {
+                if eventloop.poll().await.is_err() {
+                    // 100ms reconnect pause: keeps a downed server from
+                    // hot-spinning the pump task at 100% CPU while
+                    // staying well under any test timeout.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+        *self.state.lock().await = Some(RumqttcSparkplugInner {
+            client,
+            _pump: pump,
+        });
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SparkplugTransport for RumqttcSparkplugTransport {
+    async fn publish(&self, frame: &SparkplugFrame) -> Result<()> {
+        self.ensure_connected().await?;
+        let guard = self.state.lock().await;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Connection("sparkplug not connected".to_string()))?;
+        // QoS 1: Tahu births must reach the host, and at-least-once
+        // permits duplicates but never loss, so the qualification
+        // asserts every key is present rather than exact-once.
+        inner
+            .client
+            .publish(
+                frame.topic.clone(),
+                rumqttc::QoS::AtLeastOnce,
+                false,
+                frame.payload.clone(),
+            )
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("sparkplug publish failed: {e}")))?;
+        Ok(())
+    }
+}
+
 /// Sparkplug sink configuration (Enterprise tier only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkplugSinkConfig {
@@ -1137,6 +1431,26 @@ pub struct SparkplugSinkConfig {
     /// Request / dispatch timeout in ms (default 5000).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// MQTT server carrying the Sparkplug Protobuf frames, e.g.
+    /// `mqtt://127.0.0.1:1883` (`None` keeps frames in-process for
+    /// tests and dry runs; the management API selects the `rumqttc`
+    /// driver transport exactly when this is set, so stored
+    /// configurations without it keep working).
+    #[serde(default)]
+    pub mqtt_url: Option<String>,
+    /// MQTT client id for the driver transport (`None` derives one
+    /// per process so two kernels never evict each other).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Edge-side alias-table ceiling: distinct ingress metric names kept
+    /// in the `aliases` map (default 10_000, `None` is an explicit
+    /// operator opt-in to unbounded). 10_000 bounds the table near ~1 MiB
+    /// (one metric-name string plus a u64 per entry) and keeps
+    /// NBIRTH/DBIRTH/DATA birth frames to one MQTT publish, while real
+    /// edge nodes expose hundreds of metrics so the default never binds
+    /// in practice.
+    #[serde(default = "default_max_aliases")]
+    pub max_aliases: Option<usize>,
 }
 
 fn default_tier() -> String {
@@ -1149,6 +1463,10 @@ fn default_batch_size() -> Option<usize> {
 
 fn default_linger_ms() -> Option<u64> {
     Some(50)
+}
+
+fn default_max_aliases() -> Option<usize> {
+    Some(10_000)
 }
 
 impl SparkplugSinkConfig {
@@ -1181,7 +1499,40 @@ impl SparkplugSinkConfig {
                 "sparkplug batch_size must be >= 1".to_string(),
             ));
         }
+        if let Some(url) = self
+            .mqtt_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        {
+            let endpoint = broker_connectors::parse_bridge_address(url)?;
+            if endpoint.tls {
+                return Err(ConnectorError::Dispatch(
+                    "sparkplug mqtts TLS transport not enabled in this build; use mqtt:// \
+                     or terminate TLS in a sidecar proxy"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(client_id) = self.client_id.as_deref() {
+            if client_id.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "sparkplug client_id must not be empty".to_string(),
+                ));
+            }
+        }
+        if self.max_aliases == Some(0) {
+            return Err(ConnectorError::Dispatch(
+                "sparkplug max_aliases must be >= 1".to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Edge-side alias-table ceiling (`None` is an explicit operator
+    /// opt-in to unbounded; `Some(n)` bounds distinct ingress metric
+    /// names kept). The default is finite (see `default_max_aliases`).
+    pub fn effective_max_aliases(&self) -> Option<usize> {
+        self.max_aliases.map(|n| n.max(1))
     }
 
     pub fn effective_batch_size(&self) -> usize {
@@ -1202,6 +1553,13 @@ pub struct SparkplugBSink {
     transport: Arc<dyn SparkplugTransport>,
     buffer: parking_lot::Mutex<BatchQueue<(String, Vec<u8>)>>,
     backoff: parking_lot::Mutex<broker_connectors::BackoffState>,
+    /// Edge-side alias table: metric name to Tahu alias. Birth frames
+    /// carry name + alias so the host can cache them; later frames
+    /// reuse the same alias for the name, keeping the host alias
+    /// cache stable across rebirths. Bounded by
+    /// `SparkplugSinkConfig::max_aliases` (fail closed when full).
+    aliases: parking_lot::Mutex<HashMap<String, u64>>,
+    next_alias: AtomicU64,
     sent_batches: AtomicU64,
     sent_records: AtomicU64,
 }
@@ -1218,6 +1576,9 @@ impl SparkplugBSink {
             config,
             transport,
             backoff: parking_lot::Mutex::new(broker_connectors::BackoffState::default()),
+            aliases: parking_lot::Mutex::new(HashMap::new()),
+            // Tahu aliases start at 1; 0 is never assigned.
+            next_alias: AtomicU64::new(1),
             sent_batches: AtomicU64::new(0),
             sent_records: AtomicU64::new(0),
         })
@@ -1284,7 +1645,9 @@ impl SparkplugBSink {
 
     /// Validate + buffer one event: the topic must parse as Sparkplug
     /// (under the prefix when set) and the payload must be a
-    /// normalized JSON document with a metrics object.
+    /// normalized JSON document with a metrics object. Metrics gain
+    /// stable edge-side aliases (name + alias on every frame) and the
+    /// frame encodes through the maintained `prost` driver.
     fn buffer_row(&self, topic: &Topic, payload: &Bytes, _qos: QoS) -> Result<bool> {
         let parsed = SparkplugTopic::parse(topic.as_str())?;
         if let Some(prefix) = &self.config.topic_prefix {
@@ -1301,7 +1664,36 @@ impl SparkplugBSink {
         let doc: serde_json::Value = serde_json::from_str(text).map_err(|_| {
             ConnectorError::Dispatch("sparkplug payload must be a JSON document".to_string())
         })?;
-        let encoded = encode_payload(&payload_from_json(&doc)?);
+        let mut spb = payload_from_json(&doc)?;
+        // Stable aliases first: a name keeps the alias it was first
+        // seen with, so births, data and rebirths all agree and the
+        // host cache never flaps. The table is bounded by
+        // `max_aliases` (fail closed when full): ingress metric names
+        // would otherwise grow it without bound.
+        {
+            let cap = self.config.effective_max_aliases();
+            let mut aliases = self.aliases.lock();
+            for metric in &mut spb.metrics {
+                if let Some(name) = metric.name.clone() {
+                    if let Some(alias) = aliases.get(&name) {
+                        metric.alias = Some(*alias);
+                        continue;
+                    }
+                    if let Some(cap) = cap {
+                        if aliases.len() >= cap {
+                            return Err(ConnectorError::Dispatch(format!(
+                                "sparkplug alias table full ({cap} entries); refusing new metric"
+                            )));
+                        }
+                    }
+                    // Aliases start at 1 and fit the Tahu u64 varint.
+                    let alias = self.next_alias.fetch_add(1, Ordering::SeqCst);
+                    aliases.insert(name, alias);
+                    metric.alias = Some(alias);
+                }
+            }
+        }
+        let encoded = encode_payload_prost(&spb);
         let _ = parsed;
         Ok(self
             .buffer
@@ -1353,6 +1745,11 @@ impl broker_connectors::Connector for SparkplugBConnector {
 mod tests {
     use super::*;
     use broker_connectors::Sink;
+
+    /// Collected Sparkplug frames seen by the qualification subscriber:
+    /// topic, raw Protobuf payload and QoS. Factored out so the
+    /// `Arc<Mutex<..>>` holder stays below the complexity lint.
+    type CollectedFrames = Vec<(String, Vec<u8>, rumqttc::QoS)>;
 
     fn birth_payload(seq: u64) -> Vec<u8> {
         encode_payload(&SpbPayload {
@@ -1693,6 +2090,9 @@ mod tests {
             batch_size: Some(100),
             linger_ms: Some(50),
             timeout_ms: None,
+            mqtt_url: None,
+            client_id: None,
+            max_aliases: default_max_aliases(),
         };
         assert!(config.validate().is_err());
         config.tier = "enterprise".to_string();
@@ -1707,6 +2107,9 @@ mod tests {
             batch_size: Some(100),
             linger_ms: Some(50),
             timeout_ms: None,
+            mqtt_url: None,
+            client_id: None,
+            max_aliases: default_max_aliases(),
         };
         assert!(config.validate().is_ok());
         config.topic_prefix = Some("spBv1.0/plant1/+".to_string());
@@ -1718,6 +2121,74 @@ mod tests {
         assert!(config.validate().is_err());
         config.batch_size = None;
         assert!(config.validate().is_ok());
+        // MQTT endpoint hands to the driver transport: bad addresses
+        // and TLS fail closed, plaintext validates.
+        config.mqtt_url = Some("mqtt://127.0.0.1:1883".to_string());
+        assert!(config.validate().is_ok());
+        config.mqtt_url = Some("mqtts://iot.example.com:8883".to_string());
+        assert!(config.validate().is_err());
+        config.mqtt_url = Some("http://127.0.0.1:1883".to_string());
+        assert!(config.validate().is_err());
+        config.mqtt_url = None;
+        config.client_id = Some("  ".to_string());
+        assert!(config.validate().is_err());
+        config.client_id = None;
+        assert!(config.validate().is_ok());
+        // Alias-table bound: zero is rejected, the finite default
+        // validates, and explicit `None` stays an operator opt-in.
+        config.max_aliases = Some(0);
+        assert!(config.validate().is_err());
+        config.max_aliases = default_max_aliases();
+        assert!(config.validate().is_ok());
+        assert!(config.effective_max_aliases().is_some());
+        config.max_aliases = None;
+        assert!(config.validate().is_ok());
+        assert!(config.effective_max_aliases().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sink_alias_table_bounded_fail_closed() {
+        let transport = Arc::new(MemorySparkplugTransport::new());
+        let sink = SparkplugBSink::new(
+            SparkplugSinkConfig {
+                topic_prefix: None,
+                tier: "enterprise".to_string(),
+                batch_size: Some(100),
+                linger_ms: Some(50),
+                timeout_ms: None,
+                mqtt_url: None,
+                client_id: None,
+                max_aliases: Some(2),
+            },
+            transport.clone(),
+        )
+        .unwrap();
+        let doc = |name: &str| {
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "timestamp": 1_726_145_890_000u64,
+                    "seq": 0u64,
+                    "metrics": {name: 1.0},
+                }))
+                .unwrap(),
+            )
+        };
+        let topic = Topic::new("spBv1.0/g1/NDATA/e1").unwrap();
+        sink.send(&topic, &doc("m1"), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        sink.send(&topic, &doc("m2"), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        // Third distinct name exceeds the bound: fail closed.
+        assert!(sink
+            .send(&topic, &doc("m3"), QoS::AtMostOnce)
+            .await
+            .is_err());
+        // Known names still pass under the bound.
+        sink.send(&topic, &doc("m1"), QoS::AtMostOnce)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1730,6 +2201,9 @@ mod tests {
                 batch_size: Some(10),
                 linger_ms: Some(50),
                 timeout_ms: None,
+                mqtt_url: None,
+                client_id: None,
+                max_aliases: default_max_aliases(),
             },
             transport.clone(),
         )
@@ -1753,6 +2227,12 @@ mod tests {
         assert_eq!(frames[0].topic, "spBv1.0/plant1/DDATA/edge7/plc3");
         let back = decode_payload(&frames[0].payload).unwrap();
         assert_eq!(back.seq, Some(14));
+        // Every metric carries a stable edge-side alias alongside its
+        // name so the host can cache and resolve it.
+        for metric in &back.metrics {
+            assert!(metric.name.is_some());
+            assert!(metric.alias.is_some(), "metric needs an alias");
+        }
         let metrics: HashMap<String, SpbValue> = back
             .metrics
             .into_iter()
@@ -1787,5 +2267,528 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[test]
+    fn test_prost_codec_agrees_with_clean_room() {
+        // The maintained `prost` driver must agree with the clean-room
+        // reference on every covered datatype, including two's
+        // complement negatives, u64 extremes, floats, strings, bytes
+        // and nulls, plus bare-death empties.
+        let payload = SpbPayload {
+            timestamp: Some(1_726_145_890_000),
+            seq: Some(14),
+            uuid: Some("uuid-1".to_string()),
+            body: Some(b"raw".to_vec()),
+            metrics: vec![
+                SpbMetric {
+                    name: Some("i8".into()),
+                    alias: Some(1),
+                    timestamp: None,
+                    datatype: SpbDataType::Int8,
+                    value: SpbValue::Int(-5),
+                },
+                SpbMetric {
+                    name: Some("i64".into()),
+                    alias: Some(2),
+                    timestamp: None,
+                    datatype: SpbDataType::Int64,
+                    value: SpbValue::Int(i64::MIN),
+                },
+                SpbMetric {
+                    name: Some("u64".into()),
+                    alias: Some(3),
+                    timestamp: None,
+                    datatype: SpbDataType::UInt64,
+                    value: SpbValue::UInt(u64::MAX),
+                },
+                SpbMetric {
+                    name: Some("f".into()),
+                    alias: Some(4),
+                    timestamp: None,
+                    datatype: SpbDataType::Float,
+                    value: SpbValue::Float(0.5),
+                },
+                SpbMetric {
+                    name: Some("d".into()),
+                    alias: Some(5),
+                    timestamp: None,
+                    datatype: SpbDataType::Double,
+                    value: SpbValue::Double(101.3),
+                },
+                SpbMetric {
+                    name: Some("b".into()),
+                    alias: Some(6),
+                    timestamp: None,
+                    datatype: SpbDataType::Boolean,
+                    value: SpbValue::Bool(true),
+                },
+                SpbMetric {
+                    name: Some("s".into()),
+                    alias: Some(7),
+                    timestamp: None,
+                    datatype: SpbDataType::String,
+                    value: SpbValue::Text("héllo".to_string()),
+                },
+                SpbMetric {
+                    name: Some("by".into()),
+                    alias: Some(8),
+                    timestamp: None,
+                    datatype: SpbDataType::Bytes,
+                    value: SpbValue::Bytes(vec![0x00, 0xFF]),
+                },
+                SpbMetric {
+                    name: Some("n".into()),
+                    alias: None,
+                    timestamp: None,
+                    datatype: SpbDataType::Unknown,
+                    value: SpbValue::Null,
+                },
+            ],
+        };
+        let classic = encode_payload(&payload);
+        let driven = encode_payload_prost(&payload);
+        assert_eq!(driven, classic);
+        // Cross-decode both ways: each decoder reads the other's bytes.
+        assert_eq!(decode_payload(&driven).unwrap(), payload);
+        assert_eq!(decode_payload_prost(&classic).unwrap(), payload);
+        assert_eq!(decode_payload_prost(&[]).unwrap(), SpbPayload::default());
+        // Birth helper agrees too.
+        let birth = birth_payload(0);
+        assert_eq!(
+            decode_payload_prost(&birth).unwrap(),
+            decode_payload(&birth).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_aliases_stable_across_rebirth() {
+        let transport = Arc::new(MemorySparkplugTransport::new());
+        let sink = SparkplugBSink::new(
+            SparkplugSinkConfig {
+                topic_prefix: None,
+                tier: "enterprise".to_string(),
+                batch_size: Some(100),
+                linger_ms: Some(50),
+                timeout_ms: None,
+                mqtt_url: None,
+                client_id: None,
+                max_aliases: default_max_aliases(),
+            },
+            transport.clone(),
+        )
+        .unwrap();
+        let doc = serde_json::json!({
+            "timestamp": 1_726_145_890_000u64,
+            "seq": 0u64,
+            "metrics": {"Temperature": 82.5, "Running": true},
+        });
+        let body = Bytes::from(serde_json::to_vec(&doc).unwrap());
+        sink.send(
+            &Topic::new("spBv1.0/g1/NBIRTH/e1").unwrap(),
+            &body,
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        // Data reuses the same aliases; rebirth keeps them too.
+        let data = serde_json::json!({
+            "timestamp": 1_726_145_890_001u64,
+            "seq": 1u64,
+            "metrics": {"Temperature": 83.0},
+        });
+        sink.send(
+            &Topic::new("spBv1.0/g1/NDATA/e1").unwrap(),
+            &Bytes::from(serde_json::to_vec(&data).unwrap()),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.send(
+            &Topic::new("spBv1.0/g1/NBIRTH/e1").unwrap(),
+            &body,
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let frames = transport.frames();
+        assert_eq!(frames.len(), 3);
+        let alias_of = |frame: &SparkplugFrame| -> HashMap<String, u64> {
+            decode_payload(&frame.payload)
+                .unwrap()
+                .metrics
+                .into_iter()
+                .map(|metric| (metric.name.unwrap(), metric.alias.unwrap()))
+                .collect()
+        };
+        let birth_aliases = alias_of(&frames[0]);
+        assert_eq!(
+            alias_of(&frames[1])["Temperature"],
+            birth_aliases["Temperature"]
+        );
+        assert_eq!(alias_of(&frames[2]), birth_aliases);
+        // The host side resolves every data alias without anomalies.
+        let mut machine = SparkplugStateMachine::new();
+        for frame in &frames {
+            let outcome = machine.ingest(&frame.topic, &frame.payload).unwrap();
+            assert!(outcome.anomalies.is_empty(), "unexpected {outcome:?}");
+        }
+        assert!(machine.node_state("g1", "e1").unwrap().online);
+    }
+
+    #[test]
+    fn test_driver_transport_rejects_tls_and_bad_urls() {
+        assert!(RumqttcSparkplugTransport::new("mqtt://127.0.0.1:1883", Some("spb-1")).is_ok());
+        assert!(RumqttcSparkplugTransport::new("127.0.0.1:1883", None).is_ok());
+        assert!(RumqttcSparkplugTransport::new("mqtts://iot.example.com:8883", None).is_err());
+        assert!(RumqttcSparkplugTransport::new("http://127.0.0.1:1883", None).is_err());
+        assert!(RumqttcSparkplugTransport::new("", None).is_err());
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Discards unmatched egress for the rule-path qualification (the
+    /// connector under test receives everything through its rule).
+    struct NullBrokerSink;
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for NullBrokerSink {
+        async fn publish(
+            &self,
+            _topic: Topic,
+            _payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+            Ok(())
+        }
+    }
+
+    /// Qualification against a real MQTT server carrying Sparkplug B
+    /// Protobuf through the maintained `rumqttc` driver write path.
+    ///
+    /// Run with e.g.:
+    /// `SPARKPLUG_MQTT_URL=mqtt://127.0.0.1:1883 SPARKPLUG_GROUP_ID=qual \
+    ///  SPARKPLUG_NODE_ID=qual-b343 \
+    ///  cargo test -p broker-connectors-enterprise --lib sparkplug_b::tests::test_qualify_birth_data_write_path -- --ignored --nocapture --test-threads=1`
+    /// (the task spec's `QUAL-CMD` names the same test through the
+    /// `-p broker-connectors` shim, which drives this identical path).
+    ///
+    /// Publishes an NBIRTH/DBIRTH/DATA sequence plus a rebirth through
+    /// the broker's rule path ([`broker_rules::RuleEngine::dispatch_ingress`]
+    /// into a `SparkplugBSink` on [`RumqttcSparkplugTransport`], never
+    /// `sink.send` directly), and asserts the host subscriber decodes
+    /// every metric with stable aliases and the rebirth arrives.
+    /// Panics when its environment is missing (fail closed, never
+    /// skips).
+    ///
+    /// TODO(parity): the rebirth here is explicitly dispatched; the
+    /// sink does not watch host STATE topics and auto-rebirth on a
+    /// STATE OFFLINE->ONLINE flip — is an automatic STATE-triggered
+    /// rebirth required, or is explicit rebirth through the rule path
+    /// sufficient?
+    #[tokio::test]
+    #[ignore = "needs a real Sparkplug B MQTT server (see SPARKPLUG_* env)"]
+    async fn test_qualify_birth_data_write_path() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, RuleAction, RuleEngine};
+        use std::collections::HashSet;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const DATA_ROWS: usize = 5;
+
+        let url = qual_env("SPARKPLUG_MQTT_URL").unwrap_or_else(|| {
+            panic!(
+                "SPARKPLUG_MQTT_URL must point at a real MQTT server carrying Sparkplug B for qualification; \
+                 failing closed instead of passing vacuously \
+                 (e.g. SPARKPLUG_MQTT_URL=mqtt://127.0.0.1:1883)"
+            )
+        });
+        let group = qual_env("SPARKPLUG_GROUP_ID").unwrap_or_else(|| {
+            panic!("SPARKPLUG_GROUP_ID must be set for qualification; failing closed")
+        });
+        let node = qual_env("SPARKPLUG_NODE_ID").unwrap_or_else(|| {
+            panic!("SPARKPLUG_NODE_ID must be set for qualification; failing closed")
+        });
+        // Server version for the report comes from the qualification
+        // image the gates start (eclipse-mosquitto:2.0.18); the driver
+        // exposes no broker-version RPC here, so the endpoint line
+        // below is the measured endpoint, never a substitute version
+        // string.
+        eprintln!(
+            "qual server: image eclipse-mosquitto:2.0.18 url={url} group={group} node={node}"
+        );
+        let endpoint = broker_connectors::parse_bridge_address(&url).expect("qual url parses");
+        assert!(
+            !endpoint.tls,
+            "qual uses plaintext mqtt:// (mqtts fails closed in this build)"
+        );
+
+        let run_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // Unique device per run isolates concurrent gates sharing one
+        // group/node; the node birth itself stays on the configured
+        // node id.
+        let device = format!("plc-{run_nanos}");
+        let nbirth_topic = format!("spBv1.0/{group}/NBIRTH/{node}");
+        let dbirth_topic = format!("spBv1.0/{group}/DBIRTH/{node}/{device}");
+        let ddata_topic = format!("spBv1.0/{group}/DDATA/{node}/{device}");
+        let watched: HashSet<String> = [
+            nbirth_topic.clone(),
+            dbirth_topic.clone(),
+            ddata_topic.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let subscribe_filter = format!("spBv1.0/{group}/#");
+        let sub_id = format!("spb-qual-sub-{run_nanos}");
+        let bridge_id = format!("spb-qual-{run_nanos}");
+
+        // Subscriber first: with clean sessions a publish before the
+        // SUBACK is lost, so the subscription must be active before
+        // the sink sends anything.
+        let mut sub_options =
+            rumqttc::MqttOptions::new(sub_id.clone(), endpoint.host.clone(), endpoint.port);
+        sub_options.set_keep_alive(Duration::from_secs(10));
+        sub_options.set_clean_session(true);
+        let (sub_client, mut sub_eventloop) = rumqttc::AsyncClient::new(sub_options, 100);
+        sub_client
+            .subscribe(subscribe_filter.clone(), rumqttc::QoS::AtLeastOnce)
+            .await
+            .expect("qual subscribe request");
+        // 30s SUBACK wait: the protocol requirement is a bounded
+        // handshake, not a specific value; 30s tolerates a slow
+        // container start while failing fast on a dead server.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match sub_eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("qual subscribe failed: {e:?}"),
+                }
+            }
+        })
+        .await
+        .expect("qual suback timeout");
+        eprintln!("qual subscribed: filter={subscribe_filter}");
+
+        let expected_frames = DATA_ROWS + 3;
+        let seen: Arc<parking_lot::Mutex<CollectedFrames>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let collector_seen = seen.clone();
+        let collector_watched = watched.clone();
+        let collector = tokio::spawn(async move {
+            loop {
+                match sub_eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                        if !collector_watched.contains(&publish.topic) {
+                            continue;
+                        }
+                        let mut guard = collector_seen.lock();
+                        guard.push((publish.topic.clone(), publish.payload.to_vec(), publish.qos));
+                        if guard.len() >= expected_frames {
+                            break;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        eprintln!("qual subscriber eventloop note: {e:?}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let config = SparkplugSinkConfig {
+            topic_prefix: None,
+            tier: "enterprise".to_string(),
+            batch_size: Some(100),
+            linger_ms: Some(10),
+            timeout_ms: None,
+            mqtt_url: Some(url.clone()),
+            client_id: Some(bridge_id.clone()),
+            max_aliases: default_max_aliases(),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(
+            RumqttcSparkplugTransport::new(&url, Some(&bridge_id)).expect("qual transport"),
+        );
+        let sink = Arc::new(SparkplugBSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "sparkplug_b");
+        // The broker's path: a rule registered on the connector
+        // manager, messages published through the rule engine, so the
+        // qualification sends through it and never `sink.send`
+        // directly.
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine.connectors().register("qual-spb", sink.clone());
+        engine
+            .connectors()
+            .register("sparkplug_b:qual-spb", sink.clone());
+        engine
+            .create_rule(
+                "qual-spb-rule".to_string(),
+                TopicFilter::new(&subscribe_filter).unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "qual-spb".to_string(),
+                }],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+
+        let birth_doc = serde_json::json!({
+            "timestamp": 1_726_145_890_000u64,
+            "seq": 0u64,
+            "metrics": {"Temperature": 82.5, "Running": true},
+        });
+        let birth_body = Bytes::from(serde_json::to_vec(&birth_doc).unwrap());
+        engine
+            .dispatch_ingress(
+                &Topic::new(&nbirth_topic).unwrap(),
+                &birth_body,
+                QoS::AtLeastOnce,
+                &egress,
+            )
+            .await;
+        let dbirth_doc = serde_json::json!({
+            "timestamp": 1_726_145_890_000u64,
+            "seq": 0u64,
+            "metrics": {"Pressure": 101.3},
+        });
+        engine
+            .dispatch_ingress(
+                &Topic::new(&dbirth_topic).unwrap(),
+                &Bytes::from(serde_json::to_vec(&dbirth_doc).unwrap()),
+                QoS::AtLeastOnce,
+                &egress,
+            )
+            .await;
+        for seq in 1..=DATA_ROWS as u64 {
+            let data_doc = serde_json::json!({
+                "timestamp": 1_726_145_890_000u64 + seq,
+                "seq": seq,
+                "metrics": {"Pressure": 101.3 + seq as f64},
+            });
+            engine
+                .dispatch_ingress(
+                    &Topic::new(&ddata_topic).unwrap(),
+                    &Bytes::from(serde_json::to_vec(&data_doc).unwrap()),
+                    QoS::AtLeastOnce,
+                    &egress,
+                )
+                .await;
+        }
+        // Rebirth on state change: a fresh NBIRTH after data, as the
+        // edge would emit when the host STATE flips.
+        engine
+            .dispatch_ingress(
+                &Topic::new(&nbirth_topic).unwrap(),
+                &birth_body,
+                QoS::AtLeastOnce,
+                &egress,
+            )
+            .await;
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), expected_frames as u64);
+        eprintln!(
+            "qual rows sent: records={} batches={}",
+            sink.sent_records(),
+            sink.sent_batches()
+        );
+
+        // 180s receive window: generous against the 1800s gate timeout
+        // so a slow server still converges, while a stuck sink fails
+        // instead of hanging the gate.
+        tokio::time::timeout(Duration::from_secs(180), collector)
+            .await
+            .expect("qual receive timeout")
+            .expect("qual collector task");
+        let frames = seen.lock().clone();
+        // At-least-once permits duplicates, never loss: every expected
+        // topic and data sequence must be present, not an exact count.
+        let mut nbirth_count = 0usize;
+        let mut dbirth_count = 0usize;
+        let mut data_seqs: HashSet<u64> = HashSet::new();
+        let mut machine = SparkplugStateMachine::new();
+        for (topic, payload, qos) in &frames {
+            assert_eq!(
+                *qos,
+                rumqttc::QoS::AtLeastOnce,
+                "qual QoS must be preserved as AtLeastOnce"
+            );
+            // Both codecs read the wire: the sink encodes through
+            // `prost`, the host decodes here.
+            let via_classic = decode_payload(payload).expect("qual payload decodes");
+            let via_prost = decode_payload_prost(payload).expect("qual prost decodes");
+            assert_eq!(via_classic, via_prost);
+            assert!(!via_classic.metrics.is_empty(), "qual frame has metrics");
+            for metric in &via_classic.metrics {
+                assert!(metric.alias.is_some(), "qual metric needs an alias");
+            }
+            if *topic == nbirth_topic {
+                nbirth_count += 1;
+                let names: HashSet<&str> = via_classic
+                    .metrics
+                    .iter()
+                    .filter_map(|metric| metric.name.as_deref())
+                    .collect();
+                assert!(names.contains("Temperature"));
+                assert!(names.contains("Running"));
+            } else if *topic == dbirth_topic {
+                dbirth_count += 1;
+            } else if *topic == ddata_topic {
+                if let Some(seq) = via_classic.seq {
+                    data_seqs.insert(seq);
+                }
+            }
+            let outcome = machine
+                .ingest(topic, payload)
+                .unwrap_or_else(|e| panic!("qual host ingest failed for {topic}: {e:?}"));
+            assert!(
+                !outcome.anomalies.iter().any(|anomaly| matches!(
+                    anomaly,
+                    SpbAnomaly::UnknownAlias { .. } | SpbAnomaly::OfflineData
+                )),
+                "qual host anomalies on {topic}: {outcome:?}"
+            );
+        }
+        assert!(
+            nbirth_count >= 2,
+            "qual rebirth must arrive (saw {nbirth_count} NBIRTH)"
+        );
+        assert!(dbirth_count >= 1, "qual DBIRTH must arrive");
+        for seq in 1..=DATA_ROWS as u64 {
+            assert!(data_seqs.contains(&seq), "qual missing DATA seq {seq}");
+        }
+        assert!(
+            machine
+                .node_state(&group, &node)
+                .is_some_and(|state| state.online),
+            "qual node must read online"
+        );
+        assert!(
+            machine
+                .device_state(&group, &node, &device)
+                .is_some_and(|state| state.online),
+            "qual device must read online"
+        );
+        let aliases = &machine.node_state(&group, &node).unwrap().aliases;
+        assert!(
+            aliases.values().any(|name| name == "Temperature"),
+            "qual host must cache birth aliases"
+        );
+        eprintln!(
+            "qual rows asserted: nbirth={nbirth_count} dbirth={dbirth_count} data_seqs={} rebirth=yes",
+            data_seqs.len()
+        );
+        let _ = sub_client.disconnect().await;
+
+        eprintln!("qual cleanup: disconnected subscriber {sub_id}, bridge {bridge_id}; no retained state (retain=false)");
     }
 }

@@ -772,3 +772,139 @@ decode_publish_v5_empty_topic_without_alias_rejected_test() ->
 decode_publish_level4_still_rejects_empty_topic_test() ->
     ?assertEqual({error, malformed_publish_topic},
                  indra_mqtt_codec:decode_publish(<<0, 0, "hi">>, 0, 4)).
+
+%%====================================================================
+%% SUBSCRIBE v5 options (X1-03)
+%%====================================================================
+
+decode_subscribe_v5_opts_roundtrip_test() ->
+    %% Packet id 7, no properties, one filter "a/b" with Opts QoS1|NL|RH1:
+    %% Opts = 1 | 16#04 | 16#10 = 16#15.
+    Opts = indra_mqtt_codec:encode_subscribe_opts(1, true, false, 1),
+    ?assertEqual(16#15, Opts),
+    Body = <<0, 7, 0, 0, 3, "a/b", Opts>>,
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(Body, 5),
+    ?assertEqual(7, maps:get(packet_id, Sub)),
+    ?assertEqual([{<<"a/b">>, Opts}], maps:get(subscriptions, Sub)),
+    ?assertEqual(0, maps:get(sub_id, Sub)),
+    {ok, {1, true, false, 1}} = indra_mqtt_codec:decode_subscribe_opts(Opts).
+
+decode_subscribe_v5_sub_id_applies_packet_wide_test() ->
+    %% Subscription Identifier 42 (property 11) applies to every filter.
+    Props = <<11, 42>>,
+    Body = <<0, 9, (byte_size(Props)):8, Props/binary,
+             0, 1, "a", 0, 0, 1, "b", 2>>,
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(Body, 5),
+    ?assertEqual(42, maps:get(sub_id, Sub)),
+    ?assertEqual([{<<"a">>, 0}, {<<"b">>, 2}], maps:get(subscriptions, Sub)).
+
+decode_subscribe_v5_reserved_bits_ride_through_test() ->
+    %% Reserved bits set: the edge passes the byte through (the kernel
+    %% fails only that filter with 16#8F); the packet itself decodes.
+    Body = <<0, 7, 0, 0, 1, "a", 16#C1>>,
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(Body, 5),
+    ?assertEqual([{<<"a">>, 16#C1}], maps:get(subscriptions, Sub)),
+    ?assertEqual({error, {invalid_subscribe_opts, 16#C1}},
+                 indra_mqtt_codec:decode_subscribe_opts(16#C1)).
+
+decode_subscribe_v4_bytes_unchanged_test() ->
+    %% Level 4 decodes exactly as before (strict QoS, no properties).
+    Body = <<0, 7, 0, 1, "a", 1>>,
+    {ok, Sub} = indra_mqtt_codec:decode_subscribe(Body, 4),
+    ?assertEqual([{<<"a">>, 1}], maps:get(subscriptions, Sub)).
+
+encode_suback_v5_vectors_test() ->
+    %% Packet id 7, codes [1, 16#87] with empty properties.
+    Bin = indra_mqtt_codec:encode_suback_v5(7, [1, 16#87], #{}),
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    ?assertEqual(suback, maps:get(type_atom, Pkt)),
+    {ok, Dec} = indra_mqtt_codec:decode_suback_v5(maps:get(payload, Pkt)),
+    ?assertEqual(7, maps:get(packet_id, Dec)),
+    ?assertEqual([1, 16#87], maps:get(codes, Dec)).
+
+encode_suback_v4_shape_unchanged_test() ->
+    %% The 3.1.1 SUBACK encoder is untouched by the v5 work.
+    ?assertEqual(<<16#90, 16#03, 16#00, 16#07, 16#01>>,
+                 indra_mqtt_codec:encode_suback(7, [1])).
+
+decode_publish_v5_user_props_roundtrip_test() ->
+    %% Level 5 QoS 0: topic "t", user property "k"->"v", payload "hi".
+    %% Props = 38 Len("k") "k" Len("v") "v" (9 bytes).
+    Props = <<38, 0, 1, "k", 0, 1, "v">>,
+    Body = <<0, 1, "t", (byte_size(Props)), Props/binary, "hi">>,
+    {ok, Pub} = indra_mqtt_codec:decode_publish(Body, 0, 5),
+    ?assertEqual([{<<"k">>, <<"v">>}], maps:get(user_properties, Pub)),
+    ?assertEqual(0, maps:get(payload_format, Pub)),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
+
+decode_publish_v5_inbound_sub_id_rejected_test() ->
+    %% A client sending a subscription identifier fails closed.
+    Props = <<11, 42>>,
+    Body = <<0, 1, "t", (byte_size(Props)), Props/binary, "hi">>,
+    ?assertMatch({error, _},
+                 indra_mqtt_codec:decode_publish(Body, 0, 5)).
+
+encode_publish_v5_sub_id_vector_test() ->
+    %% Delivery with subscription identifier 7 carries property 11 on
+    %% the wire (server-to-client; inbound client publishes with 11
+    %% are rejected above, so this asserts framing only).
+    Bin = indra_mqtt_codec:encode_publish_v5(<<"t">>, 0, 0, false, false,
+                                             <<"hi">>, 0, 7),
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    ?assertEqual(publish, maps:get(type_atom, Pkt)),
+    Payload = maps:get(payload, Pkt),
+    %% Topic "t" (3 bytes) then property length + <<11, 7>> then "hi".
+    ?assert(binary:match(Payload, <<11, 7>>) =/= nomatch),
+    %% With no identifier, the packet has a property length of zero.
+    Bin0 = indra_mqtt_codec:encode_publish_v5(<<"t">>, 0, 0, false, false,
+                                              <<"hi">>, 0, 0),
+    ?assertEqual(<<16#30, 6, 0, 1, "t", 0, "hi">>, Bin0).
+
+encode_publish_v5_empty_properties_vector_test() ->
+    %% MQTT 5 requires the property length in each PUBLISH. QoS 0:
+    %% topic, property length 0, payload.
+    Q0 = indra_mqtt_codec:encode_publish_v5_full(
+           <<"t">>, 0, 0, false, false, <<"hi">>, 0, 0, 0, 0, []),
+    ?assertEqual(<<16#30, 6, 0, 1, "t", 0, "hi">>, Q0),
+    %% QoS 1: topic, packet id, property length 0, payload.
+    Q1 = indra_mqtt_codec:encode_publish_v5_full(
+           <<"t">>, 9, 1, true, false, <<"hi">>, 0, 0, 0, 0, []),
+    ?assertEqual(<<16#33, 8, 0, 1, "t", 0, 9, 0, "hi">>, Q1),
+    %% The decoder for protocol level 5 reads the same payload.
+    {ok, Pub} = indra_mqtt_codec:decode_publish(<<0, 1, "t", 0, "hi">>, 0, 5),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
+
+encode_publish_v5_full_forwards_props_test() ->
+    %% Delivery with identifier plus format and user properties carries
+    %% all three on the wire; the empty form stays property-less.
+    Bin = indra_mqtt_codec:encode_publish_v5_full(
+            <<"t">>, 0, 0, false, false, <<"hi">>, 0, 7, 1, 0,
+            [{<<"k">>, <<"v">>}]),
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    ?assertEqual(publish, maps:get(type_atom, Pkt)),
+    Payload = maps:get(payload, Pkt),
+    ?assert(binary:match(Payload, <<11, 7>>) =/= nomatch),
+    ?assert(binary:match(Payload, <<1, 1>>) =/= nomatch),
+    ?assert(binary:match(Payload, <<"k">>) =/= nomatch),
+    Empty = indra_mqtt_codec:encode_publish_v5_full(
+              <<"t">>, 0, 0, false, false, <<"hi">>, 0, 0, 0, 0, []),
+    ?assertEqual(nomatch, binary:match(Empty, <<11, 7>>)).
+
+decode_disconnect_v5_vectors_test() ->
+    %% Empty body means normal disconnection.
+    {ok, D0} = indra_mqtt_codec:decode_disconnect_v5(<<>>),
+    ?assertEqual(0, maps:get(reason_code, D0)),
+    %% Code 4 with empty properties decodes with no reason string.
+    {ok, D4} = indra_mqtt_codec:decode_disconnect_v5(<<4, 0>>),
+    ?assertEqual(4, maps:get(reason_code, D4)),
+    ?assertEqual(<<>>, maps:get(reason_string, D4)),
+    %% Encode/decode round-trip with a reason string.
+    Bin = indra_mqtt_codec:encode_disconnect_v5(16#94, <<"bad alias">>),
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    ?assertEqual(disconnect, maps:get(type_atom, Pkt)),
+    {ok, Dec} = indra_mqtt_codec:decode_disconnect_v5(maps:get(payload, Pkt)),
+    ?assertEqual(16#94, maps:get(reason_code, Dec)),
+    ?assertEqual(<<"bad alias">>, maps:get(reason_string, Dec)),
+    %% Code 0 with no properties keeps the 2-byte 3.1.1 shape.
+    ?assertEqual(<<16#E0, 16#00>>,
+                 indra_mqtt_codec:encode_disconnect_v5(0, <<>>)).
