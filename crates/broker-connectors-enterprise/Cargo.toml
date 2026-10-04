@@ -36,11 +36,11 @@ webpki-roots = { version = "0.25" }
 tokio-postgres = { version = "0.7" }
 tokio-postgres-rustls = { version = "0.14", features = ["native-certs"] }
 google-cloud-auth = { version = "1" }
-gcp-bigquery-client = { version = "0.28", default-features = false, features = ["native-tls", "aws-lc-rs"] }
+gcp-bigquery-client = { version = "0.28", default-features = false, features = ["native-tls", "aws-lc-rs"], optional = true }
 scylla = { version = "1.9" }
 clickhouse = { version = "0.15", features = ["native-tls"] }
-aws-sigv4 = { version = "1" }
-aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sigv4 = { version = "1", optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"], optional = true }
 # Redshift sink on the maintained official driver (Apache-2.0):
 # `BatchExecuteStatement` with driver-owned SigV4 (static access-key
 # credentials, session token when configured, endpoint override for
@@ -61,7 +61,6 @@ aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavi
 # `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`.
 # The hand-written `HttpS3Transport` stays for offline unit tests
 # only; production wiring uses `SdkS3Transport` below.
-aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 futures = { workspace = true }
 rdkafka = { version = "0.39", features = ["ssl"] }
 schema-registry-client = { version = "0.4" }
@@ -142,6 +141,23 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # The hand-written `HttpTdengineTransport` stays for token/TLS configs
 # and offline unit tests; production wiring uses
 # `DriverTdengineTransport` below (`reqwest` REST, Basic + plaintext).
+
+[features]
+# Default build: light enterprise sinks only (no cloud-IoT/cloud-store
+# SDKs from X1-09). Each heavy SDK/sink is off unless its feature is
+# enabled. X1-09 gates the first half (cloud-IoT + cloud-store):
+# `aws_iot`, `azure_iot`, `gcp_iot`, `dynamodb`, `bigquery`,
+# `azure_blob`, `azure_eventhubs`. X1-10 gates the rest. A feature build
+# (e.g. `--features dynamodb`) restores that sink; the release set (or
+# `--all-features`) restores all.
+default = []
+aws_iot = ["dep:aws-sigv4"]
+dynamodb = ["dep:aws-sdk-dynamodb"]
+bigquery = ["dep:gcp-bigquery-client"]
+azure_blob = []
+azure_eventhubs = []
+azure_iot = []
+gcp_iot = []
 
 [dev-dependencies]
 axum = { workspace = true }

@@ -1021,6 +1021,8 @@ mod tests {
     /// through a second crate instance and fail with E0308. The
     /// windowed timescale rule below exercises the enterprise
     /// executor end to end, exactly as before the split.
+    /// X1-09: needs the community `s3` feature (S3 mock absent by default).
+    #[cfg(feature = "s3")]
     #[tokio::test]
     async fn test_into_fans_out_to_s3_elasticsearch_timescaledb() {
         use broker_connectors::{

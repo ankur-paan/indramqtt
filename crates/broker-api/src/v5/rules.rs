@@ -780,7 +780,19 @@ pub fn seed_connectors_from_registry(
                             }
                         }
                         if reachable {
-                            register_live_sink(engine, &conn_type, &live_name, &params).await;
+                            // A disabled Cargo feature fails closed here:
+                            // the entry stays persist-only and the missing
+                            // feature is logged naming it.
+                            if let Err(feature_error) =
+                                try_register_live_sink(engine, &conn_type, &live_name, &params)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    connector = %live_name,
+                                    kind = %conn_type,
+                                    "{feature_error}"
+                                );
+                            }
                         }
                     }
                 });
@@ -850,6 +862,116 @@ pub async fn get_connector(Path(id): Path<String>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Cargo feature gating a connector kind, or `None` when the kind is
+/// always compiled in. X1-09 gates the first half (cloud-IoT +
+/// cloud-store): `s3` lives in `broker-connectors`, the rest in
+/// `broker-connectors-enterprise`. A disabled kind is absent from the
+/// build and the binary.
+pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str> {
+    match conn_type {
+        "s3" | "minio" => {
+            #[cfg(feature = "s3")]
+            {
+                None
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                Some("s3")
+            }
+        }
+        "dynamodb" | "dynamo" | "ddb" => {
+            #[cfg(feature = "dynamodb")]
+            {
+                None
+            }
+            #[cfg(not(feature = "dynamodb"))]
+            {
+                Some("dynamodb")
+            }
+        }
+        "bigquery" | "bq" | "gbq" => {
+            #[cfg(feature = "bigquery")]
+            {
+                None
+            }
+            #[cfg(not(feature = "bigquery"))]
+            {
+                Some("bigquery")
+            }
+        }
+        "aws_iot" | "aws_iot_core" => {
+            #[cfg(feature = "aws_iot")]
+            {
+                None
+            }
+            #[cfg(not(feature = "aws_iot"))]
+            {
+                Some("aws_iot")
+            }
+        }
+        "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
+            #[cfg(feature = "azure_blob")]
+            {
+                None
+            }
+            #[cfg(not(feature = "azure_blob"))]
+            {
+                Some("azure_blob")
+            }
+        }
+        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
+            #[cfg(feature = "azure_eventhubs")]
+            {
+                None
+            }
+            #[cfg(not(feature = "azure_eventhubs"))]
+            {
+                Some("azure_eventhubs")
+            }
+        }
+        "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
+            #[cfg(feature = "azure_iot")]
+            {
+                None
+            }
+            #[cfg(not(feature = "azure_iot"))]
+            {
+                Some("azure_iot")
+            }
+        }
+        "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
+            #[cfg(feature = "gcp_iot")]
+            {
+                None
+            }
+            #[cfg(not(feature = "gcp_iot"))]
+            {
+                Some("gcp_iot")
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Checked registration: a kind whose Cargo feature is disabled fails
+/// closed with an error naming the missing feature — never a silent
+/// skip, never a fallback identity. Enabled kinds go through
+/// [`register_live_sink`], the same path `create_connector` uses.
+pub(crate) async fn try_register_live_sink(
+    engine: &broker_rules::RuleEngine,
+    conn_type: &str,
+    name: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(feature) = disabled_connector_feature(conn_type) {
+        return Err(format!(
+            "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
+        ));
+    }
+    register_live_sink(engine, conn_type, name, body).await;
+    Ok(())
 }
 
 pub(crate) async fn register_live_sink(
@@ -2590,6 +2712,13 @@ pub(crate) async fn register_live_sink(
                     .register(format!("sparkplug:{}", name), sink);
             }
         }
+        #[cfg(not(feature = "s3"))]
+        "s3" | "minio" => {
+            // Feature off: fail closed with no sink. The checked
+            // wrapper already returns the naming error. Boot replay
+            // keeps the entry persist-only.
+        }
+        #[cfg(feature = "s3")]
         "s3" | "minio" => {
             let endpoint = body
                 .get("endpoint")
@@ -2788,7 +2917,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "dynamodb" | "dynamo" => {
+        #[cfg(not(feature = "dynamodb"))]
+        "dynamodb" | "dynamo" | "ddb" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "dynamodb")]
+        "dynamodb" | "dynamo" | "ddb" => {
             let table = body
                 .get("table_name")
                 .or_else(|| body.get("table"))
@@ -3011,6 +3146,12 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(not(feature = "aws_iot"))]
+        "aws_iot" | "aws_iot_core" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "aws_iot")]
         "aws_iot" | "aws_iot_core" => {
             // Fail closed (S1-01 + R1-01): mTLS material is operator-supplied
             // from the request body (flat or nested `auth`), never invented.
@@ -3103,7 +3244,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "azure_blob" | "azure_blob_storage" => {
+        #[cfg(not(feature = "azure_blob"))]
+        "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "azure_blob")]
+        "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
             let account_name = body
                 .get("account_name")
                 .and_then(|v| v.as_str())
@@ -3237,7 +3384,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "azure_eventhubs" | "azure_event_hubs" => {
+        #[cfg(not(feature = "azure_eventhubs"))]
+        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "azure_eventhubs")]
+        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
             let namespace = body
                 .get("namespace")
                 .and_then(|v| v.as_str())
@@ -3312,7 +3465,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "azure_iot" | "azure_iot_hub" => {
+        #[cfg(not(feature = "azure_iot"))]
+        "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "azure_iot")]
+        "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
             let hub_name = body
                 .get("iot_hub_name")
                 .or_else(|| body.get("hub_name"))
@@ -3485,7 +3644,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "bigquery" => {
+        #[cfg(not(feature = "bigquery"))]
+        "bigquery" | "bq" | "gbq" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "bigquery")]
+        "bigquery" | "bq" | "gbq" => {
             let project_id = body
                 .get("project_id")
                 .or_else(|| body.get("project"))
@@ -3583,7 +3748,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "gcp_iot" | "gcp_iot_core" => {
+        #[cfg(not(feature = "gcp_iot"))]
+        "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
+            // Feature disabled (X1-09): fail closed with no sink; the
+            // checked wrapper names the missing feature.
+        }
+        #[cfg(feature = "gcp_iot")]
+        "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
             // Kept: service-documented default endpoint
             // (`mqtt.googleapis.com:8883`, the Google Cloud IoT MQTT bridge;
             // same default as `GcpIotConfig::default_endpoint`).
@@ -4195,7 +4366,35 @@ pub async fn create_connector(
     }
 
     if is_reachable {
-        register_live_sink(&state.engine, &conn_type, &name, &body).await;
+        // A kind whose Cargo feature is disabled fails closed here with
+        // the missing feature named; nothing is stored degraded.
+        if let Err(feature_error) =
+            try_register_live_sink(&state.engine, &conn_type, &name, &body).await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": feature_error,
+                })),
+            )
+                .into_response();
+        }
+    } else if disabled_connector_feature(&conn_type).is_some() {
+        // Unreachable probe for a disabled kind still fails closed naming
+        // the feature instead of storing a sink that can never go live.
+        if let Some(feature) = disabled_connector_feature(&conn_type) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": format!(
+                        "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
+                    ),
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Re-check under the write lock so two concurrent creates for the
@@ -4277,7 +4476,20 @@ pub async fn update_connector(
         )
             .into_response();
     }
-    register_live_sink(&state.engine, &conn_type, &clean_id, &body).await;
+    // A kind whose Cargo feature is disabled fails closed naming the
+    // feature instead of updating a sink that can never go live.
+    if let Err(feature_error) =
+        try_register_live_sink(&state.engine, &conn_type, &clean_id, &body).await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": feature_error,
+            })),
+        )
+            .into_response();
+    }
 
     {
         let mut connectors = CONNECTORS.write().unwrap();
@@ -4806,4 +5018,234 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
         Json(serde_json::json!({ "result": "ok", "status": "connected" })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// X1-09 feature-gate tests: disabled kinds fail closed naming the feature,
+// enabled kinds register through the broker rule path.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+#[allow(dead_code, unused_imports)]
+mod connector_feature_tests {
+    use super::*;
+    use broker_protocol::{QoS, Topic, TopicFilter};
+    use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine, RuleEngineError};
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        published: StdMutex<Vec<(Topic, Bytes, QoS, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BrokerSink for RecordingSink {
+        async fn publish(
+            &self,
+            topic: Topic,
+            payload: Bytes,
+            qos: QoS,
+            retain: bool,
+        ) -> Result<(), RuleEngineError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((topic, payload, qos, retain));
+            Ok(())
+        }
+    }
+
+    async fn expect_disabled(kind: &str, feature: &str) {
+        assert_eq!(
+            disabled_connector_feature(kind),
+            Some(feature),
+            "{kind} must map to feature {feature} when disabled"
+        );
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let err = try_register_live_sink(&engine, kind, "feat-test", &serde_json::json!({}))
+            .await
+            .expect_err("disabled kind must fail registration");
+        assert!(
+            err.contains(feature),
+            "closed error must name feature '{feature}': {err}"
+        );
+        assert!(
+            engine.connectors().get("feat-test").is_none(),
+            "no sink may register when feature '{feature}' is disabled"
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    async fn test_disabled_s3_names_feature() {
+        expect_disabled("s3", "s3").await;
+        expect_disabled("minio", "s3").await;
+    }
+
+    #[cfg(not(feature = "dynamodb"))]
+    #[tokio::test]
+    async fn test_disabled_dynamodb_names_feature() {
+        expect_disabled("dynamodb", "dynamodb").await;
+        expect_disabled("dynamo", "dynamodb").await;
+    }
+
+    #[cfg(not(feature = "bigquery"))]
+    #[tokio::test]
+    async fn test_disabled_bigquery_names_feature() {
+        expect_disabled("bigquery", "bigquery").await;
+    }
+
+    #[cfg(not(feature = "aws_iot"))]
+    #[tokio::test]
+    async fn test_disabled_aws_iot_names_feature() {
+        expect_disabled("aws_iot", "aws_iot").await;
+        expect_disabled("aws_iot_core", "aws_iot").await;
+    }
+
+    #[cfg(not(feature = "azure_blob"))]
+    #[tokio::test]
+    async fn test_disabled_azure_blob_names_feature() {
+        expect_disabled("azure_blob", "azure_blob").await;
+        expect_disabled("azure_blob_storage", "azure_blob").await;
+    }
+
+    #[cfg(not(feature = "azure_eventhubs"))]
+    #[tokio::test]
+    async fn test_disabled_azure_eventhubs_names_feature() {
+        expect_disabled("azure_eventhubs", "azure_eventhubs").await;
+        expect_disabled("azure_event_hubs", "azure_eventhubs").await;
+    }
+
+    #[cfg(not(feature = "azure_iot"))]
+    #[tokio::test]
+    async fn test_disabled_azure_iot_names_feature() {
+        expect_disabled("azure_iot", "azure_iot").await;
+        expect_disabled("azure_iot_hub", "azure_iot").await;
+    }
+
+    #[cfg(not(feature = "gcp_iot"))]
+    #[tokio::test]
+    async fn test_disabled_gcp_iot_names_feature() {
+        expect_disabled("gcp_iot", "gcp_iot").await;
+        expect_disabled("gcp_iot_core", "gcp_iot").await;
+    }
+
+    /// Enabled evidence (dynamodb): a rule registered with the connector
+    /// manager delivers exactly one batch through the broker rule path.
+    #[cfg(feature = "dynamodb")]
+    #[tokio::test]
+    async fn test_enabled_dynamodb_through_rule_engine() {
+        use broker_connectors::Sink as _;
+        use broker_connectors_enterprise::dynamodb::{
+            DynamoDbSink, DynamoDbSinkConfig, DynamoKeyConfig, MockDynamoDbTransport,
+        };
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let transport = Arc::new(MockDynamoDbTransport::new());
+        let config = DynamoDbSinkConfig {
+            table_name: "telemetry_table".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            access_key_id: "AKID".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+            partition_key: DynamoKeyConfig {
+                name: "device_id".to_string(),
+                template: "${client_id}".to_string(),
+                key_type: "S".to_string(),
+            },
+            sort_key: None,
+            ttl_attribute: None,
+            ttl_secs: None,
+            attributes_mapping: std::collections::HashMap::new(),
+            batch_size: Some(1),
+            batch_bytes: Some(1_048_576),
+            linger_ms: Some(10),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: None,
+        };
+        let sink = Arc::new(DynamoDbSink::new(config, transport.clone()).expect("valid sink"));
+        assert_eq!(sink.kind(), "dynamodb");
+        engine.connectors().register("dd-feat", sink);
+        engine
+            .create_rule(
+                "dd-feat-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("dd-feat")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let broker: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#),
+                QoS::AtMostOnce,
+                &broker,
+            )
+            .await;
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1, "exactly one batch must deliver");
+        assert_eq!(captured[0].table, "telemetry_table");
+        assert_eq!(captured[0].items.len(), 1, "every key present, no loss");
+    }
+
+    /// Enabled evidence (s3): same rule-path shape over the mock object
+    /// transport; exactly one object lands with the projected JSON inside.
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn test_enabled_s3_through_rule_engine() {
+        use broker_connectors::s3::{MockS3Transport, S3Compression, S3Sink, S3SinkConfig};
+        use broker_connectors::Sink as _;
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let transport = Arc::new(MockS3Transport::new());
+        let config = S3SinkConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "telemetry".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            key_template: "telemetry/${topic}_${seq}.ndjson".to_string(),
+            compression: S3Compression::None,
+            batch_size: 1,
+            batch_bytes: 5 * 1024 * 1024,
+            batch_timeout_ms: 10,
+            timeout_ms: None,
+        };
+        let sink = Arc::new(S3Sink::new(config, transport.clone()).expect("valid sink"));
+        assert_eq!(sink.kind(), "s3");
+        engine.connectors().register("s3-feat", sink);
+        engine
+            .create_rule(
+                "s3-feat-rule".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                Some(
+                    r#"SELECT client_id, temp FROM "sensors/+" WHERE temp > 20.0 INTO connector("s3-feat")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let broker: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#),
+                QoS::AtMostOnce,
+                &broker,
+            )
+            .await;
+        let puts = transport.puts();
+        assert_eq!(puts.len(), 1, "exactly one object must land");
+        assert_eq!(puts[0].bucket, "telemetry");
+        let body = String::from_utf8(puts[0].body.clone()).expect("ndjson is UTF-8");
+        assert!(
+            body.contains("device-42"),
+            "projected payload must travel untouched: {body}"
+        );
+    }
 }

@@ -1,6 +1,18 @@
 #![allow(unknown_lints)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
+//! Community connectors: light sinks with no vendor SDK.
+//!
+//! Default build (no features): `postgres`, `mysql`, `redis`,
+//! `mqtt_bridge`, `http`, `disk_log`, `clickhouse`, `kafka`,
+//! `rabbitmq`, `elasticsearch`, `influxdb`, `greptimedb`, `opentsdb`,
+//! `timescaledb`, `kinesis`, `mssql`, `redshift`, `sparkplug_b`,
+//! `tdengine`, `cloud_tls` and the `webhook`/`console`/`test` shims.
+//! Every heavy vendor SDK is off unless its Cargo feature is enabled;
+//! X1-09 gates the cloud object-store path (`s3`, feature `s3`) and
+//! X1-10 gates the rest. Unresolvable kinds under a disabled feature
+//! fail registration closed with an error naming the missing feature.
+
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
@@ -29,6 +41,7 @@ pub mod postgres;
 pub mod rabbitmq;
 pub mod redis;
 pub mod redshift;
+#[cfg(feature = "s3")]
 pub mod s3;
 pub mod sparkplug_b;
 pub mod tdengine;
@@ -94,6 +107,7 @@ pub use redis::{
     DriverRedisTransport, MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply,
     RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport,
 };
+#[cfg(feature = "s3")]
 pub use s3::{
     HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
     S3Transport, SdkS3Transport, SigV4Request,

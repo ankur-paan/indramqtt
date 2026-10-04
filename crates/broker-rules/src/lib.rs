@@ -3587,6 +3587,8 @@ mod tests {
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Kinesis, GCP Pub/Sub, Azure Event Hubs
     /// and Pulsar mocks. All transports are in-memory.
+    /// X1-09: needs the `azure_eventhubs` feature (absent by default).
+    #[cfg(feature = "azure_eventhubs")]
     #[tokio::test]
     async fn test_into_fans_out_to_cloud_sinks() {
         use broker_connectors_enterprise::{
@@ -3822,6 +3824,8 @@ mod tests {
     /// ingress forwards (no SQL projection, bytes verbatim) into the
     /// OPC-UA memory transport as a typed node write. All transports
     /// are in-memory; the RSA key is a fixed test key (never deployed).
+    /// X1-09: needs the `aws_iot`, `azure_iot` and `gcp_iot` features.
+    #[cfg(all(feature = "aws_iot", feature = "azure_iot", feature = "gcp_iot"))]
     #[tokio::test]
     async fn test_into_fans_out_to_iot_industrial_sinks() {
         use broker_connectors_enterprise::{
@@ -4141,6 +4145,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(opcua_transport.writes().len(), 1);
     }
 
+    #[allow(dead_code)]
     fn base64_decode(input: &str) -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -4390,6 +4395,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the TDengine, IoTDB, Timestream and DynamoDB
     /// mocks with zero drops. All transports are in-memory.
+    /// X1-09: needs the `dynamodb` feature (absent by default).
+    #[cfg(feature = "dynamodb")]
     #[tokio::test]
     async fn test_into_fans_out_to_timeseries_sinks() {
         use broker_connectors_enterprise::{
@@ -4642,6 +4649,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Snowflake, Databricks, Doris, BigQuery
     /// and Redshift mocks with zero drops. All transports in-memory.
+    /// X1-09: needs the `bigquery` feature (absent by default).
+    #[cfg(feature = "bigquery")]
     #[tokio::test]
     async fn test_into_fans_out_to_lakehouse_sinks() {
         use broker_connectors_enterprise::{
@@ -4924,6 +4933,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// `SdkBigQueryTransport` to a loopback `insertAll` fake. Row count is
     /// asserted on the fake (not just the sink counters), plus selective
     /// requeue of only failed rows through the same rule path.
+    /// X1-09: needs the `bigquery` feature (absent by default).
+    #[cfg(feature = "bigquery")]
     #[tokio::test]
     async fn test_bigquery_sdk_sink_via_rule_against_fake() {
         use axum::{extract::State, http::StatusCode, routing::post, Router};
@@ -5258,6 +5269,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// through five streaming SQL `INTO connector(...)` rules and lands
     /// simultaneously in the Azure Blob, Tablestore, S3 Tables,
     /// Confluent and RocketMQ mocks. All transports are in-memory.
+    /// X1-09: needs the `azure_blob` feature (absent by default).
+    #[cfg(feature = "azure_blob")]
     #[tokio::test]
     async fn test_into_fans_out_to_storage_messaging_sinks() {
         use broker_connectors_enterprise::{
@@ -5529,6 +5542,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// `HttpAzureBlobTransport`, whose idempotent container create plus
     /// block-blob upload land on a local HTTP fake. Every request pins
     /// x-ms-version 2021-08-06.
+    /// X1-09: needs the `azure_blob` feature (absent by default).
+    #[cfg(feature = "azure_blob")]
     #[tokio::test]
     async fn test_azure_blob_rest_write_via_dispatch_against_loopback() {
         use broker_connectors::Sink as _;
@@ -5667,6 +5682,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// lands on a local HTTP fake. The SAS header carries the key name
     /// (never a pre-formed token in config), so the sink renews it from
     /// the stored key on every attempt.
+    /// X1-09: needs the `azure_eventhubs` feature (absent by default).
+    #[cfg(feature = "azure_eventhubs")]
     #[tokio::test]
     async fn test_azure_eventhubs_rest_write_via_dispatch_against_loopback() {
         use broker_connectors::Sink as _;

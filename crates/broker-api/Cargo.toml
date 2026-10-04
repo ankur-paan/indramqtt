@@ -32,6 +32,21 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 
+[features]
+# Mirrors the X1-09 connector feature set so `register_live_sink` can fail
+# closed naming the missing feature. Each forwards to the owning crate:
+# `s3` to `broker-connectors`, the rest to `broker-connectors-enterprise`.
+# Default build matches those crates' defaults (all gated kinds absent).
+default = []
+s3 = ["broker-connectors/s3"]
+aws_iot = ["broker-connectors-enterprise/aws_iot"]
+azure_blob = ["broker-connectors-enterprise/azure_blob"]
+azure_eventhubs = ["broker-connectors-enterprise/azure_eventhubs"]
+azure_iot = ["broker-connectors-enterprise/azure_iot"]
+bigquery = ["broker-connectors-enterprise/bigquery"]
+dynamodb = ["broker-connectors-enterprise/dynamodb"]
+gcp_iot = ["broker-connectors-enterprise/gcp_iot"]
+
 [dev-dependencies]
 broker-connectors = { workspace = true }
 async-trait = { workspace = true }
