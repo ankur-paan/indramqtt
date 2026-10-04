@@ -35,7 +35,8 @@ COPY proto ./proto
 COPY crates ./crates
 COPY tests ./tests
 
-RUN cargo build --release --locked -p broker-node --bin indramqtt --bin indra
+# The image contains all connector kinds.
+RUN cargo build --release --locked -p broker-node --features full --bin indramqtt --bin indra
 
 # -----------------------------------------------------------------------------
 # Stage 2: edge

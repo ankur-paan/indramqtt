@@ -4789,14 +4789,13 @@ async fn apply_subscribe(
     };
 
     let mut codes = Vec::with_capacity(subs.len());
-    // X1-03: granted entries carry their retain-handling decision plus
-    // the v5 options needed for retained replay (retain-as-published and
-    // subscription identifier ride retained deliveries too).
+    // Each granted filter, with its retain-handling decision and the
+    // subscription identifier that the retained replay carries.
     struct GrantedSub {
         filter: TopicFilter,
         qos: u8,
-        rap: bool,
         sub_id: u32,
+        send_retained: bool,
     }
     let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
     // Tenant scope (MT-02, MT-03): resolved once from the subscribing
@@ -4839,7 +4838,7 @@ async fn apply_subscribe(
                 // RAP=0 clears it. Keeps v4 bytes and semantics identical.
                 Ok(qos) => (u8::from(qos), false, true, 0u8, 0u32),
                 Err(_) => {
-                    codes.push(V5_SUBACK_FILTER_INVALID);
+                    codes.push(V5_SUBACK_UNSPECIFIED);
                     continue;
                 }
             }
@@ -5003,14 +5002,15 @@ async fn apply_subscribe(
             2 => false,
             _ => true,
         };
-        if send_retained {
-            granted.push(GrantedSub {
-                filter,
-                qos: qos_raw,
-                rap,
-                sub_id,
-            });
-        }
+        // Each grant goes in the list: the statistics and the cluster
+        // announce use all grants. Only the retained replay uses the
+        // retain-handling decision.
+        granted.push(GrantedSub {
+            filter,
+            qos: qos_raw,
+            sub_id,
+            send_retained,
+        });
         codes.push(qos_raw);
     }
     if !granted.is_empty() {
@@ -5054,7 +5054,7 @@ async fn apply_subscribe(
         .as_ref()
         .map(|session| session.tenant_id.read().clone())
         .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
-    for grant in &granted {
+    for grant in granted.iter().filter(|grant| grant.send_retained) {
         let filter = &grant.filter;
         let sub_qos = grant.qos;
         let matched = match shared
@@ -5127,14 +5127,11 @@ async fn apply_subscribe(
                 }
             }
             let topic_str = msg.topic.as_str();
-            // X1-03: retained replays carry the granting subscription's
-            // identifier (0 = absent, edge omits the property so v4
-            // bytes stay identical) alongside the full topic and
-            // alias 0. The replay honors retain-as-published: RAP=1
-            // keeps the retained flag, RAP=0 clears it, exactly like
-            // live delivery; legacy grants preserve (rap defaults
-            // true), so v4 retained replay still carries retain==1.
-            let replay_retain = grant.rap;
+            // A message sent because of a new subscription always has
+            // the retain flag. The retain-as-published option applies
+            // only to messages forwarded from a live publish. The
+            // replay carries the subscription identifier of the grant
+            // (0 = none; the edge then omits the property).
             let sub_id = if grant.sub_id <= broker_router::MAX_SUBSCRIPTION_ID {
                 grant.sub_id
             } else {
@@ -5145,7 +5142,7 @@ async fn apply_subscribe(
             meta.extend_from_slice(topic_str.as_bytes());
             meta.extend_from_slice(&downlink_id.to_be_bytes());
             meta.push(effective);
-            meta.push(u8::from(replay_retain)); // RAP-honoring retained flag
+            meta.push(1u8); // retain: replayed retained state
             meta.push(0u8);
             meta.extend_from_slice(&protocol_v5::encode_topic_alias(0));
             if sub_id != 0 {

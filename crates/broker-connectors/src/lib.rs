@@ -6,12 +6,15 @@
 //! Default build (no features): `postgres`, `mysql`, `redis`,
 //! `mqtt_bridge`, `http`, `disk_log`, `clickhouse`, `kafka`,
 //! `rabbitmq`, `elasticsearch`, `influxdb`, `greptimedb`, `opentsdb`,
-//! `timescaledb`, `kinesis`, `mssql`, `redshift`, `sparkplug_b`,
-//! `tdengine`, `cloud_tls` and the `webhook`/`console`/`test` shims.
-//! Every heavy vendor SDK is off unless its Cargo feature is enabled;
-//! X1-09 gates the cloud object-store path (`s3`, feature `s3`) and
-//! X1-10 gates the rest. Unresolvable kinds under a disabled feature
-//! fail registration closed with an error naming the missing feature.
+//! `timescaledb`, `cloud_tls` and the `webhook`/`console`/`test` shims.
+//! The `s3` sink is in the build only with the Cargo feature `s3`.
+//! With the feature off, the registration of that kind fails with an
+//! error that names the feature. Release builds use the `full` feature
+//! of `broker-node`, which adds all gated kinds.
+//!
+//! The modules `kinesis`, `mssql`, `redshift`, `sparkplug_b` and
+//! `tdengine` in this crate contain tests only. Those sinks are in
+//! `broker-connectors-enterprise`.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};

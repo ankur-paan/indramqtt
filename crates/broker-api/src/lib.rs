@@ -1233,10 +1233,8 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid sparkplug_b config: {e}"))?;
-                // Production MQTT delivery rides the maintained
-                // `rumqttc` driver transport exactly when the config
-                // names a server; without `mqtt_url` frames stay
-                // in-process (stored configurations keep working).
+                // The sink sends to the MQTT server that `mqtt_url`
+                // names, through the `rumqttc` driver transport.
                 let transport: std::sync::Arc<dyn broker_connectors_enterprise::SparkplugTransport> =
                     match config.mqtt_url.clone().filter(|url| !url.trim().is_empty()) {
                         Some(url) => std::sync::Arc::new(
@@ -1246,9 +1244,12 @@ async fn build_connector(
                             )
                             .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?,
                         ),
-                        None => std::sync::Arc::new(
-                            broker_connectors_enterprise::MemorySparkplugTransport::new(),
-                        ),
+                        // Without a server there is no destination. A sink
+                        // that keeps the frames in memory would report
+                        // success and deliver nothing.
+                        None => {
+                            return Err("invalid sparkplug_b sink: `mqtt_url` is necessary".to_string())
+                        }
                     };
                 let sink = broker_connectors_enterprise::SparkplugBSink::new(config, transport)
                     .map_err(|e| format!("invalid sparkplug_b sink: {e}"))?;
@@ -6149,13 +6150,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("disk_log"));
         std::fs::remove_dir_all(&disk_dir).ok();
 
-        // Sparkplug B sink: enterprise tier validated without any broker.
+        // Sparkplug B sink: the driver connects at the first write, thus
+        // the create step does not need a server.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
                 json!({"id": "spb-1",
                        "kind": "sparkplug_b",
                        "config": {"topic_prefix": "spBv1.0/plant1",
+                                  "mqtt_url": "mqtt://127.0.0.1:1883",
                                   "tier": "enterprise",
                                   "batch_size": 50,
                                   "linger_ms": 25}}),

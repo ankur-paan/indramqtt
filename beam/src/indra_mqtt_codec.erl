@@ -1021,25 +1021,13 @@ parse_suback_props(Bin, Acc, Seen) ->
             {error, malformed_suback}
     end.
 
-%% @doc Encode an outgoing MQTT 5 PUBLISH packet with subscription
-%% identifier (X1-03, v5 deliveries only). `SubId' 0 encodes exactly like
-%% {@link encode_publish/7} (no identifier property, so 3.1.1 peers see
-%% no change); a nonzero identifier appends the subscription-identifier
-%% property (11:varint) next to the alias property. The caller must gate
-%% on the negotiated protocol level; 3.1.1 peers never reach here.
-%% Use {@link encode_publish_v5_full/11} when forwarded v5 properties
-%% (payload format, message expiry, user properties) must ride along.
+%% @doc Encode an outgoing MQTT 5 PUBLISH packet with a subscription
+%% identifier (0 = no identifier). The packet always has the property
+%% length, because MQTT 5 requires it. The caller must use this function
+%% only for a socket that negotiated protocol level 5.
 -spec encode_publish_v5(binary(), 0..65535, 0..2, boolean(), boolean(),
                         binary(), 0..65535, 0..268435455) -> binary().
-encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, 0) ->
-    encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload, Alias);
-encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, SubId)
-  when is_binary(Topic), byte_size(Topic) >= 1, byte_size(Topic) =< ?MAX_TOPIC_LEN,
-       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
-       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
-       is_boolean(Retain), is_boolean(Dup), is_binary(Payload),
-       is_integer(Alias), Alias >= 0, Alias =< ?MAX_TOPIC_ALIAS,
-       is_integer(SubId), SubId >= 1, SubId =< ?MAX_SUB_ID ->
+encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, SubId) ->
     encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
                            Alias, SubId, 0, 0, []).
 
@@ -1047,16 +1035,13 @@ encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, SubId)
 %% identifier plus forwarded v5 properties (X1-03 deliveries).
 %% `Format' is 0|1, `Expiry' a u32 message-expiry interval, `Users' a
 %% bounded `[{Key, Value}]' user-property list. Empty properties
-%% (`0, 0, []') encode exactly like {@link encode_publish_v5/8}; a
+%% encode as a property length of zero; a
 %% version-4 peer never reaches here (the caller gates on the
 %% negotiated level). Over-bound inputs fail with `badarg' (fail
 %% closed: the caller falls back to the property-less form).
 -spec encode_publish_v5_full(binary(), 0..65535, 0..2, boolean(), boolean(),
                              binary(), 0..65535, 0..268435455,
                              0..1, 0..4294967295, [{binary(), binary()}]) -> binary().
-encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
-                       Alias, 0, 0, 0, []) ->
-    encode_publish_v5(Topic, PacketId, QoS, Retain, Dup, Payload, Alias, 0);
 encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
                        Alias, SubId, Format, Expiry, Users)
   when is_binary(Topic), byte_size(Topic) >= 1, byte_size(Topic) =< ?MAX_TOPIC_LEN,
@@ -1101,23 +1086,20 @@ encode_publish_v5_full(Topic, PacketId, QoS, Retain, Dup, Payload,
       end, <<>>, Users),
     Props = <<AliasProps/binary, SubProps/binary, FormatProps/binary,
               ExpiryProps/binary, UserProps/binary>>,
-    case byte_size(Props) of
-        0 ->
-            encode_publish(Topic, PacketId, QoS, Retain, Dup, Payload, Alias);
-        _ ->
-            PropLen = encode_varint(byte_size(Props)),
-            Header = case QoS of
-                0 -> <<(byte_size(Topic)):16/big, Topic/binary, PropLen/binary, Props/binary>>;
-                _ -> <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big,
-                       PropLen/binary, Props/binary>>
-            end,
-            Body = <<Header/binary, Payload/binary>>,
-            Flags = (case Dup of true -> 16#08; false -> 0 end)
-                bor (QoS bsl 1)
-                bor (case Retain of true -> 16#01; false -> 0 end),
-            RL = encode_remaining_length(byte_size(Body)),
-            <<3:4, Flags:4, RL/binary, Body/binary>>
-    end.
+    %% MQTT 5 requires the property length in each PUBLISH. An empty
+    %% property section is one zero byte.
+    PropLen = encode_varint(byte_size(Props)),
+    Header = case QoS of
+        0 -> <<(byte_size(Topic)):16/big, Topic/binary, PropLen/binary, Props/binary>>;
+        _ -> <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big,
+               PropLen/binary, Props/binary>>
+    end,
+    Body = <<Header/binary, Payload/binary>>,
+    Flags = (case Dup of true -> 16#08; false -> 0 end)
+        bor (QoS bsl 1)
+        bor (case Retain of true -> 16#01; false -> 0 end),
+    RL = encode_remaining_length(byte_size(Body)),
+    <<3:4, Flags:4, RL/binary, Body/binary>>.
 
 %% @doc Decode an MQTT 5 DISCONNECT body (X1-03): reason code plus
 %% properties (reason string + user properties, bounded). Empty body
@@ -1953,43 +1935,6 @@ take_prop_binary(<<Len:16/big, Rest/binary>>) ->
     end;
 take_prop_binary(_) ->
     {error, truncated_connect}.
-
-%% @private Extract the Topic Alias (property 35, u16) from a PUBLISH
-%% properties block. Returns `{ok, Alias, Present}': absent means
-%% `{ok, 0, false}', an explicit on-wire 0 means `{ok, 0, true}'
-%% (a protocol error the kernel rejects with DISCONNECT 0x94).
-parse_publish_alias(Props) ->
-    parse_publish_alias(Props, undefined).
-
-parse_publish_alias(<<>>, undefined) ->
-    {ok, 0, false};
-parse_publish_alias(<<>>, {ok, Alias}) ->
-    {ok, Alias, true};
-parse_publish_alias(Bin, Seen) ->
-    case decode_varint(Bin) of
-        {ok, 35, Rest} ->
-            case Rest of
-                <<Alias:16/big, Tail/binary>> ->
-                    case Seen of
-                        undefined -> parse_publish_alias(Tail, {ok, Alias});
-                        _ -> {error, malformed_publish_properties}
-                    end;
-                _ ->
-                    {error, truncated_publish}
-            end;
-        {ok, Id, Rest} ->
-            case skip_property(Id, Rest) of
-                {ok, Tail} ->
-                    parse_publish_alias(Tail, Seen);
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            case Err of
-                {error, truncated_connect} -> {error, truncated_publish};
-                _ -> Err
-            end
-    end.
 
 %% @private Skip one property value by its identifier. Lengths follow
 %% MQTT 5.0 §2.2.2: u8, u16, u32, variable-byte integer, UTF-8 string,

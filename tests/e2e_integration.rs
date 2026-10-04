@@ -2405,9 +2405,9 @@ fn sy02_parse_publish_classic(header: u8, body: &[u8]) -> Sy02Publish {
     }
 }
 
-/// Parse an alias-carrying PUBLISH (the edge appends the alias property
-/// after a one-byte property length when the kernel assigned one):
-/// live deliveries toward a subscriber that negotiated a maximum.
+/// Parse an MQTT 5 PUBLISH: the property length is always there, and
+/// the alias property is there when the kernel assigned an alias
+/// (`alias` is 0 when it is absent).
 fn sy02_parse_publish_alias(header: u8, body: &[u8]) -> Sy02Publish {
     let dup = header & 0x08 != 0;
     let qos = (header >> 1) & 0x03;
@@ -2444,7 +2444,6 @@ fn sy02_parse_publish_alias(header: u8, body: &[u8]) -> Sy02Publish {
             _ => panic!("unexpected PUBLISH property {id}"),
         }
     }
-    assert_ne!(alias, 0, "alias-carrying PUBLISH holds a nonzero alias");
     Sy02Publish {
         topic,
         packet_id,
@@ -3523,7 +3522,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     subscribe_qos1(&mut a_ret, "sy02-a-ret", "sy02/retained").await;
     let (head, body) = recv_packet(&mut a_ret).await;
     assert_eq!(head & 0xF0, 0x30, "retained downlink is PUBLISH");
-    let retained_a = sy02_parse_publish_classic(head, &body);
+    let retained_a = sy02_parse_publish_alias(head, &body);
     assert_eq!(retained_a.topic, "sy02/retained");
     assert_eq!(
         retained_a.payload, b"a-ret",
@@ -3539,7 +3538,7 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     subscribe_qos1(&mut b_ret, "sy02-b-ret", "sy02/retained").await;
     let (head, body) = recv_packet(&mut b_ret).await;
     assert_eq!(head & 0xF0, 0x30, "retained downlink is PUBLISH");
-    let retained_b = sy02_parse_publish_classic(head, &body);
+    let retained_b = sy02_parse_publish_alias(head, &body);
     assert_eq!(retained_b.topic, "sy02/retained");
     assert_eq!(
         retained_b.payload, b"b-ret",
@@ -3568,12 +3567,12 @@ async fn sy02_tenants_isolated_with_aliases_and_offline() {
     );
     let (head, body) = recv_packet(&mut a_re).await;
     assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
-    let off_a = sy02_parse_publish_classic(head, &body);
+    let off_a = sy02_parse_publish_alias(head, &body);
     assert_eq!(off_a.topic, "sy02/iso");
     assert_eq!(off_a.payload, b"a-off");
     let (head, body) = recv_packet(&mut b_re).await;
     assert_eq!(head & 0xF0, 0x30, "replay is PUBLISH");
-    let off_b = sy02_parse_publish_classic(head, &body);
+    let off_b = sy02_parse_publish_alias(head, &body);
     assert_eq!(off_b.topic, "sy02/iso");
     assert_eq!(off_b.payload, b"b-off");
     // Nothing crosses tenants: each reconnect holds exactly one frame.

@@ -855,10 +855,24 @@ encode_publish_v5_sub_id_vector_test() ->
     Payload = maps:get(payload, Pkt),
     %% Topic "t" (3 bytes) then property length + <<11, 7>> then "hi".
     ?assert(binary:match(Payload, <<11, 7>>) =/= nomatch),
-    %% SubId 0 encodes exactly like the alias-only shape (no property).
+    %% With no identifier, the packet has a property length of zero.
     Bin0 = indra_mqtt_codec:encode_publish_v5(<<"t">>, 0, 0, false, false,
                                               <<"hi">>, 0, 0),
-    ?assertEqual(nomatch, binary:match(Bin0, <<11, 7>>)).
+    ?assertEqual(<<16#30, 6, 0, 1, "t", 0, "hi">>, Bin0).
+
+encode_publish_v5_empty_properties_vector_test() ->
+    %% MQTT 5 requires the property length in each PUBLISH. QoS 0:
+    %% topic, property length 0, payload.
+    Q0 = indra_mqtt_codec:encode_publish_v5_full(
+           <<"t">>, 0, 0, false, false, <<"hi">>, 0, 0, 0, 0, []),
+    ?assertEqual(<<16#30, 6, 0, 1, "t", 0, "hi">>, Q0),
+    %% QoS 1: topic, packet id, property length 0, payload.
+    Q1 = indra_mqtt_codec:encode_publish_v5_full(
+           <<"t">>, 9, 1, true, false, <<"hi">>, 0, 0, 0, 0, []),
+    ?assertEqual(<<16#33, 8, 0, 1, "t", 0, 9, 0, "hi">>, Q1),
+    %% The decoder for protocol level 5 reads the same payload.
+    {ok, Pub} = indra_mqtt_codec:decode_publish(<<0, 1, "t", 0, "hi">>, 0, 5),
+    ?assertEqual(<<"hi">>, maps:get(payload, Pub)).
 
 encode_publish_v5_full_forwards_props_test() ->
     %% Delivery with identifier plus format and user properties carries

@@ -2681,9 +2681,9 @@ pub(crate) async fn register_live_sink(
                 client_id: client_id.clone(),
                 max_aliases: Some(10_000),
             };
-            // Production MQTT delivery rides the maintained `rumqttc`
-            // driver transport exactly when the rule names a server;
-            // otherwise frames stay in-process.
+            // The sink sends to the MQTT server that the connector
+            // names. Without a server there is no destination, thus no
+            // sink is registered.
             let transport: Arc<dyn broker_connectors_enterprise::sparkplug_b::SparkplugTransport> =
                 match mqtt_url.filter(|url| !url.trim().is_empty()) {
                     Some(url) => {
@@ -2695,9 +2695,7 @@ pub(crate) async fn register_live_sink(
                             Err(_) => return,
                         }
                     }
-                    None => Arc::new(
-                        broker_connectors_enterprise::sparkplug_b::MemorySparkplugTransport::new(),
-                    ),
+                    None => return,
                 };
             if let Ok(sink) =
                 broker_connectors_enterprise::sparkplug_b::SparkplugBSink::new(config, transport)

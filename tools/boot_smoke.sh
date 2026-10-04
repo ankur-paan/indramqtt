@@ -226,6 +226,37 @@ except OSError:
 report("a publish goes to a subscriber through the edge and the kernel",
        suback[:1] == b"\x90" and delivered.endswith(b"smoke-ok"))
 
+# MQTT 5 delivery. Each MQTT 5 PUBLISH has a property length, also when
+# there are no properties. The check compares the full packet.
+def mqtt5_client(client_id):
+    sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + field(client_id)))
+    ack = receive(sock, 5)
+    return sock, len(ack) >= 4 and ack[0] == 0x20 and ack[3] == 0
+
+def subscribe5(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x02\x00" + field(topic) + b"\x00"))
+    ack = receive(sock, 5)
+    return len(ack) >= 6 and ack[0] == 0x90 and ack[4] == 0 and ack[5] == 0
+
+v5_topic = b"smoke/v5"
+v5_token = os.urandom(8).hex().encode()
+v5_sub, v5_ok = mqtt5_client(b"smoke-v5-sub")
+v5_ready = v5_ok and subscribe5(v5_sub, v5_topic)
+# The publisher sets the retain flag, thus the broker keeps the message.
+pub.sendall(packet(0x31, field(v5_topic) + v5_token))
+report("an MQTT 5 subscriber gets a publish with an empty property section",
+       v5_ready and receive(v5_sub, 5) == packet(0x30, field(v5_topic) + b"\x00" + v5_token))
+v5_late, v5_late_ok = mqtt5_client(b"smoke-v5-late")
+v5_late.sendall(packet(0x82, b"\x00\x02\x00" + field(v5_topic) + b"\x00"))
+v5_replay = b""
+for _ in range(2):
+    v5_replay += receive(v5_late, 5)
+    if v5_token in v5_replay:
+        break
+report("a new MQTT 5 subscription gets the retained message with the retain flag",
+       v5_late_ok and v5_replay.endswith(packet(0x31, field(v5_topic) + b"\x00" + v5_token)))
+
 # Tenants. The payload is random, thus the broker cannot know it.
 def tenant_client(client_id, username):
     sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)

@@ -611,7 +611,14 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
     let old_len = 2 + topic_len + 5;
-    if meta.len() != old_len && meta.len() != old_len + 2 && meta.len() != old_len + 2 + 4 {
+    // Longer frames carry the forwarded MQTT 5 properties after the
+    // subscription identifier. They have the same fixed head, thus a
+    // QoS 0 publish with user properties is sheddable too.
+    let known_len = meta.len() == old_len
+        || meta.len() == old_len + 2
+        || meta.len() == old_len + 2 + 4
+        || meta.len() >= old_len + 2 + 4 + 7;
+    if !known_len {
         return false;
     }
     meta[2 + topic_len + 2] == 0
@@ -2920,6 +2927,19 @@ mod tests {
         assert!(!super::is_qos0_publish_out(&BrokerFrame::ping(1, 0)));
         assert!(super::is_qos0_publish_out(&qos0_frame(1, 9)));
         assert!(!super::is_qos0_publish_out(&qos1_frame(1, 9)));
+        // A QoS 0 frame with the alias, the subscription identifier and
+        // forwarded MQTT 5 properties (format, expiry, one user pair) is
+        // sheddable too.
+        let mut meta = qos0_frame(1, 9).metadata.to_vec();
+        meta.extend_from_slice(&0u16.to_be_bytes());
+        meta.extend_from_slice(&7u32.to_be_bytes());
+        meta.push(1);
+        meta.extend_from_slice(&0u32.to_be_bytes());
+        meta.extend_from_slice(&1u16.to_be_bytes());
+        meta.extend_from_slice(&[0, 1, b'k', 0, 1, b'v']);
+        let with_props = BrokerFrame::new(brokerlink::OpCode::PublishOut, 1, 0, meta, vec![9u8])
+            .expect("valid frame");
+        assert!(super::is_qos0_publish_out(&with_props));
     }
 
     #[test]

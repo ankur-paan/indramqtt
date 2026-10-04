@@ -52,6 +52,30 @@ reqwest = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 
+[features]
+# Each feature adds one connector kind to the build. With a feature off,
+# the registration of that kind fails with an error that names the
+# feature. `full` is the set for release builds and for the image.
+default = []
+s3 = ["broker-api/s3"]
+aws_iot = ["broker-api/aws_iot"]
+azure_blob = ["broker-api/azure_blob"]
+azure_eventhubs = ["broker-api/azure_eventhubs"]
+azure_iot = ["broker-api/azure_iot"]
+bigquery = ["broker-api/bigquery"]
+dynamodb = ["broker-api/dynamodb"]
+gcp_iot = ["broker-api/gcp_iot"]
+full = [
+    "s3",
+    "aws_iot",
+    "azure_blob",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "dynamodb",
+    "gcp_iot",
+]
+
 [dev-dependencies]
 flate2 = { workspace = true }
 yamldap = "0.2"

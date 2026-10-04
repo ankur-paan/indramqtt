@@ -38,8 +38,16 @@ jobs:
       - name: Cargo clippy (zero warnings policy)
         run: cargo clippy --workspace --all-targets -- -D warnings -A unknown-lints -A clippy::chunks_exact_to_as_chunks
 
+      - name: Cargo clippy with all connector features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A unknown-lints -A clippy::chunks_exact_to_as_chunks
+
       - name: Cargo test suite
         run: cargo test --workspace --verbose
+
+      # The connector kinds behind Cargo features have tests that the
+      # default build does not compile. This step runs them.
+      - name: Cargo test suite with all connector features
+        run: cargo test --workspace --all-features
 
   deep-soak-and-chaos:
     name: Deep Soak, Multi-Target Sinks & Chaos
@@ -98,7 +106,7 @@ jobs:
           otp-version: '26.2'
 
       - name: Build the kernel and the operator CLI
-        run: cargo build -p broker-node --bins
+        run: cargo build -p broker-node --features full --bins
 
       - name: Compile the edge
         working-directory: beam
