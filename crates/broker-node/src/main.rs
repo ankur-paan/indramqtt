@@ -38,6 +38,7 @@ mod delayed;
 #[cfg(test)]
 #[path = "../../broker-auth/src/jwks_test_support.rs"]
 mod jwks_test_support;
+mod native;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -1133,6 +1134,29 @@ async fn verify_jwks_connect(
 /// per-user connection quota applies (overage short-circuits to `0x8B`),
 /// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    apply_bind_request(
+        frame,
+        decode_bind_meta(&frame.metadata),
+        bind_looks_v5(&frame.metadata),
+        shared,
+    )
+    .await
+}
+
+/// The bind operation on a decoded request.
+///
+/// A link frame carries the request as metadata, and [`apply_bind`]
+/// decodes it. A connection that the kernel owns makes the request from
+/// the CONNECT packet and calls this function directly. `frame` gives
+/// the connection identifier and the sequence number for the reply.
+/// `looks_v5` selects the MQTT 5 shape of the refusal when `parsed` is
+/// an error.
+async fn apply_bind_request(
+    frame: &BrokerFrame,
+    parsed: Result<BindRequest, &'static str>,
+    looks_v5: bool,
+    shared: &Shared,
+) -> Option<BrokerFrame> {
     // B2-02: verified Kerberos identity for this CONNECT. Set inside the
     // auth block on Kerberos success and read by the ownership stamp below
     // without re-verifying the same token (the replay cache would refuse a
@@ -1147,7 +1171,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
     let alias_max = shared.sessions.max_topic_alias();
-    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+    if let Ok(req) = parsed.clone() {
         // X1-02: a Receive Maximum of 0 is a protocol error on the wire
         // (see the synchronous path for the code-choice rationale).
         // Fail closed before bans/credentials/quotas so no session is
@@ -1642,7 +1666,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // TODO(parity): a tenant-rule change between connects lands the
     // client in a fresh session under the new tenant key; the old
     // tenant's session stays detached in place for its own reconnect.
-    let tenant_for_bind: String = match decode_bind_meta(&frame.metadata) {
+    let tenant_for_bind: String = match parsed.clone() {
         Ok(req) => bind_tenant_for_req(shared, &req, kerberos_principal.as_deref()),
         Err(_) => broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
     };
@@ -1651,23 +1675,22 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
-    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) =
-        match decode_bind_meta(&frame.metadata) {
-            Ok(req) if req.clean_start => (
-                SessionKey::new(&tenant_for_bind, &req.client_id),
-                shared
-                    .sessions
-                    .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
-            ),
-            Ok(req) => (
-                SessionKey::new(&tenant_for_bind, &req.client_id),
-                Vec::new(),
-            ),
-            Err(_) => (
-                SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
-                Vec::new(),
-            ),
-        };
+    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) = match parsed.clone() {
+        Ok(req) if req.clean_start => (
+            SessionKey::new(&tenant_for_bind, &req.client_id),
+            shared
+                .sessions
+                .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
+        ),
+        Ok(req) => (
+            SessionKey::new(&tenant_for_bind, &req.client_id),
+            Vec::new(),
+        ),
+        Err(_) => (
+            SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
+            Vec::new(),
+        ),
+    };
     // Session resolution in the owning tenant (MT-03): same takeover
     // semantics as before, scoped to the key. The tenant is stamped
     // before binding so the `conn_id -> session key` index carries the
@@ -1675,7 +1698,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // supervision lives on the edge. Malformed binds answer return code
     // 2 exactly like the synchronous reply path (0x82 with a reason
     // string when the peer negotiated version 5).
-    let reply = match decode_bind_meta(&frame.metadata) {
+    let reply = match parsed.clone() {
         Ok(req) => {
             // F1-01: validate the CONNECT last will before touching
             // session state, so an unusable will section rejects the bind
@@ -1804,7 +1827,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             reply
         }
         Err(_) => {
-            if bind_looks_v5(&frame.metadata) {
+            if looks_v5 {
                 let v5 = SessionBindingV5 {
                     granted_expiry: 0,
                     server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
@@ -1844,7 +1867,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // CONNECTs stamp the verified client principal (not the MQTT username
     // string, which the ticket supersedes); all other paths keep the MQTT
     // username. The principal was verified above, never re-verified here.
-    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+    if let Ok(req) = parsed.clone() {
         if let Some(session) = shared
             .sessions
             .get_in_tenant(&tenant_for_bind, &req.client_id)
@@ -2013,6 +2036,7 @@ const MAX_CERT_SANS: usize = 16;
 /// path; mirrors the 16-SAN bound on the certificate section), each
 /// key/value at most [`MAX_V5_BIND_STRING`] bytes (bounds per-bind
 /// memory; mirrors the 1024-byte bound on certificate fields).
+#[derive(Clone)]
 struct BindRequest {
     client_id: String,
     clean_start: bool,
@@ -2068,6 +2092,7 @@ const MAX_V5_BIND_STRING: usize = 1024;
 
 /// Last will as carried in the bind (validated into a session will by
 /// [`will_from_bind`]).
+#[derive(Clone)]
 struct BindWill {
     topic: String,
     payload: Bytes,
@@ -3258,6 +3283,12 @@ impl Shared {
         // exactly where it discards them.
         conns.set_metrics(&metrics);
         let stats = Arc::new(StatsStore::new());
+        {
+            let counted_sessions = sessions.clone();
+            stats.set_subscription_counter(Box::new(move |stats| {
+                count_subscription_stats(&counted_sessions, stats);
+            }));
+        }
         let readiness = Arc::new(NodeReadiness::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
@@ -3686,16 +3717,18 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
             }
             Ok(())
         };
+    // A listener with `native = true` belongs to the kernel. The edge
+    // must not bind the same address.
     listener(
         "mqtt",
         "listeners.tcp.bind",
-        listeners.tcp.enabled,
+        listeners.tcp.enabled && !listeners.tcp.native,
         &listeners.tcp.bind,
     )?;
     listener(
         "tls",
         "listeners.tls.bind",
-        listeners.tls.enabled,
+        listeners.tls.enabled && !listeners.tls.native,
         &listeners.tls.bind,
     )?;
     listener(
@@ -4148,6 +4181,7 @@ async fn handle_connection(
                     );
                     if !rx_batch.is_empty() || !qos0_batch.is_empty() {
                         let batch = merge_egress_batch(rx_batch, qos0_batch);
+                        rearm_egress_if_full(&waker, &batch);
                         let batch_len = batch.len() as u64;
                         match transport.send_batch(&batch).await {
                             Ok(()) => {
@@ -4197,6 +4231,7 @@ async fn handle_connection(
                                 .saturating_sub(batch_bytes),
                         );
                         let batch = merge_egress_batch(rx_batch, qos0_batch);
+                        rearm_egress_if_full(&waker, &batch);
                         // Egress stage 0: `messages_forwarded` counted
                         // admission into the mailboxes at `route()` time;
                         // only a successful write counts as edge arrival.
@@ -4284,6 +4319,7 @@ async fn handle_connection(
                     continue;
                 }
                 let batch = merge_egress_batch(rx_batch, qos0_batch);
+                rearm_egress_if_full(&waker, &batch);
                 let batch_len = batch.len() as u64;
                 match transport.send_batch(&batch).await {
                     Ok(()) => {
@@ -4296,6 +4332,23 @@ async fn handle_connection(
                 }
             }
         }
+    }
+}
+
+/// Wake the egress loop again when a batch used its full budget.
+///
+/// One wake writes at most one batch. A full batch means that more
+/// frames can be in the queues, and no later event is certain to wake
+/// the loop for them. The stored permit makes the next loop turn drain
+/// again, after the loop gave the inbound side its turn.
+fn rearm_egress_if_full(waker: &tokio::sync::Notify, batch: &[BrokerFrame]) {
+    if batch.len() >= brokerlink::transport::MAX_BATCH_FRAMES {
+        waker.notify_one();
+        return;
+    }
+    let bytes: usize = batch.iter().map(BrokerFrame::total_frame_len).sum();
+    if bytes >= brokerlink::transport::MAX_BATCH_BYTES {
+        waker.notify_one();
     }
 }
 
@@ -4422,10 +4475,18 @@ fn detach(bound: &[(SessionKey, u64)], shared: &Shared, tx: &UnboundedSender<Bro
 /// Lifecycle points only (bind, detach, unbind, subscribe): the
 /// per-message publish path performs no session/router scans.
 fn refresh_subscription_stats(shared: &Shared) {
+    // The count is a walk of all connected sessions. It runs when a
+    // subscription gauge is read, not for each connect and subscribe.
+    shared.stats.mark_subscriptions_dirty();
+}
+
+/// Counts the subscriptions and the distinct topic filters of the
+/// connected sessions and stores them in `stats`.
+fn count_subscription_stats(sessions: &SessionManager, stats: &StatsStore) {
     // Snapshot connected sessions directly (MT-03): iterating bare
     // client ids plus a default-tenant `get` would miss (or conflate)
     // non-default tenants sharing a client id.
-    let active = shared.sessions.active_sessions();
+    let active = sessions.active_sessions();
     let mut subs = 0u64;
     let mut topic_set = std::collections::HashSet::new();
     for s in &active {
@@ -4435,8 +4496,8 @@ fn refresh_subscription_stats(shared: &Shared) {
             topic_set.insert(f.as_str().to_string());
         }
     }
-    shared.stats.set_subscriptions(subs);
-    shared.stats.set_topics(topic_set.len() as u64);
+    stats.set_subscriptions(subs);
+    stats.set_topics(topic_set.len() as u64);
 }
 
 /// Recount retained topics into the stats store after a successful
@@ -4522,6 +4583,27 @@ async fn handle_inbound_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    handle_inbound_frame_with(frame, shared, tx, transport, bound, waker, None).await
+}
+
+/// Handles one inbound frame for any transport.
+///
+/// A link transport gives `native_bind = None`, and the bind request is
+/// decoded from the frame metadata. A connection that the kernel owns
+/// gives the request that it made from the CONNECT packet. Its bind
+/// frame has no metadata.
+async fn handle_inbound_frame_with<T>(
+    frame: BrokerFrame,
+    shared: &Shared,
+    tx: &UnboundedSender<BrokerFrame>,
+    transport: &T,
+    bound: &mut Vec<(SessionKey, u64)>,
+    waker: &Arc<tokio::sync::Notify>,
+    native_bind: Option<&BindRequest>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: BrokerLinkTransport + ?Sized,
+{
     // Measured ingress bytes from the real BrokerLink frame length.
     shared
         .metrics
@@ -4529,7 +4611,22 @@ where
     match frame.header.opcode {
         OpCode::BindConnection => {
             shared.metrics.inc_connect_received();
-            if let Some(reply) = apply_bind(&frame, shared).await {
+            let bind_reply = match native_bind {
+                // The bind operation has a large state. It runs one time
+                // for each connection, thus it is on the heap. The state
+                // of each connection task stays small.
+                Some(request) => {
+                    Box::pin(apply_bind_request(
+                        &frame,
+                        Ok(request.clone()),
+                        request.protocol_version == 5,
+                        shared,
+                    ))
+                    .await
+                }
+                None => Box::pin(apply_bind(&frame, shared)).await,
+            };
+            if let Some(reply) = bind_reply {
                 let accepted = is_binding_accepted(&reply);
                 shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
@@ -4540,7 +4637,11 @@ where
                 // Remember who we serve so a dead socket detaches cleanly.
                 // One entry per bind: this transport multiplexes its whole
                 // shard, and death must detach every client on it.
-                if let Ok(req) = decode_bind_meta(&frame.metadata) {
+                let bind_parsed = match native_bind {
+                    Some(request) => Ok(request.clone()),
+                    None => decode_bind_meta(&frame.metadata),
+                };
+                if let Ok(req) = bind_parsed {
                     // D1-02: label the mailbox for per-client shed
                     // accounting and point it at this transport's directed
                     // wakeup. Short writes on bind only; the per-message
@@ -4582,7 +4683,12 @@ where
                         );
                     }
                 }
-                let replayed = replay_offline(&frame, shared).await;
+                let replayed = match native_bind {
+                    Some(request) => {
+                        Box::pin(replay_offline_client(&frame, &request.client_id, shared)).await
+                    }
+                    None => Box::pin(replay_offline(&frame, shared)).await,
+                };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
         }
@@ -5173,16 +5279,20 @@ async fn apply_subscribe(
 /// the edge always observes binding before backlog. Returns the replayed
 /// frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
-    let req = match decode_bind_meta(&frame.metadata) {
-        Ok(req) => req,
-        Err(_) => return 0,
-    };
+    match decode_bind_meta(&frame.metadata) {
+        Ok(req) => replay_offline_client(frame, &req.client_id, shared).await,
+        Err(_) => 0,
+    }
+}
+
+/// The offline replay for the client that the bind in `frame` named.
+async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Shared) -> usize {
     // Replay delivers only the owning tenant's queued state (MT-03):
     // prefer the session bound to this connection (tenant-correct when
     // two tenants share the client id), falling back to the
     // default-tenant record for binds that predate the index entry.
-    let session = match session_for_conn_if_client(shared, frame.header.conn_id, &req.client_id)
-        .or_else(|| shared.sessions.get(&req.client_id))
+    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id)
+        .or_else(|| shared.sessions.get(client_id))
     {
         Some(session) => session,
         None => return 0,
@@ -9173,6 +9283,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The listeners that the kernel owns (`listeners.*.native = true`).
+    // A listener that cannot start stops the kernel: a broker that runs
+    // without a configured listener looks healthy and accepts no client.
+    if cfg.listeners.tcp.enabled && cfg.listeners.tcp.native {
+        let listener = native::bind_listener(&cfg.listeners.tcp.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.tcp.bind {}: {e}", cfg.listeners.tcp.bind))?;
+        info!("Kernel MQTT listener on {}", cfg.listeners.tcp.bind);
+        tokio::spawn(native::serve_native_mqtt(
+            listener,
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
+    }
+    if cfg.listeners.tls.enabled && cfg.listeners.tls.native {
+        let tls_config =
+            native::load_tls_config(&cfg.listeners.tls.cert_file, &cfg.listeners.tls.key_file)
+                .map_err(|e| format!("listeners.tls: {e}"))?;
+        // The TLS listener has no connection limit of its own in the
+        // configuration. It uses the limit of the plaintext listener.
+        let listener = native::bind_listener(&cfg.listeners.tls.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.tls.bind {}: {e}", cfg.listeners.tls.bind))?;
+        info!("Kernel MQTT TLS listener on {}", cfg.listeners.tls.bind);
+        tokio::spawn(native::serve_native_mqtts(
+            listener,
+            tls_config,
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
+    }
     serve_brokerlink(&args.brokerlink_bind, shared).await
 }
 

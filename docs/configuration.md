@@ -101,7 +101,31 @@ sockets. Set a listener in `indra.toml` only:
 
 A listener bind must be an IP address and a port. The broker accepts
 and reports `listeners.tcp.max_connections` and `listeners.tcp.backlog`,
-but the edge does not apply them at this time.
+but the edge does not apply them at this time. A listener of the kernel
+(`native = true`) applies the two settings.
+
+## Which process owns an MQTT listener
+
+By default the edge process accepts the MQTT clients and sends their
+packets to the kernel. With `native = true`, the kernel accepts the
+clients of that listener itself:
+
+```toml
+[listeners.tcp]
+bind = "0.0.0.0:1883"
+native = true
+
+[listeners.tls]
+enabled = true
+native = true
+cert_file = "/etc/indramqtt/server.pem"
+key_file = "/etc/indramqtt/server.key"
+```
+
+The edge does not open a listener that has `native = true`. The
+WebSocket listeners always belong to the edge. The kernel listener does
+not support UNSUBSCRIBE, PSK and client certificates yet. If a kernel
+listener cannot start, the kernel stops with an error.
 
 ## Flags: one more layer, then the schema
 

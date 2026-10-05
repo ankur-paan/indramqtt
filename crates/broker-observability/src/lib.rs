@@ -970,6 +970,12 @@ impl Default for NodeReadiness {
 /// isolated.
 #[derive(Debug, Default)]
 pub struct StatsStore {
+    /// Set when the subscription gauges are out of date. The next read
+    /// of a subscription gauge counts again.
+    subscriptions_dirty: std::sync::atomic::AtomicBool,
+    /// Counts the subscriptions and the topics and stores them with
+    /// [`StatsStore::set_subscriptions`] and [`StatsStore::set_topics`].
+    subscription_counter: CounterSlot,
     connections: AtomicU64,
     connections_max: AtomicU64,
     subscriptions: AtomicU64,
@@ -1007,9 +1013,49 @@ fn raise_max(atom: &AtomicU64, value: u64) {
     }
 }
 
+/// The function that counts the subscriptions for a [`StatsStore`].
+pub type SubscriptionCounter = Box<dyn Fn(&StatsStore) + Send + Sync>;
+
+/// Holds the counter function. A function has no `Debug` form.
+#[derive(Default)]
+struct CounterSlot(std::sync::OnceLock<SubscriptionCounter>);
+
+impl std::fmt::Debug for CounterSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "CounterSlot(set)"
+        } else {
+            "CounterSlot(empty)"
+        })
+    }
+}
+
 impl StatsStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs the function that counts the subscriptions. Only the
+    /// first call has an effect.
+    pub fn set_subscription_counter(&self, counter: SubscriptionCounter) {
+        let _ = self.subscription_counter.0.set(counter);
+    }
+
+    /// Tells the store that the subscriptions changed. The count is a
+    /// walk of all connected sessions, thus it does not run for each
+    /// connect and each subscribe. It runs at the next read of a
+    /// subscription gauge. A maximum can thus miss a peak that is
+    /// between two reads.
+    pub fn mark_subscriptions_dirty(&self) {
+        self.subscriptions_dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn refresh_subscriptions(&self) {
+        if self.subscriptions_dirty.swap(false, Ordering::Relaxed) {
+            if let Some(counter) = self.subscription_counter.0.get() {
+                counter(self);
+            }
+        }
     }
 
     /// Current bound edge connections (mirrors `connections_active`).
@@ -1060,18 +1106,22 @@ impl StatsStore {
     }
 
     pub fn subscriptions(&self) -> u64 {
+        self.refresh_subscriptions();
         self.subscriptions.load(Ordering::Relaxed)
     }
 
     pub fn subscriptions_max(&self) -> u64 {
+        self.refresh_subscriptions();
         self.subscriptions_max.load(Ordering::Relaxed)
     }
 
     pub fn topics(&self) -> u64 {
+        self.refresh_subscriptions();
         self.topics.load(Ordering::Relaxed)
     }
 
     pub fn topics_max(&self) -> u64 {
+        self.refresh_subscriptions();
         self.topics_max.load(Ordering::Relaxed)
     }
 

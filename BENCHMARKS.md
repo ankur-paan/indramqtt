@@ -2,6 +2,8 @@
 
 This document provides the full empirical methodology, test harness specifications, literature citations, and step-by-step reproducibility instructions for all performance metrics reported by **IndraMQTT** ([indramqtt.com](https://indramqtt.com)).
 
+> The end-to-end comparison with other brokers at 1 CPU and 1 GB (method, tool and raw data) is in [`benchmark/`](benchmark/README.md). This document is about the in-process microbenchmarks.
+
 ---
 
 ## 1. Important Scope Distinction: Microbenchmarks vs. Network Services
