@@ -84,4 +84,7 @@ broker-config = { path = "crates/broker-config" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# A panic unwinds. The runtime then contains it in the task of one
+# connection, and the other connections continue. With "abort", one
+# panic stops the broker for all clients.
+panic = "unwind"

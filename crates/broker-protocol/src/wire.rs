@@ -587,8 +587,8 @@ pub fn decode_subscribe(body: &[u8], level: u8) -> Result<Subscribe<'_>> {
         if bytes.is_empty() {
             return Err(WireError::Malformed("empty topic filter"));
         }
-        let filter = std::str::from_utf8(bytes)
-            .map_err(|_| WireError::Malformed("string is not UTF-8"))?;
+        let filter =
+            std::str::from_utf8(bytes).map_err(|_| WireError::Malformed("string is not UTF-8"))?;
         let options = reader.u8()?;
         filters.push((filter, options));
     }
@@ -900,7 +900,11 @@ pub fn encode_unsuback(packet_id: u16, codes: &[u8], level: u8, out: &mut Vec<u8
 /// the constants in [`kind`]. A reason code other than 0 is sent only
 /// for protocol level 5.
 pub fn encode_ack(packet_kind: u8, packet_id: u16, reason: u8, level: u8, out: &mut Vec<u8>) {
-    let flags = if packet_kind == kind::PUBREL { 0x02 } else { 0x00 };
+    let flags = if packet_kind == kind::PUBREL {
+        0x02
+    } else {
+        0x00
+    };
     let first = (packet_kind << 4) | flags;
     if level == 5 && reason != 0 {
         out.extend_from_slice(&[first, 0x03]);
@@ -936,9 +940,96 @@ mod tests {
         (header, &packet[header.header_len..])
     }
 
+    /// A small generator of test bytes (xorshift). The sequence is the
+    /// same in each run.
+    struct TestBytes(u64);
+
+    impl TestBytes {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    fn decode_all(first: u8, body: &[u8]) {
+        for level in [3u8, 4, 5] {
+            let _ = decode_connect(body);
+            let _ = decode_publish(first & 0x0F, body, level);
+            let _ = decode_subscribe(body, level);
+            let _ = decode_unsubscribe(body, level);
+            let _ = decode_ack(body, level);
+            let _ = decode_disconnect(body, level);
+        }
+    }
+
+    #[test]
+    fn random_bytes_do_not_panic() {
+        let mut source = TestBytes(0x2545_F491_4F6C_DD1D);
+        for _ in 0..300_000 {
+            let packet = source.bytes(96);
+            let _ = fixed_header(&packet);
+            let _ = decode_varint(&packet);
+            let first = packet.first().copied().unwrap_or(0);
+            decode_all(first, &packet);
+        }
+    }
+
+    #[test]
+    fn changed_and_cut_packets_do_not_panic() {
+        // Correct bodies. Each is cut at each length, and each byte is
+        // changed to some other values.
+        let connect_v5: Vec<u8> = {
+            let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5, 0xEE, 0, 30];
+            let props = [
+                17, 0, 0, 0, 9, 33, 0, 10, 34, 0, 5, 38, 0, 1, b'k', 0, 1, b'v',
+            ];
+            body.push(props.len() as u8);
+            body.extend_from_slice(&props);
+            body.extend_from_slice(&[0, 2, b'c', b'1', 0, 0, 1, b'w', 0, 2, b'h', b'i']);
+            body.extend_from_slice(&[0, 1, b'u', 0, 1, b'p']);
+            body
+        };
+        let publish_v5 = vec![
+            0, 1, b't', 0, 7, 11, 35, 0, 2, 1, 1, 38, 0, 1, b'a', 0, 0, b'x',
+        ];
+        let subscribe_v5 = vec![0, 2, 2, 11, 42, 0, 3, b'a', b'/', b'#', 0x2D, 0, 1, b'b', 1];
+        let ack_v5 = vec![0, 7, 0x10, 4, 31, 0, 1, b'r'];
+        let mut source = TestBytes(0xD6E8_FEB8_6659_FD93);
+        for body in [connect_v5, publish_v5, subscribe_v5, ack_v5] {
+            for cut in 0..=body.len() {
+                decode_all(0x32, &body[..cut]);
+            }
+            for index in 0..body.len() {
+                for _ in 0..64 {
+                    let mut changed = body.clone();
+                    changed[index] = source.next() as u8;
+                    decode_all(0x32, &changed);
+                    decode_all(0x30, &changed);
+                }
+            }
+        }
+    }
+
     #[test]
     fn varint_round_trip_and_limits() {
-        for value in [0u32, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152, 268_435_455] {
+        for value in [
+            0u32,
+            1,
+            127,
+            128,
+            16_383,
+            16_384,
+            2_097_151,
+            2_097_152,
+            268_435_455,
+        ] {
             let mut out = Vec::new();
             encode_varint(value, &mut out);
             assert_eq!(out.len(), varint_len(value as usize));
@@ -952,10 +1043,16 @@ mod tests {
     fn fixed_header_examines_the_flags() {
         assert_eq!(fixed_header(&[]).unwrap(), None);
         assert_eq!(fixed_header(&[0x30]).unwrap(), None);
-        assert!(fixed_header(&[0x80, 0x00]).is_err(), "SUBSCRIBE needs flags 0010");
+        assert!(
+            fixed_header(&[0x80, 0x00]).is_err(),
+            "SUBSCRIBE needs flags 0010"
+        );
         assert!(fixed_header(&[0x00, 0x00]).is_err());
         let header = fixed_header(&[0x82, 0x05]).unwrap().unwrap();
-        assert_eq!((header.kind, header.header_len, header.remaining), (8, 2, 5));
+        assert_eq!(
+            (header.kind, header.header_len, header.remaining),
+            (8, 2, 5)
+        );
     }
 
     #[test]
@@ -1015,10 +1112,14 @@ mod tests {
             Err(WireError::Unsupported("protocol level"))
         );
         // Receive maximum 0.
-        let body = [0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 0, 3, 33, 0, 0, 0, 0];
+        let body = [
+            0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 0, 3, 33, 0, 0, 0, 0,
+        ];
         assert!(decode_connect(&body).is_err());
         // A property two times.
-        let body = [0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 0, 6, 33, 0, 1, 33, 0, 1, 0, 0];
+        let body = [
+            0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 0, 6, 33, 0, 1, 33, 0, 1, 0, 0,
+        ];
         assert!(decode_connect(&body).is_err());
         // Bytes after the payload.
         assert!(decode_connect(&[0, 4, b'M', b'Q', b'T', b'T', 4, 0x02, 0, 0, 0, 0, 9]).is_err());
@@ -1044,7 +1145,10 @@ mod tests {
             4,
             &mut out,
         );
-        assert_eq!(out, [0x33, 12, 0, 3, b'a', b'/', b'b', 0, 7, b'h', b'e', b'l', b'l', b'o']);
+        assert_eq!(
+            out,
+            [0x33, 12, 0, 3, b'a', b'/', b'b', 0, 7, b'h', b'e', b'l', b'l', b'o']
+        );
         let (header, body) = body_of(&out);
         let publish = decode_publish(header.flags, body, 4).unwrap();
         assert_eq!(publish.topic, "a/b");
@@ -1130,7 +1234,10 @@ mod tests {
         assert!(decode_publish(0, &[0, 1, b't', 2, 11, 42, b'h'], 5).is_err());
         // An empty topic with an alias is correct.
         let publish = decode_publish(0, &[0, 0, 3, 35, 0, 4, b'p'], 5).unwrap();
-        assert_eq!((publish.topic, publish.alias, publish.payload), ("", Some(4), &b"p"[..]));
+        assert_eq!(
+            (publish.topic, publish.alias, publish.payload),
+            ("", Some(4), &b"p"[..])
+        );
     }
 
     #[test]
@@ -1147,7 +1254,10 @@ mod tests {
         assert_eq!(sub.filters, vec![("t", 0x2D)]);
 
         assert!(decode_subscribe(&[0, 1], 4).is_err(), "no filter");
-        assert!(decode_subscribe(&[0, 0, 0, 1, b't', 0], 4).is_err(), "identifier 0");
+        assert!(
+            decode_subscribe(&[0, 0, 0, 1, b't', 0], 4).is_err(),
+            "identifier 0"
+        );
         assert!(decode_subscribe(&[0, 2, 2, 11, 0, 0, 1, b't', 0], 5).is_err());
     }
 
@@ -1202,7 +1312,10 @@ mod tests {
             },
             &mut out,
         );
-        assert_eq!(out, [0x20, 13, 0, 0, 10, 34, 0, 8, 38, 0, 1, b'k', 0, 1, b'v']);
+        assert_eq!(
+            out,
+            [0x20, 13, 0, 0, 10, 34, 0, 8, 38, 0, 1, b'k', 0, 1, b'v']
+        );
 
         let mut out = Vec::new();
         encode_suback(3, &[0, 0x80], 4, &mut out);

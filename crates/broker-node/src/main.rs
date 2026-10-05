@@ -30,7 +30,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod delayed;
-mod native;
 /// Shared JWKS fixtures (B5-02): single-sourced in
 /// `crates/broker-auth/src/jwks_test_support.rs` (test-only in both crates),
 /// included here with `#[path]` so there is one copy of the
@@ -39,6 +38,7 @@ mod native;
 #[cfg(test)]
 #[path = "../../broker-auth/src/jwks_test_support.rs"]
 mod jwks_test_support;
+mod native;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -1675,23 +1675,22 @@ async fn apply_bind_request(
     // session: snapshot them before `get_or_create` drops the old
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
-    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) =
-        match parsed.clone() {
-            Ok(req) if req.clean_start => (
-                SessionKey::new(&tenant_for_bind, &req.client_id),
-                shared
-                    .sessions
-                    .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
-            ),
-            Ok(req) => (
-                SessionKey::new(&tenant_for_bind, &req.client_id),
-                Vec::new(),
-            ),
-            Err(_) => (
-                SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
-                Vec::new(),
-            ),
-        };
+    let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) = match parsed.clone() {
+        Ok(req) if req.clean_start => (
+            SessionKey::new(&tenant_for_bind, &req.client_id),
+            shared
+                .sessions
+                .subscription_filters_in_tenant(&tenant_for_bind, &req.client_id),
+        ),
+        Ok(req) => (
+            SessionKey::new(&tenant_for_bind, &req.client_id),
+            Vec::new(),
+        ),
+        Err(_) => (
+            SessionKey::new(broker_session::tenant::DEFAULT_TENANT_ID, ""),
+            Vec::new(),
+        ),
+    };
     // Session resolution in the owning tenant (MT-03): same takeover
     // semantics as before, scoped to the key. The tenant is stamped
     // before binding so the `conn_id -> session key` index carries the

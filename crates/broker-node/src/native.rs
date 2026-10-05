@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Connection identifiers of kernel-owned connections start here. The
 /// edge counts from 1, and the API WebSocket connections start at
@@ -39,6 +39,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BATCH_FRAMES: usize = 64;
 /// Largest number of frame bytes in one write to the socket.
 const EGRESS_BATCH_BYTES: usize = 64 * 1024;
+/// Largest CONNECT packet. A client that is not authenticated yet must
+/// not make the broker keep more than this.
+const MAX_CONNECT_PACKET_BYTES: usize = 64 * 1024;
+/// Largest packet from a connected client. It becomes a setting of the
+/// configuration before this path ships.
+const MAX_PACKET_BYTES: usize = 1024 * 1024;
+/// A write to a client that does not read must end in this time. The
+/// connection then closes, thus a stalled client cannot keep its
+/// queues and its session for an unlimited time.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Initial size of the read buffer of one connection. An idle
 /// connection keeps only this much. The buffer grows for a larger packet.
 const READ_BUFFER_BYTES: usize = 256;
@@ -462,6 +472,78 @@ fn subscribe_in_meta(client_id: &str, subscribe: &wire::Subscribe<'_>, level: u8
     meta
 }
 
+/// Removes one connection from the kernel tables. `fire_will` tells the
+/// kernel that the connection ended without DISCONNECT.
+async fn release_connection(
+    shared: Shared,
+    tx: tokio::sync::mpsc::UnboundedSender<BrokerFrame>,
+    mut bound: Vec<(SessionKey, u64)>,
+    conn_id: u64,
+    client_id: String,
+    fire_will: bool,
+) {
+    if fire_will {
+        let id = client_id.as_bytes();
+        let mut meta = Vec::with_capacity(2 + id.len());
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        if let Ok(frame) = BrokerFrame::new(
+            OpCode::DisconnectIn,
+            conn_id,
+            0,
+            Bytes::from(meta),
+            Bytes::new(),
+        ) {
+            // The replies of this frame have no socket to go to.
+            let sink = NativeSink::new();
+            let waker = Arc::new(tokio::sync::Notify::new());
+            let _ = handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
+                .await;
+        }
+    }
+    detach(&bound, &shared, &tx);
+    shared.conns.unregister(conn_id);
+}
+
+/// Owns the kernel state of one connection. When the task ends without
+/// the normal release (a panic in the task, or a cancelled task), the
+/// drop of this guard starts the release. One faulty connection then
+/// leaves no session that looks connected and no entry in the tables.
+struct ConnGuard {
+    shared: Shared,
+    tx: tokio::sync::mpsc::UnboundedSender<BrokerFrame>,
+    bound: Vec<(SessionKey, u64)>,
+    conn_id: u64,
+    client_id: String,
+    connected: bool,
+    released: bool,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if std::thread::panicking() {
+            error!(
+                "Kernel MQTT connection {} stopped on a panic. The other connections continue.",
+                self.conn_id
+            );
+        }
+        let release = release_connection(
+            self.shared.clone(),
+            self.tx.clone(),
+            std::mem::take(&mut self.bound),
+            self.conn_id,
+            std::mem::take(&mut self.client_id),
+            self.connected,
+        );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(release);
+        }
+    }
+}
+
 async fn run_connection(
     stream: TcpStream,
     peer: String,
@@ -471,7 +553,15 @@ async fn run_connection(
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
     let waker = Arc::new(tokio::sync::Notify::new());
-    let mut bound: Vec<(SessionKey, u64)> = Vec::new();
+    let mut guard = ConnGuard {
+        shared: shared.clone(),
+        tx: tx.clone(),
+        bound: Vec::new(),
+        conn_id,
+        client_id: String::new(),
+        connected: false,
+        released: false,
+    };
     let sink = NativeSink::new();
     let mut inbuf = BytesMut::with_capacity(READ_BUFFER_BYTES);
     let mut conn = Conn {
@@ -506,13 +596,31 @@ async fn run_connection(
                     Ok(_) => {}
                 }
                 last_packet = Instant::now();
-                match drain_inbound(&mut inbuf, &mut conn, &shared, &tx, &sink, &mut bound, &waker).await {
+                let drained = drain_inbound(
+                    &mut inbuf,
+                    &mut conn,
+                    &shared,
+                    &tx,
+                    &sink,
+                    &mut guard.bound,
+                    &waker,
+                )
+                .await;
+                // The guard must know the state for a release after a panic.
+                guard.connected = conn.connected;
+                if guard.client_id.is_empty() && !conn.client_id.is_empty() {
+                    guard.client_id.clone_from(&conn.client_id);
+                }
+                match drained {
                     Ok(None) => {}
                     Ok(Some(stop)) => {
                         let _ = flush(&sink, &mut writer).await;
                         break stop;
                     }
-                    Err(_) => break Stop::Abnormal,
+                    Err(reason) => {
+                        debug!("Kernel MQTT connection {}: {}", conn_id, reason);
+                        break Stop::Abnormal;
+                    }
                 }
                 // Frames for this connection that the packets above
                 // made (a client that subscribes to its own topic).
@@ -539,16 +647,17 @@ async fn run_connection(
 
     // An abnormal end of an accepted connection is a disconnect without
     // DISCONNECT: the kernel publishes the will.
-    if matches!(stop, Stop::Abnormal) && conn.connected {
-        let meta = conn.id_meta();
-        if let Some(frame) = conn.frame(OpCode::DisconnectIn, meta, Bytes::new()) {
-            let _ =
-                handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
-                    .await;
-        }
-    }
-    detach(&bound, &shared, &tx);
-    shared.conns.unregister(conn.conn_id);
+    let fire_will = matches!(stop, Stop::Abnormal) && conn.connected;
+    guard.released = true;
+    release_connection(
+        shared,
+        tx,
+        std::mem::take(&mut guard.bound),
+        conn_id,
+        std::mem::take(&mut conn.client_id),
+        fire_will,
+    )
+    .await;
     let _ = writer.shutdown().await;
     Ok(())
 }
@@ -562,7 +671,13 @@ async fn flush(
     if bytes.is_empty() {
         return Ok(());
     }
-    writer.write_all(&bytes).await
+    match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&bytes)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the client does not read",
+        )),
+    }
 }
 
 /// Encodes the frames that wait for this connection: the guaranteed
@@ -621,7 +736,12 @@ async fn drain_inbound(
         let Some(header) = wire::fixed_header(inbuf)? else {
             return Ok(None);
         };
-        if header.remaining > SERVER_V5_MAX_PACKET_SIZE as usize {
+        let limit = if conn.connected {
+            MAX_PACKET_BYTES.min(SERVER_V5_MAX_PACKET_SIZE as usize)
+        } else {
+            MAX_CONNECT_PACKET_BYTES
+        };
+        if header.packet_len() > limit {
             return Err(WireError::Unsupported("packet is too large"));
         }
         if inbuf.len() < header.packet_len() {
@@ -708,9 +828,8 @@ async fn drain_inbound(
                     meta.push(reason);
                 }
                 if let Some(frame) = conn.frame(OpCode::UnbindConnection, meta, Bytes::new()) {
-                    let _ =
-                        handle_inbound_frame_with(frame, shared, tx, sink, bound, waker, None)
-                            .await;
+                    let _ = handle_inbound_frame_with(frame, shared, tx, sink, bound, waker, None)
+                        .await;
                 }
                 // The kernel handled the disconnect. The task must not
                 // send a second one.
@@ -730,5 +849,225 @@ async fn drain_inbound(
         {
             return Ok(Some(Stop::Abnormal));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small generator of test bytes (xorshift). The sequence is the
+    /// same in each run.
+    struct TestBytes(u64);
+
+    impl TestBytes {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    #[test]
+    fn publish_out_metadata_round_trip() {
+        let mut meta = vec![0, 3, b'a', b'/', b'b', 0, 9, 1, 1, 0];
+        let plain = decode_publish_out(&meta).expect("plain form");
+        assert_eq!((plain.topic, plain.packet_id, plain.qos), ("a/b", 9, 1));
+        assert!(plain.retain && !plain.dup);
+        meta.extend_from_slice(&[0, 4]);
+        assert_eq!(decode_publish_out(&meta).expect("alias form").alias, 4);
+        meta.extend_from_slice(&[0, 0, 0, 7]);
+        assert_eq!(
+            decode_publish_out(&meta)
+                .expect("identifier form")
+                .subscription_id,
+            7
+        );
+        meta.extend_from_slice(&[1, 0, 0, 0, 60, 0, 1, 0, 1, b'k', 0, 1, b'v']);
+        let full = decode_publish_out(&meta).expect("property form");
+        assert_eq!((full.payload_format, full.message_expiry), (1, 60));
+        assert_eq!(full.users, vec![(b"k".to_vec(), b"v".to_vec())]);
+        // One more byte is not a known shape.
+        meta.push(0);
+        assert!(decode_publish_out(&meta).is_none());
+    }
+
+    #[test]
+    fn frames_with_incorrect_metadata_do_not_panic() {
+        let opcodes = [
+            OpCode::PublishOut,
+            OpCode::SessionBinding,
+            OpCode::SubAckOut,
+            OpCode::PubAckOut,
+            OpCode::PubRecOut,
+            OpCode::PubRelOut,
+            OpCode::PubCompOut,
+            OpCode::ConnClose,
+            OpCode::Pong,
+        ];
+        let mut source = TestBytes(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200_000u32 {
+            let opcode = opcodes[(round as usize) % opcodes.len()];
+            let meta = source.bytes(48);
+            let payload = source.bytes(16);
+            let Ok(frame) = BrokerFrame::new(opcode, 1, 1, Bytes::from(meta), Bytes::from(payload))
+            else {
+                continue;
+            };
+            let mut out = Vec::new();
+            let level = if round % 2 == 0 { 4 } else { 5 };
+            let _ = encode_frame(&frame, level, &mut out);
+        }
+    }
+
+    /// Binds one client through the production frame handler and gives
+    /// back what the connection task keeps.
+    async fn bind_client(
+        shared: &Shared,
+        conn_id: u64,
+        client_id: &str,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<BrokerFrame>,
+        tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>,
+        Vec<(SessionKey, u64)>,
+    ) {
+        let (tx, rx) = unbounded_channel::<BrokerFrame>();
+        let waker = Arc::new(tokio::sync::Notify::new());
+        let sink = NativeSink::new();
+        let mut bound = Vec::new();
+        let request = bind_request(
+            wire::Connect {
+                level: 4,
+                clean_start: true,
+                keepalive: 60,
+                client_id: client_id.to_string(),
+                will: None,
+                username: None,
+                password: None,
+                properties: None,
+            },
+            "127.0.0.1",
+        );
+        let frame = BrokerFrame::new(
+            OpCode::BindConnection,
+            conn_id,
+            1,
+            Bytes::new(),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(
+            frame,
+            shared,
+            &tx,
+            &sink,
+            &mut bound,
+            &waker,
+            Some(&request),
+        )
+        .await
+        .expect("bind is handled");
+        assert!(
+            sink.accepted.load(Ordering::Relaxed),
+            "the bind is accepted"
+        );
+        assert_eq!(
+            sink.take(),
+            [0x20, 0x02, 0x00, 0x00],
+            "CONNACK for the client"
+        );
+        (tx, rx, bound)
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_one_connection_releases_only_that_connection() {
+        let shared = Shared::new();
+        let first = NATIVE_CONN_ID_BASE + 900_001;
+        let second = NATIVE_CONN_ID_BASE + 900_002;
+        let (tx_a, _rx_a, bound_a) = bind_client(&shared, first, "panic-a").await;
+        let (_tx_b, mut rx_b, bound_b) = bind_client(&shared, second, "panic-b").await;
+        assert_eq!(bound_a.len(), 1);
+        assert_eq!(bound_b.len(), 1);
+        let mut connected = shared.sessions.active_client_ids();
+        connected.sort();
+        assert_eq!(
+            connected,
+            vec!["panic-a".to_string(), "panic-b".to_string()]
+        );
+
+        // The task of the first connection panics while it owns its state.
+        let guard_shared = shared.clone();
+        let task = tokio::spawn(async move {
+            let _guard = ConnGuard {
+                shared: guard_shared,
+                tx: tx_a,
+                bound: bound_a,
+                conn_id: first,
+                client_id: "panic-a".to_string(),
+                connected: true,
+                released: false,
+            };
+            panic!("deliberate panic of one connection task");
+        });
+        let ended = task.await.expect_err("the task ends with an error");
+        assert!(
+            ended.is_panic(),
+            "the runtime contains the panic in the task"
+        );
+
+        // The release runs as a task. Wait until it is complete.
+        for _ in 0..100 {
+            if shared.sessions.active_client_ids() == vec!["panic-b".to_string()] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            shared.sessions.active_client_ids(),
+            vec!["panic-b".to_string()],
+            "only the connection that panicked is released"
+        );
+        assert!(
+            shared.conns.tenant_for(first).is_none(),
+            "its table entry is removed"
+        );
+        assert!(
+            shared.conns.tenant_for(second).is_some(),
+            "the other entry stays"
+        );
+
+        // The second connection still gets frames.
+        let frame = BrokerFrame::new(
+            OpCode::PubAckOut,
+            second,
+            0,
+            Bytes::from_static(&[0, 7, 0]),
+            Bytes::new(),
+        )
+        .expect("frame");
+        assert!(
+            shared.conns.route(second, frame),
+            "the route to the other connection works"
+        );
+        let got = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("a frame in time")
+            .expect("a frame");
+        assert_eq!(got.header.opcode, OpCode::PubAckOut);
+    }
+
+    #[test]
+    fn connack_return_codes_for_protocol_level_4() {
+        assert_eq!(connack_return_code(0), 0);
+        assert_eq!(connack_return_code(0x86), 4);
+        assert_eq!(connack_return_code(0x87), 5);
+        assert_eq!(connack_return_code(0x8A), 5);
+        assert_eq!(connack_return_code(0x97), 3);
     }
 }
