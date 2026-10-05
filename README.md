@@ -29,7 +29,27 @@ Highest load that each broker holds for 180 s with 1 CPU and 1 GB of memory, wit
 | Memory with no clients | 76 MiB | 322 MiB | **1.5 MiB** |
 
 > [!IMPORTANT]
-> **Limits of this comparison**: each result is one search and one 180 s run on a shared server, without TLS, and the load generator runs on the same server. IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients. With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB). The IndraMQTT numbers use the MQTT listener of the kernel (`listeners.tcp.native = true`), which is off by default. See [`benchmark/README.md`](benchmark/README.md) for all conditions and for the cases where a broker has no sustained load.
+> **Limits of this comparison**: each result is one search and one 180 s run on a shared server, without TLS, and the load generator runs on the same server. IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients. With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB). The IndraMQTT numbers use the MQTT listener of the kernel (`listeners.tcp.native = true`). This listener is off by default at this time: the default path through the Erlang edge holds approximately 5,000 msg/s in the point-to-point scenario. See [Direction: One Rust Process](#direction-one-rust-process). See [`benchmark/README.md`](benchmark/README.md) for all conditions and for the cases where a broker has no sustained load.
+
+---
+
+## Direction: One Rust Process
+
+IndraMQTT started with two processes: an Erlang/OTP edge that holds the client sockets, and a Rust kernel that does the routing, the sessions and the rules. We measured the two paths on the same server with 1 CPU and 1 GB:
+
+| Path for MQTT clients | Point-to-point QoS 0, highest sustained load | Status |
+| :--- | :--- | :--- |
+| Erlang edge, then the kernel through an IPC link (the default today) | approximately 5,000 msg/s | Works with all listeners. It will be deprecated. |
+| MQTT listener of the kernel, Rust only (`listeners.tcp.native = true`) | 100,000 msg/s | New. It is the path of the comparison table above. |
+
+Because of these results, IndraMQTT moves to one Rust process:
+
+1. The kernel listener gets the functions that only the edge has today: WebSocket, secure WebSocket, PSK and client certificates.
+2. The full end-to-end test suite moves to the kernel listener.
+3. The kernel listener becomes the default.
+4. The Erlang edge is deprecated and then removed in a later release.
+
+Until step 3, a broker that starts with the default settings uses the Erlang edge and has the lower load of the first row. To get the load of the comparison table, set `listeners.tcp.native = true`. The value for the Erlang edge is from a run of 2026-10-04 with a smaller load generator. The sections below that describe the Erlang edge show the default path of today.
 
 ---
 

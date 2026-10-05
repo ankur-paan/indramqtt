@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Cloud Streaming Studio (`INDRA-218`)**: REST API and Web Dashboard forms for all 4 cloud bridges.
 
 ### Changed
+- **Direction**: the Erlang edge will be deprecated. The MQTT listener of the kernel will get the functions of the edge and then become the default. A later release removes the edge.
 - **Release profile**: a panic now unwinds. A panic in the task of one connection ends only that connection, and the kernel releases its session. Before this change, one panic stopped the broker.
 - **Subscription statistics**: the count of subscriptions and topics runs when a statistic is read. Before this change, it ran for each connect, subscribe and disconnect, and the work increased with the square of the number of connections. A maximum can miss a peak that is between two reads.
 - **Kafka connector `health_check_topic` default**: the schema default is now `indramqtt_health_check`. Anyone who set the topic explicitly is unaffected; to keep the previous topic, set `health_check_topic` explicitly in the connector configuration.
