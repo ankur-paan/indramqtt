@@ -3283,6 +3283,12 @@ impl Shared {
         // exactly where it discards them.
         conns.set_metrics(&metrics);
         let stats = Arc::new(StatsStore::new());
+        {
+            let counted_sessions = sessions.clone();
+            stats.set_subscription_counter(Box::new(move |stats| {
+                count_subscription_stats(&counted_sessions, stats);
+            }));
+        }
         let readiness = Arc::new(NodeReadiness::new());
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
@@ -4467,10 +4473,18 @@ fn detach(bound: &[(SessionKey, u64)], shared: &Shared, tx: &UnboundedSender<Bro
 /// Lifecycle points only (bind, detach, unbind, subscribe): the
 /// per-message publish path performs no session/router scans.
 fn refresh_subscription_stats(shared: &Shared) {
+    // The count is a walk of all connected sessions. It runs when a
+    // subscription gauge is read, not for each connect and subscribe.
+    shared.stats.mark_subscriptions_dirty();
+}
+
+/// Counts the subscriptions and the distinct topic filters of the
+/// connected sessions and stores them in `stats`.
+fn count_subscription_stats(sessions: &SessionManager, stats: &StatsStore) {
     // Snapshot connected sessions directly (MT-03): iterating bare
     // client ids plus a default-tenant `get` would miss (or conflate)
     // non-default tenants sharing a client id.
-    let active = shared.sessions.active_sessions();
+    let active = sessions.active_sessions();
     let mut subs = 0u64;
     let mut topic_set = std::collections::HashSet::new();
     for s in &active {
@@ -4480,8 +4494,8 @@ fn refresh_subscription_stats(shared: &Shared) {
             topic_set.insert(f.as_str().to_string());
         }
     }
-    shared.stats.set_subscriptions(subs);
-    shared.stats.set_topics(topic_set.len() as u64);
+    stats.set_subscriptions(subs);
+    stats.set_topics(topic_set.len() as u64);
 }
 
 /// Recount retained topics into the stats store after a successful
