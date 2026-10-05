@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod delayed;
+mod native;
 /// Shared JWKS fixtures (B5-02): single-sourced in
 /// `crates/broker-auth/src/jwks_test_support.rs` (test-only in both crates),
 /// included here with `#[path]` so there is one copy of the
@@ -1133,6 +1134,29 @@ async fn verify_jwks_connect(
 /// per-user connection quota applies (overage short-circuits to `0x8B`),
 /// then the standard session resolution applies.
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    apply_bind_request(
+        frame,
+        decode_bind_meta(&frame.metadata),
+        bind_looks_v5(&frame.metadata),
+        shared,
+    )
+    .await
+}
+
+/// The bind operation on a decoded request.
+///
+/// A link frame carries the request as metadata, and [`apply_bind`]
+/// decodes it. A connection that the kernel owns makes the request from
+/// the CONNECT packet and calls this function directly. `frame` gives
+/// the connection identifier and the sequence number for the reply.
+/// `looks_v5` selects the MQTT 5 shape of the refusal when `parsed` is
+/// an error.
+async fn apply_bind_request(
+    frame: &BrokerFrame,
+    parsed: Result<BindRequest, &'static str>,
+    looks_v5: bool,
+    shared: &Shared,
+) -> Option<BrokerFrame> {
     // B2-02: verified Kerberos identity for this CONNECT. Set inside the
     // auth block on Kerberos success and read by the ownership stamp below
     // without re-verifying the same token (the replay cache would refuse a
@@ -1147,7 +1171,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
     let alias_max = shared.sessions.max_topic_alias();
-    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+    if let Ok(req) = parsed.clone() {
         // X1-02: a Receive Maximum of 0 is a protocol error on the wire
         // (see the synchronous path for the code-choice rationale).
         // Fail closed before bans/credentials/quotas so no session is
@@ -1642,7 +1666,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // TODO(parity): a tenant-rule change between connects lands the
     // client in a fresh session under the new tenant key; the old
     // tenant's session stays detached in place for its own reconnect.
-    let tenant_for_bind: String = match decode_bind_meta(&frame.metadata) {
+    let tenant_for_bind: String = match parsed.clone() {
         Ok(req) => bind_tenant_for_req(shared, &req, kerberos_principal.as_deref()),
         Err(_) => broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
     };
@@ -1652,7 +1676,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // session object. Scoped to the owning tenant: another tenant's
     // namesake keeps its subscriptions.
     let stale: (SessionKey, Vec<broker_protocol::TopicFilter>) =
-        match decode_bind_meta(&frame.metadata) {
+        match parsed.clone() {
             Ok(req) if req.clean_start => (
                 SessionKey::new(&tenant_for_bind, &req.client_id),
                 shared
@@ -1675,7 +1699,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // supervision lives on the edge. Malformed binds answer return code
     // 2 exactly like the synchronous reply path (0x82 with a reason
     // string when the peer negotiated version 5).
-    let reply = match decode_bind_meta(&frame.metadata) {
+    let reply = match parsed.clone() {
         Ok(req) => {
             // F1-01: validate the CONNECT last will before touching
             // session state, so an unusable will section rejects the bind
@@ -1804,7 +1828,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             reply
         }
         Err(_) => {
-            if bind_looks_v5(&frame.metadata) {
+            if looks_v5 {
                 let v5 = SessionBindingV5 {
                     granted_expiry: 0,
                     server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
@@ -1844,7 +1868,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // CONNECTs stamp the verified client principal (not the MQTT username
     // string, which the ticket supersedes); all other paths keep the MQTT
     // username. The principal was verified above, never re-verified here.
-    if let Ok(req) = decode_bind_meta(&frame.metadata) {
+    if let Ok(req) = parsed.clone() {
         if let Some(session) = shared
             .sessions
             .get_in_tenant(&tenant_for_bind, &req.client_id)
@@ -2013,6 +2037,7 @@ const MAX_CERT_SANS: usize = 16;
 /// path; mirrors the 16-SAN bound on the certificate section), each
 /// key/value at most [`MAX_V5_BIND_STRING`] bytes (bounds per-bind
 /// memory; mirrors the 1024-byte bound on certificate fields).
+#[derive(Clone)]
 struct BindRequest {
     client_id: String,
     clean_start: bool,
@@ -2068,6 +2093,7 @@ const MAX_V5_BIND_STRING: usize = 1024;
 
 /// Last will as carried in the bind (validated into a session will by
 /// [`will_from_bind`]).
+#[derive(Clone)]
 struct BindWill {
     topic: String,
     payload: Bytes,
@@ -4542,6 +4568,27 @@ async fn handle_inbound_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    handle_inbound_frame_with(frame, shared, tx, transport, bound, waker, None).await
+}
+
+/// Handles one inbound frame for any transport.
+///
+/// A link transport gives `native_bind = None`, and the bind request is
+/// decoded from the frame metadata. A connection that the kernel owns
+/// gives the request that it made from the CONNECT packet. Its bind
+/// frame has no metadata.
+async fn handle_inbound_frame_with<T>(
+    frame: BrokerFrame,
+    shared: &Shared,
+    tx: &UnboundedSender<BrokerFrame>,
+    transport: &T,
+    bound: &mut Vec<(SessionKey, u64)>,
+    waker: &Arc<tokio::sync::Notify>,
+    native_bind: Option<&BindRequest>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: BrokerLinkTransport + ?Sized,
+{
     // Measured ingress bytes from the real BrokerLink frame length.
     shared
         .metrics
@@ -4549,7 +4596,19 @@ where
     match frame.header.opcode {
         OpCode::BindConnection => {
             shared.metrics.inc_connect_received();
-            if let Some(reply) = apply_bind(&frame, shared).await {
+            let bind_reply = match native_bind {
+                Some(request) => {
+                    apply_bind_request(
+                        &frame,
+                        Ok(request.clone()),
+                        request.protocol_version == 5,
+                        shared,
+                    )
+                    .await
+                }
+                None => apply_bind(&frame, shared).await,
+            };
+            if let Some(reply) = bind_reply {
                 let accepted = is_binding_accepted(&reply);
                 shared.metrics.inc_connack_sent();
                 transport.send(reply).await?;
@@ -4560,7 +4619,11 @@ where
                 // Remember who we serve so a dead socket detaches cleanly.
                 // One entry per bind: this transport multiplexes its whole
                 // shard, and death must detach every client on it.
-                if let Ok(req) = decode_bind_meta(&frame.metadata) {
+                let bind_parsed = match native_bind {
+                    Some(request) => Ok(request.clone()),
+                    None => decode_bind_meta(&frame.metadata),
+                };
+                if let Ok(req) = bind_parsed {
                     // D1-02: label the mailbox for per-client shed
                     // accounting and point it at this transport's directed
                     // wakeup. Short writes on bind only; the per-message
@@ -4602,7 +4665,12 @@ where
                         );
                     }
                 }
-                let replayed = replay_offline(&frame, shared).await;
+                let replayed = match native_bind {
+                    Some(request) => {
+                        replay_offline_client(&frame, &request.client_id, shared).await
+                    }
+                    None => replay_offline(&frame, shared).await,
+                };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
         }
@@ -5193,16 +5261,20 @@ async fn apply_subscribe(
 /// the edge always observes binding before backlog. Returns the replayed
 /// frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
-    let req = match decode_bind_meta(&frame.metadata) {
-        Ok(req) => req,
-        Err(_) => return 0,
-    };
+    match decode_bind_meta(&frame.metadata) {
+        Ok(req) => replay_offline_client(frame, &req.client_id, shared).await,
+        Err(_) => 0,
+    }
+}
+
+/// The offline replay for the client that the bind in `frame` named.
+async fn replay_offline_client(frame: &BrokerFrame, client_id: &str, shared: &Shared) -> usize {
     // Replay delivers only the owning tenant's queued state (MT-03):
     // prefer the session bound to this connection (tenant-correct when
     // two tenants share the client id), falling back to the
     // default-tenant record for binds that predate the index entry.
-    let session = match session_for_conn_if_client(shared, frame.header.conn_id, &req.client_id)
-        .or_else(|| shared.sessions.get(&req.client_id))
+    let session = match session_for_conn_if_client(shared, frame.header.conn_id, client_id)
+        .or_else(|| shared.sessions.get(client_id))
     {
         Some(session) => session,
         None => return 0,
@@ -9193,6 +9265,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Prototype switch for the kernel MQTT listener. It becomes a
+    // setting of the configuration before this path ships.
+    if let Ok(bind) = std::env::var("NATIVE_MQTT_BIND") {
+        let native_shared = shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) = native::serve_native_mqtt(bind, native_shared).await {
+                warn!("Kernel MQTT listener stopped: {}", e);
+            }
+        });
+    }
     serve_brokerlink(&args.brokerlink_bind, shared).await
 }
 
