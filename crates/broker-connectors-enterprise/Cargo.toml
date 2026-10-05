@@ -2,7 +2,7 @@
 name = "broker-connectors-enterprise"
 version.workspace = true
 edition.workspace = true
-license = "LicenseRef-Indra-Enterprise"
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

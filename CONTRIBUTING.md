@@ -19,9 +19,8 @@ IndraMQTT is engineered for arbitrary scale. Never clamp, cap, or hardcode scale
 ### Rule 3: Surgical Changes & Code Simplicity
 Touch only what you must. Match existing codebase style. Avoid speculative abstractions, unnecessary generic indirection, or dead code. Every changed line should trace directly to a concrete requirement.
 
-### Rule 4: Open-Core Tier Boundaries
-- **Community Edition**: Core MQTT broker, BEAM network edge, BrokerLink IPC, storage engine, embedded stateless SQL rules, community connectors (HTTP, PostgreSQL, MySQL, Redis, S3, ClickHouse, InfluxDB, TimescaleDB, RabbitMQ, Disk Log, Remote MQTT Bridge).
-- **Enterprise Edition**: Distributed clustering (`crates/broker-cluster`), stateful stream window operators (`TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW`, `COUNTWINDOW`), industrial protocols (Sparkplug B, OPC-UA), and hyperscaler cloud bridges.
+### Rule 4: One Licence
+All the code in this repository is under MIT OR Apache-2.0. There is no enterprise edition. Do not add a function that needs a licence key. The licence functions from the earlier model (trial period, licence key, the names "community" and "enterprise") are removed step by step. Do not add new uses of them.
 
 ---
 

@@ -145,7 +145,7 @@ allow_anonymous = true
 superusers = ["admin", "root"]
 
 # =============================================================================
-# Distributed Clustering (Enterprise Edition)
+# Distributed Clustering
 # =============================================================================
 
 [cluster]

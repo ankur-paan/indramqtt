@@ -9092,8 +9092,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // startup whether or not clustering is enabled (a single node is a
     // cluster of one). The cluster identity is created on first start and
     // persisted in the data directory with the trial start, so restarts and
-    // added nodes never restart the trial. See LICENSING.md for the data
-    // directory loss procedure and the two-node join case.
+    // added nodes never restart the trial.
     let trusted_keys = if args.license_keys.trim().is_empty() {
         TrustedKeys::new()
     } else {

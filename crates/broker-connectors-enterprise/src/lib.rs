@@ -13,7 +13,7 @@
 //! shapes are identical to before the split, so existing registrations
 //! keep working.
 //!
-//! Licence: `LicenseRef-Indra-Enterprise` (see `LICENSE-ENTERPRISE`).
+//! Licence: MIT OR Apache-2.0, as the other crates of this repository.
 //!
 //! Default build (no features): every module except the X1-09 first half
 //! is compiled in. The gated kinds are absent from the build and the

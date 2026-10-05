@@ -22,4 +22,4 @@ Describe the tests you ran to verify your changes:
 ## Zero-Limit Scale Invariant Checklist
 - [ ] No hardcoded buffer depths or magic constant caps introduced.
 - [ ] Scale limits (buffer depths, batch sizes, retry counts, pool sizes) are exposed in configuration structs.
-- [ ] Open-Core tier boundaries respected (Community vs. Enterprise).
+- [ ] No new function needs a licence key.

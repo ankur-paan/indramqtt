@@ -28,14 +28,3 @@ body:
     attributes:
       label: Alternatives Considered
       description: Any alternative approaches or workarounds you considered?
-  - type: dropdown
-    id: tier
-    attributes:
-      label: Open-Core Classification
-      description: Where does this feature belong?
-      options:
-        - "Community Edition (Core / Stateless SQL / Edge Sinks)"
-        - "Enterprise Edition (Clustering / Stateful Windows / Industrial & Cloud)"
-        - "Unsure / Need Discussion"
-    validations:
-      required: true

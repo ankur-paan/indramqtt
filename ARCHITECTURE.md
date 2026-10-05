@@ -43,7 +43,7 @@ graph TB
         REST[Axum REST API & Web Dashboard :18083]
     end
 
-    subgraph Enterprise[Layer 4: Distributed Clustering - Enterprise LICENSE]
+    subgraph Enterprise[Layer 4: Distributed Clustering]
         QUIC[QUIC Multiplexed Data Plane]
         SWIM[SWIM Gossip Failure Detection]
         RAFT[Raft Metadata Consensus]
@@ -134,7 +134,7 @@ graph LR
 * **Stateless Rules (Community Tier)**:
   - 185 scalar functions (trigonometry, math, bitwise, string, datetime, conditionals; catalog length asserted by `test_function_catalog_has_185_entries` in `crates/broker-rules/src/lib.rs`).
   - Evaluated inline on the ingress thread with zero task spawns and zero network loopback at **~4.77M ± 0.10M events/sec** in the in-process single-threaded microbenchmark `bench_sql_ingress_throughput` in `crates/broker-node/benches/broker_throughput.rs` (hardware-dependent; re-run locally; JSON parsing plus `WHERE`/`SELECT` with `Block` backpressure and 100 percent sink delivery); not end-to-end network throughput.
-* **Stateful Window Operators (Enterprise Tier)**:
+* **Stateful Window Operators**:
   - `TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW`, `COUNTWINDOW`.
   - Dedicated background Tokio worker tasks with interval bounds injection (`window_start()`, `window_end()`).
   - Multi-event aggregations (`avg`, `sum`, `count`, `min`, `max`, `stddev`, `percentile`).
