@@ -266,6 +266,37 @@ def subscribe(sock, topic):
     sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
     return sock.recv(5)[:1] == b"\x90"
 
+# Fan-out. One publish to many subscribers must reach each of them.
+# The count is larger than one write batch of the kernel for each link,
+# thus a kernel that writes one batch and then waits fails this check.
+import select
+fan_topic = b"smoke/fan"
+fan_token = os.urandom(6).hex().encode()
+fan_socks = []
+for index in range(400):
+    fan_sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    if mqtt_connect(fan_sock, b"smoke-fan-%d" % index) and subscribe(fan_sock, fan_topic):
+        fan_socks.append(fan_sock)
+FAN_PUBLISHES = 4
+for _ in range(FAN_PUBLISHES):
+    pub.sendall(packet(0x30, field(fan_topic) + fan_token))
+fan_seen = {s: b"" for s in fan_socks}
+fan_deadline = time.time() + 10
+def fan_complete():
+    return all(data.count(fan_token) >= FAN_PUBLISHES for data in fan_seen.values())
+while time.time() < fan_deadline and not fan_complete():
+    readable, _, _ = select.select(fan_socks, [], [], 0.5)
+    for s in readable:
+        try:
+            fan_seen[s] += s.recv(4096)
+        except OSError:
+            pass
+fan_got = sum(data.count(fan_token) for data in fan_seen.values())
+report("each of 400 subscribers gets each of 4 publishes (%d of %d deliveries)" % (fan_got, 400 * FAN_PUBLISHES),
+       len(fan_socks) == 400 and fan_complete())
+for s in fan_socks:
+    s.close()
+
 secret = base64.b16encode(os.urandom(8))
 a_sub, a_ok = tenant_client(b"smoke-a-sub", b"alpha")
 b_sub, b_ok = tenant_client(b"smoke-b-sub", b"beta")

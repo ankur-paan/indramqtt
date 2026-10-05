@@ -4148,6 +4148,7 @@ async fn handle_connection(
                     );
                     if !rx_batch.is_empty() || !qos0_batch.is_empty() {
                         let batch = merge_egress_batch(rx_batch, qos0_batch);
+                        rearm_egress_if_full(&waker, &batch);
                         let batch_len = batch.len() as u64;
                         match transport.send_batch(&batch).await {
                             Ok(()) => {
@@ -4197,6 +4198,7 @@ async fn handle_connection(
                                 .saturating_sub(batch_bytes),
                         );
                         let batch = merge_egress_batch(rx_batch, qos0_batch);
+                        rearm_egress_if_full(&waker, &batch);
                         // Egress stage 0: `messages_forwarded` counted
                         // admission into the mailboxes at `route()` time;
                         // only a successful write counts as edge arrival.
@@ -4284,6 +4286,7 @@ async fn handle_connection(
                     continue;
                 }
                 let batch = merge_egress_batch(rx_batch, qos0_batch);
+                rearm_egress_if_full(&waker, &batch);
                 let batch_len = batch.len() as u64;
                 match transport.send_batch(&batch).await {
                     Ok(()) => {
@@ -4296,6 +4299,23 @@ async fn handle_connection(
                 }
             }
         }
+    }
+}
+
+/// Wake the egress loop again when a batch used its full budget.
+///
+/// One wake writes at most one batch. A full batch means that more
+/// frames can be in the queues, and no later event is certain to wake
+/// the loop for them. The stored permit makes the next loop turn drain
+/// again, after the loop gave the inbound side its turn.
+fn rearm_egress_if_full(waker: &tokio::sync::Notify, batch: &[BrokerFrame]) {
+    if batch.len() >= brokerlink::transport::MAX_BATCH_FRAMES {
+        waker.notify_one();
+        return;
+    }
+    let bytes: usize = batch.iter().map(BrokerFrame::total_frame_len).sum();
+    if bytes >= brokerlink::transport::MAX_BATCH_BYTES {
+        waker.notify_one();
     }
 }
 
