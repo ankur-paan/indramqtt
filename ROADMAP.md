@@ -70,6 +70,20 @@ gantt
 
 ---
 
+## One Rust Process (in work)
+
+The broker moves from an Erlang edge plus a Rust kernel to one Rust process. The reason and the measured loads are in the README.
+
+1. MQTT listener of the kernel for TCP and TLS (done, off by default).
+2. WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener.
+3. MQTT over QUIC on the kernel listener.
+4. The end-to-end test suite on the kernel listener.
+5. The kernel listener becomes the default. The Erlang edge is deprecated.
+6. Connections stay open during a restart: planned restart for TCP and WebSocket, then the crash case, then TLS with kTLS.
+7. The Erlang edge is removed.
+
+---
+
 ## 4. Deferred Milestones
 
 - **Category A: AI & LLM Suite (`INDRA-141..INDRA-146`)**: OpenAI, Anthropic, Gemini, MCP Bridge, MCP over MQTT, Realtime AI. Bypassed per project directive.

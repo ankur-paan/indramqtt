@@ -49,6 +49,21 @@ Because of these results, IndraMQTT moves to one Rust process:
 3. The kernel listener becomes the default.
 4. The Erlang edge is deprecated and then removed in a later release.
 
+### Connections during a restart
+
+With the Erlang edge, a client stays connected when the kernel restarts. This is a property of the Erlang path only. The MQTT listener of the kernel does not have it at this time: when the kernel restarts, its clients connect again.
+
+The plan for the Rust process keeps this property without work on the message path:
+
+| Case | Plan | What a client sees |
+| :--- | :--- | :--- |
+| Planned restart (upgrade, change of the configuration) | The old process gives each open socket and a small record of the connection to the new process. | A short pause. No new connection. |
+| Crash of the process | A small process holds a copy of each socket and gives the sockets to a new broker process. It does not touch the messages. | Most clients stay connected. A client that was in the middle of a packet connects again. |
+
+Limits of this plan: it is for Linux. TLS connections stay connected only when the encryption runs in the Linux kernel (kTLS). QUIC connections connect again. Session state that is only in memory is lost in a crash, as it is today.
+
+This work starts after the kernel listener is the default. Its order is: planned restart for TCP and WebSocket, then the crash case, then TLS.
+
 Until step 3, a broker that starts with the default settings uses the Erlang edge and has the lower load of the first row. To get the load of the comparison table, set `listeners.tcp.native = true`. The value for the Erlang edge is from a run of 2026-10-04 with a smaller load generator. The sections below that describe the Erlang edge show the default path of today.
 
 ---
@@ -125,7 +140,7 @@ IndraMQTT decouples the network edge from the broker kernel through a clean, res
 ### 1. Connection != Session
 * **BEAM Network Appliance**: The Erlang/OTP layer is strictly a lightweight, high-concurrency network appliance. It owns sockets, TLS handshakes, MQTT framing, keepalive timers, and socket backpressure. It has no business logic, no distributed database, and no rule engine.
 * **Rust Canonical Session**: Rust owns the canonical MQTT session, subscription registrations, QoS inflight tracking, offline message cursors, and expiry timers.
-* **Core Restart Immunity (single-connection test)**: If the Rust broker kernel restarts, the BEAM edge holds the client socket in `await_core` and rebinds on resumption without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms budget); not a multi-client production claim.
+* **Core Restart Immunity (Erlang edge only, single-connection test)**: If the Rust broker kernel restarts, the BEAM edge holds the client socket in `await_core` and rebinds on resumption without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms budget); not a multi-client production claim.
 
 ### 2. Zero-Copy BrokerLink IPC
 The BEAM edge communicates with the Rust kernel over **BrokerLink**, a dedicated high-throughput, multi-lane binary IPC protocol:
@@ -159,7 +174,7 @@ IndraMQTT is engineered with a transparent **Open-Core** architecture designed t
 | **Licensing** | **Permissive MIT OR Apache-2.0** ([`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE)) | **Commercial Subscription** ([`LICENSE-ENTERPRISE`](LICENSE-ENTERPRISE)) |
 | **License Enforcement** | **Zero license key required**. Free forever for production. | Hardware-rooted ECDSA P-256 licence verification against a configured key set. Free Community Evaluation mode for local dev/testing. |
 | **Broker Kernel** | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec single-threaded, hardware-dependent, 1,000 filters with 3 targets; not network throughput; no idle-RSS figure claimed) | High-performance Rust Core (router microbenchmark `bench_router_match_throughput` ~3.05M lookups/sec single-threaded, hardware-dependent, 1,000 filters with 3 targets; not network throughput; no idle-RSS figure claimed) |
-| **Network Edge** | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity |
+| **Network Edge** | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity (to be deprecated), or the MQTT listener of the kernel | Erlang/OTP 26+ BEAM Edge with Core Restart Immunity (to be deprecated), or the MQTT listener of the kernel |
 | **Protocols Supported** | MQTT v3.1.1 only on every edge listener (TCP, TLS, `ws`, `wss`): v5 CONNECT rejected as `unsupported_protocol` in `beam/src/indra_mqtt_codec.erl:decode_connect`; v5 not supported yet. Plaintext `ws` edge listener enabled by default (`0.0.0.0:8083`, configurable path; `beam/src/indra_ws_listener.erl`, proven by `beam/test/indra_ws_tests.erl`). Opt-in `wss` edge listener disabled by default (needs cert/key or it fails closed at startup; `beam/test/indra_wss_tests.erl`). TLS via edge `ssl` transport (`beam/test/indra_listener_tests.erl:tls_connect_connack_test`). MQTT-over-WebSocket test console on the API port (`/ws/mqtt` in `crates/broker-api/src/ws.rs`) is a test console only | MQTT v3.1.1 only on every edge listener (v5 not supported yet), `ws` edge listener, opt-in `wss` edge listener, TLS via edge `ssl` transport, MQTT-over-WebSocket test console on the API port (`/ws/mqtt`), Sparkplug B, OPC-UA |
 | **Routing & Sessions** | Zero-allocation Radix Trie, QoS 0/1/2, Shared Subscriptions (`$share`), Delayed Messages (`$delayed`), Retained Store | Radix Trie, QoS 0/1/2, Shared Subscriptions, Delayed Messages, Retained Store |
 | **Scale Limits** | **Configurable bounds with finite defaults**. Queue and pool capacities are bounded by default (for example `session.max_qos0_backlog` 1000, `session.max_offline_queue` 50000, `rules_engine.window_channel_depth` 65536 in `indramqtt.example.toml` and `crates/broker-config/src/schema.rs`); unbounded is only an explicit operator opt-in, never the default. | **Configurable bounds with finite defaults** (same defaults as Community); unbounded only as an explicit operator opt-in. |
@@ -202,7 +217,7 @@ For enterprise licensing, multi-node clustering subscriptions, or commercial sup
 - **Auth & ACL Manager**: Runtime credential and topic access policy configuration.
 
 ### 5. Resilience & Bounded Scale Architecture
-- **Core Restart Immunity (single-connection test)**: Decoupled BEAM edge holds the client socket in `await_core` and rebinds after a core restart without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget); not a multi-client production restart measurement. No end-to-end restart throughput or multi-client recovery rate is claimed.
+- **Core Restart Immunity (Erlang edge only, single-connection test)**: Decoupled BEAM edge holds the client socket in `await_core` and rebinds after a core restart without a disconnect, proven only for one loopback connection against a fake core by `core_restart_zero_disconnect_test` in `beam/test/indra_chaos_tests.erl` (500 ms recovery budget); not a multi-client production restart measurement. No end-to-end restart throughput or multi-client recovery rate is claimed.
 - **Zero Hardcoded Limits, Finite Defaults**: Buffer depths (`window_channel_depth`, default 65536), offline session queues (`max_offline_queue`, default 50000), per-subscriber QoS 0 backlog (`max_qos0_backlog`, default 1000), batch sizes, and pool capacities are configurable with finite defaults (see `indramqtt.example.toml` and `crates/broker-config/src/schema.rs`); unbounded is only an explicit operator opt-in, never the default.
 - **Multi-Tenant Protection**: Per-client and per-user connection quotas (`max_connections` -> RC `0x8B`) and token-bucket publish rate limiters (`max_publish_rate` -> RC `0x97`).
 
