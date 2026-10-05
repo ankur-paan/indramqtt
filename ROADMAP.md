@@ -6,6 +6,26 @@ This roadmap outlines our completed milestones, active capabilities, and future 
 
 ---
 
+## Stable Release and Licence Direction
+
+- **Stable release:** the target for the first full stable release (1.0) is April 2027, six months from October 2026.
+- **Open source:** all stable releases of IndraMQTT will be open source.
+- **Licence:** IndraMQTT has a community edition (MIT OR Apache-2.0) and an enterprise edition (commercial licence) at this time. We are working with our team on the transition from this format to MIT OR Apache-2.0 for the project. The transition is planned for the time when this repository has 1,000 GitHub stars. Until the transition, the licence files in this repository apply as they are.
+
+### Path to the stable release
+
+This is a plan. The order can change.
+
+| Period | Work |
+| :--- | :--- |
+| October to November 2026 | MQTT listener of the kernel for TCP and TLS (done, off by default). WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener. MQTT over QUIC. Public benchmark with the method and the raw data, and a wider comparison with more brokers. |
+| December 2026 to January 2027 | The end-to-end test suite on the kernel listener. The kernel listener becomes the default and the Erlang edge is deprecated. Tenant management. Connections stay open during a planned restart. |
+| February to April 2027 | Connections stay open after a crash, and TLS with kTLS. Removal of the Erlang edge. Connector qualification against real servers. Cluster and soak tests. Security review. Documentation. Stable release 1.0. |
+
+The steps of the move to one Rust process are in the section "One Rust Process" below.
+
+---
+
 ## 1. Platform Milestones
 
 ```mermaid

@@ -68,6 +68,16 @@ Until step 3, a broker that starts with the default settings uses the Erlang edg
 
 ---
 
+## Roadmap
+
+- The target for the first full stable release (1.0) is April 2027.
+- All stable releases of IndraMQTT will be open source.
+- We are working with our team on the transition from the current licence format (community edition and enterprise edition) to MIT OR Apache-2.0 for the project. The transition is planned for the time when this repository has 1,000 GitHub stars. Until then, the licence files in this repository apply as they are.
+
+The plan for each period is in [ROADMAP.md](ROADMAP.md).
+
+---
+
 ## Router & Rule Engine Microbenchmarks
 
 All figures below are grounded in reproducible, multi-sample automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs).
