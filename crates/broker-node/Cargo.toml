@@ -55,7 +55,7 @@ toml = { workspace = true }
 # broker-auth and broker-connectors.
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+rustls-pemfile = { version = "2" }
 
 [features]
 # Each feature adds one connector kind to the build. With a feature off,

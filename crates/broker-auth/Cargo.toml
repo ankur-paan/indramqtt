@@ -52,7 +52,7 @@ tempfile = "3"
 rsa = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+rustls-pemfile = { version = "2" }
 
 [features]
 default = ["jwks-bench", "webhook-bench"]
