@@ -66,6 +66,10 @@ PY
 EOF
 
 API_KEY_GOOD=boot-smoke-key-0001
+# With SMOKE_NATIVE=1 the kernel owns the plaintext MQTT listener
+# (listeners.tcp.native = true). Without it the edge owns the listener.
+# The MQTT checks are the same for the two modes.
+if [ "${SMOKE_NATIVE:-0}" = 1 ]; then NATIVE=true; else NATIVE=false; fi
 mkdir -p "$ROOT/cfg" "$ROOT/data"
 cat > "$ROOT/cfg/indra.toml" <<EOF
 [node]
@@ -75,6 +79,7 @@ brokerlink_bind = "127.0.0.1:$LINK_PORT"
 
 [listeners.tcp]
 bind = "127.0.0.1:$MQTT_PORT"
+native = $NATIVE
 
 [listeners.ws]
 bind = "127.0.0.1:$WS_PORT"
@@ -93,7 +98,7 @@ EOF
 
 # --- 1. The kernel starts from the file and the credential variables ---
 INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
-    env ${SMOKE_NATIVE_PORT:+NATIVE_MQTT_BIND=127.0.0.1:$SMOKE_NATIVE_PORT} "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel.log" 2>&1 &
+    "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel.log" 2>&1 &
 KERNEL_PID=$!
 
 healthz=
@@ -170,9 +175,7 @@ check "the kernel prints the edge arguments" $?
     > "$ROOT/edge.log" 2>&1) &
 EDGE_PID=$!
 
-# With SMOKE_NATIVE_PORT set, the MQTT checks use the listener of the
-# kernel on that port. Without it they use the edge.
-python3 - "${SMOKE_NATIVE_PORT:-$MQTT_PORT}" "$WS_PORT" <<'PY'
+python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
 import base64, os, socket, struct, sys, time
 mqtt_port, ws_port = int(sys.argv[1]), int(sys.argv[2])
 

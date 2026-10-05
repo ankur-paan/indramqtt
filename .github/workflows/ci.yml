@@ -118,6 +118,11 @@ jobs:
       - name: Run the boot test
         run: bash tools/boot_smoke.sh target/debug beam/ebin
 
+      # The same checks with the MQTT listener that the kernel owns
+      # (listeners.tcp.native = true).
+      - name: Run the boot test with the kernel listener
+        run: SMOKE_NATIVE=1 bash tools/boot_smoke.sh target/debug beam/ebin
+
   beam-eunit:
     name: BEAM Network Edge (EUnit)
     runs-on: ubuntu-latest

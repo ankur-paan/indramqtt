@@ -22,10 +22,10 @@ use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Connection identifiers of kernel-owned connections start here. The
 /// edge counts from 1, and the API WebSocket connections start at
@@ -53,13 +53,59 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection keeps only this much. The buffer grows for a larger packet.
 const READ_BUFFER_BYTES: usize = 256;
 
-/// Accepts MQTT clients on `bind` and runs one task for each of them.
-pub(super) async fn serve_native_mqtt(
-    bind: String,
-    shared: Shared,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(&bind).await?;
-    info!("Kernel MQTT listener on {}", bind);
+/// Number of connections that the kernel listeners hold at this time.
+static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// One accepted connection in [`ACTIVE_CONNECTIONS`]. The drop takes it
+/// out again, also when the task ends on a panic.
+struct ConnectionSlot;
+
+impl ConnectionSlot {
+    /// Takes a slot if the number of connections is below `limit`.
+    fn take(limit: u32) -> Option<Self> {
+        let limit = u64::from(limit);
+        let mut current = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match ACTIVE_CONNECTIONS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Binds a listener socket with the accept backlog of the configuration.
+pub(super) fn bind_listener(bind: &str, backlog: u32) -> std::io::Result<TcpListener> {
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
+}
+
+/// Accepts MQTT clients and runs one task for each of them. A client
+/// above `max_connections` is closed at once.
+pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u32, shared: Shared) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -69,19 +115,112 @@ pub(super) async fn serve_native_mqtt(
                 continue;
             }
         };
+        let Some(slot) = ConnectionSlot::take(max_connections) else {
+            debug!("Kernel MQTT listener is at its connection limit");
+            continue;
+        };
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let task = run_connection(stream, peer.ip().to_string(), conn_id, shared);
-        if conn_id == NATIVE_CONN_ID_BASE {
-            info!(
-                "Kernel MQTT connection task state: {} bytes",
-                std::mem::size_of_val(&task)
-            );
-        }
+        let (reader, writer) = stream.into_split();
         tokio::spawn(async move {
-            if let Err(e) = task.await {
+            let _slot = slot;
+            if let Err(e) =
+                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            {
                 debug!("Kernel MQTT connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+/// A TLS handshake must end in this time. A client that opens a socket
+/// and sends nothing does not keep a task for a longer time.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads the certificate chain and the private key of the TLS listener
+/// and makes the server configuration. The protocol versions are TLS 1.2
+/// and TLS 1.3 with the default cipher suites of the library.
+pub(super) fn load_tls_config(
+    cert_file: &str,
+    key_file: &str,
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert_file)?);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)?
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    if certs.is_empty() {
+        return Err(format!("no certificate in {cert_file}").into());
+    }
+    let key_bytes = std::fs::read(key_file)?;
+    let mut key: Option<PrivateKeyDer<'static>> = None;
+    for item in rustls_pemfile::read_all(&mut key_bytes.as_slice())? {
+        key = match item {
+            rustls_pemfile::Item::PKCS8Key(der) => Some(PrivateKeyDer::Pkcs8(der.into())),
+            rustls_pemfile::Item::RSAKey(der) => Some(PrivateKeyDer::Pkcs1(der.into())),
+            rustls_pemfile::Item::ECKey(der) => Some(PrivateKeyDer::Sec1(der.into())),
+            _ => continue,
+        };
+        break;
+    }
+    let key = key.ok_or_else(|| format!("no private key in {key_file}"))?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(Arc::new(config))
+}
+
+/// Accepts MQTT clients over TLS. The handshake runs in the task of the
+/// connection, thus a slow handshake does not delay the accept of other
+/// clients. A client above `max_connections` is closed at once.
+pub(super) async fn serve_native_mqtts(
+    listener: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    max_connections: u32,
+    shared: Shared,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT TLS accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = ConnectionSlot::take(max_connections) else {
+            debug!("Kernel MQTT TLS listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let acceptor = acceptor.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let _slot = slot;
+            let tls =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => tls,
+                    Ok(Err(e)) => {
+                        debug!("Kernel MQTT TLS handshake with {} failed: {}", peer, e);
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("Kernel MQTT TLS handshake with {} timed out", peer);
+                        return;
+                    }
+                };
+            let (reader, writer) = tokio::io::split(tls);
+            if let Err(e) =
+                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            {
+                debug!("Kernel MQTT TLS connection {} ended: {}", conn_id, e);
             }
         });
     }
@@ -544,13 +683,17 @@ impl Drop for ConnGuard {
     }
 }
 
-async fn run_connection(
-    stream: TcpStream,
+async fn run_connection<R, W>(
+    mut reader: R,
+    mut writer: W,
     peer: String,
     conn_id: u64,
     shared: Shared,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut reader, mut writer) = stream.into_split();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
     let waker = Arc::new(tokio::sync::Notify::new());
     let mut guard = ConnGuard {
@@ -663,15 +806,20 @@ async fn run_connection(
 }
 
 /// Writes the collected bytes to the socket in one write.
-async fn flush(
-    sink: &NativeSink,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-) -> std::io::Result<()> {
+async fn flush<W>(sink: &NativeSink, writer: &mut W) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     let bytes = sink.take();
     if bytes.is_empty() {
         return Ok(());
     }
-    match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&bytes)).await {
+    let write = async {
+        writer.write_all(&bytes).await?;
+        // A TLS stream keeps the record until the flush.
+        writer.flush().await
+    };
+    match tokio::time::timeout(WRITE_TIMEOUT, write).await {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

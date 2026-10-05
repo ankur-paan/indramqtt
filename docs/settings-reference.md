@@ -20,10 +20,12 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.tcp.bind` | string | `0.0.0.0:1883` | string | Bind address for the plaintext MQTT listener. |
 | `listeners.tcp.max_connections` | integer | `1000000` | 1..=10000000 | Maximum concurrent connections on the plaintext MQTT listener. |
 | `listeners.tcp.backlog` | integer | `1024` | 1..=65536 | Listener accept backlog for the plaintext MQTT listener. |
+| `listeners.tcp.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them. |
 | `listeners.tls.enabled` | boolean | `false` | boolean | Whether the secure TLS MQTT listener accepts connections. |
 | `listeners.tls.bind` | string | `0.0.0.0:8883` | string | Bind address for the secure TLS MQTT listener. |
 | `listeners.tls.cert_file` | string | `` | string | Path to the PEM server certificate for the TLS listener. |
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
+| `listeners.tls.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them. |
 | `listeners.ws.enabled` | boolean | `true` | boolean | Whether the MQTT-over-WebSocket listener accepts connections. |
 | `listeners.ws.bind` | string | `0.0.0.0:8083` | string | Bind address for the MQTT-over-WebSocket listener. |
 | `listeners.ws.path` | string | `/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |

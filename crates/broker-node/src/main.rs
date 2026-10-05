@@ -3717,16 +3717,18 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
             }
             Ok(())
         };
+    // A listener with `native = true` belongs to the kernel. The edge
+    // must not bind the same address.
     listener(
         "mqtt",
         "listeners.tcp.bind",
-        listeners.tcp.enabled,
+        listeners.tcp.enabled && !listeners.tcp.native,
         &listeners.tcp.bind,
     )?;
     listener(
         "tls",
         "listeners.tls.bind",
-        listeners.tls.enabled,
+        listeners.tls.enabled && !listeners.tls.native,
         &listeners.tls.bind,
     )?;
     listener(
@@ -9281,15 +9283,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Prototype switch for the kernel MQTT listener. It becomes a
-    // setting of the configuration before this path ships.
-    if let Ok(bind) = std::env::var("NATIVE_MQTT_BIND") {
-        let native_shared = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = native::serve_native_mqtt(bind, native_shared).await {
-                warn!("Kernel MQTT listener stopped: {}", e);
-            }
-        });
+    // The listeners that the kernel owns (`listeners.*.native = true`).
+    // A listener that cannot start stops the kernel: a broker that runs
+    // without a configured listener looks healthy and accepts no client.
+    if cfg.listeners.tcp.enabled && cfg.listeners.tcp.native {
+        let listener = native::bind_listener(&cfg.listeners.tcp.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.tcp.bind {}: {e}", cfg.listeners.tcp.bind))?;
+        info!("Kernel MQTT listener on {}", cfg.listeners.tcp.bind);
+        tokio::spawn(native::serve_native_mqtt(
+            listener,
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
+    }
+    if cfg.listeners.tls.enabled && cfg.listeners.tls.native {
+        let tls_config =
+            native::load_tls_config(&cfg.listeners.tls.cert_file, &cfg.listeners.tls.key_file)
+                .map_err(|e| format!("listeners.tls: {e}"))?;
+        // The TLS listener has no connection limit of its own in the
+        // configuration. It uses the limit of the plaintext listener.
+        let listener = native::bind_listener(&cfg.listeners.tls.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.tls.bind {}: {e}", cfg.listeners.tls.bind))?;
+        info!("Kernel MQTT TLS listener on {}", cfg.listeners.tls.bind);
+        tokio::spawn(native::serve_native_mqtts(
+            listener,
+            tls_config,
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
     }
     serve_brokerlink(&args.brokerlink_bind, shared).await
 }

@@ -51,6 +51,11 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
+# TLS for the MQTT listener of the kernel. The same versions as
+# broker-auth and broker-connectors.
+rustls = { version = "0.23.45" }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "1" }
 
 [features]
 # Each feature adds one connector kind to the build. With a feature off,
@@ -84,9 +89,6 @@ base64 = { workspace = true }
 rand = { workspace = true }
 rsa = { workspace = true }
 jsonwebtoken = { workspace = true }
-rustls = { version = "0.23.45" }
-tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
 ring = "0.17"
 picky-krb = "0.12"
 picky-asn1 = { version = "0.10", features = ["time_conversion"] }

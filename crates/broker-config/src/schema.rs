@@ -97,6 +97,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Listener accept backlog for the plaintext MQTT listener.",
             },
             FieldDoc {
+                path: "listeners.tcp.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.",
+            },
+            FieldDoc {
                 path: "listeners.tls.enabled",
                 setting_type: "bool",
                 default: "false",
@@ -123,6 +130,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when TLS is enabled",
                 doc: "Path to the PEM private key for the TLS listener.",
+            },
+            FieldDoc {
+                path: "listeners.tls.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
             },
             FieldDoc {
                 path: "listeners.ws.enabled",
@@ -778,6 +792,9 @@ pub struct TcpListenerConf {
     /// Listener accept backlog for the plaintext MQTT listener.
     #[serde(default = "default_tcp_backlog")]
     pub backlog: u32,
+    /// Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
 }
 
 fn default_true() -> bool {
@@ -808,6 +825,7 @@ impl Default for TcpListenerConf {
             bind: default_tcp_bind(),
             max_connections: default_tcp_max_connections(),
             backlog: default_tcp_backlog(),
+            native: false,
         }
     }
 }
@@ -842,6 +860,9 @@ pub struct TlsListenerConf {
     /// Path to the PEM private key for the TLS listener.
     #[serde(default)]
     pub key_file: String,
+    /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
 }
 
 // Reason: the standard secure MQTT port.
@@ -856,6 +877,7 @@ impl Default for TlsListenerConf {
             bind: default_tls_bind(),
             cert_file: String::new(),
             key_file: String::new(),
+            native: false,
         }
     }
 }
@@ -2565,6 +2587,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     65_536,
                     "Listener accept backlog for the plaintext MQTT listener.",
                 ),
+                bool_field("tcp.native", false, "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them."),
                 bool_field(
                     "tls.enabled",
                     false,
@@ -2585,6 +2608,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "",
                     "Path to the PEM private key for the TLS listener.",
                 ),
+                bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
                 bool_field(
                     "ws.enabled",
                     true,

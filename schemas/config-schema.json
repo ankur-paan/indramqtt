@@ -412,6 +412,11 @@
               "maximum": 10000000,
               "minimum": 1,
               "type": "integer"
+            },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.",
+              "type": "boolean"
             }
           },
           "type": "object"
@@ -437,6 +442,11 @@
               "default": "",
               "description": "Path to the PEM private key for the TLS listener.",
               "type": "string"
+            },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
+              "type": "boolean"
             }
           },
           "type": "object"
