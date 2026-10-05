@@ -4597,16 +4597,19 @@ where
         OpCode::BindConnection => {
             shared.metrics.inc_connect_received();
             let bind_reply = match native_bind {
+                // The bind operation has a large state. It runs one time
+                // for each connection, thus it is on the heap. The state
+                // of each connection task stays small.
                 Some(request) => {
-                    apply_bind_request(
+                    Box::pin(apply_bind_request(
                         &frame,
                         Ok(request.clone()),
                         request.protocol_version == 5,
                         shared,
-                    )
+                    ))
                     .await
                 }
-                None => apply_bind(&frame, shared).await,
+                None => Box::pin(apply_bind(&frame, shared)).await,
             };
             if let Some(reply) = bind_reply {
                 let accepted = is_binding_accepted(&reply);
@@ -4667,9 +4670,9 @@ where
                 }
                 let replayed = match native_bind {
                     Some(request) => {
-                        replay_offline_client(&frame, &request.client_id, shared).await
+                        Box::pin(replay_offline_client(&frame, &request.client_id, shared)).await
                     }
-                    None => replay_offline(&frame, shared).await,
+                    None => Box::pin(replay_offline(&frame, shared)).await,
                 };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }

@@ -39,8 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BATCH_FRAMES: usize = 64;
 /// Largest number of frame bytes in one write to the socket.
 const EGRESS_BATCH_BYTES: usize = 64 * 1024;
-/// Initial size of the read buffer of one connection.
-const READ_BUFFER_BYTES: usize = 4 * 1024;
+/// Initial size of the read buffer of one connection. An idle
+/// connection keeps only this much. The buffer grows for a larger packet.
+const READ_BUFFER_BYTES: usize = 256;
 
 /// Accepts MQTT clients on `bind` and runs one task for each of them.
 pub(super) async fn serve_native_mqtt(
@@ -61,8 +62,15 @@ pub(super) async fn serve_native_mqtt(
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let task = run_connection(stream, peer.ip().to_string(), conn_id, shared);
+        if conn_id == NATIVE_CONN_ID_BASE {
+            info!(
+                "Kernel MQTT connection task state: {} bytes",
+                std::mem::size_of_val(&task)
+            );
+        }
         tokio::spawn(async move {
-            if let Err(e) = run_connection(stream, peer.ip().to_string(), conn_id, shared).await {
+            if let Err(e) = task.await {
                 debug!("Kernel MQTT connection {} ended: {}", conn_id, e);
             }
         });
@@ -86,7 +94,7 @@ struct NativeSink {
 impl NativeSink {
     fn new() -> Self {
         Self {
-            out: parking_lot::Mutex::new(Vec::with_capacity(1024)),
+            out: parking_lot::Mutex::new(Vec::new()),
             level: AtomicU8::new(4),
             close: AtomicBool::new(false),
             accepted: AtomicBool::new(false),

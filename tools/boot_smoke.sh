@@ -93,7 +93,7 @@ EOF
 
 # --- 1. The kernel starts from the file and the credential variables ---
 INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
-    "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel.log" 2>&1 &
+    env ${SMOKE_NATIVE_PORT:+NATIVE_MQTT_BIND=127.0.0.1:$SMOKE_NATIVE_PORT} "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel.log" 2>&1 &
 KERNEL_PID=$!
 
 healthz=
@@ -170,7 +170,9 @@ check "the kernel prints the edge arguments" $?
     > "$ROOT/edge.log" 2>&1) &
 EDGE_PID=$!
 
-python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
+# With SMOKE_NATIVE_PORT set, the MQTT checks use the listener of the
+# kernel on that port. Without it they use the edge.
+python3 - "${SMOKE_NATIVE_PORT:-$MQTT_PORT}" "$WS_PORT" <<'PY'
 import base64, os, socket, struct, sys, time
 mqtt_port, ws_port = int(sys.argv[1]), int(sys.argv[2])
 
