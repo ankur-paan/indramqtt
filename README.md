@@ -15,6 +15,24 @@
 
 ---
 
+## Broker Comparison at 1 CPU and 1 GB
+
+Highest load that each broker holds for 180 s with 1 CPU and 1 GB of memory, with no lost message, no backlog, latency below 1 s and level memory. MQTT 5, payload 256 bytes, one broker at a time on the same server, measured on 2026-10-05. The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw data are in [`benchmark/`](benchmark/README.md).
+
+| Scenario | IndraMQTT | EMQX Enterprise 6.3.0 | rumqttd 0.19.0 |
+| :--- | :--- | :--- | :--- |
+| Point-to-point QoS 0 | **100,000 msg/s** | 20,000 msg/s | none: memory increases |
+| Point-to-point QoS 1 | **30,000 msg/s** | 7,500 msg/s | none: memory increases |
+| Fan-in QoS 0 (N publishers, 1 subscriber) | 40,000 msg/s | 10,000 msg/s | **80,000 msg/s** |
+| Fan-out QoS 0 (1 publisher, N subscribers) | **160,000 deliveries/s** | 20,000 deliveries/s | 80,000 deliveries/s |
+| 10,000 idle connections, memory | **283 MiB** | 720 MiB | 638 MiB (161 clients not connected) |
+| Memory with no clients | 76 MiB | 322 MiB | **1.5 MiB** |
+
+> [!IMPORTANT]
+> **Limits of this comparison**: each result is one search and one 180 s run on a shared server, without TLS, and the load generator runs on the same server. IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients. With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB). The IndraMQTT numbers use the MQTT listener of the kernel (`listeners.tcp.native = true`), which is off by default. See [`benchmark/README.md`](benchmark/README.md) for all conditions and for the cases where a broker has no sustained load.
+
+---
+
 ## Router & Rule Engine Microbenchmarks
 
 All figures below are grounded in reproducible, multi-sample automated benchmark gates defined in [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-node/benches/broker_throughput.rs).

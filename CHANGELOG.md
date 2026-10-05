@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased] - Sprint 20
 
 ### Added
+- **MQTT listeners of the kernel**: with `listeners.tcp.native = true` or `listeners.tls.native = true`, the kernel accepts the MQTT clients of that listener itself, without the edge process in the data path. The default is `false`. The kernel listener handles MQTT 3.1.1 and MQTT 5, applies `listeners.tcp.max_connections`, limits a CONNECT packet to 64 KiB and other packets to 1 MiB, and closes a client that does not read for 30 seconds. UNSUBSCRIBE, WebSocket and PSK are not available on this listener yet.
+- **Broker comparison**: [`benchmark/`](benchmark/README.md) contains the method, the tool and the raw results of the comparison at 1 CPU and 1 GB.
 - **Amazon Kinesis Sink (`INDRA-197`)**: High-throughput `PutRecords` batch ingestion with SigV4 signing, dynamic partition key derivation, and partial-failure exponential retry.
 - **Google Cloud Pub/Sub Sink (`INDRA-199`)**: `v1.publisher.publish` batch sink with ordering keys, dynamic attributes, and OAuth2/JWT authentication.
 - **Azure Event Hubs Sink (`INDRA-198`)**: Batch event ingestion with Shared Access Signature (SAS) token generation and partition key hashing.
@@ -16,7 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Cloud Streaming Studio (`INDRA-218`)**: REST API and Web Dashboard forms for all 4 cloud bridges.
 
 ### Changed
+- **Release profile**: a panic now unwinds. A panic in the task of one connection ends only that connection, and the kernel releases its session. Before this change, one panic stopped the broker.
+- **Subscription statistics**: the count of subscriptions and topics runs when a statistic is read. Before this change, it ran for each connect, subscribe and disconnect, and the work increased with the square of the number of connections. A maximum can miss a peak that is between two reads.
 - **Kafka connector `health_check_topic` default**: the schema default is now `indramqtt_health_check`. Anyone who set the topic explicitly is unaffected; to keep the previous topic, set `health_check_topic` explicitly in the connector configuration.
+
+### Fixed
+- **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 
 ---
 
