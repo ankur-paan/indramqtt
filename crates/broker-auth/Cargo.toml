@@ -30,7 +30,7 @@ native-tls = "0.2"
 kerberos-parser = "0.9"
 der-parser = "10"
 ring = "0.17"
-nom = "7"
+nom = "8"
 picky-krb = "0.12"
 picky-asn1 = { version = "0.10", features = ["time_conversion"] }
 picky-asn1-der = "0.5"
